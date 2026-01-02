@@ -1,0 +1,11 @@
+# Configuration file for https://skip.tools project
+#
+# Kotlin dependencies and Gradle build options for this module can be configured here
+
+build:
+  contents:
+    # Intentionally empty. The root module's Skip config injects the
+    # SwiftPM symlink fix into the generated Gradle project.
+
+skip:
+  mode: 'native'

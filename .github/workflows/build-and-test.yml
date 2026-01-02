@@ -1,0 +1,68 @@
+name: PQSRTC CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Require macOS 26
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Expecting macOS major: 26"
+          MACOS_VERSION=$(sw_vers -productVersion)
+          echo "macOS $MACOS_VERSION"
+          MACOS_MAJOR=$(echo "$MACOS_VERSION" | cut -d. -f1)
+          if [[ "$MACOS_MAJOR" != "26" ]]; then
+            echo "macOS 26 is required on this runner. Found: macOS $MACOS_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Require Xcode 26
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Expecting Xcode major: 26"
+          XCODE_VERSION_LINE=$(xcodebuild -version | head -n 1)
+          echo "$XCODE_VERSION_LINE"
+          XCODE_MAJOR=$(echo "$XCODE_VERSION_LINE" | awk '{print $2}' | cut -d. -f1)
+          if [[ "$XCODE_MAJOR" != "26" ]]; then
+            echo "Xcode 26 is required on this runner. Found: $XCODE_VERSION_LINE" >&2
+            exit 1
+          fi
+
+      - name: Swift version
+        run: |
+          swift --version
+          xcrun swift --version
+
+      - name: Install Skip.tools
+        run: |
+          brew install skiptools/skip/skip
+          skip version
+
+      - name: Cache Swift build artifacts
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: "macos-swift-${{ hashFiles('Package.swift', 'Package.resolved') }}"
+          restore-keys: |
+            macos-swift-
+
+      - name: Build
+        run: swift build --configuration release
+
+      - name: Test
+        run: swift test

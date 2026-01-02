@@ -1,0 +1,248 @@
+{
+  "originHash" : "36b92fe350e0913ed40fffefec750c280a1d50e361de10abed07eefa90de6441",
+  "pins" : [
+    {
+      "identity" : "binary-codable",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/needletails/binary-codable.git",
+      "state" : {
+        "revision" : "12bd3687711c34b93dbaaa9c2cddfe93a2d6ecdb",
+        "version" : "1.0.3"
+      }
+    },
+    {
+      "identity" : "double-ratchet-kit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/needletails/double-ratchet-kit.git",
+      "state" : {
+        "revision" : "264504da466875487869be7906eaa4bb7fe8da9f",
+        "version" : "2.0.2"
+      }
+    },
+    {
+      "identity" : "needletail-algorithms",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/needletails/needletail-algorithms.git",
+      "state" : {
+        "revision" : "95679a3bfd5daf7d5bf0f72598beffe9d08a264b",
+        "version" : "2.0.4"
+      }
+    },
+    {
+      "identity" : "needletail-crypto",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/needletails/needletail-crypto.git",
+      "state" : {
+        "revision" : "fb712d0f2e67f8b44c2afc35b3da414074db5bdc",
+        "version" : "1.2.1"
+      }
+    },
+    {
+      "identity" : "needletail-logger",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/needletails/needletail-logger.git",
+      "state" : {
+        "revision" : "4b595db6d9c17d6134c662c6949b4688d263ae50",
+        "version" : "3.1.3"
+      }
+    },
+    {
+      "identity" : "needletail-media-kit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/needletails/needletail-media-kit.git",
+      "state" : {
+        "revision" : "bd2bb653fefb0b10369e6b133f5ed3d06ff98320"
+      }
+    },
+    {
+      "identity" : "skip",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip.git",
+      "state" : {
+        "revision" : "0e3a6a5d0bae46d4f2241580d2e8afb749cf5ce9",
+        "version" : "1.6.32"
+      }
+    },
+    {
+      "identity" : "skip-android-bridge",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip-android-bridge.git",
+      "state" : {
+        "revision" : "f1f761fa208296b7fa56ee29e725529cc55735ac",
+        "version" : "0.6.1"
+      }
+    },
+    {
+      "identity" : "skip-bridge",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip-bridge.git",
+      "state" : {
+        "revision" : "0f6a896d7e31ca48d5f5b0e911dc2cc4545fa06a",
+        "version" : "0.16.3"
+      }
+    },
+    {
+      "identity" : "skip-foundation",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip-foundation.git",
+      "state" : {
+        "revision" : "efd63920b2b651326334f8aefe09895072c87a29",
+        "version" : "1.3.10"
+      }
+    },
+    {
+      "identity" : "skip-fuse",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip-fuse.git",
+      "state" : {
+        "revision" : "8f3295094ad29075730284c5197c7f1d94c0f2d9",
+        "version" : "1.0.2"
+      }
+    },
+    {
+      "identity" : "skip-fuse-ui",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip-fuse-ui.git",
+      "state" : {
+        "revision" : "c053133ebca112e54d21f55ed1fcaea169c549e5",
+        "version" : "1.10.3"
+      }
+    },
+    {
+      "identity" : "skip-lib",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip-lib.git",
+      "state" : {
+        "revision" : "112874f0222f4815798c924e2b299ba23eb53111",
+        "version" : "1.3.8"
+      }
+    },
+    {
+      "identity" : "skip-model",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip-model.git",
+      "state" : {
+        "revision" : "c12c738470841e0bd4b9398566d4d48b14ed57cc",
+        "version" : "1.7.0"
+      }
+    },
+    {
+      "identity" : "skip-ui",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip-ui.git",
+      "state" : {
+        "revision" : "a42741aa8961d1fea356ba12c77455d1202ad8ff",
+        "version" : "1.44.4"
+      }
+    },
+    {
+      "identity" : "skip-unit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/skip-unit.git",
+      "state" : {
+        "revision" : "37097af075cddb4ea4cd7f0acbf05169b8359c23",
+        "version" : "1.4.0"
+      }
+    },
+    {
+      "identity" : "specs",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/needletails/Specs.git",
+      "state" : {
+        "revision" : "220864aff85b428aaf603bfc8a6cbbcbdc84bfdf",
+        "version" : "137.7151.11"
+      }
+    },
+    {
+      "identity" : "swift-algorithms",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-algorithms.git",
+      "state" : {
+        "revision" : "87e50f483c54e6efd60e885f7f5aa946cee68023",
+        "version" : "1.2.1"
+      }
+    },
+    {
+      "identity" : "swift-android-native",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/skiptools/swift-android-native.git",
+      "state" : {
+        "revision" : "8bfa631886b4dd1f9e3fc3f43d653a71b6d19295",
+        "version" : "1.4.3"
+      }
+    },
+    {
+      "identity" : "swift-asn1",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-asn1.git",
+      "state" : {
+        "revision" : "810496cf121e525d660cd0ea89a758740476b85f",
+        "version" : "1.5.1"
+      }
+    },
+    {
+      "identity" : "swift-async-algorithms",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-async-algorithms.git",
+      "state" : {
+        "revision" : "6c050d5ef8e1aa6342528460db614e9770d7f804",
+        "version" : "1.1.1"
+      }
+    },
+    {
+      "identity" : "swift-atomics",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-atomics.git",
+      "state" : {
+        "revision" : "b601256eab081c0f92f059e12818ac1d4f178ff7",
+        "version" : "1.3.0"
+      }
+    },
+    {
+      "identity" : "swift-collections",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-collections.git",
+      "state" : {
+        "revision" : "7b847a3b7008b2dc2f47ca3110d8c782fb2e5c7e",
+        "version" : "1.3.0"
+      }
+    },
+    {
+      "identity" : "swift-crypto",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/needletails/swift-crypto.git",
+      "state" : {
+        "revision" : "63bff550740e524201d9ba183642f25ea0c255eb",
+        "version" : "1.0.1"
+      }
+    },
+    {
+      "identity" : "swift-jni",
+      "kind" : "remoteSourceControl",
+      "location" : "https://source.skip.tools/swift-jni.git",
+      "state" : {
+        "revision" : "e2cc18b34695d0f3e7948a6c1d4b95cd5d89571f",
+        "version" : "0.3.1"
+      }
+    },
+    {
+      "identity" : "swift-log",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-log.git",
+      "state" : {
+        "revision" : "bc386b95f2a16ccd0150a8235e7c69eab2b866ca",
+        "version" : "1.8.0"
+      }
+    },
+    {
+      "identity" : "swift-numerics",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-numerics.git",
+      "state" : {
+        "revision" : "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
+        "version" : "1.1.1"
+      }
+    }
+  ],
+  "version" : 3
+}

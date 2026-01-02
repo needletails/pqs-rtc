@@ -32,6 +32,10 @@ DerivedData/
 xcuserdata/
 xcodebuild*.log
 .idea/
+.vscode/
+
+*.xcresult
+*.xcarchive
 
 *.moved-aside
 *.pbxuser
@@ -62,7 +66,11 @@ playground.xcworkspace
 # Add this line if you want to avoid checking in source code from Swift Package Manager dependencies.
 Packages/
 Package.pins
-Package.resolved
+# Package.resolved is intentionally committed for reproducible dependency resolution.
+
+# Xcode-generated SwiftPM integration files
+.swiftpm/xcode/
+.swiftpm/configuration/
 #*.xcodeproj
 
 Carthage/Build/
@@ -74,3 +82,6 @@ Carthage/Build/
 **/fastlane/README.md
 **/fastlane/Preview.html
 **/fastlane/test_output
+
+# Generated test artifacts
+Tests/PQSRTCTests/debug
