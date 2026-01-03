@@ -183,7 +183,7 @@ actor PreviewViewRender: RendererDelegate {
     
     func stopCaptureSession() async {
         guard let session = layer.session else {
-            logger.log(level: .warning, message: "Cannot stop capture session - session is nil")
+            logger.log(level: .debug, message: "Capture session already nil; skipping stop")
             await shutdown()
             return
         }

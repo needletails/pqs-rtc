@@ -241,6 +241,12 @@ public actor AndroidVideoCallController: CallActionDelegate {
         guard isRunning else { return }
         // Prevent concurrent teardown from running more than once
         isRunning = false
+
+        // Guarantee the underlying RTCSession is returned to a pre-call baseline
+        // even when teardown is triggered by remote end/failure (not user-initiated endCall()).
+        if let call = self.currentCall {
+            await session.shutdown(with: call)
+        }
         await tearDownPreviewView()
         await tearDownSampleView()
         stateStreamTask?.cancel()

@@ -174,6 +174,12 @@ public final class VideoCallViewController: UICollectionViewController {
         // Prevent concurrent teardown from running more than once
         isRunning = false
 
+        // Guarantee the underlying RTCSession is returned to a pre-call baseline
+        // even when teardown is triggered by remote end/failure (not user-initiated endCall()).
+        if let call = self.currentCall {
+            await session.shutdown(with: call)
+        }
+
         await tearDownPreviewView()
         await tearDownSampleView()
         
@@ -269,8 +275,8 @@ public final class VideoCallViewController: UICollectionViewController {
     func tearDownPreviewView() async {
         guard let localView = videoViews.views.first(where: { $0.videoView.contextName == "preview" })?.videoView else { return }
         guard let localVideoRenderer = localView.renderer as? PreviewViewRender else { return }
-        await localVideoRenderer.setCapture(nil)
         await localVideoRenderer.stopCaptureSession()
+        await localVideoRenderer.setCapture(nil)
         guard let connectionId = currentCall?.sharedCommunicationId else { return }
         await session.removeLocal(renderer: localVideoRenderer.rtcVideoRenderWrapper, connectionId: connectionId)
         localView.shutdownMetalStream()
@@ -550,7 +556,7 @@ extension VideoCallViewController: AVPictureInPictureControllerDelegate, AVPictu
                 }
             } else {
                 guard let previewRenderer = localView.renderer as? PreviewViewRender else { return }
-                guard let captureSession = previewRenderer.layer.session else { return }
+                guard let captureSession = await previewRenderer.layer.session else { return }
                 if captureSession.isMultitaskingCameraAccessSupported {
                     pipController?.stopPictureInPicture()
                     self.pipController = nil

@@ -17,6 +17,9 @@
 
 import Foundation
 import DoubleRatchetKit
+#if os(iOS)
+import AVFoundation
+#endif
 #if canImport(WebRTC)
 import WebRTC
 #endif
@@ -64,7 +67,7 @@ extension RTCSession {
         let delegateWrapper = RTCPeerConnectionDelegateWrapper(
             connectionId: call.sharedCommunicationId,
             logger: logger,
-            continuation: continuation)
+            continuation: peerConnectionNotificationsContinuation)
         rtcClient.setEventDelegate(delegateWrapper.delegate)
         delegateWrapper.delegate?.setRTCClient(rtcClient)
         
@@ -127,7 +130,7 @@ extension RTCSession {
         let delegateWrapper = RTCPeerConnectionDelegateWrapper(
             connectionId: call.sharedCommunicationId,
             logger: self.logger,
-            continuation: continuation)
+            continuation: peerConnectionNotificationsContinuation)
         
         // Apple Platform WebRTC peer connection creation
         guard let createdPeerConnection = RTCSession.factory.peerConnection(
@@ -201,43 +204,81 @@ extension RTCSession {
     /// - Parameter call: The call to end. If `nil`, the session attempts to close any remaining
     ///   connections as a fallback.
     public func shutdown(with call: Call?) async {
-        
-        await finishEndConnection(currentCall: call)
-        
-        for continuation in await callState.streamContinuations {
-            continuation.finish()
-        }
-        
-        // Close any remaining peer connections and notify delegates
-        for connection in await connectionManager.findAllConnections() {
-            await connection.delegateWrapper.delegate?.shutdown()
-#if os(Android)
-            self.rtcClient.close()
-            logger.log(level: .info, message: "Did close AndroidRTCClient for call: \(connection)")
-#else
-            connection.peerConnection.delegate = nil
-            connection.peerConnection.close()
-#endif
-        }
-        
-        // Cancel and cleanup tasks
+        // Stop background consumers first so we don't process late callbacks
+        // while tearing down peer connections.
         stateTask?.cancel()
         stateTask = nil
-        
+        // Retire peer-notifications consumer. Bump generation and yield a `nil` wake-up so any
+        // lingering consumer can observe cancellation/mismatch and exit.
+        notificationsTaskGeneration &+= 1
+        peerConnectionNotificationsContinuation.yield(nil)
         notificationsTask?.cancel()
         notificationsTask = nil
-        
+        notificationsConsumerIsRunning = false
+
+        // Recreate the notifications stream so subsequent calls start with a fresh pipeline.
+        // This is critical for sequential-call reliability when the previous stream has
+        // terminated (observed via consumer immediately exiting on call #2).
+        resetPeerConnectionNotificationsStream()
+
+        // Prefer idempotent teardown: `shutdown(with:)` can be invoked multiple times from
+        // different end-call triggers (e.g. signaling end_call + CallKit). The rest of
+        // `shutdown(with:)` still performs a full reset.
+        await finishEndConnection(currentCall: call, force: false)
+
+        // Close any remaining peer connections and notify delegates.
+        // (Normally `finishEndConnection` already removed them, but keep this as a safety net.)
+        let remainingConnections = await connectionManager.findAllConnections()
+        for connection in remainingConnections {
+            await connection.delegateWrapper.delegate?.shutdown()
+    #if os(Android)
+            // Android cleanup is centralized on the shared AndroidRTCClient.
+    #else
+            connection.peerConnection.delegate = nil
+            connection.peerConnection.close()
+    #endif
+        }
+
+    #if os(Android)
+        self.rtcClient.close()
+        logger.log(level: .info, message: "Did close AndroidRTCClient during shutdown")
+    #endif
+
+    #if os(iOS)
+        // Disable WebRTC audio playout/recording and deactivate AVAudioSession so the next call starts clean.
+        setAudio(false)
+        do {
+            try deactivateAudioSession(session: AVAudioSession.sharedInstance())
+        } catch {
+            logger.log(level: .warning, message: "⚠️ Failed to deactivate AVAudioSession during shutdown: \(error.localizedDescription)")
+        }
+    #endif
+
+        // Clear any session-level pending buffers/caches.
+        iceDeque.removeAll()
+    #if !os(Android)
+        pendingRemoteVideoRenderersByConnectionId.removeAll()
+    #endif
+
         // Shutdown ratchet manager and clear all crypto/key state so the
         // next call starts from a clean slate (no pending ciphertext/keys).
         try? await ratchetManager.shutdown()
         await keyManager.clearAll()
-        
+
         await connectionManager.removeAllConnections()
-        continuation.finish()
-#if os(Android)
+
+    #if os(Android)
         didStartReceiving = false
         remoteViewData.removeAll()
-#endif
+    #endif
+
+    #if DEBUG
+        let remainingConnectionCount = await connectionManager.findAllConnections().count
+        assert(remainingConnectionCount == 0, "RTCSession shutdown should leave zero connections (found: \(remainingConnectionCount))")
+        assert(inboundCandidateConsumers.isEmpty, "RTCSession shutdown should clear inbound candidate buffers")
+        assert(pcStateByConnectionId.isEmpty, "RTCSession shutdown should clear per-connection pcState")
+        assert(pcState == .none, "RTCSession shutdown should reset pcState to .none")
+    #endif
     }
     
     /// Adds audio to a stream with proper error handling
@@ -342,13 +383,42 @@ extension RTCSession {
     /// The session consumes an internal notification stream (emitted by platform delegates) to
     /// coordinate negotiation, media events, and crypto lifecycle changes.
     func handleNotificationsStream() {
-        // Only start a new task if one doesn't exist or is cancelled
-        if notificationsTask?.isCancelled != false {
-            notificationsTask = Task { [weak self] in
-                guard let self else { return }
-                await handlePeerConnectionNotifications()
-            }
+        // Start a new task if one doesn't exist, is cancelled, or we previously observed that the
+        // consumer isn't actually running.
+        let needsRestart = notificationsTask == nil
+            || notificationsTask?.isCancelled == true
+            || notificationsConsumerIsRunning == false
+
+        guard needsRestart else { return }
+
+        if notificationsTask != nil {
+            logger.log(level: .info, message: "Restarting peer-notifications consumer task")
+            // Wake any existing consumer so it can observe cancellation/generation mismatch.
+            peerConnectionNotificationsContinuation.yield(nil)
+            notificationsTask?.cancel()
         }
+
+        notificationsTaskGeneration &+= 1
+        let generation = notificationsTaskGeneration
+        logger.log(level: .info, message: "Starting peer-notifications consumer task (generation=\(generation))")
+
+        // Use a detached task so this long-lived consumer does not inherit cancellation from
+        // whatever call/setup task happened to create it.
+        notificationsTask = Task.detached { [weak self] in
+            guard let self else { return }
+            await self.handlePeerConnectionNotifications(generation: generation)
+            // Always clear the task reference when the consumer exits (usually due to
+            // cancellation during teardown). Do not use a nested Task here because it can
+            // inherit cancellation and fail to run, leaving a completed 'zombie' task.
+            await self.notificationsTaskDidFinish(generation: generation)
+        }
+    }
+
+    private func notificationsTaskDidFinish(generation: UInt64) {
+        // Only clear if this is still the latest task.
+        guard generation == notificationsTaskGeneration else { return }
+        notificationsTask = nil
+        notificationsConsumerIsRunning = false
     }
     
     /// Creates a state stream for a call.
@@ -362,6 +432,9 @@ extension RTCSession {
         with call: Call,
         recipientName: String? = nil
     ) async throws {
+        // Treat this call's connection id as the active one.
+        // This prevents late callbacks from a previous call from affecting the new call.
+        activeConnectionId = call.sharedCommunicationId
         await callState.createStreams(with: call)
         handleStateStream()
     }
@@ -402,9 +475,58 @@ extension RTCSession {
     /// Safely ends a connection with proper cleanup and error handling
     /// - Parameter currentCall: The call to end
     public func finishEndConnection(currentCall: Call?) async {
+        await finishEndConnection(currentCall: currentCall, force: false)
+    }
+
+    /// Safely ends a connection with proper cleanup and error handling.
+    ///
+    /// - Parameters:
+    ///   - currentCall: The call to end.
+    ///   - force: If `true`, performs cleanup even if the session has already recorded teardown
+    ///     for this call key. This is used by `shutdown(with:)` to guarantee a full reset.
+    public func finishEndConnection(currentCall: Call?, force: Bool) async {
+        let callKey = currentCall.map { teardownKey(for: $0) }
+        let connectionIdKey = currentCall?.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !force {
+            if let connectionIdKey, !connectionIdKey.isEmpty {
+                if !beginEnding(connectionId: connectionIdKey) {
+                    logger.log(level: .debug, message: "Skipping duplicate finishEndConnection for connectionId: \(connectionIdKey)")
+                    return
+                }
+            } else if let callKey {
+                if !beginEnding(callKey: callKey) {
+                    logger.log(level: .debug, message: "Skipping duplicate finishEndConnection for callKey: \(callKey)")
+                    return
+                }
+            }
+        }
+
+        defer {
+            if let connectionIdKey, !connectionIdKey.isEmpty {
+                endEnding(connectionId: connectionIdKey)
+            }
+            if let callKey {
+                endEnding(callKey: callKey)
+            }
+        }
+
         logger.log(level: .info, message: "Finishing connection for call: \(String(describing: currentCall?.id))")
+
+        // If we're ending the currently active call, clear the active connection marker.
+        if let currentCall {
+            if activeConnectionId == currentCall.sharedCommunicationId {
+                activeConnectionId = nil
+            }
+        } else {
+            activeConnectionId = nil
+        }
         
         let connectionId = currentCall?.sharedCommunicationId
+
+        if let connectionId {
+            pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
+        }
         
         // Clean up video and crypto resources before closing connection
         if let connectionId,
@@ -464,18 +586,42 @@ extension RTCSession {
             connection.peerConnection.close()
 #endif
         }
-        
-        // Close peer connection if found
-        if let currentCall, let connection = await connectionManager.findConnection(with: currentCall.sharedCommunicationId) {
-            await cleanup(connection: connection)
-            logger.log(level: .debug, message: "Closed peer connection for call: \(currentCall.id)")
-        } else {
-            // Fallback to last connection if specific connection not found
-            if let lastConnection = await connectionManager.findAllConnections().last {
-                await cleanup(connection: lastConnection)
-                logger.log(level: .debug, message: "Closed last peer connection as fallback")
+
+        // Close peer connection(s).
+        //
+        // Important: do NOT close an arbitrary "last connection" when the call-specific connection
+        // can't be found. Late callbacks from a previous call can arrive after a new call has
+        // already created its peer connection; closing the wrong connection breaks subsequent calls.
+        if let currentCall {
+            if let connection = await connectionManager.findConnection(with: currentCall.sharedCommunicationId) {
+                await cleanup(connection: connection)
+                logger.log(level: .debug, message: "Closed peer connection for call: \(currentCall.id)")
             } else {
-                logger.log(level: .warning, message: "No connections found to close for call: \(String(describing: currentCall?.id))")
+                let activeIds = await connectionManager.findAllConnections().map { $0.id }
+                logger.log(
+                    level: .warning,
+                    message: "No peer connection found to close for call: \(String(describing: currentCall.id)); activeConnections=\(activeIds)"
+                )
+            }
+        } else {
+            let remainingConnections = await connectionManager.findAllConnections()
+            for connection in remainingConnections {
+                await cleanup(connection: connection)
+                // Remove per-connection identity so the next call starts clean.
+                await keyManager.removeConnectionIdentity(connectionId: connection.id)
+            }
+
+            // Remove all connections from the manager so subsequent calls don't accidentally
+            // reference stale connections.
+            await connectionManager.removeAllConnections()
+
+            // Clear any buffered renderer requests since they are scoped to old connections.
+#if !os(Android)
+            pendingRemoteVideoRenderersByConnectionId.removeAll()
+#endif
+
+            if !remainingConnections.isEmpty {
+                logger.log(level: .debug, message: "Closed \(remainingConnections.count) peer connection(s) (no call provided)")
             }
         }
         
@@ -486,13 +632,23 @@ extension RTCSession {
         
         // Reset call state
         await self.callState.resetState()
+
+        // Reset inbound call answer gating
+        resetCallAnswerGating()
         
         // Reset connection state
         pcState = PeerConnectionState.none
+        pcStateByConnectionId.removeAll()
         readyForCandidates = false
+
+        // Clear any queued outbound candidates.
+        iceDeque.removeAll()
         
-        // Clean up candidate consumer
-        await inboundCandidateConsumer.removeAll()
+        // Clean up candidate buffers
+        for (_, consumer) in inboundCandidateConsumers {
+            await consumer.removeAll()
+        }
+        inboundCandidateConsumers.removeAll()
         
         // Reset counters and flags
         notRunning = true

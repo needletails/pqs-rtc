@@ -97,7 +97,22 @@ internal class PreviewCaptureView: UIView {
     // MARK: - Memory Management
     
     deinit {
-        precondition(didShutdown , "didShutdown should be true upon PreviewCaptureView deallocation")
+        #if DEBUG
+        assert(didShutdown, "didShutdown should be true upon PreviewCaptureView deallocation")
+        #endif
+
+        // Be defensive: if a caller forgets to remove the session, ensure we don't keep
+        // the capture session attached to a deallocating preview layer.
+        if !didShutdown {
+            if Thread.isMainThread {
+                previewLayer.session = nil
+            } else {
+                DispatchQueue.main.sync {
+                    self.previewLayer.session = nil
+                }
+            }
+            didShutdown = true
+        }
         #if DEBUG
         logger.log(level: .debug, message: "PreviewCaptureView deallocated")
         #endif

@@ -2,12 +2,6 @@
 // This is a Skip (https://skip.tools) package.
 import PackageDescription
 
-let enableSkipstone: Bool = {
-    let env = Context.environment
-    // When building through Skip tooling, one (or more) of these is typically set.
-    return (env["SKIPSTONE"] ?? "0") != "0" || (env["SKIP_BRIDGE"] ?? "0") != "0" || (env["SKIP"] ?? "0") != "0"
-}()
-
 let package = Package(
     name: "pqs-rtc",
     defaultLocalization: "en",
@@ -43,21 +37,12 @@ let package = Package(
             .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
             .product(name: "NeedleTailMediaKit", package: "needletail-media-kit", condition: .when(platforms: [.iOS, .macOS])),
             .product(name: "WebRTC", package: "Specs", condition: .when(platforms: [.iOS, .macOS]))
-        ],
-            exclude: [
-            "Skip/skip.yml"
-        ],
-            resources: [
+        ], resources: [
             .process("Resources"),
             .process("Rendering/MetalProcessors/MetalShaders/RenderingShaders.metal")
         ],
-            plugins: enableSkipstone ? [
-                .plugin(name: "skipstone", package: "skip"),
-            ] : []
-        ),
-        // SkipTest/skipstone-based tests are intended for Skip/Android builds.
-        // They are gated to keep local macOS `swift test` runs fast and deterministic.
-        enableSkipstone ? .testTarget(
+                plugins: [.plugin(name: "skipstone", package: "skip")]),
+        .testTarget(
             name: "PQSRTCTests",
             dependencies: [
                 "PQSRTC",
@@ -65,7 +50,7 @@ let package = Package(
             ],
             path: "Tests/PQSRTCTests",
             plugins: [.plugin(name: "skipstone", package: "skip")]
-        ) : nil,
+        ),
         .testTarget(
             name: "PQSRTCCompiledSwiftTests",
             dependencies: [
@@ -76,7 +61,7 @@ let package = Package(
             ],
             path: "Tests/PQSRTCCompiledSwiftTests"
         ),
-    ].compactMap { $0 }
+    ]
 )
 
 if Context.environment["SKIP_BRIDGE"] ?? "0" != "0" {

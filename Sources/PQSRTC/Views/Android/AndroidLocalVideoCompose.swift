@@ -333,7 +333,6 @@ public struct AndroidVideoCallView: SkipSwiftUI.View {
     @State var localViewSize: CGSize = .zero
     @Binding var delegate: CallActionDelegate?
     @Binding var errorMessage: String
-    @Binding var videoUpgraded: Bool
     @Binding var endedCall: Bool
     @Binding var width: CGFloat
     @Binding var height: CGFloat
@@ -344,7 +343,6 @@ public struct AndroidVideoCallView: SkipSwiftUI.View {
         remoteCount: Int = 1,
         delegate: Binding<CallActionDelegate?>,
         errorMessage: Binding<String>,
-        videoUpgraded: Binding<Bool>,
         endedCall: Binding<Bool>,
         width: Binding<CGFloat>,
         height: Binding<CGFloat>,
@@ -354,7 +352,6 @@ public struct AndroidVideoCallView: SkipSwiftUI.View {
         self.remoteCount = remoteCount
         self._delegate = delegate
         self._errorMessage = errorMessage
-        self._videoUpgraded = videoUpgraded
         self._endedCall = endedCall
         self._width = width
         self._height = height
@@ -456,9 +453,7 @@ public struct AndroidVideoCallView: SkipSwiftUI.View {
         public func passErrorMessage(_ message: String) async {
             self.parent.errorMessage = message
         }
-        public func videoUpgraded(_ upgraded: Bool) async {
-            self.parent.videoUpgraded = upgraded
-        }
+
         public func deliverCallState(_ state: CallStateMachine.State) async {
             self.parent.callState = state
         }

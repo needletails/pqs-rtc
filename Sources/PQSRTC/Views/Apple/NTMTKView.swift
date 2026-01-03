@@ -259,6 +259,15 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
                     trailing: trailingAnchor)
             } else {
                 if let previewCaptureView = subviews.first(where: { $0 is PreviewCaptureView }) {
+                    if let previewCaptureView = previewCaptureView as? PreviewCaptureView {
+                        if Thread.isMainThread {
+                            previewCaptureView.removeSession()
+                        } else {
+                            DispatchQueue.main.sync {
+                                previewCaptureView.removeSession()
+                            }
+                        }
+                    }
                     previewCaptureView.removeFromSuperview()
                 }
             }
@@ -423,6 +432,16 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
 
         if let sampleCaptureView = captureView as? SampleCaptureView {
             sampleCaptureView.shutdown()
+        }
+
+        if let previewCaptureView = captureView as? PreviewCaptureView {
+            if Thread.isMainThread {
+                previewCaptureView.removeSession()
+            } else {
+                DispatchQueue.main.sync {
+                    previewCaptureView.removeSession()
+                }
+            }
         }
 
         captureView?.removeFromSuperview()

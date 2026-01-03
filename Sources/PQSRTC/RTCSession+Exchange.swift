@@ -158,6 +158,11 @@ extension RTCSession {
         do {
             let hasVideo = call.supportsVideo
             logger.log(level: .info, message: "Creating offer for call: \(call.id), hasVideo: \(hasVideo)")
+
+            // ICE gathering + negotiation callbacks are emitted via the internal peer-notifications
+            // stream. If the consumer task exited during a previous teardown, restart it here so
+            // we don't miss generated ICE candidates on subsequent calls.
+            handleNotificationsStream()
             
             // Find or create connection
             var connection: RTCConnection!
@@ -233,12 +238,16 @@ extension RTCSession {
     func createAnswer(call: Call) async throws -> Call {
         
         logger.log(level: .info, message: "Creating answer for call: \(call.id)")
+
+        // Ensure peer-notifications consumer is running before setting descriptions.
+        handleNotificationsStream()
         
         // Wait for peer connection to be ready
         try await loop.run(10, sleep: Duration.seconds(1)) { [weak self] in
             guard let self else { return false }
             var canRun = true
-            if await self.pcState == PeerConnectionState.setRemote {
+            let state = await self.pcStateByConnectionId[call.sharedCommunicationId] ?? .none
+            if state == .setRemote {
                 canRun = false
             }
             return canRun
@@ -326,6 +335,9 @@ extension RTCSession {
         call: Call
     ) async throws {
         logger.log(level: .info, message: "Setting remote SDP for call: \(call.id)")
+
+        // Remote description can trigger negotiation/ICE events; ensure consumer is alive.
+        handleNotificationsStream()
         
         do {
             // Find or create connection
@@ -392,12 +404,23 @@ extension RTCSession {
         call: Call
     ) async throws {
         logger.log(level: .info, message: "Setting remote SDP for call: \(call.id)")
+
+        // Remote description can trigger negotiation/ICE events; ensure consumer is alive.
+        handleNotificationsStream()
         
         do {
-            guard let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
-                throw RTCErrors.connectionNotFound
-            }
+            let connection: RTCConnection
+            if let existing = await connectionManager.findConnection(with: call.sharedCommunicationId) {
+                connection = existing
                 logger.log(level: .debug, message: "Found connection for call: \(call.id)")
+            } else {
+                logger.log(level: .info, message: "No connection found for call \(call.id); creating peer connection before applying remote SDP")
+                try await createCryptoSession(with: call)
+                guard let created = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
+                    throw RTCErrors.connectionNotFound
+                }
+                connection = created
+            }
             
             // Modify SDP for specific requirements
             var modifiedSdp = sdp
@@ -408,11 +431,13 @@ extension RTCSession {
             try await setRemoteSDP(modifiedSdp, for: connection)
             
             pcState = PeerConnectionState.setRemote
+            pcStateByConnectionId[call.sharedCommunicationId] = .setRemote
             logger.log(level: .info, message: "Successfully set remote SDP for call: \(call.id)")
             
             // Process any queued incoming candidates that arrived before setRemote
             do {
-                try await processAllQueuedCandidates(connection: connection)
+                let consumer = inboundCandidateConsumer(for: call.sharedCommunicationId)
+                try await processAllQueuedCandidates(connection: connection, consumer: consumer)
             } catch {
                 logger.log(level: .warning, message: "Error processing queued candidates: \(error.localizedDescription)")
             }
@@ -446,24 +471,26 @@ extension RTCSession {
         call: Call
     ) async throws {
         logger.log(level: .info, message: "Received ICE candidate with id: \(candidate.id) for call: \(call.id)")
-        await inboundCandidateConsumer.feedConsumer(candidate)
+        let consumer = inboundCandidateConsumer(for: call.sharedCommunicationId)
+        await consumer.feedConsumer(candidate)
         guard let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
             logger.log(level: .warning, message: "No connection found for candidate with id: \(candidate.id), call: \(call.id)")
             return
         }
-        logger.log(level: .info, message: "Current pcState: \(pcState), checking if ready to process candidates")
-        if pcState == PeerConnectionState.setRemote {
+        let state = pcStateByConnectionId[call.sharedCommunicationId] ?? pcState
+        logger.log(level: .info, message: "Current pcState: \(state), checking if ready to process candidates")
+        if state == PeerConnectionState.setRemote {
             logger.log(level: .info, message: "Processing candidates for call: \(call.id)")
-            try await processAllQueuedCandidates(connection: connection)
+            try await processAllQueuedCandidates(connection: connection, consumer: consumer)
         } else {
-            logger.log(level: .warning, message: "Not processing candidate yet - pcState is \(pcState), waiting for setRemote state")
+            logger.log(level: .warning, message: "Not processing candidate yet - pcState is \(state), waiting for setRemote state")
         }
     }
     
     
-    private func processCandidates(connection: RTCConnection) async throws {
+    private func processCandidates(connection: RTCConnection, consumer: NeedleTailAsyncConsumer<IceCandidate>) async throws {
         // Skip-compatible approach: process candidates directly from the consumer
-        let result = await inboundCandidateConsumer.next()
+        let result = await consumer.next()
         switch result {
         case NTASequenceStateMachine.NextNTAResult.ready(let candidate):
             //we need to find if last id contained in deq
@@ -486,10 +513,10 @@ extension RTCSession {
     
     /// Processes all queued incoming ICE candidates
     /// This is called after setRemote to process any candidates that arrived early
-    private func processAllQueuedCandidates(connection: RTCConnection) async throws {
+    private func processAllQueuedCandidates(connection: RTCConnection, consumer: NeedleTailAsyncConsumer<IceCandidate>) async throws {
         var processedCount = 0
         while true {
-            let result = await inboundCandidateConsumer.next()
+            let result = await consumer.next()
             switch result {
             case NTASequenceStateMachine.NextNTAResult.ready(let candidate):
                 let iceCandidate = candidate.item

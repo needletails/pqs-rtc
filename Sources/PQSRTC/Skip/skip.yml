@@ -3,10 +3,6 @@
 # Kotlin dependencies and Gradle build options for this module can be configured here
 build:
   contents:
-    # Ensure the Gradle `plugins {}` block is emitted before any `dependencies {}` / `android {}` blocks.
-    # Gradle Kotlin DSL requires this ordering for plugin-provided DSL symbols (e.g. `implementation`, `android`).
-    - block: 'plugins'
-      contents: []
     - block: 'dependencies'
       contents:
         - 'implementation("io.github.webrtc-sdk:android:137.7151.05")'

@@ -20,9 +20,28 @@ import WebRTC
 #endif
 
 extension RTCSession {
-    func handlePeerConnectionNotifications() async {
-        for await notification in stream {
+    func handlePeerConnectionNotifications(generation: UInt64) async {
+        notificationsConsumerIsRunning = true
+        logger.log(level: .info, message: "Peer-notifications consumer is now listening (generation=\(generation))")
+        defer {
+            notificationsConsumerIsRunning = false
+            let activeConnectionIdDescription = activeConnectionId ?? "nil"
+            logger.log(
+                level: .info,
+                message: "Peer-notifications consumer exited (generation=\(generation), cancelled=\(Task.isCancelled), currentGeneration=\(notificationsTaskGeneration), activeConnectionId=\(activeConnectionIdDescription))"
+            )
+        }
+
+        var didLogFirstNotification = false
+        for await notification in peerConnectionNotificationsStream {
+            if Task.isCancelled { break }
+            if generation != notificationsTaskGeneration { break }
             guard let notification else { continue }
+
+            if !didLogFirstNotification {
+                didLogFirstNotification = true
+                logger.log(level: .info, message: "Peer-notifications consumer received first notification")
+            }
             
             // Extract connection ID from notification
             let connectionId: String
@@ -122,6 +141,11 @@ extension RTCSession {
                         updated.remoteVideoTrack = videoTrack
                         await connectionManager.updateConnection(id: updated.id, with: updated)
 
+                        if let pendingRenderer = pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: updated.id) {
+                            logger.log(level: .info, message: "Attaching buffered remote renderer now that remote video track is available (trackId=\(trackId))")
+                            videoTrack.add(pendingRenderer)
+                        }
+
                         if let mediaDelegate, !participantId.isEmpty {
                             await mediaDelegate.didAddRemoteTrack(connectionId: updated.id, participantId: participantId, kind: "video", trackId: trackId)
                         }
@@ -157,6 +181,10 @@ extension RTCSession {
                 }
 #endif
             case .iceConnectionStateDidChange(let connectionId, let newState):
+                if let active = activeConnectionId, active != connection.id {
+                    self.logger.log(level: .debug, message: "Ignoring iceConnectionStateDidChange for non-active connection (active=\(active), got=\(connection.id))")
+                    continue
+                }
                 self.logger.log(level: .info, message: "peerConnection new connection state: \(newState.description)")
                 if newState.state == .connected, let callDirection = await self.callState.callDirection {
                     let id: String? = connectionId
@@ -170,6 +198,10 @@ extension RTCSession {
                     await finishEndConnection(currentCall: connection.call)
                 }
             case .generatedIceCandidate(_, let sdp, let mLine, let mid):
+                if let active = activeConnectionId, active != connection.id {
+                    self.logger.log(level: .debug, message: "Ignoring generatedIceCandidate for non-active connection (active=\(active), got=\(connection.id))")
+                    continue
+                }
                 do {
                     iceId += 1
                     var candidate: IceCandidate?
@@ -201,6 +233,10 @@ extension RTCSession {
                     self.logger.log(level: .error, message: "Failed to Send Ice Candidate \(error)")
                 }
             case .standardizedIceConnectionState(let connectionId, let newState):
+                if let active = activeConnectionId, active != connection.id {
+                    self.logger.log(level: .debug, message: "Ignoring standardizedIceConnectionState for non-active connection (active=\(active), got=\(connection.id))")
+                    continue
+                }
                 self.logger.log(level: .info, message: "peerConnection did change ice state \(newState.description)")
                 
                 if newState.state == .failed || newState.state == .disconnected || newState.state == .closed {

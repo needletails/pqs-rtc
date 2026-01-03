@@ -157,6 +157,10 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     /// This cancels any active stream task, finishes the underlying `AsyncStream`, and clears
     /// the `RTCVideoRenderWrapper` output callback.
     func shutdown() {
+        guard !isShutdown else {
+            logger.log(level: .debug, message: "Shutdown already completed; skipping")
+            return
+        }
         logger.log(level: .info, message: "Shutdown initiated")
         
         isShutdown = true

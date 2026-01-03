@@ -28,6 +28,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private let continuation: AsyncStream<PeerConnectionNotifications?>.Continuation
     private let connectionId: String
     private weak var rtcClient: AndroidRTCClient?
+    private var isShutdown = false
     
     public init(
         connectionId: String,
@@ -44,7 +45,11 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     }
     
     func shutdown() async {
-        continuation.finish()
+        lock.withLock { [weak self] in
+            guard let self else { return }
+            isShutdown = true
+            rtcClient = nil
+        }
     }
     
     /* SKIP @bridge */
@@ -91,6 +96,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleIceCandidate(_ candidate: RTCIceCandidate) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             guard !connectionId.isEmpty else {
                 logger.log(level: .warning, message: "Dropping ICE candidate event because connectionId is empty")
                 return
@@ -107,6 +113,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleRemoteVideoTrack(_ track: RTCVideoTrack) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Remote video track received from NeedleTailRTC")
             logger.log(level: .info, message: "Video track ID: \(track.trackId)")
             guard !connectionId.isEmpty else { return }
@@ -119,6 +126,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleRemoteAudioTrack(_ track: RTCAudioTrack) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Remote audio track received from NeedleTailRTC")
             guard !connectionId.isEmpty else { return }
             // Mirror the Apple Unified Plan callback (`didAddReceiver`) so the session can
@@ -130,6 +138,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleSignalingStateChange(_ stateDesc: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             let state = SPTSignalingState(description: stateDesc)
             logger.log(level: .info, message: "Signaling state changed to: \(state.description)")
             guard !connectionId.isEmpty else { return }
@@ -140,6 +149,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleIceConnectionStateChange(_ stateDesc: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             let state = SPTIceConnectionState(description: stateDesc)
             logger.log(level: .info, message: "ICE connection state changed to: \(state.description)")
             guard !connectionId.isEmpty else { return }
@@ -150,6 +160,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleStandardizedIceConnectionStateChange(_ stateDesc: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             let state = SPTIceConnectionState(description: stateDesc)
             logger.log(level: .info, message: "Standardized ICE connection state changed to: \(state.description)")
             guard !connectionId.isEmpty else { return }
@@ -160,6 +171,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handlePeerConnectionStateChange(_ stateDesc: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             let state = SPTPeerConnectionState(description: stateDesc)
             logger.log(level: .info, message: "Peer connection state changed to: \(state.description)")
             guard !connectionId.isEmpty else { return }
@@ -170,6 +182,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleIceConnectionReceivingChange(_ receiving: Bool) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "ICE connection receiving changed to: \(receiving)")
             guard !connectionId.isEmpty else { return }
             // Note: There's no direct mapping for ICE connection receiving in PeerConnectionNotifications
@@ -180,6 +193,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleIceGatheringStateChange(_ stateDesc: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             let state = SPTIceGatheringState(description: stateDesc)
             logger.log(level: .info, message: "ICE gathering state changed to: \(state.description)")
             guard !connectionId.isEmpty else { return }
@@ -190,6 +204,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleIceCandidatesRemoved(_ count: Int) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Removed \(count) ICE candidates")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.removedIceCandidates(connectionId, count))
@@ -199,6 +214,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleAddStream(_ streamId: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Stream added: \(streamId)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.addedStream(connectionId, streamId))
@@ -208,6 +224,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleRemoveStream(_ streamId: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Stream removed: \(streamId)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.removedStream(connectionId, streamId))
@@ -217,6 +234,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleDataChannel(_ label: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Data channel opened: \(label)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.dataChannel(connectionId, label))
@@ -226,6 +244,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleShouldNegotiate() {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "PeerConnection renegotiation needed")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.shouldNegotiate(connectionId))
@@ -235,6 +254,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleAddTrack(_ trackKind: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Track added: \(trackKind)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.startedReceiving(connectionId, trackKind))
@@ -244,6 +264,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private func handleRemoveTrack(_ trackKind: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Track removed: \(trackKind)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.startedReceiving(connectionId, "removed_\(trackKind)"))
@@ -255,6 +276,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     func triggerSignalingStateChange(_ state: SPTSignalingState) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Signaling state changed to: \(state.description)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.signalingStateDidChange(connectionId, state))
@@ -264,6 +286,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     func triggerIceConnectionStateChange(_ state: SPTIceConnectionState) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "ICE connection state changed to: \(state.description)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.iceConnectionStateDidChange(connectionId, state))
@@ -273,6 +296,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     func triggerIceGatheringStateChange(_ state: SPTIceGatheringState) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "ICE gathering state changed to: \(state.description)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.iceGatheringDidChange(connectionId, state))
@@ -282,6 +306,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     func triggerDataChannel(_ label: String) {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Data channel: \(label)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.dataChannel(connectionId, label))
@@ -291,6 +316,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     func triggerShouldNegotiate() {
         lock.withLock { [weak self] in
             guard let self else { return }
+            guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Should negotiate for connection: \(connectionId)")
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.shouldNegotiate(connectionId))

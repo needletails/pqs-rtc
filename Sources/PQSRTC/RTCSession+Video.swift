@@ -93,11 +93,19 @@ extension RTCSession {
     func renderRemoteVideo(to renderer: RTCVideoRenderWrapper, with connectionId: String) async {
         logger.log(level: .info, message: "Rendering remote video for connection: \(connectionId)")
         let manager = connectionManager as RTCConnectionManager
+
+        // Buffer the renderer request in case the remote track arrives after the UI calls this.
+        pendingRemoteVideoRenderersByConnectionId[connectionId] = renderer
+
         guard var connection: RTCConnection = await manager.findConnection(with: connectionId) else {
             logger.log(level: .error, message: "Connection not found for: \(connectionId)")
             return
         }
-        connection.remoteVideoTrack = connection.peerConnection.transceivers.first { $0.mediaType == .video }?.receiver.track as? WebRTC.RTCVideoTrack
+
+        // Prefer any track already cached from delegate events; otherwise try to read from transceivers.
+        if connection.remoteVideoTrack == nil {
+            connection.remoteVideoTrack = connection.peerConnection.transceivers.first { $0.mediaType == .video }?.receiver.track as? WebRTC.RTCVideoTrack
+        }
         
         if let videoTrack = connection.remoteVideoTrack {
             logger.log(level: .info, message: "✅ Found remote video track, attaching renderer")
@@ -117,8 +125,10 @@ extension RTCSession {
                 }
             }
             videoTrack.add(renderer)
+            pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
         } else {
             logger.log(level: .warning, message: "⚠️ Remote video track is nil - transceivers: \(connection.peerConnection.transceivers.count)")
+            logger.log(level: .info, message: "Remote renderer buffered; will attach when receiver/track is added")
             // Log transceiver details for debugging
             for (index, transceiver) in connection.peerConnection.transceivers.enumerated() {
                 logger.log(level: .info, message: "Transceiver \(index): mediaType=\(transceiver.mediaType), receiver.track=\(String(describing: transceiver.receiver.track))")
@@ -128,6 +138,7 @@ extension RTCSession {
     }
     func removeRemote(renderer: RTCVideoRenderWrapper, connectionId: String) async {
         logger.log(level: .info, message: "Removing remote video renderer for connection: \(connectionId)")
+        pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
         let manager = connectionManager as RTCConnectionManager
         guard let connection: RTCConnection = await manager.findConnection(with: connectionId) else { return }
         connection.remoteVideoTrack?.remove(renderer)

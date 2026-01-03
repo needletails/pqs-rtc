@@ -123,8 +123,21 @@ public actor RTCSession {
     let loop = NTKLoop()
     let connectionManager = RTCConnectionManager()
     let keyManager = KeyManager()
-    let (stream, continuation) = AsyncStream<PeerConnectionNotifications?>.makeStream()
-    let inboundCandidateConsumer = NeedleTailAsyncConsumer<IceCandidate>()
+    /// Shared peer-connection notifications stream.
+    ///
+    /// This stream is consumed by a long-lived task (`handleNotificationsStream`) and is fed by
+    /// platform delegates (Apple/Android peer-connection delegates).
+    ///
+    /// Important: This stream must remain usable across sequential calls. Some teardown paths or
+    /// consumer restarts can lead to a finished stream; therefore we keep the ability to recreate
+    /// the stream+continuation pair.
+    var peerConnectionNotificationsStream: AsyncStream<PeerConnectionNotifications?>
+    var peerConnectionNotificationsContinuation: AsyncStream<PeerConnectionNotifications?>.Continuation
+    /// Inbound ICE candidates buffered per connectionId.
+    ///
+    /// Candidates may arrive before `setRemote` completes. Keeping per-connection buffers
+    /// prevents cross-call mixing when multiple calls occur back-to-back.
+    var inboundCandidateConsumers: [String: NeedleTailAsyncConsumer<IceCandidate>] = [:]
     let iceServers: [String]
     let username: String
     let password: String
@@ -135,6 +148,16 @@ public actor RTCSession {
     var mediaDelegate: RTCSessionMediaEvents?
 
     let frameEncryptionKeyMode: RTCFrameEncryptionKeyMode
+
+#if !os(Android)
+    /// Remote renderers requested by the UI before the remote track exists.
+    ///
+    /// On iOS/macOS, the UI may call `renderRemoteVideo(...)` as soon as the call is marked
+    /// connected, but the remote receiver/track may be delivered slightly later via
+    /// `peerConnection(_:didAdd:streams:)`. We buffer the renderer request here and attach it
+    /// once the remote video track becomes available.
+    var pendingRemoteVideoRenderersByConnectionId: [String: RTCVideoRenderWrapper] = [:]
+#endif
 
     public typealias RemoteParticipantIdResolver = @Sendable (_ streamIds: [String], _ trackId: String, _ trackKind: String) -> String?
     var remoteParticipantIdResolver: RemoteParticipantIdResolver?
@@ -221,10 +244,129 @@ public actor RTCSession {
     var lastId = 0
     var iceId = 0
     var iceDeque = Deque<IceCandidate>()
+
+    /// The connection id considered "active" for the current call.
+    ///
+    /// SFU and 1:1 use cases typically have a single active PeerConnection at a time.
+    /// We use this to avoid acting on late WebRTC callbacks from a previous call after
+    /// a new call has already started.
+    var activeConnectionId: String?
+    /// Legacy/global peer-connection state (kept for compatibility).
+    /// Prefer `pcStateByConnectionId` for correctness across sequential calls.
     var pcState = PeerConnectionState.none
+    /// Peer-connection state per connectionId.
+    var pcStateByConnectionId: [String: PeerConnectionState] = [:]
     var notificationsTask: Task<Void, Error>?
+    var notificationsTaskGeneration: UInt64 = 0
+    var notificationsConsumerIsRunning = false
     var stateTask: Task<Void, Error>?
     nonisolated(unsafe) var isAudioActivated = false
+
+    // MARK: - Teardown idempotency
+    // `finishEndConnection(currentCall:)` can be triggered from multiple async entry points
+    // (e.g. remote end-call message + CallKit end action). Track per-call teardown to avoid
+    // double-running cleanup.
+    private var finishingCallKeys: Set<String> = []
+    private var recentlyEndedCallKeys: [String] = []
+    private var endedCallKeys: Set<String> = []
+
+    // Some platforms/layers can represent the same underlying call with different `Call.id` values
+    // (e.g. CallKit UUID vs signaling UUID). The PeerConnection lifecycle is keyed by
+    // `sharedCommunicationId`, so also track idempotency by connection id to avoid double-teardown.
+    private var finishingConnectionIds: Set<String> = []
+    private var recentlyEndedConnectionIds: [String] = []
+    private var endedConnectionIds: Set<String> = []
+
+    func teardownKey(for call: Call) -> String {
+        if let sharedMessageId = call.sharedMessageId?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines),
+           !sharedMessageId.isEmpty {
+            // Prefer sharedMessageId because sharedCommunicationId can be reused across
+            // sequential calls, and Call.id can differ between CallKit and RTC layers.
+            return "msg:\(sharedMessageId)|comm:\(call.sharedCommunicationId)"
+        }
+        return "id:\(call.id.uuidString)|comm:\(call.sharedCommunicationId)"
+    }
+
+    func beginEnding(connectionId: String) -> Bool {
+        let trimmed = connectionId.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if endedConnectionIds.contains(trimmed) { return false }
+        if finishingConnectionIds.contains(trimmed) { return false }
+        finishingConnectionIds.insert(trimmed)
+        return true
+    }
+
+    func endEnding(connectionId: String) {
+        let trimmed = connectionId.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        finishingConnectionIds.remove(trimmed)
+        endedConnectionIds.insert(trimmed)
+        recentlyEndedConnectionIds.append(trimmed)
+        // Prevent unbounded growth in long-lived sessions.
+        let maxRemembered = 32
+        if recentlyEndedConnectionIds.count > maxRemembered {
+            let overflow = recentlyEndedConnectionIds.count - maxRemembered
+            for _ in 0..<overflow {
+                if let oldest = recentlyEndedConnectionIds.first {
+                    recentlyEndedConnectionIds.removeFirst()
+                    endedConnectionIds.remove(oldest)
+                }
+            }
+        }
+    }
+
+    func resetTeardownIdempotency() {
+        finishingCallKeys.removeAll()
+        recentlyEndedCallKeys.removeAll()
+        endedCallKeys.removeAll()
+
+        finishingConnectionIds.removeAll()
+        recentlyEndedConnectionIds.removeAll()
+        endedConnectionIds.removeAll()
+    }
+
+    func beginEnding(callKey: String) -> Bool {
+        if endedCallKeys.contains(callKey) { return false }
+        if finishingCallKeys.contains(callKey) { return false }
+        finishingCallKeys.insert(callKey)
+        return true
+    }
+
+    func endEnding(callKey: String) {
+        finishingCallKeys.remove(callKey)
+        endedCallKeys.insert(callKey)
+        recentlyEndedCallKeys.append(callKey)
+        // Prevent unbounded growth in long-lived sessions.
+        let maxRemembered = 32
+        if recentlyEndedCallKeys.count > maxRemembered {
+            let overflow = recentlyEndedCallKeys.count - maxRemembered
+            for _ in 0..<overflow {
+                if let oldest = recentlyEndedCallKeys.first {
+                    recentlyEndedCallKeys.removeFirst()
+                    endedCallKeys.remove(oldest)
+                }
+            }
+        }
+    }
+
+    func inboundCandidateConsumer(for connectionId: String) -> NeedleTailAsyncConsumer<IceCandidate> {
+        if let existing = inboundCandidateConsumers[connectionId] {
+            return existing
+        }
+        let created = NeedleTailAsyncConsumer<IceCandidate>()
+        inboundCandidateConsumers[connectionId] = created
+        return created
+    }
+
+    /// Resets inbound call acceptance gating.
+    ///
+    /// Kept as a method so other files/extensions don't need access to the underlying
+    /// `private` storage.
+    func resetCallAnswerGating() {
+        pendingAnswerCallId = nil
+        callAnswerState = .pending
+        callAnswerStatesById.removeAll()
+    }
 
 #if os(Android)
     // Android-only session state used for renderer/candidate ordering.
@@ -264,6 +406,9 @@ public actor RTCSession {
         frameEncryptionKeyMode: RTCFrameEncryptionKeyMode = .shared,
         delegate: RTCTransportEvents?
     ) {
+        let (notificationStream, notificationContinuation) = AsyncStream<PeerConnectionNotifications?>.makeStream()
+        self.peerConnectionNotificationsStream = notificationStream
+        self.peerConnectionNotificationsContinuation = notificationContinuation
         self.iceServers = iceServers
         self.username = username
         self.password = password
@@ -285,6 +430,16 @@ public actor RTCSession {
         logger.log(level: .info, message: "Created RTCSession")
     }
 
+    /// Recreates the peer-connection notifications stream.
+    ///
+    /// Use this during teardown to ensure subsequent calls start with a fresh, non-terminated
+    /// notification pipeline.
+    func resetPeerConnectionNotificationsStream() {
+        let (notificationStream, notificationContinuation) = AsyncStream<PeerConnectionNotifications?>.makeStream()
+        self.peerConnectionNotificationsStream = notificationStream
+        self.peerConnectionNotificationsContinuation = notificationContinuation
+    }
+
     /// Starts a group call by creating a single PeerConnection intended to connect to an SFU.
     ///
     /// Prefer using ``RTCGroupCall/join()`` unless you are building your own group facade.
@@ -295,6 +450,9 @@ public actor RTCSession {
     ///   distribution inside ``RTCGroupCall``.
     public func startGroupCall(call: Call, sfuRecipientId: String) async throws -> Call {
         var call = call
+
+        // Mark this call's PeerConnection as the active one (SFU uses a single PC).
+        activeConnectionId = call.sharedCommunicationId
 
         // Ensure state streams are created so the UI can observe call state.
         try await createStateStream(with: call, recipientName: sfuRecipientId)
