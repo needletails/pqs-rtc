@@ -17,6 +17,7 @@
 
 #if !os(Android)
 @preconcurrency import WebRTC
+import NeedleTailLogger
 
 final class RTCVideoRenderWrapper: NSObject, RTCVideoRenderer, @unchecked Sendable {
     
@@ -24,10 +25,12 @@ final class RTCVideoRenderWrapper: NSObject, RTCVideoRenderer, @unchecked Sendab
     let needsRendering: Bool
     private let lock = NSLock()
     var frameOutput: (@Sendable (RTCVideoFrame?) -> Void)?
+    private let logger: NeedleTailLogger
     
     init(id: String, needsRendering: Bool = true) {
         self.id = id
         self.needsRendering = needsRendering
+        self.logger = NeedleTailLogger("[RTCVideoRenderWrapper:\(id)]")
     }
      func renderFrame(_ frame: RTCVideoFrame?) {
          if needsRendering {

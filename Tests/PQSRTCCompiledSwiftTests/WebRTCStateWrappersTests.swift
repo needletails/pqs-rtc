@@ -5,7 +5,7 @@ import Testing
 #if canImport(WebRTC) && !os(Android)
 import WebRTC
 
-@Suite
+@Suite(.serialized)
 struct WebRTCStateWrappersTests {
     @Test
     func signalingStateDescriptionMapping() {

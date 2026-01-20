@@ -350,7 +350,11 @@ public struct Call: Sendable, Codable, Equatable {
     /// Used to determine the current state of the call.
     public var isActive: Bool
     
-    public var identityProps: SessionIdentity.UnwrappedProps?
+    /// RTC Frame Props
+    public var frameIdentityProps: SessionIdentity.UnwrappedProps?
+    
+    ///Signalling props
+    public var signalingIdentityProps: SessionIdentity.UnwrappedProps?
     
     /// Additional metadata associated with the call.
     /// Stored as a Foundation Data
@@ -392,7 +396,8 @@ public struct Call: Sendable, Codable, Equatable {
         rejected: Bool? = nil,
         failed: Bool? = nil,
         isActive: Bool = false,
-        identityProps: SessionIdentity.UnwrappedProps? = nil,
+        frameIdentityProps: SessionIdentity.UnwrappedProps? = nil,
+        signalingIdentityProps: SessionIdentity.UnwrappedProps? = nil,
         metadata: Data? = nil
     ) throws {
         // Validate input parameters for production safety
@@ -416,7 +421,47 @@ public struct Call: Sendable, Codable, Equatable {
         self.rejected = rejected
         self.failed = failed
         self.isActive = isActive
-        self.identityProps = identityProps
+        self.frameIdentityProps = frameIdentityProps
+        self.signalingIdentityProps = signalingIdentityProps
+        self.metadata = metadata
+    }
+
+    /// Initializes a `Call` intended for SFU/group-call usage.
+    ///
+    /// Unlike the primary initializer, this initializer **allows empty `recipients`** so an SFU room
+    /// can be joined before any remote participants are known.
+    ///
+    /// - Important: For 1:1 calls, prefer the primary initializer which enforces `recipients` is non-empty.
+    public init(
+        groupSharedCommunicationId: String,
+        sender: Participant,
+        recipients: [Participant] = [],
+        supportsVideo: Bool = false,
+        isActive: Bool = false,
+        frameIdentityProps: SessionIdentity.UnwrappedProps? = nil,
+        signalingIdentityProps: SessionIdentity.UnwrappedProps? = nil,
+        metadata: Data? = nil
+    ) throws {
+        let trimmed = groupSharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw CallError.invalidMetadata("sharedCommunicationId cannot be empty")
+        }
+
+        self.id = UUID()
+        self.sharedMessageId = nil
+        self.sharedCommunicationId = trimmed
+        self.sender = sender
+        self.recipients = recipients
+        self.createdAt = Date()
+        self.updatedAt = nil
+        self.endedAt = nil
+        self.supportsVideo = supportsVideo
+        self.unanswered = nil
+        self.rejected = nil
+        self.failed = nil
+        self.isActive = isActive
+        self.frameIdentityProps = frameIdentityProps
+        self.signalingIdentityProps = signalingIdentityProps
         self.metadata = metadata
     }
     

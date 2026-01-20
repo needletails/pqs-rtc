@@ -28,18 +28,18 @@ import Foundation
 import PQSRTC
 
 struct MyTransport: RTCTransportEvents {
-  func sendOffer(call: Call) async throws {
-    // Send call's SDP offer to your peer or SFU.
-    // The easiest routing key is call.sharedCommunicationId.
+  func sendStartCall(_ call: Call) async throws {
+    // 1:1 calls: Send start_call message to trigger VoIP notifications.
   }
 
-  func sendAnswer(call: Call, metadata: PQSRTC.SDPNegotiationMetadata) async throws {
-    // 1:1 only.
-    // Send the SDP answer to the offerer along with negotiation metadata.
+  func sendOneToOneMessage(_ packet: RatchetMessagePacket, recipient: Call.Participant) async throws {
+    // 1:1 calls: Send encrypted signaling packet.
+    // Use `packet.flag` to distinguish offer/answer/candidate.
   }
 
-  func sendCandidate(_ candidate: IceCandidate, call: Call) async throws {
-    // Send ICE candidate to your peer/SFU.
+  func sendSfuMessage(_ packet: RTCGroupE2EE.RatchetMessagePacket, call: Call) async throws {
+    // Group calls: Send encrypted SFU signaling packet.
+    // Use `packet.flag` to distinguish offer/answer/candidate.
   }
 
   func sendCiphertext(

@@ -107,7 +107,7 @@ public actor CallStateMachine {
         // Clean up existing streams first
         await cleanup()
         
-        logger.log(level: .info, message: "Creating streams for call: \(call.id)")
+        logger.log(level: .info, message: "Creating streams for call: \(call.sharedCommunicationId)")
         
         let logger = self.logger
         currentCallStream.append(contentsOf: [
@@ -314,38 +314,38 @@ public actor CallStateMachine {
         case .waiting:
             self.logger.log(level: .info, message: "Waiting To Initialize Call")
         case .ready(let call):
-            self.logger.log(level: .info, message: "Ready To Initialize Call: \(call.id)")
+            self.logger.log(level: .info, message: "Ready To Initialize Call: \(call.sharedCommunicationId)")
         case .connecting(let callDirection, let currentCall):
             self.callDirection = callDirection
             self.currentCall = currentCall
             switch callDirection {
             case .inbound(let type):
                 callType = type
-                self.logger.log(level: .info, message: "Inbound \(type) Call Received, Connecting... Call ID: \(currentCall.id)")
+                self.logger.log(level: .info, message: "Inbound \(type) Call Received, Connecting... Call ID: \(currentCall.sharedCommunicationId)")
             case .outbound(let type):
                 callType = type
-                self.logger.log(level: .info, message: "Outbound \(type) Call Made, Connecting... Call ID: \(currentCall.id)")
+                self.logger.log(level: .info, message: "Outbound \(type) Call Made, Connecting... Call ID: \(currentCall.sharedCommunicationId)")
             }
         case .connected(let callDirection, let pendingCall):
             self.pendingCall = pendingCall
             switch callDirection {
             case .inbound(let type):
                 callType = type
-                self.logger.log(level: .info, message: "Connected Inbound \(type) Call: \(pendingCall.id)")
+                self.logger.log(level: .info, message: "Connected Inbound \(type) Call: \(pendingCall.sharedCommunicationId)")
             case .outbound(let type):
                 callType = type
-                self.logger.log(level: .info, message: "Connected Outbound \(type) Call: \(pendingCall.id)")
+                self.logger.log(level: .info, message: "Connected Outbound \(type) Call: \(pendingCall.sharedCommunicationId)")
             }
         case .held(let direction, let call):
             let directionString = direction?.description ?? "unknown"
             self.logger.log(level: .info, message: "Held \(directionString) Call: \(call.id)")
         case .ended(let endState, let call):
-            self.logger.log(level: .info, message: "Ended Call in state \(endState) for call: \(call.id)")
+            self.logger.log(level: .info, message: "Ended Call in state \(endState) for call: \(call.sharedCommunicationId)")
         case .failed(let direction, let call, let error):
             let directionString = direction?.description ?? "unknown"
-            self.logger.log(level: .error, message: "Call Failed with error: \(error) for \(directionString) call: \(call.id)")
+            self.logger.log(level: .error, message: "Call Failed with error: \(error) for \(directionString) call: \(call.sharedCommunicationId)")
         case .callAnsweredAuxDevice(let call):
-            self.logger.log(level: .info, message: "Call Answered by other device: \(call.id)")
+            self.logger.log(level: .info, message: "Call Answered by other device: \(call.sharedCommunicationId)")
         }
         
         // Yield to all continuations with error handling
@@ -353,7 +353,7 @@ public actor CallStateMachine {
             continuation.yield(nextState)
         }
         
-        logger.log(level: .debug, message: "State transition completed: \(previousState?.description ?? "nil") -> \(nextState)")
+        logger.log(level: .info, message: "State transition completed: \(previousState?.description ?? "nil") -> \(nextState)")
     }
 }
 
@@ -380,13 +380,13 @@ extension CallStateMachine.State: CustomStringConvertible {
     public var description: String {
         switch self {
         case .waiting: return "Waiting"
-        case .ready(let call): return "Ready(\(call.id))"
-        case .connecting(let direction, let call): return "Connecting(\(direction), \(call.id))"
-        case .connected(let direction, let call): return "Connected(\(direction), \(call.id))"
-        case .held(let direction, let call): return "Held(\(direction?.description ?? "nil"), \(call.id))"
+        case .ready(let call): return "Ready(\(call.sharedCommunicationId))"
+        case .connecting(let direction, let call): return "Connecting(\(direction), \(call.sharedCommunicationId))"
+        case .connected(let direction, let call): return "Connected(\(direction), \(call.sharedCommunicationId))"
+        case .held(let direction, let call): return "Held(\(direction?.description ?? "nil"), \(call.sharedCommunicationId))"
         case .ended(let endState, let call): return "Ended(\(endState), \(call.id))"
-        case .failed(let direction, let call, let error): return "Failed(\(direction?.description ?? "nil"), \(call.id), \(error))"
-        case .callAnsweredAuxDevice(let call): return "CallAnsweredAuxDevice(\(call.id))"
+        case .failed(let direction, let call, let error): return "Failed(\(direction?.description ?? "nil"), \(call.sharedCommunicationId), \(error))"
+        case .callAnsweredAuxDevice(let call): return "CallAnsweredAuxDevice(\(call.sharedCommunicationId))"
         }
     }
 }

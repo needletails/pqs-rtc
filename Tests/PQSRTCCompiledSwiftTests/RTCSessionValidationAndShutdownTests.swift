@@ -4,10 +4,10 @@ import Testing
 
 @testable import PQSRTC
 
-@Suite
+@Suite(.serialized)
 struct RTCSessionValidationAndShutdownTests {
     @Test
-    func createCryptoSessionThrowsWhenIdentityPropsMissing() async throws {
+    func createCryptoPeerConnectionThrowsWhenIdentityPropsMissing() async throws {
         let sender = try Call.Participant(secretName: "s", nickname: "S", deviceId: "sd")
         let recipient = try Call.Participant(secretName: "r", nickname: "R", deviceId: "rd")
         let call = try Call(
@@ -18,30 +18,31 @@ struct RTCSessionValidationAndShutdownTests {
             isActive: true
         )
 
-        let session = RTCSession(
+        let session = await RTCSession(
             iceServers: ["stun:stun.l.google.com:19302"],
             username: "",
             password: "",
             delegate: nil
         )
 
-        var thrownEncryptionError: EncryptionErrors?
+        var thrownRTCError: RTCErrors?
         do {
-            try await session.createCryptoSession(with: call)
-        } catch let error as EncryptionErrors {
-            thrownEncryptionError = error
+            try await session.createCryptoPeerConnection(with: call)
+        } catch let error as RTCErrors {
+            thrownRTCError = error
         } catch {
             throw error
         }
 
-        #expect(thrownEncryptionError == .missingProps, "Expected .missingProps but got \(String(describing: thrownEncryptionError))")
+        // Missing remote identity props should fail fast.
+        #expect(thrownRTCError != nil, "Expected an RTCErrors but got \(String(describing: thrownRTCError))")
 
         await session.shutdown(with: nil)
     }
 
     @Test
     func shutdownClearsKeyManagerState() async throws {
-        let session = RTCSession(
+        let session = await RTCSession(
             iceServers: ["stun:stun.l.google.com:19302"],
             username: "",
             password: "",

@@ -3,11 +3,11 @@ import Testing
 
 @testable import PQSRTC
 
-@Suite
+@Suite(.serialized)
 struct RTCSessionSDPModifyTests {
     @Test
     func modifySDP_normalizesNewlines_andAppendsTrailingNewline() async {
-        let session = RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
+        let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
 
         let input = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n\r\n"
         let output = await session.modifySDP(sdp: input)
@@ -21,7 +21,7 @@ struct RTCSessionSDPModifyTests {
 
     @Test
     func modifySDP_rewritesAudioDirectionToSendRecv_onlyOncePerAudioSection() async {
-        let session = RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
+        let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
 
         let inputLines = [
             "v=0",
@@ -45,7 +45,7 @@ struct RTCSessionSDPModifyTests {
 
     @Test
     func modifySDP_rewritesVideoDirection_onlyWhenHasVideoTrue() async {
-        let session = RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
+        let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
 
         let baseLines = [
             "v=0",
@@ -69,7 +69,7 @@ struct RTCSessionSDPModifyTests {
 
     @Test
     func modifySDP_downgradesH264ProfileLevelId() async {
-        let session = RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
+        let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
 
         let inputLines = [
             "v=0",

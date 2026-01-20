@@ -50,7 +50,6 @@ extension RTCSession {
         sender: String,
         recipient: String,
         localIdentity: ConnectionLocalIdentity,
-        sessionIdentity: SessionIdentity,
         willFinishNegotiation: Bool = false
     ) async throws -> RTCConnection {
         logger.log(level: .info, message: "Creating peer connection with id: \(call.sharedCommunicationId), hasVideo: \(call.supportsVideo)")
@@ -61,6 +60,7 @@ extension RTCSession {
         
         let localKeys = localIdentity.localKeys
         let symmetricKey = localIdentity.symmetricKey
+        let sessionIdentity = localIdentity.sessionIdentity
         
         var connection: RTCConnection?
 #if os(Android)
@@ -125,8 +125,8 @@ extension RTCSession {
         let constraints = WebRTC.RTCMediaConstraints(mandatoryConstraints: nil,
                                                      optionalConstraints: [
                                                         "DtlsSrtpKeyAgreement": kRTCMediaConstraintsValueTrue,
-                                                        "googDscp" : kRTCMediaConstraintsValueTrue]
-        )
+                                                        "googDscp" : kRTCMediaConstraintsValueTrue])
+        
         let delegateWrapper = RTCPeerConnectionDelegateWrapper(
             connectionId: call.sharedCommunicationId,
             logger: self.logger,
@@ -206,6 +206,8 @@ extension RTCSession {
     public func shutdown(with call: Call?) async {
         // Stop background consumers first so we don't process late callbacks
         // while tearing down peer connections.
+        shouldOffer = false
+        setHandshakeComplete(false)
         stateTask?.cancel()
         stateTask = nil
         // Retire peer-notifications consumer. Bump generation and yield a `nil` wake-up so any
@@ -256,17 +258,17 @@ extension RTCSession {
 
         // Clear any session-level pending buffers/caches.
         iceDeque.removeAll()
-    #if !os(Android)
         pendingRemoteVideoRenderersByConnectionId.removeAll()
-    #endif
 
         // Shutdown ratchet manager and clear all crypto/key state so the
         // next call starts from a clean slate (no pending ciphertext/keys).
         try? await ratchetManager.shutdown()
+        // Group-call/SFU signaling ratchet manager (separate from 1:1 ratchetManager).
+        try? await pcRatchetManager.shutdown()
         await keyManager.clearAll()
+        await pcKeyManager.clearAll()
 
         await connectionManager.removeAllConnections()
-
     #if os(Android)
         didStartReceiving = false
         remoteViewData.removeAll()
@@ -428,10 +430,7 @@ extension RTCSession {
     /// - Parameters:
     ///   - call: The call to create a state stream for
     ///   - recipientName: The name/identifier of the recipient (used for SessionIdentity)
-    public func createStateStream(
-        with call: Call,
-        recipientName: String? = nil
-    ) async throws {
+    public func createStateStream(with call: Call) async throws {
         // Treat this call's connection id as the active one.
         // This prevents late callbacks from a previous call from affecting the new call.
         activeConnectionId = call.sharedCommunicationId
@@ -468,7 +467,7 @@ extension RTCSession {
                     )
                 )
             default:
-                break
+                logger.log(level: .info, message: "Could not transition to connecting state from current state: \(String(describing: await callState.currentState))")
             }
         }
     
@@ -595,12 +594,12 @@ extension RTCSession {
         if let currentCall {
             if let connection = await connectionManager.findConnection(with: currentCall.sharedCommunicationId) {
                 await cleanup(connection: connection)
-                logger.log(level: .debug, message: "Closed peer connection for call: \(currentCall.id)")
+                logger.log(level: .debug, message: "Closed peer connection for call: \(currentCall.sharedCommunicationId)")
             } else {
                 let activeIds = await connectionManager.findAllConnections().map { $0.id }
                 logger.log(
                     level: .warning,
-                    message: "No peer connection found to close for call: \(String(describing: currentCall.id)); activeConnections=\(activeIds)"
+                    message: "No peer connection found to close for call: \(String(describing: currentCall.sharedCommunicationId)); activeConnections=\(activeIds)"
                 )
             }
         } else {
@@ -616,9 +615,7 @@ extension RTCSession {
             await connectionManager.removeAllConnections()
 
             // Clear any buffered renderer requests since they are scoped to old connections.
-#if !os(Android)
             pendingRemoteVideoRenderersByConnectionId.removeAll()
-#endif
 
             if !remainingConnections.isEmpty {
                 logger.log(level: .debug, message: "Closed \(remainingConnections.count) peer connection(s) (no call provided)")

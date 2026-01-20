@@ -47,6 +47,124 @@ public enum SDPHandlerError: Error, Sendable {
 
 extension RTCSession {
     
+    func modifySDP(sdp: String, hasVideo: Bool = false) async -> String {
+        let sdp = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        // Helper function to replace receive/sendonly/inactive with sendrecv in a given line.
+        func sendAndReceiveMedia(in line: String) -> (String, Bool) {
+            var modifiedLine = line
+            if modifiedLine.contains("a=recvonly") {
+                modifiedLine = modifiedLine.replacingOccurrences(of: "a=recvonly", with: "a=sendrecv")
+                return (modifiedLine, true)
+            }
+            if modifiedLine.contains("a=sendonly") {
+                modifiedLine = modifiedLine.replacingOccurrences(of: "a=sendonly", with: "a=sendrecv")
+                return (modifiedLine, true)
+            }
+            if modifiedLine.contains("a=inactive") {
+                modifiedLine = modifiedLine.replacingOccurrences(of: "a=inactive", with: "a=sendrecv")
+                return (modifiedLine, true)
+            }
+            return (modifiedLine, false)
+        }
+        
+        // Helper function to change media direction to inactive.
+        func removeMedia(in line: String) async -> (String, Bool) {
+            var modifiedLine = line
+            if modifiedLine.contains("a=recvonly") {
+                modifiedLine = modifiedLine.replacingOccurrences(of: "a=recvonly", with: "a=inactive")
+                return (modifiedLine, true)
+            }
+            if modifiedLine.contains("a=sendonly") {
+                modifiedLine = modifiedLine.replacingOccurrences(of: "a=sendonly", with: "a=inactive")
+                return (modifiedLine, true)
+            }
+            if modifiedLine.contains("a=sendrecv") {
+                modifiedLine = modifiedLine.replacingOccurrences(of: "a=sendrecv", with: "a=inactive")
+                return (modifiedLine, true)
+            }
+            return (modifiedLine, false)
+        }
+        
+        let lines = sdp.components(separatedBy: CharacterSet.newlines)
+            .filter { !$0.trimmingCharacters(in: CharacterSet.whitespaces).isEmpty }
+        
+        var modifiedLines: [String] = []
+        
+        // Flags to indicate that we're in a media section and should modify direction attributes
+        var inAudioSection = false
+        var inVideoSection = false
+        
+        for line in lines {
+            var line = line
+            if line.contains("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034") { // Don't allow high level
+                line = line.replacingOccurrences(of: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034", with: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f")
+            }
+            
+            // Check if this line starts a new media section.
+            if line.hasPrefix("m=audio") {
+                inVideoSection = false
+                inAudioSection = true
+                modifiedLines.append(line)
+                continue
+            }
+            if line.hasPrefix("m=video") {
+                inAudioSection = false
+                inVideoSection = true
+                modifiedLines.append(line)
+                continue
+            }
+            
+            // Check if we're starting a new section (non-media)
+            if line.hasPrefix("v=") || line.hasPrefix("o=") || line.hasPrefix("s=") || line.hasPrefix("t=") {
+                inAudioSection = false
+                inVideoSection = false
+                modifiedLines.append(line)
+                continue
+            }
+            
+            // Process lines based on current media section
+            if inAudioSection {
+                // Only process lines that contain direction attributes
+                if line.contains("a=recvonly") || line.contains("a=sendonly") || line.contains("a=inactive") {
+                    let (modifiedLine, didModify) = sendAndReceiveMedia(in: line)
+                    modifiedLines.append(modifiedLine)
+                    if didModify {
+                        // Once we've updated a media direction line, we can stop looking for audio direction
+                        inAudioSection = false
+                    }
+                } else {
+                    modifiedLines.append(line)
+                }
+            } else if inVideoSection {
+                
+                // Only process lines that contain direction attributes
+                if line.contains("a=recvonly") || line.contains("a=sendonly") || line.contains("a=inactive") || line.contains("a=sendrecv") {
+                    if hasVideo {
+                        let (modifiedLine, didModify) = sendAndReceiveMedia(in: line)
+                        modifiedLines.append(modifiedLine)
+                        if didModify {
+                            inVideoSection = false
+                        }
+                    } else {
+                        // When hasVideo is false, leave video direction unchanged
+                        modifiedLines.append(line)
+                        inVideoSection = false
+                    }
+                } else {
+                    modifiedLines.append(line)
+                }
+            } else {
+                // If not in any media section, append as-is
+                modifiedLines.append(line)
+            }
+        }
+        
+        // Recombine the modified lines back into a single SDP string
+        return modifiedLines.joined(separator: "\n") + "\n"
+    }
+    
     /// Validates SDP format and content
     /// - Parameter sdp: The SDP string to validate
     /// - Returns: True if valid, false otherwise
@@ -106,7 +224,7 @@ extension RTCSession {
         
         return constraints
     }
-
+    
     /// Safely generates an SDP offer with proper error handling
     /// - Parameters:
     ///   - connection: The peer connection to generate offer for
@@ -123,7 +241,7 @@ extension RTCSession {
             let constraints = try createMediaConstraints(hasAudio: hasAudio, hasVideo: hasVideo)
             
             self.logger.log(level: .info, message: "Generating SDP offer for connection: \(connection.id)")
-          
+            
             let description = try await connection.peerConnection.offer(for: constraints)
             
             self.logger.log(level: .info, message: "Apple Platform Offer SDP:\n\(description.sdp)")

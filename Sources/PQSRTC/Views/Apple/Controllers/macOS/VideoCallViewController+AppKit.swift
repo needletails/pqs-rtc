@@ -326,9 +326,13 @@ public final class VideoCallViewController: NSViewController {
             await performQuery()
         }
         guard let connectionId = currentCall?.sharedCommunicationId else { return }
-        let connection = await session.connectionManager.findConnection(with: connectionId)
         guard let previewRenderer = localVideoView.renderer as? PreviewViewRender else { return }
-        if let wrapper = connection?.rtcVideoCaptureWrapper {
+        
+        // Bind capture injection into WebRTC as soon as the wrapper exists.
+        // This is event-driven (no retry loop): if the wrapper isn't ready yet, we await it.
+        if let wrapper = (await session.connectionManager.findConnection(with: connectionId))?.rtcVideoCaptureWrapper {
+            await previewRenderer.setCapture(wrapper)
+        } else if let wrapper = await session.waitForVideoCaptureWrapper(connectionId: connectionId) {
             await previewRenderer.setCapture(wrapper)
         }
         await self.session.renderLocalVideo(to: previewRenderer.rtcVideoRenderWrapper, connectionId: connectionId)
@@ -512,27 +516,25 @@ extension VideoCallViewController: CallActionDelegate {
     /// Toggles the local audio track and updates the session.
     public func muteAudio() async {
         guard let callId = currentCall?.sharedCommunicationId else { return }
-        
-        isMutingAudio.toggle()
+        let shouldMute = !isMutingAudio
         do {
-            // When isMutingAudio is true, disable audio track
-            try await session.setAudioTrack(isEnabled: !isMutingAudio, connectionId: callId)
+            try await session.setAudioTrack(isEnabled: !shouldMute, connectionId: callId)
+            isMutingAudio = shouldMute
         } catch {
             logger.log(level: .error, message: "Failed to set audio track: \(error)")
-        }
-        
-        if await session.callState._callType == .video {
-            await muteVideo()
         }
     }
     
     /// Toggles the local video track and applies a blur overlay when video is muted.
     public func muteVideo() async {
         guard let callId = currentCall?.sharedCommunicationId else { return }
+        // Only meaningful for video calls.
+        guard await session.callState._callType == .video else { return }
         
-        isMutingVideo.toggle()
-        await session.setVideoTrack(isEnabled: !isMutingVideo, connectionId: callId)
-        await blurView(isMutingVideo)
+        let shouldMute = !isMutingVideo
+        await session.setVideoTrack(isEnabled: !shouldMute, connectionId: callId)
+        isMutingVideo = shouldMute
+        await blurView(shouldMute)
     }
 
     public func toggleSpeakerPhone() {

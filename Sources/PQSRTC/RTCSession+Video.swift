@@ -50,6 +50,9 @@ extension RTCSession {
             return
         }
         
+        // Buffer the renderer request in case the remote track arrives after the UI calls this.
+        pendingRemoteVideoRenderersByConnectionId[connectionId] = view
+        
         logger.log(level: .info, message: "Attempting to get remote video track from peer connection")
         connection.remoteVideoTrack = client.getRemoteVideoTrack(peerConnection: connection.peerConnection)
         
@@ -57,12 +60,11 @@ extension RTCSession {
             logger.log(level: .info, message: "✅ Found remote video track, attaching renderer")
             logger.log(level: .info, message: "📹 Video track - trackId: \(videoTrack.trackId)")
             view.attach(videoTrack)
+            pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
         } else {
-            logger.log(level: .error, message: "Failed to get remote video track from peer connection")
-            logger.log(level: .error, message: "Peer connection state: \(connection.peerConnection)")
-            logger.log(level: .error, message: "didStartReceiving: \(didStartReceiving)")
-            // Don't fatal error, just log and return
-            return
+            logger.log(level: .warning, message: "⚠️ Remote video track is nil - will attach renderer when track becomes available")
+            logger.log(level: .info, message: "Remote renderer buffered; will attach when receiver/track is added")
+            // Don't fatal error, just log and return - renderer is buffered
         }
         
         await manager.updateConnection(id: connectionId, with: connection)
@@ -71,6 +73,7 @@ extension RTCSession {
     /// Remove remote video renderer
     func removeRemote(view: AndroidSampleCaptureView, connectionId: String) async {
         logger.log(level: .info, message: "Removing remote video renderer for connection: \(connectionId)")
+        pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
         let manager = connectionManager as RTCConnectionManager
         guard let remoteTrack: RTCVideoTrack = await manager.findConnection(with: connectionId)?.remoteVideoTrack else { return }
         view.detach(remoteTrack)
@@ -183,6 +186,11 @@ extension RTCSession {
         // Update connection in manager
         let manager = connectionManager as RTCConnectionManager
         await manager.updateConnection(id: connection.id, with: updatedConnection)
+
+        // Wake any controller waiting for the wrapper so it can bind capture injection.
+        if let wrapper = updatedConnection.rtcVideoCaptureWrapper {
+            resumeVideoCaptureWrapperWaiters(connectionId: connection.id, wrapper: wrapper)
+        }
         
         logger.log(level: .info, message: "Successfully created local video track for connection: \(connection.id)")
         return (.init(track: videoTrack), updatedConnection)
@@ -193,7 +201,14 @@ extension RTCSession {
     
     func setVideoTrack(isEnabled: Bool, connectionId: String) async {
         let manager = connectionManager as RTCConnectionManager
-        guard let connection: RTCConnection = await manager.findConnection(with: connectionId) else { return }
+        guard !connectionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            logger.log(level: .error, message: "setVideoTrack called with empty connectionId")
+            return
+        }
+        guard let connection: RTCConnection = await manager.findConnection(with: connectionId) else {
+            logger.log(level: .error, message: "Connection not found for video track modification: \(connectionId)")
+            return
+        }
 #if !os(Android)
         await setTrackEnabled(WebRTC.RTCVideoTrack.self, isEnabled: isEnabled, with: connection)
 #elseif os(Android)

@@ -2,7 +2,7 @@ import Testing
 
 @testable import PQSRTC
 
-@Suite
+@Suite(.serialized)
 struct ErrorDescriptionsTests {
     @Test
     func connectionErrorsHaveHumanReadableDescriptions() {

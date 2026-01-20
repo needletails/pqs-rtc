@@ -70,30 +70,17 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
     /// and maps into one of these cases.
     public enum ControlMessage: Sendable {
         /// SFU signaling
-        case sfuAnswer(SessionDescription)
-        case sfuCandidate(IceCandidate)
+        case sfuAnswer(RatchetMessagePacket)
+        case sfuCandidate(RatchetMessagePacket)
 
         /// Roster
-        case participants([Participant])
-        case participantDemuxId(participantId: String, demuxId: UInt32?)
-
-        /// Frame E2EE keys distributed out-of-band.
-        ///
-        /// The meaning of `participantId` is “track owner / sender id” (the same id the
-        /// receiver cryptor is configured with).
-        case frameKey(participantId: String, index: Int, key: Data)
-
-        /// Sender-key group E2EE: per-recipient encrypted sender-key distribution messages.
-        ///
-        /// You must also provide `participantIdentity` for each participant that can send you
-        /// encrypted sender keys (i.e. their DoubleRatchet public identity props).
-        case participantIdentity(RTCGroupE2EE.ParticipantIdentity)
-        case encryptedSenderKey(RTCGroupE2EE.EncryptedSenderKeyMessage)
+        case participants(RatchetMessagePacket)
+        case participantDemuxId(RatchetMessagePacket)
     }
 
-    private let session: RTCSession
     private let sfuRecipientId: String
     private var call: Call
+    let localIdentity: ConnectionLocalIdentity
 
     private var state: State = .idle
     private var participantsById: [String: Participant] = [:]
@@ -107,10 +94,13 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
     private let eventsStream: AsyncStream<Event>
     private let eventsContinuation: AsyncStream<Event>.Continuation
 
-    public init(session: RTCSession, call: Call, sfuRecipientId: String) {
-        self.session = session
+    public init(
+        call: Call,
+        sfuRecipientId: String,
+        localIdentity: ConnectionLocalIdentity) {
         self.call = call
         self.sfuRecipientId = sfuRecipientId
+        self.localIdentity = localIdentity
         (self.eventsStream, self.eventsContinuation) = AsyncStream.makeStream(of: Event.self)
     }
 
@@ -144,9 +134,6 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
         state = .joining
         eventsContinuation.yield(.stateChanged(.joining))
 
-        await session.setMediaDelegate(self)
-        call = try await session.startGroupCall(call: call, sfuRecipientId: sfuRecipientId)
-
         // We treat “join” as “connected enough to proceed”; actual ICE connectivity
         // is still tracked by the existing call state machine.
         state = .joined
@@ -157,53 +144,12 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
         guard state != .ended else { return }
         state = .ended
         eventsContinuation.yield(.stateChanged(.ended))
-        await session.shutdown(with: call)
-    }
-
-    /// Single entrypoint to apply decoded control-plane messages.
-    ///
-    /// This is the intended transport-agnostic surface: your app owns the networking and
-    /// calls into this API as messages arrive.
-    ///
-    /// Your networking layer should decode inbound SFU signaling, roster updates, and key
-    /// distribution messages into ``ControlMessage`` and call this method.
-    public func handleControlMessage(_ message: ControlMessage) async throws {
-        switch message {
-        case .sfuAnswer(let sdp):
-            try await handleSfuAnswer(sdp)
-        case .sfuCandidate(let candidate):
-            try await handleSfuCandidate(candidate)
-        case .participants(let participants):
-            updateParticipants(participants)
-        case .participantDemuxId(let participantId, let demuxId):
-            setDemuxId(demuxId, for: participantId)
-        case .frameKey(let participantId, let index, let key):
-            await setFrameEncryptionKey(key, index: index, for: participantId)
-
-        case .participantIdentity(let identity):
-            identityPropsByParticipantId[identity.participantId] = identity.identityProps
-
-        case .encryptedSenderKey(let encrypted):
-            try await handleEncryptedSenderKeyMessage(encrypted)
-        }
-    }
-
-    // MARK: - Signaling ingress (SFU)
-
-    /// Applies an inbound SFU SDP answer to the underlying PeerConnection.
-    public func handleSfuAnswer(_ sdp: SessionDescription) async throws {
-        try await session.handleAnswer(call: call, sdp: sdp)
-    }
-
-    /// Applies an inbound SFU ICE candidate to the underlying PeerConnection.
-    public func handleSfuCandidate(_ candidate: IceCandidate) async throws {
-        try await session.handleCandidate(call: call, candidate: candidate)
     }
 
     // MARK: - Control plane / roster
 
     /// Replaces the participant roster with the given list.
-    public func updateParticipants(_ participants: [Participant]) {
+    public func updateParticipants(_ participants: [Participant]) async {
         var updated: [String: Participant] = [:]
         for p in participants {
             updated[p.id] = p
@@ -220,191 +166,6 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
         eventsContinuation.yield(.participantsUpdated(Array(participantsById.values)))
     }
 
-    // MARK: - E2EE key injection
-
-    /// Sets (injects) a frame-level E2EE key for a specific sender/participant.
-    public func setFrameEncryptionKey(_ key: Data, index: Int = 0, for participantId: String) async {
-        await session.setFrameEncryptionKey(key, index: index, for: participantId)
-    }
-
-    /// Advances the ratchet for the specified participant and key index.
-    ///
-    /// The returned key is the newly-derived key bytes.
-    public func ratchetFrameEncryptionKey(index: Int = 0, for participantId: String) async -> Data {
-        await session.ratchetFrameEncryptionKey(index: index, for: participantId)
-    }
-
-    /// Exports the current frame key for the specified participant and key index.
-    public func exportFrameEncryptionKey(index: Int = 0, for participantId: String) async -> Data {
-        await session.exportFrameEncryptionKey(index: index, for: participantId)
-    }
-
-    // MARK: - Sender-key group E2EE (Sender Keys)
-
-    /// Stores / updates the Double Ratchet identity props for participants.
-    ///
-    /// This is required for sender-key distribution encryption/decryption.
-    ///
-    /// Your application is responsible for exchanging identity material (e.g. during join/roster updates)
-    /// and then calling this method to provide the current set of identity properties.
-    ///
-    /// - Parameter identities: Participant identities keyed by `participantId`.
-    public func setParticipantIdentities(_ identities: [RTCGroupE2EE.ParticipantIdentity]) {
-        for identity in identities {
-            identityPropsByParticipantId[identity.participantId] = identity.identityProps
-        }
-    }
-
-    /// Rotates the local sender key and encrypts the distribution message to each other participant.
-    ///
-    /// The caller is responsible for transporting the returned messages to their recipients.
-    ///
-    /// - Important: This is designed for groups up to ~20 participants. Complexity is O(N).
-    ///
-    /// Typical usage:
-    /// 1. Call ``setParticipantIdentities(_:)`` whenever the roster changes.
-    /// 2. Call this method to get one encrypted message per recipient.
-    /// 3. Send each message over your control plane (opaque bytes), keyed by `(recipientId, connectionId)`.
-    ///
-    /// The local sender key is applied immediately for outbound media encryption. Receivers apply the
-    /// sender key after successfully decrypting the message via ``handleEncryptedSenderKeyMessage(_:)``.
-    public func rotateAndEncryptLocalSenderKeyForCurrentParticipants() async throws -> [RTCGroupE2EE.EncryptedSenderKeyMessage] {
-        let callId = call.sharedCommunicationId
-        let localSecretName = call.sender.secretName
-        let fromParticipantId = call.sender.secretName
-
-        // Generate a fresh per-sender media key.
-        let key = Self.randomSymmetricKeyBytes()
-        localSenderKeyIndex += 1
-        let keyIndex = localSenderKeyIndex
-
-        // Apply locally for outbound encryption. (participantId = local sender id)
-        await session.setFrameEncryptionKey(key, index: keyIndex, for: fromParticipantId)
-
-        let distribution = RTCGroupE2EE.SenderKeyDistribution(
-            callId: callId,
-            senderParticipantId: fromParticipantId,
-            keyIndex: keyIndex,
-            key: key
-        )
-
-        var messages: [RTCGroupE2EE.EncryptedSenderKeyMessage] = []
-        for participant in participantsById.values {
-            let toParticipantId = participant.id
-            guard toParticipantId != fromParticipantId else { continue }
-            guard let props = identityPropsByParticipantId[toParticipantId] else {
-                // No identity props: cannot encrypt to this participant.
-                continue
-            }
-
-            let sessionId = e2eeSessionIdByParticipantId[toParticipantId] ?? {
-                let id = UUID()
-                e2eeSessionIdByParticipantId[toParticipantId] = id
-                return id
-            }()
-
-            let includeHandshake = !e2eeHandshakeSentToParticipantIds.contains(toParticipantId)
-            let encrypted = try await session.encryptGroupSenderKeyDistribution(
-                callId: callId,
-                localSecretName: localSecretName,
-                fromParticipantId: fromParticipantId,
-                toParticipantId: toParticipantId,
-                toIdentityProps: props,
-                sessionId: sessionId,
-                includeHandshakeCiphertext: includeHandshake,
-                distribution: distribution
-            )
-            if includeHandshake {
-                e2eeHandshakeSentToParticipantIds.insert(toParticipantId)
-            }
-            messages.append(encrypted)
-        }
-
-        return messages
-    }
-
-    /// Convenience: rotates the local sender key and sends per-recipient encrypted sender-key messages
-    /// using the existing `RTCTransportEvents.sendCiphertext(...)` callback.
-    ///
-    /// This keeps group-call key exchange aligned with the 1:1 transport approach: the application
-    /// still transports opaque ciphertext blobs, while the SDK owns the Double Ratchet state.
-    ///
-    /// - Important: This uses `msg.toParticipantId` as the transport recipient and `msg.sessionId.uuidString`
-    ///   as the `connectionId` correlation key.
-    public func rotateAndSendLocalSenderKeyForCurrentParticipants() async throws {
-        let messages = try await rotateAndEncryptLocalSenderKeyForCurrentParticipants()
-        for msg in messages {
-            let ciphertext = try JSONEncoder().encode(msg)
-            try await session.sendCiphertextViaTransport(
-                recipient: msg.toParticipantId,
-                connectionId: msg.sessionId.uuidString,
-                ciphertext: ciphertext,
-                call: call)
-        }
-    }
-
-    /// Convenience: handle inbound sender-key ciphertext delivered via `RTCTransportEvents.sendCiphertext(...)`.
-    ///
-    /// Your control plane should route these ciphertext blobs to the correct group call instance.
-    ///
-    /// This method expects `ciphertext` to be the JSON-encoded form of ``RTCGroupE2EE/EncryptedSenderKeyMessage``.
-    /// The `fromParticipantId` / `connectionId` parameters are treated as best-effort metadata; the SDK will
-    /// not hard-fail if they differ from the decoded payload.
-    public func handleCiphertextFromParticipant(
-        fromParticipantId: String,
-        connectionId: String,
-        ciphertext: Data
-    ) async throws {
-        let message = try JSONDecoder().decode(RTCGroupE2EE.EncryptedSenderKeyMessage.self, from: ciphertext)
-        // Best-effort consistency checks.
-        if message.fromParticipantId != fromParticipantId {
-            // Don't hard-fail; apps may not pass `fromParticipantId` consistently.
-        }
-        if message.sessionId.uuidString != connectionId {
-            // Same rationale: allow decode even if routing metadata differs.
-        }
-        try await handleEncryptedSenderKeyMessage(message)
-    }
-
-    /// Handles an inbound encrypted sender-key distribution message.
-    ///
-    /// Call this when your transport receives a sender-key distribution message from another participant.
-    ///
-    /// On success, this applies the decrypted sender key to the underlying session so inbound media frames
-    /// from `message.fromParticipantId` can be decrypted.
-    ///
-    /// - Throws: ``RTCSession/EncryptionErrors`` when required identity/handshake material is missing.
-    public func handleEncryptedSenderKeyMessage(_ message: RTCGroupE2EE.EncryptedSenderKeyMessage) async throws {
-        guard message.callId == call.sharedCommunicationId else { return }
-
-        // Cache the sessionId by sender so future replies can reuse it if desired.
-        if e2eeSessionIdByParticipantId[message.fromParticipantId] == nil {
-            e2eeSessionIdByParticipantId[message.fromParticipantId] = message.sessionId
-        }
-
-        let localSecretName = call.sender.secretName
-
-        guard let fromProps = identityPropsByParticipantId[message.fromParticipantId] else {
-            // Can't decrypt without the sender's identity props.
-            throw EncryptionErrors.missingProps
-        }
-
-        let dist = try await session.decryptGroupSenderKeyDistribution(
-            callId: call.sharedCommunicationId,
-            localSecretName: localSecretName,
-            fromParticipantId: message.fromParticipantId,
-            fromIdentityProps: fromProps,
-            message: message
-        )
-
-        // Apply for decrypting frames from that sender/participant.
-        await session.setFrameEncryptionKey(dist.key, index: dist.keyIndex, for: dist.senderParticipantId)
-    }
-
-    private static func randomSymmetricKeyBytes() -> Data {
-        let key = SymmetricKey(size: .bits256)
-        return key.withUnsafeBytes { Data($0) }
-    }
 
     // MARK: - RTCSessionMediaEvents
 

@@ -25,10 +25,12 @@ Instead, you implement ``RTCTransportEvents`` and route inbound messages back in
 
 Your implementation receives outbound intents from the SDK:
 
-- ``RTCTransportEvents/sendOffer(call:)``
-- ``RTCTransportEvents/sendAnswer(call:metadata:)`` (1:1)
-- ``RTCTransportEvents/sendCandidate(_:call:)``
 - ``RTCTransportEvents/sendCiphertext(recipient:connectionId:ciphertext:call:)``
+- ``RTCTransportEvents/sendOneToOneMessage(_:recipient:)`` (1:1 encrypted signaling: offer/answer/candidate via `packet.flag`)
+- ``RTCTransportEvents/sendSfuMessage(_:call:)`` (SFU group-call encrypted signaling: offer/answer/candidate via `packet.flag`)
+- ``RTCTransportEvents/sendStartCall(_:)``
+- ``RTCTransportEvents/sendCallAnswered(_:)``
+- ``RTCTransportEvents/sendCallAnsweredAuxDevice(_:)``
 - ``RTCTransportEvents/didEnd(call:endState:)``
 
 A few important routing rules:
@@ -58,7 +60,7 @@ Example (JSON-ish):
 When you send/receive SDP, you’ll usually serialize ``SessionDescription``.
 
 - For 1:1 offers/answers, route inbound:
-  - offer → ``RTCSession/handleOffer(call:sdp:metadata:)``
+  - offer → ``RTCSession/handleOffer(call:sdp:metadata:)`` (SDK will emit `sendOneToOneMessage(..., flag: .answer, ...)`)
   - answer → ``RTCSession/handleAnswer(call:sdp:)``
 
 ### ICE candidates
@@ -79,7 +81,9 @@ You must route it:
 
 ## Joining an SFU group call
 
-For SFU signaling, you typically treat the SFU as a special “recipient”:
+For SFU signaling, you typically treat the SFU as a special “recipient”.
+You do **not** need IRC tags for SFU signaling: the SDK emits/consumes a `RatchetMessagePacket`
+that already includes a `flag` describing the message kind (offer/answer/candidate).
 
 - `to: "sfu"` (or any constant/identifier you choose)
 - deliver inbound SFU answer/candidates into ``RTCGroupCall`` using ``RTCGroupCall/handleControlMessage(_:)``.

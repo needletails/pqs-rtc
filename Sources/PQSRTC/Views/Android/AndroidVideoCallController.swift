@@ -179,15 +179,13 @@ public actor AndroidVideoCallController: CallActionDelegate {
     }
     
     public func muteAudio() async {
-        isMutingAudio.toggle()
+        let shouldMute = !isMutingAudio
         guard let callId = self.currentCall?.sharedCommunicationId else { return }
         do {
-            try await self.session.setAudioTrack(isEnabled: !self.isMutingAudio, connectionId: callId)
+            try await self.session.setAudioTrack(isEnabled: !shouldMute, connectionId: callId)
+            isMutingAudio = shouldMute
         } catch {
             // swallow in release; delegate already receives failures
-        }
-        if await self.session.callState.callType == .video {
-            await self.muteVideo()
         }
     }
     

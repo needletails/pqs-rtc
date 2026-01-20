@@ -4,7 +4,7 @@ import Testing
 
 @testable import PQSRTC
 
-@Suite
+@Suite(.serialized)
 struct KeyManagerSessionIdentityMappingTests {
     @Test
     func recipientIdentityUsesConnectionIdAsSessionIdentityId_whenConnectionIdIsUUIDString() async throws {

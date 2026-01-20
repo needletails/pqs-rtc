@@ -65,6 +65,26 @@ public final class RemoteViewItemCell: UICollectionViewCell {
         contentView.layoutMargins = .zero
         backgroundColor = .clear
         contentView.backgroundColor = .clear
+        contentView.clipsToBounds = true
+    }
+
+    public override func prepareForReuse() {
+        super.prepareForReuse()
+        // Ensure reused cells never accumulate multiple NTMTKViews or constraints.
+        contentView.subviews.forEach { $0.removeFromSuperview() }
+    }
+
+    /// Installs a video view as the cell’s sole content, pinned edge-to-edge.
+    func setVideoView(_ view: UIView) {
+        contentView.subviews.forEach { $0.removeFromSuperview() }
+        contentView.addSubview(view)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            view.topAnchor.constraint(equalTo: contentView.topAnchor),
+            view.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            view.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            view.trailingAnchor.constraint(equalTo: contentView.trailingAnchor)
+        ])
     }
 }
 #endif

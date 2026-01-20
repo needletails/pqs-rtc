@@ -3,7 +3,7 @@ import Testing
 
 @testable import PQSRTC
 
-@Suite
+@Suite(.serialized)
 struct RatchetExecutorTests {
     @Test
     func checkIsolatedOnQueueDoesNotTrap() {

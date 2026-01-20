@@ -470,11 +470,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///
     /// If the Android `FrameCryptorKeyProvider` hasn't been created yet, we stash the key/index
     /// and apply it as soon as `setSharedKey(..., ratchetSalt:)` (or `setupCryptor`) creates the provider.
-    func setSharedKey(_ key: Data, with index: Int32) async {
+    func setSharedKey(_ key: Data, with index: Int32) {
         lock.lock()
-        defer { lock.unlock() }
-
-        guard !isClosed else {
+        if isClosed {
+            lock.unlock()
             // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Cannot set shared key: AndroidRTCClient has been closed")
             return
         }
@@ -482,6 +481,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         guard let keyProvider else {
             pendingSharedKey = key
             pendingSharedKeyIndex = index
+            lock.unlock()
             // SKIP INSERT: android.util.Log.w("AndroidRTCClient", "FrameCryptorKeyProvider not ready; stashing shared key index $index")
             return
         }
@@ -489,24 +489,67 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: val keySize = key.count
         // SKIP INSERT: val keyBytesUInt8 = kotlin.UByteArray(keySize) { key.bytes[it] }
         // SKIP INSERT: val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
-        // SKIP INSERT: val success = keyProvider.setSharedKey(index.toInt(), keyBytes)
+        // SKIP INSERT: val success = keyProvider?.setSharedKey(index.toInt(), keyBytes) ?: false
         // SKIP INSERT: if (!success) {
         // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "❌ Failed to set shared media key at index $index")
         // SKIP INSERT: } else {
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Shared media key set at index $index")
         // SKIP INSERT: }
+
+        // Clear any pending shared key; this call is now authoritative.
+        pendingSharedKey = nil
+        pendingSharedKeyIndex = nil
+        lock.unlock()
     }
 
     /// Ratchet-salt-aware variant that ensures the Android key provider exists.
     ///
     /// This is the closest equivalent to the Apple behavior where a keyProvider is always present
     /// and `setSharedKey` immediately updates the active key ring.
-    func setSharedKey(_ key: Data, with index: Int32, ratchetSalt: Data) async {
-        lock.lock()
-        defer { lock.unlock() }
+    func setSharedKey(_ key: Data, with index: Int32, ratchetSalt: Data) {
+        // Ensure the provider exists, but do NOT install a dummy key as a side effect.
+        ensureSharedKeyProvider(ratchetSalt: ratchetSalt)
 
-        guard !isClosed else {
+        lock.lock()
+        if isClosed {
+            lock.unlock()
             // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Cannot set shared key: AndroidRTCClient has been closed")
+            return
+        }
+
+        guard let keyProvider else {
+            // Provider creation failed; stash for later.
+            pendingSharedKey = key
+            pendingSharedKeyIndex = index
+            lock.unlock()
+            // SKIP INSERT: android.util.Log.w("AndroidRTCClient", "FrameCryptorKeyProvider not ready; stashing shared key index $index")
+            return
+        }
+
+        // Apply the requested key.
+        // SKIP INSERT: val keySize = key.count
+        // SKIP INSERT: val keyBytesUInt8 = kotlin.UByteArray(keySize) { key.bytes[it] }
+        // SKIP INSERT: val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
+        // SKIP INSERT: val success = keyProvider?.setSharedKey(index.toInt(), keyBytes) ?: false
+        // SKIP INSERT: if (!success) {
+        // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "❌ Failed to set shared media key at index $index")
+        // SKIP INSERT: } else {
+        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Shared media key set at index $index")
+        // SKIP INSERT: }
+
+        pendingSharedKey = nil
+        pendingSharedKeyIndex = nil
+        lock.unlock()
+    }
+
+    /// Ensures a shared-key-mode FrameCryptorKeyProvider exists.
+    ///
+    /// This **must not** install a dummy key. It may apply a previously stashed shared key
+    /// (`pendingSharedKey`) if present.
+    private func ensureSharedKeyProvider(ratchetSalt: Data) {
+        lock.lock()
+        if isClosed {
+            lock.unlock()
             return
         }
 
@@ -541,31 +584,32 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyMode)")
         // SKIP INSERT: }
 
-        // Apply the requested key.
-        // SKIP INSERT: val keySize = key.count
-        // SKIP INSERT: val keyBytesUInt8 = kotlin.UByteArray(keySize) { key.bytes[it] }
-        // SKIP INSERT: val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
-        // SKIP INSERT: val success = keyProvider?.setSharedKey(index.toInt(), keyBytes) ?: false
-        // SKIP INSERT: if (!success) {
-        // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "❌ Failed to set shared media key at index $index")
-        // SKIP INSERT: } else {
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Shared media key set at index $index")
+        // If we stashed a key earlier, apply it now that a provider exists.
+        // SKIP INSERT: val pendingKey = this@AndroidRTCClient.pendingSharedKey
+        // SKIP INSERT: val pendingIndex = this@AndroidRTCClient.pendingSharedKeyIndex
+        // SKIP INSERT: if (pendingKey != null && pendingIndex != null && keyProvider != null) {
+        // SKIP INSERT:     val keySize = pendingKey.count
+        // SKIP INSERT:     val keyBytesUInt8 = kotlin.UByteArray(keySize) { pendingKey.bytes[it] }
+        // SKIP INSERT:     val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
+        // SKIP INSERT:     val ok = keyProvider.setSharedKey(pendingIndex.toInt(), keyBytes)
+        // SKIP INSERT:     if (ok) {
+        // SKIP INSERT:         android.util.Log.i("AndroidRTCClient", "✅ Applied stashed shared media key at index $pendingIndex")
+        // SKIP INSERT:         this@AndroidRTCClient.pendingSharedKey = null
+        // SKIP INSERT:         this@AndroidRTCClient.pendingSharedKeyIndex = null
+        // SKIP INSERT:     } else {
+        // SKIP INSERT:         android.util.Log.e("AndroidRTCClient", "❌ Failed to apply stashed shared media key at index $pendingIndex")
+        // SKIP INSERT:     }
         // SKIP INSERT: }
 
-        // If we had an earlier stashed key, prefer the most recent call (this one).
-        pendingSharedKey = nil
-        pendingSharedKeyIndex = nil
+        lock.unlock()
     }
 
     /// Ensures a key provider exists in the requested mode.
-    private func ensureKeyProvider(sharedKeyMode: Bool, ratchetSalt: Data) async {
+    private func ensureKeyProvider(sharedKeyMode: Bool, ratchetSalt: Data) {
         // We piggy-back on `setSharedKey(..., ratchetSalt:)` for provider creation logic.
         // If we're in per-participant mode, we call a dedicated creation path.
         if sharedKeyMode {
-            // Caller will set actual key separately.
-            if keyProvider == nil || keyProviderIsSharedKeyMode != true {
-                await setSharedKey(Data(), with: 0, ratchetSalt: ratchetSalt)
-            }
+            ensureSharedKeyProvider(ratchetSalt: ratchetSalt)
             return
         }
 
@@ -603,8 +647,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
     }
 
     /// Per-participant key setter (participant-scoped key ring).
-    func setKey(_ key: Data, with index: Int32, forParticipant participantId: String, ratchetSalt: Data) async {
-        await ensureKeyProvider(sharedKeyMode: false, ratchetSalt: ratchetSalt)
+    func setKey(_ key: Data, with index: Int32, forParticipant participantId: String, ratchetSalt: Data) {
+        ensureKeyProvider(sharedKeyMode: false, ratchetSalt: ratchetSalt)
 
         lock.lock()
         defer { lock.unlock() }
@@ -624,8 +668,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   val keyBytesUInt8 = kotlin.UByteArray(keySize) { key.bytes[it] }
         // SKIP INSERT:   val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
         // SKIP INSERT:   // Use reflection for compatibility across WebRTC versions.
-        // SKIP INSERT:   val m = keyProvider.javaClass.methods.firstOrNull { it.name == "setKey" && it.parameterTypes.size == 3 }
-        // SKIP INSERT:   val success = if (m != null) {
+        // SKIP INSERT:   val m = keyProvider?.javaClass?.methods?.firstOrNull { it.name == "setKey" && it.parameterTypes.size == 3 }
+        // SKIP INSERT:   val success = if (m != null && keyProvider != null) {
         // SKIP INSERT:     (m.invoke(keyProvider, participantId, index.toInt(), keyBytes) as? Boolean) ?: false
         // SKIP INSERT:   } else {
         // SKIP INSERT:     false
@@ -642,16 +686,21 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
     /// Best-effort export of the current key. If the underlying WebRTC API doesn't support it,
     /// this returns empty `Data`.
-    func exportKey(forParticipant participantId: String, index: Int32) async -> Data {
+    func exportKey(forParticipant participantId: String, index: Int32) -> Data {
         lock.lock()
-        defer { lock.unlock() }
+        if isClosed {
+            lock.unlock()
+            return Data()
+        }
+        guard let keyProvider else {
+            lock.unlock()
+            return Data()
+        }
 
-        guard !isClosed else { return Data() }
-        guard let keyProvider else { return Data() }
-
-        // SKIP INSERT: return try {
-        // SKIP INSERT:   val m = keyProvider.javaClass.methods.firstOrNull { it.name == "exportKey" && it.parameterTypes.size == 2 }
-        // SKIP INSERT:   val bytes = if (m != null) (m.invoke(keyProvider, participantId, index.toInt()) as? ByteArray) else null
+        var result = Data()
+        // SKIP INSERT: result = try {
+        // SKIP INSERT:   val m = keyProvider?.javaClass?.methods?.firstOrNull { it.name == "exportKey" && it.parameterTypes.size == 2 }
+        // SKIP INSERT:   val bytes = if (m != null && keyProvider != null) (m.invoke(keyProvider, participantId, index.toInt()) as? ByteArray) else null
         // SKIP INSERT:   if (bytes == null) {
         // SKIP INSERT:     android.util.Log.w("AndroidRTCClient", "exportKey not available for '$participantId' index $index")
         // SKIP INSERT:     null
@@ -662,24 +711,30 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   android.util.Log.e("AndroidRTCClient", "exportKey failed: ${e.message}", e)
         // SKIP INSERT:   null
         // SKIP INSERT: }?.let { bytes ->
-        // SKIP INSERT:   val u = kotlin.UByteArray(bytes.size) { idx -> bytes[idx].toUByte() }
-        // SKIP INSERT:   Data(bytes: u)
+        // SKIP INSERT:   // `bytes` is a Kotlin `ByteArray` from WebRTC. Wrap it directly as SkipFoundation `Data`.
+        // SKIP INSERT:   Data(platformValue = bytes)
         // SKIP INSERT: } ?: Data()
 
-        return Data()
+        lock.unlock()
+        return result
     }
 
     /// Best-effort ratchet; returns the newly derived key if available, else empty `Data`.
-    func ratchetKey(forParticipant participantId: String, index: Int32) async -> Data {
+    func ratchetKey(forParticipant participantId: String, index: Int32) -> Data {
         lock.lock()
-        defer { lock.unlock() }
+        if isClosed {
+            lock.unlock()
+            return Data()
+        }
+        guard let keyProvider else {
+            lock.unlock()
+            return Data()
+        }
 
-        guard !isClosed else { return Data() }
-        guard let keyProvider else { return Data() }
-
-        // SKIP INSERT: return try {
-        // SKIP INSERT:   val m = keyProvider.javaClass.methods.firstOrNull { it.name == "ratchetKey" && it.parameterTypes.size == 2 }
-        // SKIP INSERT:   val bytes = if (m != null) (m.invoke(keyProvider, participantId, index.toInt()) as? ByteArray) else null
+        var result = Data()
+        // SKIP INSERT: result = try {
+        // SKIP INSERT:   val m = keyProvider?.javaClass?.methods?.firstOrNull { it.name == "ratchetKey" && it.parameterTypes.size == 2 }
+        // SKIP INSERT:   val bytes = if (m != null && keyProvider != null) (m.invoke(keyProvider, participantId, index.toInt()) as? ByteArray) else null
         // SKIP INSERT:   if (bytes == null) {
         // SKIP INSERT:     android.util.Log.w("AndroidRTCClient", "ratchetKey not available for '$participantId' index $index")
         // SKIP INSERT:     null
@@ -690,11 +745,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   android.util.Log.e("AndroidRTCClient", "ratchetKey failed: ${e.message}", e)
         // SKIP INSERT:   null
         // SKIP INSERT: }?.let { bytes ->
-        // SKIP INSERT:   val u = kotlin.UByteArray(bytes.size) { idx -> bytes[idx].toUByte() }
-        // SKIP INSERT:   Data(bytes: u)
+        // SKIP INSERT:   // `bytes` is a Kotlin `ByteArray` from WebRTC. Wrap it directly as SkipFoundation `Data`.
+        // SKIP INSERT:   Data(platformValue = bytes)
         // SKIP INSERT: } ?: Data()
 
-        return Data()
+        lock.unlock()
+        return result
     }
 
     // MARK: - E2EE (FrameCryptor)
@@ -704,13 +760,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Notes:
     /// - We use shared-key mode to mirror the Apple implementation (`RTCFrameCryptorKeyProvider.setSharedKey`).
     /// - `participant` is kept for API symmetry but is not required in shared-key mode.
-    func setupCryptor(key: Data, index: Int, participant: String, ratchetSalt: Data) async {
+    func setupCryptor(key: Data, index: Int, participant: String, ratchetSalt: Data) {
         // Kept for backwards call-sites: create/ensure key provider and set the shared key.
-        await setSharedKey(key, with: Int32(index), ratchetSalt: ratchetSalt)
+        setSharedKey(key, with: Int32(index), ratchetSalt: ratchetSalt)
     }
 
     /// Attaches FrameCryptor encryptors to current RTP senders (audio/video) on the active PeerConnection.
-    func createSenderEncryptedFrame(participant: String, connectionId: String) async {
+    func createSenderEncryptedFrame(participant: String, connectionId: String) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -719,12 +775,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
             return
         }
 
+        // SKIP INSERT: run {
         // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
         // SKIP INSERT: val pc = this@AndroidRTCClient.peerConnection?.platformPeerConnection
         // SKIP INSERT: val factory = this@AndroidRTCClient.factory
         // SKIP INSERT: if (keyProvider == null || pc == null || factory == null) {
         // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "KeyProvider, PeerConnection, or Factory not initialized")
-        // SKIP INSERT:     return
+        // SKIP INSERT:     return@run
         // SKIP INSERT: }
         // SKIP INSERT: val pcNonNull = pc!!
         // SKIP INSERT: val senders = pcNonNull.senders
@@ -788,10 +845,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     this@AndroidRTCClient.audioSenderCryptor = cryptor
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Audio sender cryptor attached")
         // SKIP INSERT: }
+        // SKIP INSERT: }
     }
 
     /// Attaches FrameCryptor decryptors to current RTP receivers (audio/video) on the active PeerConnection.
-    func createReceiverEncryptedFrame(participant: String, connectionId: String, trackKind: String? = nil, trackId: String? = nil) async {
+    func createReceiverEncryptedFrame(participant: String, connectionId: String, trackKind: String? = nil, trackId: String? = nil) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -800,12 +858,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
             return
         }
 
+        // SKIP INSERT: run {
         // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
         // SKIP INSERT: val pc = this@AndroidRTCClient.peerConnection?.platformPeerConnection
         // SKIP INSERT: val factory = this@AndroidRTCClient.factory
         // SKIP INSERT: if (keyProvider == null || pc == null || factory == null) {
         // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "KeyProvider, PeerConnection, or Factory not initialized")
-        // SKIP INSERT:     return
+        // SKIP INSERT:     return@run
         // SKIP INSERT: }
         // SKIP INSERT: val pcNonNull = pc!!
         // SKIP INSERT: val receivers = pcNonNull.receivers
@@ -866,6 +925,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     cryptor?.setEnabled(true)
         // SKIP INSERT:     this@AndroidRTCClient.audioReceiverCryptorsByParticipantId[participant] = cryptor
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Audio receiver cryptor attached")
+        // SKIP INSERT: }
         // SKIP INSERT: }
     }
 
@@ -1074,7 +1134,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: val c = org.webrtc.MediaConstraints()
         // SKIP INSERT: for ((k, v) in mandatory) { c.mandatory.add(org.webrtc.MediaConstraints.KeyValuePair(k, v)) }
         // SKIP INSERT: for ((k, v) in optional)  { c.optional.add(org.webrtc.MediaConstraints.KeyValuePair(k, v)) }
-        // SKIP INSERT: return needle.tail.rtc.RTCMediaConstraints(c)
+        // SKIP INSERT: return RTCMediaConstraints(c)
+        fatalError("createConstraints should only be called on Android")
     }
     
     /// Creates and stores an audio source.
@@ -1084,9 +1145,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     @discardableResult
     public func createAudioSource(_ constraints: RTCMediaConstraints) -> RTCAudioSource {
         // SKIP INSERT: val fac = factory ?: throw IllegalStateException("Factory not initialized")
-        // SKIP INSERT: val src = needle.tail.rtc.RTCAudioSource(fac.createAudioSource(constraints.platformConstraints))
+        // SKIP INSERT: val src = RTCAudioSource(fac.createAudioSource(constraints.platformConstraints))
         // SKIP INSERT: this.audioSource = src
         // SKIP INSERT: return src
+        fatalError("createAudioSource should only be called on Android")
     }
     
     /// Creates and stores a local audio track.
@@ -1098,9 +1160,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     @discardableResult
     public func createAudioTrack(id: String, _ audioSource: RTCAudioSource) -> RTCAudioTrack {
         // SKIP INSERT: val fac = factory ?: throw IllegalStateException("Factory not initialized")
-        // SKIP INSERT: val track = needle.tail.rtc.RTCAudioTrack(fac.createAudioTrack("audio_${id}", audioSource.platformSource))
+        // SKIP INSERT: val track = RTCAudioTrack(fac.createAudioTrack("audio_${id}", audioSource.platformSource))
         // SKIP INSERT: this.localAudioTrack = track
         // SKIP INSERT: return track
+        fatalError("createAudioTrack should only be called on Android")
     }
     
     /// Creates and stores a video source.
@@ -1108,9 +1171,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// - Parameter isScreen: Whether the source is intended for screen capture.
     public func createVideoSource(_ isScreen: Bool = false) -> RTCVideoSource {
         // SKIP INSERT: val fac = factory ?: throw IllegalStateException("Factory not initialized")
-        // SKIP INSERT: val src = needle.tail.rtc.RTCVideoSource(fac.createVideoSource(isScreen))
+        // SKIP INSERT: val src = RTCVideoSource(fac.createVideoSource(isScreen))
         // SKIP INSERT: this.videoSource = src
         // SKIP INSERT: return src
+        fatalError("createVideoSource should only be called on Android")
     }
     
     /// Creates and stores a local video track.
@@ -1120,9 +1184,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///   - videoSource: The video source wrapper.
     public func createVideoTrack(id: String, _ videoSource: RTCVideoSource) -> RTCVideoTrack {
         // SKIP INSERT: val fac = factory ?: throw IllegalStateException("Factory not initialized")
-        // SKIP INSERT: val track = needle.tail.rtc.RTCVideoTrack(fac.createVideoTrack("video_${id}", videoSource.platformSource))
+        // SKIP INSERT: val track = RTCVideoTrack(fac.createVideoTrack("video_${id}", videoSource.platformSource))
         // SKIP INSERT: this.localVideoTrack = track
         // SKIP INSERT: return track
+        fatalError("createVideoTrack should only be called on Android")
     }
     
     /// Enables or disables the local audio track.

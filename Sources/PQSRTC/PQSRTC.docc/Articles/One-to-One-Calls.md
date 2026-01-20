@@ -20,11 +20,14 @@ The SDK exposes two layers:
 
 ### 1) Prepare crypto session
 
-The caller must have the callee’s identity props available on the call (typically in `call.identityProps`).
+The caller must have the callee’s identity props available on the call:
+
+- `call.frameIdentityProps` (for frame/media identity)
+- `call.signalingIdentityProps` (for signaling identity)
 
 ```swift
-// call.identityProps must be set to the remote participant's identity props.
-try await session.createCryptoSession(with: call)
+// Both props must be set to the *remote* participant’s props before starting.
+try await session.createCryptoPeerConnection(with: call)
 ```
 
 ### 2) Receive callee ciphertext, decide to answer, then send offer
@@ -36,11 +39,10 @@ When your transport receives a ciphertext blob from the callee, call:
 session.setCanAnswer(true)
 
 let updatedCall = try await session.finishCryptoSessionCreation(
-  recipient: remoteSecretName,
   ciphertext: ciphertext,
   call: call
 )
-// finishCryptoSessionCreation will send the SDP offer via RTCTransportEvents.sendOffer.
+// finishCryptoSessionCreation will send the encrypted SDP offer via RTCTransportEvents.sendOneToOneMessage(..., flag: .offer, ...).
 ```
 
 To reject:
@@ -48,7 +50,6 @@ To reject:
 ```swift
 session.setCanAnswer(false)
 _ = try? await session.finishCryptoSessionCreation(
-  recipient: remoteSecretName,
   ciphertext: ciphertext,
   call: call
 )
@@ -67,7 +68,7 @@ let processedCall = try await session.handleOffer(
   metadata: metadata
 )
 
-// `handleOffer` will send an SDP answer via RTCTransportEvents.sendAnswer.
+// `handleOffer` will send an encrypted SDP answer via RTCTransportEvents.sendOneToOneMessage(..., flag: .answer, ...).
 ```
 
 ### 2) Exchange ICE candidates

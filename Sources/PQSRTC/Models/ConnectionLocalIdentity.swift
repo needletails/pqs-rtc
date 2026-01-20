@@ -16,12 +16,13 @@
 //
 
 import DoubleRatchetKit
+import NTKLoop
 
 /// Cryptographic identity material generated locally for a single connection.
 ///
 /// `RTCSession`/`KeyManager` use this to persist the local party's key material
 /// needed to establish and advance pairwise ratchets.
-public struct ConnectionLocalIdentity: Sendable {
+public struct ConnectionLocalIdentity: TaskObjectProtocol {
     /// Application-level connection identifier used for routing.
     public let connectionId: String
     /// The local party's asymmetric key material (ratchet identity keys).

@@ -24,6 +24,13 @@ import UIKit
 /// This view hosts call UI overlays (e.g. local preview) and provides
 /// sizing/constraint helpers used by ``VideoCallViewController``.
 class ControllerView: UIView {
+    
+    // MARK: - Local preview layout constraints (rotation-safe)
+    private weak var currentPreviewView: NTMTKView?
+    private var previewOverlayConstraints: [NSLayoutConstraint] = []
+    private var previewFullscreenConstraints: [NSLayoutConstraint] = []
+    private var previewWidthConstraint: NSLayoutConstraint?
+    private var previewHeightConstraint: NSLayoutConstraint?
         
     // MARK: - Blur support (used by the view controller)
     /// Blur effect used when obscuring video (e.g. during local mute).
@@ -81,7 +88,7 @@ class ControllerView: UIView {
     /// Updates the local preview's constraints based on orientation and state.
     ///
     /// This no-ops while the app is backgrounded.
-    func updateLocalVideoSize(with orientation: UIDeviceOrientation, should minimize: Bool, isConnected: Bool, view: NTMTKView) {
+    func updateLocalVideoSize(with orientation: UIDeviceOrientation, should minimize: Bool, isConnected: Bool, view: NTMTKView, animated: Bool = true) {
         if UIApplication.shared.applicationState != .background {
             var size: CGSize = .zero
             switch orientation {
@@ -99,33 +106,85 @@ class ControllerView: UIView {
                 size = setSize(isLandscape: true, minimize: minimize)
             }
             Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                await updateVideoConstraints(size: size, isConnected: isConnected, view: view)
+                guard let self else { return }
+                await updateVideoConstraints(size: size, isConnected: isConnected, view: view, animated: animated)
             }
         }
     }
     
     /// Applies constraints to the preview view for connected vs. not-yet-connected layouts.
-    func updateVideoConstraints(size: CGSize, isConnected: Bool, view: NTMTKView) async {
+    func updateVideoConstraints(size: CGSize, isConnected: Bool, view: NTMTKView, animated: Bool) async {
+        // Ensure we're constraining the view in the right hierarchy.
+        guard view.superview === self else { return }
+        
+        // If the preview view instance changes (new call), drop old constraint references.
+        if currentPreviewView !== view {
+            NSLayoutConstraint.deactivate(previewOverlayConstraints + previewFullscreenConstraints)
+            previewOverlayConstraints = []
+            previewFullscreenConstraints = []
+            previewWidthConstraint = nil
+            previewHeightConstraint = nil
+            currentPreviewView = view
+        }
+        
+        view.translatesAutoresizingMaskIntoConstraints = false
+        
         if isConnected {
-            view.anchors(
-                bottom: bottomAnchor,
-                trailing: trailingAnchor,
-                paddingBottom: 100,
-                paddingRight: 20,
-                width: size.width - 5,
-                height: size.height - 5
-            )
+            // Overlay mode: bottom-right "PiP-style" local preview.
+            NSLayoutConstraint.deactivate(previewFullscreenConstraints)
+            
+            if previewOverlayConstraints.isEmpty {
+                // Use safe-area so the preview never sits under the home indicator / notch.
+                let bottom = view.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -16)
+                let trailing = view.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -16)
+                let width = view.widthAnchor.constraint(equalToConstant: max(1, size.width - 5))
+                let height = view.heightAnchor.constraint(equalToConstant: max(1, size.height - 5))
+                
+                previewWidthConstraint = width
+                previewHeightConstraint = height
+                previewOverlayConstraints = [bottom, trailing, width, height]
+                NSLayoutConstraint.activate(previewOverlayConstraints)
+            } else {
+                previewWidthConstraint?.constant = max(1, size.width - 5)
+                previewHeightConstraint?.constant = max(1, size.height - 5)
+            }
             
             view.layer.cornerRadius = 10
+            if #available(iOS 13.0, *) {
+                view.layer.cornerCurve = .continuous
+            }
             view.layer.masksToBounds = true
+            // Subtle shadow reads as “premium” and improves depth separation from remote video.
+            view.layer.shadowColor = UIColor.black.cgColor
+            view.layer.shadowOpacity = 0.18
+            view.layer.shadowRadius = 12
+            view.layer.shadowOffset = CGSize(width: 0, height: 6)
+            view.layer.masksToBounds = false
         } else {
-            view.anchors(
-                top: topAnchor,
-                leading: leadingAnchor,
-                bottom: bottomAnchor,
-                trailing: trailingAnchor
-            )
+            // Fullscreen mode (pre-connect / local-only).
+            NSLayoutConstraint.deactivate(previewOverlayConstraints)
+            
+            if previewFullscreenConstraints.isEmpty {
+                previewFullscreenConstraints = [
+                    view.topAnchor.constraint(equalTo: topAnchor),
+                    view.leadingAnchor.constraint(equalTo: leadingAnchor),
+                    view.bottomAnchor.constraint(equalTo: bottomAnchor),
+                    view.trailingAnchor.constraint(equalTo: trailingAnchor)
+                ]
+                NSLayoutConstraint.activate(previewFullscreenConstraints)
+            }
+            
+            // Reset rounding when fullscreen.
+            view.layer.cornerRadius = 0
+            view.layer.masksToBounds = false
+            view.layer.shadowOpacity = 0
+        }
+        
+        // Smooth resizing feels much more “polished”, especially when minimizing and rotating.
+        if animated, window != nil {
+            UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseInOut, .allowUserInteraction]) {
+                self.layoutIfNeeded()
+            }
         }
     }
     

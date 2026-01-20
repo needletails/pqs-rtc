@@ -66,7 +66,8 @@ playground.xcworkspace
 # Add this line if you want to avoid checking in source code from Swift Package Manager dependencies.
 Packages/
 Package.pins
-# Package.resolved is intentionally committed for reproducible dependency resolution.
+# Package.resolved is ignored (project policy: do not commit lockfiles).
+Package.resolved
 
 # Xcode-generated SwiftPM integration files
 .swiftpm/xcode/
@@ -85,3 +86,9 @@ Carthage/Build/
 
 # Generated test artifacts
 Tests/PQSRTCTests/debug
+
+# Swift build byproducts occasionally emitted at repo root (e.g. resource bundle accessor)
+resource_bundle_accessor-*.d
+resource_bundle_accessor-*.dia
+resource_bundle_accessor-*.swiftdeps
+resource_bundle_accessor-*.swiftmodule

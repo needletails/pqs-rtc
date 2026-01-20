@@ -72,7 +72,11 @@ internal class SampleCaptureView: UIView {
     func enqueue(sampleBuffer: CMSampleBuffer) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.sampleBufferLayer.sampleBufferRenderer.enqueue(sampleBuffer)
+            if self.sampleBufferLayer.status == .failed {
+                self.logger.log(level: .warning, message: "AVSampleBufferDisplayLayer failed: \(String(describing: self.sampleBufferLayer.error)). Flushing.")
+                self.sampleBufferLayer.flush()
+            }
+            self.sampleBufferLayer.enqueue(sampleBuffer)
         }
     }
     
@@ -90,7 +94,7 @@ internal class SampleCaptureView: UIView {
 
         let flushWork = { @Sendable @MainActor [weak self] in
             guard let self else { return }
-            self.sampleBufferLayer.sampleBufferRenderer.flush()
+            self.sampleBufferLayer.flush()
             #if DEBUG
             self.logger.log(level: .debug, message: "SampleCaptureView layer flushed")
             #endif
@@ -165,7 +169,11 @@ internal class SampleCaptureView: NSView {
     func enqueue(sampleBuffer: CMSampleBuffer) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.sampleBufferLayer.sampleBufferRenderer.enqueue(sampleBuffer)
+            if self.sampleBufferLayer.status == .failed {
+                self.logger.log(level: .warning, message: "AVSampleBufferDisplayLayer failed: \(String(describing: self.sampleBufferLayer.error)). Flushing.")
+                self.sampleBufferLayer.flush()
+            }
+            self.sampleBufferLayer.enqueue(sampleBuffer)
         }
     }
     
@@ -182,7 +190,7 @@ internal class SampleCaptureView: NSView {
 
         let flushWork = { @Sendable @MainActor [weak self] in
             guard let self else { return }
-            self.sampleBufferLayer.sampleBufferRenderer.flush()
+            self.sampleBufferLayer.flush()
             #if DEBUG
             self.logger.log(level: .debug, message: "SampleCaptureView layer flushed")
             #endif

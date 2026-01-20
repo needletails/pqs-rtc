@@ -21,6 +21,7 @@
 import NeedleTailLogger
 import Foundation
 import DoubleRatchetKit
+import NTKLoop
 #if canImport(FoundationEssentials)
 import FoundationEssentials
 #endif
@@ -44,7 +45,7 @@ import FoundationEssentials
 ///
 /// `RTCSession` stores one `RTCConnection` per active peer (1:1) or per SFU endpoint
 /// (group calls), and uses it to manage tracks, data channels, and frame cryptors.
-/* SKIP @bridge */ public struct RTCConnection: @unchecked Sendable {
+/* SKIP @bridge */ public struct RTCConnection: TaskObjectProtocol {
     // Shared properties for both platforms
     /// Stable identifier for this connection (used for routing/correlation).
     public let id: String
@@ -53,7 +54,7 @@ import FoundationEssentials
     let recipient: String
     let localKeys: LocalKeys
     let symmetricKey: SymmetricKey
-    let sessionIdentity: SessionIdentity
+    var sessionIdentity: SessionIdentity
     var call: Call
     let logger = NeedleTailLogger()
 

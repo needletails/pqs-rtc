@@ -4,7 +4,7 @@ import Testing
 @preconcurrency import WebRTC
 @testable import PQSRTC
 
-@Suite
+@Suite(.serialized)
 struct IceCandidateTests {
     @Test
     func validationErrors() {

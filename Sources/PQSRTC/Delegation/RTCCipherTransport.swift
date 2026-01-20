@@ -16,6 +16,7 @@
 //
 
 import Foundation
+import BinaryCodable
 
 /// Transport callbacks implemented by the application.
 ///
@@ -38,19 +39,49 @@ public protocol RTCTransportEvents: Sendable {
     ///   - call: Call context for routing (typically `call.sharedCommunicationId`).
     func sendCiphertext(recipient: String, connectionId: String, ciphertext: Data, call: Call) async throws
 
-    /// Sends an SDP offer.
+    // MARK: - SFU group-call signaling (encrypted)
+    /// Sends an encrypted SFU signaling packet (group calls).
     ///
-    /// - Important: For SFU group calls, this offer is intended for the SFU endpoint.
-    func sendOffer(call: Call) async throws
-
-    /// Sends an SDP answer and 1:1 negotiation metadata.
+    /// Use `packet.flag` to distinguish `.offer` / `.answer` / `.candidate` / `.handshakeComplete`.
     ///
-    /// - Note: This callback is used for 1:1 calls.
-    func sendAnswer(call: Call, metadata: PQSRTC.SDPNegotiationMetadata) async throws
-
-    /// Sends an ICE candidate.
-    func sendCandidate(_ candidate: IceCandidate, call: Call) async throws
-
+    /// Routing guidance:
+    /// - `packet.sfuIdentity` identifies the SFU endpoint / room route
+    /// - `call.sharedCommunicationId` identifies the local call instance
+    func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws
+    
+    // MARK: - 1:1 call signaling (encrypted via SwiftSFU)
+    
+    /// Sends a start_call message to trigger VoIP notifications for the recipient.
+    ///
+    /// This should be sent before establishing the crypto session. The message contains
+    /// `StartCallMetadata` and triggers push notifications so the recipient can accept/decline.
+    /// - Parameter call: The call to start (must have sender, recipients, and sharedCommunicationId)
+    func sendStartCall(_ call: Call) async throws
+    
+    /// Sends a call_answered notification to notify the caller that the call was answered.
+    ///
+    /// This should be sent after the callee accepts the call and generates an SDP answer.
+    /// - Parameter call: The call that was answered
+    func sendCallAnswered(_ call: Call) async throws
+    
+    /// Sends a call_answered_aux_device notification to notify other devices that the call was answered on this device.
+    ///
+    /// This is used for multi-device scenarios where the user has multiple devices.
+    /// - Parameter call: The call that was answered on this device
+    func sendCallAnsweredAuxDevice(_ call: Call) async throws
+    
+    /// Sends an encrypted 1:1 message.
+    ///
+    /// The packet contains an encrypted `Call` object with SDP offer in metadata.
+    /// Default behavior encodes the packet and forwards it through `sendCiphertext(...)` using
+    /// `recipient = packet.sfuIdentity` and `connectionId = call.sharedCommunicationId`.
+    func sendOneToOneMessage(_ packet: RatchetMessagePacket, recipient: Call.Participant) async throws
+    
     /// Called when the SDK ends a call.
     func didEnd(call: Call, endState: CallStateMachine.EndState) async throws
+    
+    //Information will not be encrypted should go through a secure route
+    func negotiateGroupIdentity(call: Call, sfuRecipientId: String) async throws
+    //Information will not be encrypted should go through a secure route
+    func requestInitializeGroupCallRecipient(call: Call, sfuRecipientId: String) async throws
 }

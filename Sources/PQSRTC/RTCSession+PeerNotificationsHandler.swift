@@ -18,8 +18,36 @@
 #if canImport(WebRTC)
 import WebRTC
 #endif
+import BinaryCodable
 
 extension RTCSession {
+    
+    private func sendEncryptedSfuCandidateIfPossible(
+        _ candidate: IceCandidate,
+        call: Call,
+        sfuRecipientId: String
+    ) async throws {
+        // Encode candidate into the call metadata, then ratchet-encrypt the call bytes.
+        var callForWire = call
+        callForWire.metadata = try BinaryEncoder().encode(candidate)
+        let plaintext = try BinaryEncoder().encode(callForWire)
+        
+        // Ensure sender initialization occurred before ratchet encrypting (idempotent).
+        let recipientIdentity = try await ensureSfuSenderInitialization(call: call, sfuRecipientId: sfuRecipientId)
+        
+        let message = try await pcRatchetManager.ratchetEncrypt(
+            plainText: plaintext,
+            sessionId: recipientIdentity.sessionIdentity.id
+        )
+        let packet = RatchetMessagePacket(
+            sfuIdentity: sfuRecipientId,
+            header: message.header,
+            ratchetMessage: message,
+            flag: .candidate)
+        
+        try await requireTransport().sendSfuMessage(packet, call: call)
+    }
+    
     func handlePeerConnectionNotifications(generation: UInt64) async {
         notificationsConsumerIsRunning = true
         logger.log(level: .info, message: "Peer-notifications consumer is now listening (generation=\(generation))")
@@ -117,18 +145,53 @@ extension RTCSession {
                 // On Android, remote tracks are delivered via the AndroidRTCClient bridge.
                 // We still model this as a Unified Plan receiver event so group-call demux
                 // and per-participant cryptors work consistently.
-                if let mediaDelegate, !participantId.isEmpty {
-                    await mediaDelegate.didAddRemoteTrack(connectionId: connection.id, participantId: participantId, kind: trackKind, trackId: trackId)
-                }
+                    if trackKind == "video" {
+                        // Get the remote video track from the peer connection
+                        let videoTrack = rtcClient.getRemoteVideoTrack(peerConnection: connection.peerConnection)
+                        if let videoTrack {
+                            var updated = connection
+                            if !participantId.isEmpty {
+                                // Note: Android doesn't have remoteVideoTracksByParticipantId yet,
+                                // but we store the track for consistency
+                            }
+                            updated.remoteVideoTrack = videoTrack
+                            await connectionManager.updateConnection(id: updated.id, with: updated)
+                            
+                            // Attach any pending renderer that was buffered before the track arrived
+                            if let pendingRenderer = pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: updated.id) as? AndroidSampleCaptureView {
+                                logger.log(level: .info, message: "Attaching buffered remote renderer now that remote video track is available (trackId=\(trackId))")
+                                pendingRenderer.attach(videoTrack)
+                            }
+                        }
+                    }
+                    
+                    if let mediaDelegate, !participantId.isEmpty {
+                        await mediaDelegate.didAddRemoteTrack(connectionId: connection.id, participantId: participantId, kind: trackKind, trackId: trackId)
+                    }
 
-                if !participantId.isEmpty {
-                    await rtcClient.createReceiverEncryptedFrame(
-                        participant: participantId,
-                        connectionId: connection.id,
-                        trackKind: trackKind,
-                        trackId: trackId
-                    )
-                }
+                    // Determine the correct participant ID for the receiver cryptor:
+                    // - For group calls: use participantId from streamIds (identifies the track owner)
+                    // - For 1:1 calls in perParticipant mode: use connection.remoteParticipantId (matches the key that was set)
+                    let receiverParticipantId: String
+                    if self.groupCalls[connection.id] != nil {
+                        // Group call: use the participantId from streamIds
+                        receiverParticipantId = participantId.isEmpty ? connection.remoteParticipantId : participantId
+                    } else if self.frameEncryptionKeyMode == .perParticipant {
+                        // 1:1 call in perParticipant mode: use remoteParticipantId to match the key
+                        receiverParticipantId = connection.remoteParticipantId
+                    } else {
+                        // 1:1 call in shared mode: use remoteParticipantId for consistency
+                        receiverParticipantId = connection.remoteParticipantId
+                    }
+
+                    if !receiverParticipantId.isEmpty {
+                        rtcClient.createReceiverEncryptedFrame(
+                            participant: receiverParticipantId,
+                            connectionId: connection.id,
+                            trackKind: trackKind,
+                            trackId: trackId
+                        )
+                    }
 #elseif canImport(WebRTC)
                 do {
                     if trackKind == kRTCMediaStreamTrackKindVideo,
@@ -150,10 +213,25 @@ extension RTCSession {
                             await mediaDelegate.didAddRemoteTrack(connectionId: updated.id, participantId: participantId, kind: "video", trackId: trackId)
                         }
 
+                        // Determine the correct participant ID for the receiver cryptor:
+                        // - For group calls: use participantId from streamIds (identifies the track owner)
+                        // - For 1:1 calls in perParticipant mode: use connection.remoteParticipantId (matches the key that was set)
+                        let receiverParticipantId: String?
+                        if self.groupCalls[connection.id] != nil {
+                            // Group call: use the participantId from streamIds
+                            receiverParticipantId = participantId.isEmpty ? nil : participantId
+                        } else if self.frameEncryptionKeyMode == .perParticipant {
+                            // 1:1 call in perParticipant mode: use remoteParticipantId to match the key
+                            receiverParticipantId = connection.remoteParticipantId
+                        } else {
+                            // 1:1 call in shared mode: participantId doesn't matter, but use remoteParticipantId for consistency
+                            receiverParticipantId = nil
+                        }
+
                         try await self.createEncryptedFrame(
                             connection: updated,
                             kind: .videoReceiver(receiver),
-                            participantIdOverride: participantId.isEmpty ? nil : participantId
+                            participantIdOverride: receiverParticipantId
                         )
                     }
 
@@ -170,10 +248,25 @@ extension RTCSession {
                             await mediaDelegate.didAddRemoteTrack(connectionId: updated.id, participantId: participantId, kind: "audio", trackId: trackId)
                         }
 
+                        // Determine the correct participant ID for the receiver cryptor:
+                        // - For group calls: use participantId from streamIds (identifies the track owner)
+                        // - For 1:1 calls in perParticipant mode: use connection.remoteParticipantId (matches the key that was set)
+                        let receiverParticipantId: String?
+                        if self.groupCalls[connection.id] != nil {
+                            // Group call: use the participantId from streamIds
+                            receiverParticipantId = participantId.isEmpty ? nil : participantId
+                        } else if self.frameEncryptionKeyMode == .perParticipant {
+                            // 1:1 call in perParticipant mode: use remoteParticipantId to match the key
+                            receiverParticipantId = connection.remoteParticipantId
+                        } else {
+                            // 1:1 call in shared mode: participantId doesn't matter, but use remoteParticipantId for consistency
+                            receiverParticipantId = nil
+                        }
+
                         try await self.createEncryptedFrame(
                             connection: updated,
                             kind: .audioReceiver(receiver),
-                            participantIdOverride: participantId.isEmpty ? nil : participantId
+                            participantIdOverride: receiverParticipantId
                         )
                     }
                 } catch {
@@ -220,9 +313,48 @@ extension RTCSession {
                     }
                     
                     if readyForCandidates {
+                        
                         do {
-                            try await self.requireTransport().sendCandidate(candidate, call: connection.call)
-                            self.logger.log(level: .info, message: "Sent Candidate, \(candidate.id)")
+                            // For SFU group calls, encrypt ICE candidates over the SFU ratchet.
+                            if self.groupCalls[connection.id] != nil {
+                                try await self.sendEncryptedSfuCandidateIfPossible(
+                                    candidate,
+                                    call: connection.call,
+                                    sfuRecipientId: connection.id
+                                )
+                                self.logger.log(level: .info, message: "Sent encrypted SFU candidate, \(candidate.id)")
+                            } else {
+                                // For 1:1 calls, encrypt candidate and send via encrypted transport
+                                var call = connection.call
+                                call.metadata = try BinaryEncoder().encode(candidate)
+                                let plaintext = try BinaryEncoder().encode(call)
+                                guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(call.sharedCommunicationId),
+                                      let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey)  else {
+                                    throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
+                                }
+                                let packet = try await self.encryptOneToOneSignaling(
+                                    plaintext: plaintext,
+                                    connectionId: connection.call.sharedCommunicationId,
+                                    flag: .candidate,
+                                    remoteProps: remoteProps)
+                                guard var recipient = call.recipients.first else {
+                                    throw RTCErrors.invalidConfiguration("Received a call without a recipient")
+                                }
+
+                                guard let sessionParticipant else {
+                                    throw RTCErrors.invalidConfiguration("Received a call without a session participant")
+                                }
+                                if recipient.secretName == sessionParticipant.secretName {
+                                    recipient.deviceId = sessionParticipant.deviceId
+                                    
+                                    let copiedSender = call.sender
+                                    call.recipients = [copiedSender]
+                                    call.sender = recipient
+                                    recipient = copiedSender
+                                }
+                                try await self.requireTransport().sendOneToOneMessage(packet, recipient: recipient)
+                                self.logger.log(level: .info, message: "Sent encrypted 1:1 candidate, \(candidate.id)")
+                            }
                         } catch {
                             self.logger.log(level: .error, message: "Failed to send ICE candidate (id=\(candidate.id)): \(error)")
                         }
@@ -280,19 +412,26 @@ extension RTCSession {
                 self.logger.log(level: .info, message: "peerConnection didStartReceiving \(trackKind)")
 #if canImport(WebRTC)
                 do {
-                    //                        if let ciphertext = await keyManager.fetchCiphertext(connectionId: connectionId),
-                    //                           initialHandshakeComplete["receivingHandshake"] != true {
-                    //
-                    //                            try await receiveCiphertext(recipient: connection.recipient,
-                    //                                                        connectionId: connectionId,
-                    //                                                        ciphertext: ciphertext)
-                    //
-                    //                        }
+                    // Determine the correct participant ID for receiver cryptors:
+                    // - For group calls: participantIdOverride will be set in didAddReceiver
+                    // - For 1:1 calls in perParticipant mode: use remoteParticipantId to match the key
+                    let receiverParticipantId: String?
+                    if self.groupCalls[connection.id] != nil {
+                        // Group call: participantId will be set when didAddReceiver fires
+                        receiverParticipantId = nil
+                    } else if self.frameEncryptionKeyMode == .perParticipant {
+                        // 1:1 call in perParticipant mode: use remoteParticipantId to match the key
+                        receiverParticipantId = connection.remoteParticipantId
+                    } else {
+                        // 1:1 call in shared mode: participantId doesn't matter
+                        receiverParticipantId = nil
+                    }
+                    
                     if trackKind == "video", let videoReceiver = connection.peerConnection.transceivers.first(where: { $0.mediaType == .video })?.receiver {
-                        try await self.createEncryptedFrame(connection: connection, kind: .videoReceiver(videoReceiver))
+                        try await self.createEncryptedFrame(connection: connection, kind: .videoReceiver(videoReceiver), participantIdOverride: receiverParticipantId)
                     }
                     if trackKind == "audio", let audioReceiver = connection.peerConnection.transceivers.first(where: { $0.mediaType == .audio })?.receiver {
-                        try await self.createEncryptedFrame(connection: connection, kind: .audioReceiver(audioReceiver))
+                        try await self.createEncryptedFrame(connection: connection, kind: .audioReceiver(audioReceiver), participantIdOverride: receiverParticipantId)
                     }
                 } catch {
                     logger.log(level: .error, message: "Failed to create encrypted frame")

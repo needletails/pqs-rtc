@@ -25,75 +25,6 @@ import NeedleTailAsyncSequence
 @preconcurrency import WebRTC
 #endif
 
-
-/// Answer/acceptance state for an incoming call.
-///
-/// `RTCSession` uses this to gate whether an inbound offer may proceed.
-/// See ``RTCSession/setCanAnswer(_:)``.
-public enum CallAnswerState: Sendable {
-    case pending
-    case answered
-    case rejected
-}
-
-/// Errors surfaced by `RTCSession` when a call cannot proceed.
-public enum ConnectionErrors: Error, Sendable {
-    /// The remote party rejected the call.
-    case rejected
-    /// The call was not answered within the configured timeout.
-    case unanswered
-    /// An operation referenced a connection/call that does not exist.
-    case connectionNotFound
-
-    /// A human-readable description suitable for logging/UX.
-    public var errorDescription: String? {
-        switch self {
-        case .rejected:
-            return "Call was rejected"
-        case .unanswered:
-            return "Call was unanswered"
-        case .connectionNotFound:
-            return "Connection not found"
-        }
-    }
-}
-
-/// Minimal state used when sequencing peer-connection operations.
-public enum PeerConnectionState: Sendable {
-    case setRemote, none
-}
-
-/// A decoded WebRTC data-channel message, annotated with routing metadata.
-///
-/// `connectionId` and `channelLabel` let your app correlate messages to the
-/// right peer and channel when multiple calls/data channels are active.
-public struct RTCDataChannelMessage: Sendable {
-    /// Connection identifier associated with the underlying PeerConnection.
-    public let connectionId: String
-    /// WebRTC data channel label.
-    public let channelLabel: String
-    /// Raw message payload.
-    public let data: Data
-
-    /// Creates a new data-channel message container.
-    public init(connectionId: String, channelLabel: String, data: Data) {
-        self.connectionId = connectionId
-        self.channelLabel = channelLabel
-        self.data = data
-    }
-}
-
-/// Configures how frame-level E2EE keys are applied to the WebRTC key provider.
-///
-/// - `shared`: One shared media key ring (current behavior). This is simplest but does not
-///   model multi-sender SFU calls.
-/// - `perParticipant`: Keys are set per `participantId`, enabling SFU/group calls where
-///   each sender can have a distinct key.
-public enum RTCFrameEncryptionKeyMode: Sendable {
-    case shared
-    case perParticipant
-}
-
 /// Primary entry point for 1:1 and SFU group calls.
 ///
 /// `RTCSession` owns WebRTC state and call lifecycle. Your app provides the networking layer
@@ -114,15 +45,85 @@ public enum RTCFrameEncryptionKeyMode: Sendable {
 /// For SFU group calls, prefer ``RTCSession/createGroupCall(call:sfuRecipientId:)``.
 public actor RTCSession {
     
+    // MARK: - Type aliases & executors
+    
+    /// Resolves a logical `participantId` for a given set of inbound WebRTC stream/track identifiers.
+    ///
+    /// SFU deployments often encode the participant identity in stream IDs or track metadata.
+    /// This resolver lets the app plug in that mapping logic.
+    public typealias RemoteParticipantIdResolver = @Sendable (_ streamIds: [String], _ trackId: String, _ trackKind: String) -> String?
+    
+    /// Serial executor used by the ratchet key managers and other internal async tasks.
     let executor = RatchetExecutor(queue: .init(label: "testable-executor"))
     
+    /// Unowned executor view exposed for integration with Swift concurrency.
     public nonisolated var unownedExecutor: UnownedSerialExecutor {
         executor.asUnownedSerialExecutor()
     }
+
+    // MARK: - Video capture wrapper availability (Apple platforms)
+    //
+    // The UI preview pipeline (PreviewViewRender) needs the per-connection RTCVideoCaptureWrapper
+    // to inject captured frames into the WebRTC video source.
+    //
+    // That wrapper is created when the local WebRTC video track is created, which may happen
+    // after the preview UI starts. We expose an event-driven "await wrapper" API to avoid
+    // polling or retry loops in controllers.
+#if canImport(WebRTC)
+    private var pendingVideoCaptureWrapperWaiters: [String: [CheckedContinuation<RTCVideoCaptureWrapper?, Never>]] = [:]
     
+    /// Resolves when the connection's `rtcVideoCaptureWrapper` is available, or returns `nil`
+    /// if it never becomes available within the timeout.
+    ///
+    /// This method is non-throwing and does not poll; it waits on a continuation that is
+    /// resumed when the wrapper is created.
+    internal func waitForVideoCaptureWrapper(
+        connectionId: String,
+        timeoutNanoseconds: UInt64 = 3_000_000_000
+    ) async -> RTCVideoCaptureWrapper? {
+        let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        
+        if let existing = await connectionManager.findConnection(with: trimmed)?.rtcVideoCaptureWrapper {
+            return existing
+        }
+        
+        return await withCheckedContinuation { (continuation: CheckedContinuation<RTCVideoCaptureWrapper?, Never>) in
+            pendingVideoCaptureWrapperWaiters[trimmed, default: []].append(continuation)
+            
+            // Enforce a timeout so we never hang a controller task forever.
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                await self?.resumeVideoCaptureWrapperWaiters(connectionId: trimmed, wrapper: nil)
+            }
+        }
+    }
+    
+    /// Called internally when a wrapper is created (or when timing out) to resume waiters.
+    internal func resumeVideoCaptureWrapperWaiters(connectionId: String, wrapper: RTCVideoCaptureWrapper?) {
+        let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let waiters = pendingVideoCaptureWrapperWaiters.removeValue(forKey: trimmed), !waiters.isEmpty else { return }
+        for waiter in waiters {
+            waiter.resume(returning: wrapper)
+        }
+    }
+#endif
+    
+    // MARK: - Core runtime infrastructure
+    
+    /// Internal loop used to schedule RTC-related work.
     let loop = NTKLoop()
+    
+    /// Manages the lifecycle and lookup of `RTCConnection` instances.
     let connectionManager = RTCConnectionManager()
+    
+    /// Key manager used for frame/media encryption identities.
     let keyManager = KeyManager()
+    
+    /// Key manager used for signaling (SDP/ICE) encryption identities.
+    let pcKeyManager = KeyManager()
+    
     /// Shared peer-connection notifications stream.
     ///
     /// This stream is consumed by a long-lived task (`handleNotificationsStream`) and is fed by
@@ -132,45 +133,238 @@ public actor RTCSession {
     /// consumer restarts can lead to a finished stream; therefore we keep the ability to recreate
     /// the stream+continuation pair.
     var peerConnectionNotificationsStream: AsyncStream<PeerConnectionNotifications?>
+    
+    /// Continuation used to push new peer-connection notifications into `peerConnectionNotificationsStream`.
     var peerConnectionNotificationsContinuation: AsyncStream<PeerConnectionNotifications?>.Continuation
-    /// Inbound ICE candidates buffered per connectionId.
+    
+    /// Inbound ICE candidates buffered per `connectionId`.
     ///
     /// Candidates may arrive before `setRemote` completes. Keeping per-connection buffers
     /// prevents cross-call mixing when multiple calls occur back-to-back.
     var inboundCandidateConsumers: [String: NeedleTailAsyncConsumer<IceCandidate>] = [:]
-    let iceServers: [String]
-    let username: String
-    let password: String
-    let logger: NeedleTailLogger
-    let ratchetSalt: Data
+    
+    /// The participant that represents "this device/user" for the current session, if known.
+    var sessionParticipant: Call.Participant?
+    
+    // MARK: - Configuration
+    
+    /// ICE servers used when creating peer connections.
+    public let iceServers: [String]
+    
+    /// TURN/STUN username associated with `iceServers`.
+    public let username: String
+    
+    /// TURN/STUN password associated with `iceServers`.
+    public let password: String
+    
+    /// Logger used for all RTCSession-related logging.
+    public let logger: NeedleTailLogger
+    
+    /// Salt used when deriving frame-level E2EE keys.
+    public let ratchetSalt: Data
+    
+    /// Controls how frame-level E2EE keys are applied to the WebRTC key provider.
+    public let frameEncryptionKeyMode: RTCFrameEncryptionKeyMode
+    
+    // MARK: - Crypto state
+    
+    /// Manages frame/media ratchet key state.
     let ratchetManager: RatchetKeyStateManager<SHA256>
+    
+    /// Manages peer-connection/signaling ratchet key state.
+    let pcRatchetManager: DoubleRatchetStateManager<SHA256>
+    
+    // MARK: - Delegates & callbacks
+    
+    /// Transport delegate used to send encrypted signaling messages.
     var delegate: RTCTransportEvents?
+    
+    /// Media delegate used for group-call/conference style track notifications.
     var mediaDelegate: RTCSessionMediaEvents?
-
-    let frameEncryptionKeyMode: RTCFrameEncryptionKeyMode
-
-#if !os(Android)
+    
+    /// Handler invoked for inbound WebRTC data-channel messages.
+    ///
+    /// Set this if you want to receive arbitrary app-level messages (e.g. chat, control signals)
+    /// delivered over `RTCDataChannel`.
+    var dataChannelMessageHandler: (@Sendable (RTCDataChannelMessage) async -> Void)?
+    
+    /// Controls how inbound receiver events map to a `participantId`.
+    var remoteParticipantIdResolver: RemoteParticipantIdResolver?
+    
+    // MARK: - Call lifecycle & state (grouped by access level)
+    
+    // MARK: Public
+    
+    /// Acceptance state for the current inbound call.
+    ///
+    /// `finishCryptoSessionCreation(recipient:ciphertext:call:)` waits up to ~30 seconds for
+    /// this to transition away from `.pending`.
+    public var callAnswerState: CallAnswerState = .pending
+    
+    /// High-level call state machine used by the session.
+    public var callState = CallStateMachine()
+    
+    /// Whether the 1:1 crypto handshake has completed for the active connection.
+    public private(set) var handshakeComplete = false
+    
+    // MARK: Internal
+    
+    /// Per-call group-call state keyed by `sharedCommunicationId`.
+    var groupCalls: [String: RTCGroupCall] = [:]
+    
+    /// Pending inbound call identifier whose acceptance is being gated.
+    var pendingAnswerCallId: UUID?
+    
+    /// Per-call acceptance state used when multiple inbound calls may be in flight.
+    var callAnswerStatesById: [UUID: CallAnswerState] = [:]
+    
+    /// Whether the current inbound crypto session should generate and send an offer.
+    var shouldOffer = false
+    
+    /// Whether the peer connection/ICE machinery has been started for the current call.
+    var notRunning = true
+    
+    /// Whether the session is ready to send/receive ICE candidates.
+    var readyForCandidates = false
+    
+    /// Monotonic identifier used when creating local tracks/transceivers.
+    var lastId = 0
+    
+    /// Monotonic identifier used when creating ICE candidates.
+    var iceId = 0
+    
+    /// Local buffer for ICE candidates when ordering needs to be preserved.
+    var iceDeque = Deque<IceCandidate>()
+    
+    /// The connection id considered "active" for the current call.
+    ///
+    /// SFU and 1:1 use cases typically have a single active `RTCPeerConnection` at a time.
+    /// We use this to avoid acting on late WebRTC callbacks from a previous call after
+    /// a new call has already started.
+    var activeConnectionId: String?
+    
+    /// Legacy/global peer-connection state (kept for compatibility).
+    ///
+    /// Prefer `pcStateByConnectionId` for correctness across sequential calls.
+    var pcState = PeerConnectionState.none
+    
+    /// Peer-connection state per `connectionId`.
+    var pcStateByConnectionId: [String: PeerConnectionState] = [:]
+    
+    /// Long-lived task that consumes `peerConnectionNotificationsStream`.
+    var notificationsTask: Task<Void, Error>?
+    
+    /// Generation counter for `notificationsTask` used to avoid acting on stale tasks.
+    var notificationsTaskGeneration: UInt64 = 0
+    
+    /// Tracks whether the notifications consumer is currently processing events.
+    var notificationsConsumerIsRunning = false
+    
+    /// Task that mirrors high-level RTC state into `callState`.
+    var stateTask: Task<Void, Error>?
+#if os(iOS)
+    /// Shared `RTCAudioSession` wrapper used to integrate with the platform audio stack.
+    nonisolated let audioSession = RTCAudioSession.sharedInstance()
+#endif
+#if os(macOS)
+    /// Optional audio player used for simple audio feedback on macOS.
+    var audioPlayer: AVAudioPlayer?
+#endif
+    
+    // MARK: - Android-only session state
+    
+#if os(Android)
+    /// Whether the Android client has started receiving remote frames for the active connection.
+    var didStartReceiving: Bool = false
+    
+    /// Raw remote view snapshots used for logging/cleanup on Android.
+    var remoteViewData: [Data] = []
+#endif
+    
+    // MARK: - Platform-specific RTC clients & encryption
+    
+#if os(Android)
+    
+    /// SkipRTC client used to drive WebRTC on Android platforms.
+    ///
+    /// This is a shared singleton wrapper around the underlying Android WebRTC stack.
+    let rtcClient = AndroidRTCClient()
+#elseif canImport(WebRTC)
+    
+    /// WebRTC frame-cryptor key provider used for frame-level E2EE on Apple platforms.
+    let keyProvider: RTCFrameCryptorKeyProvider
+    
+    /// Tracks whether audio has been activated for the current call on Apple platforms.
+    nonisolated(unsafe) var isAudioActivated = false
+#endif
+    
+    // MARK: - Teardown idempotency
+    // `finishEndConnection(currentCall:)` can be triggered from multiple async entry points
+    // (e.g. remote end-call message + CallKit end action). Track per-call teardown to avoid
+    // double-running cleanup.
+    private var finishingCallKeys: Set<String> = []
+    private var recentlyEndedCallKeys: [String] = []
+    private var endedCallKeys: Set<String> = []
+    
+    // Some platforms/layers can represent the same underlying call with different `Call.id` values
+    // (e.g. CallKit UUID vs signaling UUID). The PeerConnection lifecycle is keyed by
+    // `sharedCommunicationId`, so also track idempotency by connection id to avoid double-teardown.
+    private var finishingConnectionIds: Set<String> = []
+    private var recentlyEndedConnectionIds: [String] = []
+    private var endedConnectionIds: Set<String> = []
+    
+#if canImport(WebRTC)
+    /// Delegate that surfaces frame-cryptor events for debugging and monitoring.
+    var frameCryptorDelegate = FrameCryptorDelegate()
+#endif
+    
     /// Remote renderers requested by the UI before the remote track exists.
     ///
     /// On iOS/macOS, the UI may call `renderRemoteVideo(...)` as soon as the call is marked
     /// connected, but the remote receiver/track may be delivered slightly later via
-    /// `peerConnection(_:didAdd:streams:)`. We buffer the renderer request here and attach it
-    /// once the remote video track becomes available.
+    /// `peerConnection(_:didAdd:streams:)`. On Android, the same timing issue can occur.
+    /// We buffer the renderer request here and attach it once the remote video track becomes available.
+#if os(Android)
+    var pendingRemoteVideoRenderersByConnectionId: [String: Any] = [:]
+#else
     var pendingRemoteVideoRenderersByConnectionId: [String: RTCVideoRenderWrapper] = [:]
 #endif
 
-    public typealias RemoteParticipantIdResolver = @Sendable (_ streamIds: [String], _ trackId: String, _ trackKind: String) -> String?
-    var remoteParticipantIdResolver: RemoteParticipantIdResolver?
+    // MARK: - Group-call (SFU) ratchet ingress state
+    //
+    // Group calls receive multiple control-plane messages (answer, candidates, roster updates).
+    // We only need to run `recipientInitialization` once per SFU identity; subsequent messages
+    // should simply decrypt on the advancing ratchet state.
+    // `internal` so SFU/group-call handlers in extensions can access it.
+    var sfuRecipientInitializationCompleteBySfuId: Set<String> = []
+
+    // MARK: - Frame key provisioning diagnostics (DEBUG-only consumers)
+    //
+    // We track the latest key index provisioned per participant so we can emit targeted diagnostics
+    // if a receiver cryptor is created before the app/server has injected keys for that participant.
+    // This does not affect crypto correctness; it is purely a guardrail for production operations.
+    var lastFrameKeyIndexByParticipantId: [String: Int] = [:]
+
+    // MARK: - Public configuration & delegate API
+    
     /// Sets the transport delegate.
     ///
     /// This is where the session emits outbound signaling/ciphertext via ``RTCTransportEvents``.
     public func setDelegate(_ delegate: RTCTransportEvents) {
         self.delegate = delegate
     }
+    
+    public func setSessionParticipant(_ participant: Call.Participant) {
+        self.sessionParticipant = participant
+    }
 
     /// Sets the media delegate used for group-call/conference style track notifications.
     public func setMediaDelegate(_ delegate: RTCSessionMediaEvents) {
         self.mediaDelegate = delegate
+    }
+    
+    public func setHandshakeComplete(_ handshakeComplete: Bool) {
+        self.handshakeComplete = handshakeComplete
     }
 
     /// Controls how inbound receiver events map to a `participantId`.
@@ -182,20 +376,26 @@ public actor RTCSession {
         self.remoteParticipantIdResolver = resolver
     }
 
+    // MARK: - Public group-call API
+    
     /// Creates an SFU group call wrapper that drives SFU signaling through `RTCSession`.
     ///
     /// The returned ``RTCGroupCall`` provides a single ingress for decoded SFU signaling,
     /// roster updates, and key distribution.
-    public func createGroupCall(call: Call, sfuRecipientId: String) -> RTCGroupCall {
-        RTCGroupCall(session: self, call: call, sfuRecipientId: sfuRecipientId)
+    public func createGroupCall(
+        call: Call,
+        sfuRecipientId: String,
+        localIdentity: ConnectionLocalIdentity
+    ) -> RTCGroupCall {
+        RTCGroupCall(
+            call: call,
+            sfuRecipientId: sfuRecipientId,
+            localIdentity: localIdentity
+        )
     }
 
-    /// Handler invoked for inbound WebRTC data-channel messages.
-    ///
-    /// Set this if you want to receive arbitrary app-level messages (e.g. chat, control signals)
-    /// delivered over RTCDataChannel.
-    var dataChannelMessageHandler: (@Sendable (RTCDataChannelMessage) async -> Void)?
-
+    // MARK: - Public data-channel API
+    
     /// Sets a handler invoked for inbound WebRTC data-channel messages.
     ///
     /// - Note: The handler runs asynchronously and may be called multiple times concurrently.
@@ -205,19 +405,8 @@ public actor RTCSession {
         self.dataChannelMessageHandler = handler
     }
 
-#if canImport(WebRTC)
-    var frameCryptorDelegate = FrameCryptorDelegate()
-#endif
-    /// Acceptance state for the current inbound call.
-    ///
-    /// `finishCryptoSessionCreation(recipient:ciphertext:call:)` waits up to ~30 seconds for
-    /// this to transition away from `.pending`.
-    public var callAnswerState: CallAnswerState = .pending
-    private var pendingAnswerCallId: UUID?
-    private var callAnswerStatesById: [UUID: CallAnswerState] = [:]
-    /// High-level call state machine used by the session.
-    public var callState = CallStateMachine()
-
+    // MARK: - Public inbound call acceptance API
+    
     /// Sets whether the current inbound call may proceed.
     ///
     /// This is a convenience wrapper over setting ``callAnswerState`` and is primarily used
@@ -239,44 +428,9 @@ public actor RTCSession {
             callAnswerState = state
         }
     }
-    var notRunning = true
-    var readyForCandidates = false
-    var lastId = 0
-    var iceId = 0
-    var iceDeque = Deque<IceCandidate>()
 
-    /// The connection id considered "active" for the current call.
-    ///
-    /// SFU and 1:1 use cases typically have a single active PeerConnection at a time.
-    /// We use this to avoid acting on late WebRTC callbacks from a previous call after
-    /// a new call has already started.
-    var activeConnectionId: String?
-    /// Legacy/global peer-connection state (kept for compatibility).
-    /// Prefer `pcStateByConnectionId` for correctness across sequential calls.
-    var pcState = PeerConnectionState.none
-    /// Peer-connection state per connectionId.
-    var pcStateByConnectionId: [String: PeerConnectionState] = [:]
-    var notificationsTask: Task<Void, Error>?
-    var notificationsTaskGeneration: UInt64 = 0
-    var notificationsConsumerIsRunning = false
-    var stateTask: Task<Void, Error>?
-    nonisolated(unsafe) var isAudioActivated = false
-
-    // MARK: - Teardown idempotency
-    // `finishEndConnection(currentCall:)` can be triggered from multiple async entry points
-    // (e.g. remote end-call message + CallKit end action). Track per-call teardown to avoid
-    // double-running cleanup.
-    private var finishingCallKeys: Set<String> = []
-    private var recentlyEndedCallKeys: [String] = []
-    private var endedCallKeys: Set<String> = []
-
-    // Some platforms/layers can represent the same underlying call with different `Call.id` values
-    // (e.g. CallKit UUID vs signaling UUID). The PeerConnection lifecycle is keyed by
-    // `sharedCommunicationId`, so also track idempotency by connection id to avoid double-teardown.
-    private var finishingConnectionIds: Set<String> = []
-    private var recentlyEndedConnectionIds: [String] = []
-    private var endedConnectionIds: Set<String> = []
-
+    // MARK: - Internal teardown idempotency helpers
+    
     func teardownKey(for call: Call) -> String {
         if let sharedMessageId = call.sharedMessageId?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines),
            !sharedMessageId.isEmpty {
@@ -349,6 +503,8 @@ public actor RTCSession {
         }
     }
 
+    // MARK: - Internal connection & candidate helpers
+    
     func inboundCandidateConsumer(for connectionId: String) -> NeedleTailAsyncConsumer<IceCandidate> {
         if let existing = inboundCandidateConsumers[connectionId] {
             return existing
@@ -368,17 +524,8 @@ public actor RTCSession {
         callAnswerStatesById.removeAll()
     }
 
-#if os(Android)
-    // Android-only session state used for renderer/candidate ordering.
-    // These are currently used for logging/cleanup and may be expanded later.
-    var didStartReceiving: Bool = false
-    var remoteViewData: [Data] = []
-#endif
-#if os(Android)
-    // SkipRTC AndroidRTCClient for Android platform - use shared singleton
-    let rtcClient = AndroidRTCClient()
-#elseif canImport(WebRTC)
-    let keyProvider: RTCFrameCryptorKeyProvider
+    // MARK: - Peer-connection factory & initialization
+#if canImport(WebRTC)
     static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
         let videoEncoderFactory = RTCDefaultVideoEncoderFactory()
@@ -390,13 +537,6 @@ public actor RTCSession {
     }()
 #endif
     
-#if os(iOS)
-    nonisolated let audioSession = RTCAudioSession.sharedInstance()
-#endif
-#if os(macOS)
-    var audioPlayer: AVAudioPlayer?
-#endif
-    
     public init(
         iceServers: [String],
         username: String,
@@ -405,7 +545,7 @@ public actor RTCSession {
         ratchetSalt: Data = "PQSRTCFrameEncryptionSalt".data(using: .utf8)!,
         frameEncryptionKeyMode: RTCFrameEncryptionKeyMode = .shared,
         delegate: RTCTransportEvents?
-    ) {
+    ) async {
         let (notificationStream, notificationContinuation) = AsyncStream<PeerConnectionNotifications?>.makeStream()
         self.peerConnectionNotificationsStream = notificationStream
         self.peerConnectionNotificationsContinuation = notificationContinuation
@@ -417,7 +557,10 @@ public actor RTCSession {
         self.frameEncryptionKeyMode = frameEncryptionKeyMode
         self.delegate = delegate
         self.ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
+        self.pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
+
 #if canImport(WebRTC)
+        logger.log(level: .debug, message: "RTC Encryption key mode: \(frameEncryptionKeyMode)")
         self.keyProvider = RTCFrameCryptorKeyProvider(
             ratchetSalt: ratchetSalt,
             ratchetWindowSize: 0,
@@ -427,7 +570,7 @@ public actor RTCSession {
             keyRingSize: 16,
             discardFrameWhenCryptorNotReady: true)
 #endif
-        logger.log(level: .info, message: "Created RTCSession")
+        logger.log(level: .trace, message: "Created RTCSession")
     }
 
     /// Recreates the peer-connection notifications stream.
@@ -440,240 +583,8 @@ public actor RTCSession {
         self.peerConnectionNotificationsContinuation = notificationContinuation
     }
 
-    /// Starts a group call by creating a single PeerConnection intended to connect to an SFU.
-    ///
-    /// Prefer using ``RTCGroupCall/join()`` unless you are building your own group facade.
-    ///
-    /// - Important: This intentionally skips the 1:1 Double Ratchet handshake.
-    ///   For group calls, frame keys must be distributed via the control plane and applied using
-    ///   `setFrameEncryptionKey(_:index:for:)` (control-plane injected keys) or via sender-key
-    ///   distribution inside ``RTCGroupCall``.
-    public func startGroupCall(call: Call, sfuRecipientId: String) async throws -> Call {
-        var call = call
-
-        // Mark this call's PeerConnection as the active one (SFU uses a single PC).
-        activeConnectionId = call.sharedCommunicationId
-
-        // Ensure state streams are created so the UI can observe call state.
-        try await createStateStream(with: call, recipientName: sfuRecipientId)
-
-        let localIdentity: ConnectionLocalIdentity
-        if let existingIdentity = try await keyManager.fetchCallKeyBundle() {
-            localIdentity = existingIdentity
-        } else {
-            localIdentity = try await generateSenderIdentity(
-                connectionId: call.sharedCommunicationId,
-                secretName: call.sender.secretName
-            )
-        }
-
-        // Use a placeholder session identity: group calls do not use this for key agreement.
-        _ = try await createPeerConnection(
-            with: call,
-            sender: call.sender.secretName,
-            recipient: sfuRecipientId,
-            localIdentity: localIdentity,
-            sessionIdentity: localIdentity.sessionIdentity,
-            willFinishNegotiation: true
-        )
-
-        // Create and send the offer to the SFU via the app-provided transport.
-        call = try await createOffer(call: call)
-        await setConnectingIfReady(call: call, callDirection: .outbound(call.supportsVideo ? .video : .voice))
-        try await requireTransport().sendOffer(call: call)
-        return call
-    }
+    // MARK: - Internal transport helpers
     
-    
-    // The Call must contain the proper unwrapped session identity props.
-    /// Prepares a 1:1 crypto session.
-    ///
-    /// The call must contain the remote participant's identity props (typically on `call.identityProps`).
-    /// After this step, your app can proceed with ciphertext exchange and SDP negotiation.
-    ///
-    /// See <doc:One-to-One-Calls>.
-    public func createCryptoSession(with call: Call) async throws  {
-        var call = call
-        guard let recipient = call.recipients.first?.secretName else {
-            throw EncryptionErrors.missingProps
-        }
-        guard let identityProps = call.identityProps else {
-            logger.log(level: .info, message: "Call will not proceed the session identity for sender is missing")
-            throw EncryptionErrors.missingProps
-        }
-        
-        
-        var localIdentity: ConnectionLocalIdentity
-        if let existingIdentity = try await keyManager.fetchCallKeyBundle() {
-            localIdentity = existingIdentity
-        } else {
-            localIdentity = try await generateSenderIdentity(
-                connectionId: call.sharedCommunicationId,
-                secretName: call.sender.secretName)
-        }
-        
-        let connectionIdentity = try await createRecipientIdentity(
-            connectionId: call.sharedCommunicationId,
-            props: identityProps)
-        
-        guard let props = await localIdentity.sessionIdentity.props(symmetricKey: localIdentity.symmetricKey) else {
-            return
-        }
-        call.identityProps = props
-        
-        _ = try await createPeerConnection(
-            with: call,
-            sender: recipient,
-            recipient: call.sender.secretName,
-            localIdentity: localIdentity,
-            sessionIdentity: connectionIdentity.sessionIdentity)
-        
-        logger.log(level: .info, message: "Start call created PeerConnection for sharedCommunicationId=\(call.sharedCommunicationId)")
-    }
-    
-    /// Completes the 1:1 crypto handshake after receiving an inbound ciphertext message.
-    ///
-    /// This method waits for the app to decide whether to accept the call via
-    /// ``RTCSession/setCanAnswer(_:)`` or ``RTCSession/setCallAnswerState(_:for:)``.
-    /// If accepted, it will create and send an SDP offer via ``RTCTransportEvents/sendOffer(call:)``.
-    public func finishCryptoSessionCreation(
-        recipient: String,
-        ciphertext: Data,
-        call: Call
-    ) async throws -> Call {
-        pendingAnswerCallId = call.id
-        if callAnswerStatesById[call.id] == nil {
-            callAnswerStatesById[call.id] = .pending
-        }
-        try await receiveCiphertext(
-            recipient: recipient,
-            ciphertext: ciphertext,
-            call: call)
-        
-        try await loop.run(30, sleep: .seconds(1)) { [weak self] in
-            guard let self else { return false }
-            let state: CallAnswerState
-            if let perCall = await self.callAnswerStatesById[call.id] {
-                state = perCall
-            } else {
-                state = await self.callAnswerState
-            }
-            switch state {
-            case .pending:
-                return true
-            case .answered, .rejected:
-                return false
-            }
-        }
-
-        let finalState = callAnswerStatesById[call.id] ?? callAnswerState
-        pendingAnswerCallId = nil
-
-        switch finalState {
-        case .answered:
-            let call = try await createOffer(call: call)
-            await self.setConnectingIfReady(call: call, callDirection: .outbound(call.supportsVideo ? .video : .voice))
-            try await requireTransport().sendOffer(call: call)
-            return call
-        case .rejected:
-            await shutdown(with: call)
-            throw ConnectionErrors.rejected
-        case .pending:
-            await shutdown(with: call)
-            throw ConnectionErrors.unanswered
-        }
-    }
-    
-    /// Applies an inbound SDP offer (1:1) and generates/sends an SDP answer.
-    ///
-    /// This calls ``RTCTransportEvents/sendAnswer(call:metadata:)`` and begins ICE candidate sending.
-    public func handleOffer(
-        call: Call,
-        sdp: SessionDescription,
-        metadata: SDPNegotiationMetadata
-    ) async throws -> Call {
-        
-        let modified = await modifySDP(sdp: sdp.sdp, hasVideo: call.supportsVideo)
-        
-#if os(Android)
-        try await rtcClient.setRemoteDescription(RTCSessionDescription(
-            typeDescription: "OFFER",
-            sdp: modified))
-#else
-        try await setRemote(sdp:
-                                WebRTC.RTCSessionDescription(
-                                    type: sdp.type.rtcSdpType,
-                                    sdp: modified),
-                            call: call)
-#endif
-        
-        
-        let processedCall = try await createAnswer(call: call)
-        try await requireTransport().sendAnswer(
-            call: processedCall,
-            metadata: metadata)
-        await setConnectingIfReady(call: call, callDirection: .inbound(call.supportsVideo ? .video : .voice))
-        
-#if os(iOS) && canImport(AVKit)
-        try setExternalAudioSession()
-#endif
-        try await startSendingCandidates(call: call)
-        if var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
-            connection.call = processedCall
-            await connectionManager.updateConnection(id: call.sharedCommunicationId, with: connection)
-        }
-        return processedCall
-    }
-    
-    /// Applies an inbound SDP answer (1:1).
-    public func handleAnswer(
-        call: Call,
-        sdp: SessionDescription
-    ) async throws {
-        
-        let modified = await modifySDP(sdp: sdp.sdp, hasVideo: call.supportsVideo)
-        
-#if os(Android)
-        try await rtcClient.setRemoteDescription(RTCSessionDescription(
-            typeDescription: "ANSWER",
-            sdp: modified))
-#else
-        try await setRemote(sdp:
-                                WebRTC.RTCSessionDescription(type: sdp.type.rtcSdpType, sdp: modified),
-                            call: call)
-#endif
-        if var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
-            connection.call = call
-            await connectionManager.updateConnection(id: call.sharedCommunicationId, with: connection)
-        }
-    }
-    
-    /// Applies an inbound ICE candidate.
-    public func handleCandidate(
-        call: Call,
-        candidate: IceCandidate
-    ) async throws {
-        try await setRemote(candidate: candidate, call: call)
-    }
-    
-    public func generateSenderIdentity(
-        connectionId: String,
-        secretName: String
-    ) async throws -> ConnectionLocalIdentity {
-        try await keyManager.generateSenderIdentity(connectionId: connectionId, secretName: secretName)
-    }
-    
-    func createRecipientIdentity(
-        connectionId: String,
-        props: SessionIdentity.UnwrappedProps
-    ) async throws -> ConnectionSessionIdentity {
-        try await keyManager.createRecipientIdentity(connectionId: connectionId, props: props)
-    }
-    
-    func fetchLocalIdentity() async throws -> ConnectionLocalIdentity? {
-        try await keyManager.fetchCallKeyBundle()
-    }
-
     func requireTransport(
         file: StaticString = #fileID,
         line: UInt = #line
@@ -683,24 +594,6 @@ public actor RTCSession {
             throw RTCErrors.invalidConfiguration("RTCTransportEvents delegate not set")
         }
         return delegate
-    }
-
-    /// Sends an opaque ciphertext blob via the app-provided transport.
-    ///
-    /// This helper exists so non-`RTCSession` actors (like `RTCGroupCall`) can request a send
-    /// without violating `RTCSession` actor isolation.
-    public func sendCiphertextViaTransport(
-        recipient: String,
-        connectionId: String,
-        ciphertext: Data,
-        call: Call
-    ) async throws {
-        try await requireTransport().sendCiphertext(
-            recipient: recipient,
-            connectionId: connectionId,
-            ciphertext: ciphertext,
-            call: call
-        )
     }
 }
 
@@ -713,7 +606,9 @@ public enum EncryptionErrors: Error, Sendable {
     case missingProps
     /// A required crypto payload (e.g., encoded message body) was missing.
     case missingCryptoPayload
-
+    case missingSessionIdentity
+    case missingMetadata
+    
     public var errorDescription: String? {
         switch self {
         case .missingCipherText:
@@ -722,6 +617,10 @@ public enum EncryptionErrors: Error, Sendable {
             return "Missing encryption/session identity properties"
         case .missingCryptoPayload:
             return "Missing crypto payload"
+        case .missingSessionIdentity:
+            return "Missing session identity"
+        case .missingMetadata:
+             return "Missing metadata"
         }
     }
 }
@@ -750,6 +649,7 @@ public enum RTCErrors: Error, Sendable {
     /// A media-related error occurred.
     case mediaError(String)
     
+    case missingGroupCall
     /// Human-readable description suitable for logging/UX.
     public var errorDescription: String? {
         switch self {
@@ -773,12 +673,78 @@ public enum RTCErrors: Error, Sendable {
             return "Network error: \(message)"
         case .mediaError(let message):
             return "Media error: \(message)"
+        case .missingGroupCall:
+            return "No group call available"
         }
     }
 }
 
-extension NeedleTailAsyncConsumer {
-    func removeAll() async {
-        deque.removeAll()
+/// Answer/acceptance state for an incoming call.
+///
+/// `RTCSession` uses this to gate whether an inbound offer may proceed.
+/// See ``RTCSession/setCanAnswer(_:)``.
+public enum CallAnswerState: Sendable {
+    case pending
+    case answered
+    case rejected
+}
+
+/// Errors surfaced by `RTCSession` when a call cannot proceed.
+public enum ConnectionErrors: Error, Sendable {
+    /// The remote party rejected the call.
+    case rejected
+    /// The call was not answered within the configured timeout.
+    case unanswered
+    /// An operation referenced a connection/call that does not exist.
+    case connectionNotFound
+
+    /// A human-readable description suitable for logging/UX.
+    public var errorDescription: String? {
+        switch self {
+        case .rejected:
+            return "Call was rejected"
+        case .unanswered:
+            return "Call was unanswered"
+        case .connectionNotFound:
+            return "Connection not found"
+        }
     }
 }
+
+/// Minimal state used when sequencing peer-connection operations.
+public enum PeerConnectionState: Sendable {
+    case setRemote, none
+}
+
+/// A decoded WebRTC data-channel message, annotated with routing metadata.
+///
+/// `connectionId` and `channelLabel` let your app correlate messages to the
+/// right peer and channel when multiple calls/data channels are active.
+public struct RTCDataChannelMessage: Sendable {
+    /// Connection identifier associated with the underlying PeerConnection.
+    public let connectionId: String
+    /// WebRTC data channel label.
+    public let channelLabel: String
+    /// Raw message payload.
+    public let data: Data
+
+    /// Creates a new data-channel message container.
+    public init(connectionId: String, channelLabel: String, data: Data) {
+        self.connectionId = connectionId
+        self.channelLabel = channelLabel
+        self.data = data
+    }
+}
+
+/// Configures how frame-level E2EE keys are applied to the WebRTC key provider.
+///
+/// - `shared`: One shared media key ring (current behavior). This is simplest but does not
+///   model multi-sender SFU calls.
+/// - `perParticipant`: Keys are set per `participantId`, enabling SFU/group calls where
+///   each sender can have a distinct key.
+public enum RTCFrameEncryptionKeyMode: Sendable {
+    case shared
+    case perParticipant
+}
+
+

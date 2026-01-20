@@ -96,6 +96,7 @@ public final class VideoCallViewController: UICollectionViewController {
     /// Subscribes to call state updates and updates UI + rendering accordingly.
     public override func viewDidLoad() {
         super.viewDidLoad()
+        view.backgroundColor = .black
         collectionView.isScrollEnabled = false
         collectionView.delegate = self
         collectionView.allowsSelection = true
@@ -236,8 +237,11 @@ public final class VideoCallViewController: UICollectionViewController {
         guard let connectionId = currentCall?.sharedCommunicationId else { return }
         guard let previewRenderer = localVideoView.renderer as? PreviewViewRender else { return }
         
-        let connection = await session.connectionManager.findConnection(with: connectionId)
-        if let wrapper = connection?.rtcVideoCaptureWrapper {
+        // Bind capture injection into WebRTC as soon as the wrapper exists.
+        // This is event-driven (no retry loop): if the wrapper isn't ready yet, we await it.
+        if let wrapper = (await session.connectionManager.findConnection(with: connectionId))?.rtcVideoCaptureWrapper {
+            await previewRenderer.setCapture(wrapper)
+        } else if let wrapper = await session.waitForVideoCaptureWrapper(connectionId: connectionId) {
             await previewRenderer.setCapture(wrapper)
         }
         
@@ -299,7 +303,8 @@ public final class VideoCallViewController: UICollectionViewController {
             guard let self else { return }
             if await session.callState._callType == .video {
                 guard let localView = videoViews.views.first(where: { $0.videoView.contextName == "preview" })?.videoView else { return }
-                controllerView.updateLocalVideoSize(with: UIDevice.current.orientation, should: false, isConnected: isConnected() ? true : false, view: localView)
+                // Disable our own animation here; UIKit already animates alongside rotation via coordinator.
+                controllerView.updateLocalVideoSize(with: UIDevice.current.orientation, should: false, isConnected: isConnected() ? true : false, view: localView, animated: false)
             }
         }
     }
@@ -341,6 +346,8 @@ public final class VideoCallViewController: UICollectionViewController {
         if localView.superview !== controllerView {
             controllerView.addSubview(localView)
         }
+        localView.isAccessibilityElement = true
+        localView.accessibilityLabel = "Local preview"
         
         // Enable dragging and tap-to-minimize on the local preview view (idempotent).
         if !(localView.gestureRecognizers ?? []).contains(where: { $0 is UIPanGestureRecognizer && $0.view === localView }) {
@@ -356,7 +363,8 @@ public final class VideoCallViewController: UICollectionViewController {
             with: UIDevice.current.orientation,
             should: false,
             isConnected: isConnected(),
-            view: localView)
+            view: localView,
+            animated: true)
         controllerView.bringSubviewToFront(localView)
         bringControlsToFront()
     }
@@ -407,13 +415,7 @@ public final class VideoCallViewController: UICollectionViewController {
     /// Attaches a `VideoViewModel`'s view to a collection view cell.
     fileprivate func setCollectionViewItem(item: RemoteViewItemCell? = nil, viewModel: VideoViewModel) {
         guard let item = item else { return }
-        item.addSubview(viewModel.videoView)
-        viewModel.videoView.anchors(
-            top: item.topAnchor,
-            leading: item.leadingAnchor,
-            bottom: item.bottomAnchor,
-            trailing: item.trailingAnchor
-        )
+        item.setVideoView(viewModel.videoView)
     }
     
     /// Configures the diffable data source to render ``VideoViewModel`` items.
@@ -466,8 +468,41 @@ public final class VideoCallViewController: UICollectionViewController {
             guard let localView = videoViews.views.first(where: { $0.videoView.contextName == "preview" })?.videoView else { return }
             controllerView.bringSubviewToFront(localView)
             let translation = sender.translation(in: self.view)
-            localView.center = CGPoint(x: localView.center.x + translation.x, y: localView.center.y + translation.y)
+            // Keep the preview within safe bounds (feels “tight” and prevents losing the preview off-screen).
+            let proposed = CGPoint(x: localView.center.x + translation.x, y: localView.center.y + translation.y)
+            let safe = controllerView.safeAreaLayoutGuide.layoutFrame
+            let halfW = localView.bounds.width / 2
+            let halfH = localView.bounds.height / 2
+            let minX = safe.minX + halfW
+            let maxX = safe.maxX - halfW
+            let minY = safe.minY + halfH
+            let maxY = safe.maxY - halfH
+            localView.center = CGPoint(
+                x: min(max(proposed.x, minX), maxX),
+                y: min(max(proposed.y, minY), maxY)
+            )
             sender.setTranslation(CGPoint.zero, in: self.view)
+            
+            // Snap-to-corner on end feels premium and prevents awkward mid-screen placement.
+            if sender.state == .ended || sender.state == .cancelled || sender.state == .failed {
+                let candidates = [
+                    CGPoint(x: minX, y: minY),
+                    CGPoint(x: maxX, y: minY),
+                    CGPoint(x: minX, y: maxY),
+                    CGPoint(x: maxX, y: maxY)
+                ]
+                let current = localView.center
+                let target = candidates.min(by: { a, b in
+                    hypot(a.x - current.x, a.y - current.y) < hypot(b.x - current.x, b.y - current.y)
+                }) ?? current
+                
+                if #available(iOS 10.0, *) {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                }
+                UIView.animate(withDuration: 0.18, delay: 0, options: [.curveEaseOut, .allowUserInteraction]) {
+                    localView.center = target
+                }
+            }
         }
     }
     
@@ -477,7 +512,7 @@ public final class VideoCallViewController: UICollectionViewController {
             guard let self else { return }
             isMinimized.toggle()
             guard let localView = videoViews.views.first(where: { $0.videoView.contextName == "preview" })?.videoView else { return }
-            controllerView.updateLocalVideoSize(with: UIDevice.current.orientation, should: isMinimized, isConnected: isConnected() ? true : false, view: localView)
+            controllerView.updateLocalVideoSize(with: UIDevice.current.orientation, should: isMinimized, isConnected: isConnected() ? true : false, view: localView, animated: true)
         }
     }
     
@@ -487,6 +522,16 @@ public final class VideoCallViewController: UICollectionViewController {
         if let renderer = localView.renderer as? PreviewViewRender {
             await renderer.setShouldRender(shouldRender)
         }
+    }
+    
+    /// Enables/disables feeding frames from the local camera preview into the capture wrapper.
+    ///
+    /// This is used to make "mute video" feel instant: the user expects the camera to stop
+    /// immediately (not a delayed disable after negotiation).
+    private func setLocalPreviewCapturing(isEnabled: Bool) async {
+        guard let localView = videoViews.views.first(where: { $0.videoView.contextName == "preview" })?.videoView else { return }
+        guard let renderer = localView.renderer as? PreviewViewRender else { return }
+        await renderer.setShouldRender(isEnabled)
     }
 }
 
@@ -635,27 +680,31 @@ extension VideoCallViewController: CallActionDelegate {
     /// Toggles the local audio track and updates the session.
     public func muteAudio() async {
         guard let callId = currentCall?.sharedCommunicationId else { return }
-        
-        isMutingAudio.toggle()
+        let shouldMute = !isMutingAudio
         do {
-            // When isMutingAudio is true, disable audio track
-            try await session.setAudioTrack(isEnabled: !isMutingAudio, connectionId: callId)
+            // When muted, disable the local microphone track.
+            try await session.setAudioTrack(isEnabled: !shouldMute, connectionId: callId)
+            isMutingAudio = shouldMute
         } catch {
             logger.log(level: .error, message: "Failed to set audio track: \(error)")
-        }
-        
-        if await session.callState._callType == .video {
-            await muteVideo()
         }
     }
     
     /// Toggles the local video track and applies a blur overlay when video is muted.
     public func muteVideo() async {
         guard let callId = currentCall?.sharedCommunicationId else { return }
+        // Only meaningful for video calls.
+        guard await session.callState._callType == .video else { return }
         
-        isMutingVideo.toggle()
-        await session.setVideoTrack(isEnabled: !isMutingVideo, connectionId: callId)
-        await blurView(isMutingVideo)
+        let shouldMute = !isMutingVideo
+        
+        // Best-effort: immediately stop feeding frames into the local capture wrapper so the user
+        // experiences "camera off" instantly (privacy). This is separate from disabling the WebRTC track.
+        await setLocalPreviewCapturing(isEnabled: !shouldMute)
+        
+        await session.setVideoTrack(isEnabled: !shouldMute, connectionId: callId)
+        isMutingVideo = shouldMute
+        await blurView(shouldMute)
     }
     
     public func toggleSpeakerPhone() {

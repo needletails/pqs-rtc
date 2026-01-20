@@ -3,19 +3,23 @@ import Testing
 
 @testable import PQSRTC
 
-@Suite
+@Suite(.serialized)
 struct RTCSessionTransportRequirementTests {
     actor TestTransportEvents: RTCTransportEvents {
         func sendCiphertext(recipient: String, connectionId: String, ciphertext: Data, call: Call) async throws {}
-        func sendOffer(call: Call) async throws {}
-        func sendAnswer(call: Call, metadata: PQSRTC.SDPNegotiationMetadata) async throws {}
-        func sendCandidate(_ candidate: IceCandidate, call: Call) async throws {}
+        func sendStartCall(_ call: Call) async throws {}
+        func sendCallAnswered(_ call: Call) async throws {}
+        func sendCallAnsweredAuxDevice(_ call: Call) async throws {}
+        func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws {}
+        func sendOneToOneMessage(_ packet: RatchetMessagePacket, recipient: Call.Participant) async throws {}
         func didEnd(call: Call, endState: CallStateMachine.EndState) async throws {}
+        func negotiateGroupIdentity(call: Call, sfuRecipientId: String) async throws {}
+        func requestInitializeGroupCallRecipient(call: Call, sfuRecipientId: String) async throws {}
     }
 
     @Test
     func requireTransportThrowsWhenDelegateNotSet() async {
-        let session = RTCSession(
+        let session = await RTCSession(
             iceServers: [],
             username: "u",
             password: "p",
@@ -37,7 +41,7 @@ struct RTCSessionTransportRequirementTests {
     @Test
     func requireTransportReturnsDelegateWhenSet() async {
         let events = TestTransportEvents()
-        let session = RTCSession(
+        let session = await RTCSession(
             iceServers: [],
             username: "u",
             password: "p",

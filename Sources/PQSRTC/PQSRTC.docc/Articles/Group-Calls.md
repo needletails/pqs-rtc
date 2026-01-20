@@ -52,16 +52,19 @@ You implement ``RTCTransportEvents`` to send signaling to your backend/SFU.
 import PQSRTC
 
 struct MyTransport: RTCTransportEvents {
-  func sendOffer(call: Call) async throws {
-    // Send `call.sdp` (and any IDs in Call) to your signaling service.
+  func sendStartCall(_ call: Call) async throws {
+    // 1:1 calls: Send start_call message to trigger VoIP notifications.
   }
 
-  func sendAnswer(call: Call, metadata: PQSRTC.SDPNegotiationMetadata) async throws {
-    // 1:1 only (not used for SFU group calls).
+  func sendOneToOneMessage(_ packet: RatchetMessagePacket, recipient: Call.Participant) async throws {
+    // 1:1 calls: Send encrypted signaling packet.
+    // Use `packet.flag` to distinguish offer/answer/candidate.
   }
 
-  func sendCandidate(_ candidate: IceCandidate, call: Call) async throws {
-    // Send ICE candidates to your signaling service.
+  func sendSfuMessage(_ packet: RTCGroupE2EE.RatchetMessagePacket, call: Call) async throws {
+    // Group-call (SFU): forward the encoded packet to your SFU/signaling service.
+    // Use `packet.flag` to distinguish offer/answer/candidate.
+    // Default implementation forwards through sendCiphertext(...).
   }
 
   func sendCiphertext(recipient: String, connectionId: String, ciphertext: Data, call: Call) async throws {
@@ -120,19 +123,21 @@ Task {
 try await groupCall.join()
 ```
 
-At `join()`, the SDK will:
+After `join()`, your app should complete SFU identity negotiation (via your control plane) and
+call ``RTCSession/createSFUIdentity(sfuRecipientId:call:)`` once it has the SFU’s identity props.
+That call will:
 
 - create a PeerConnection intended to connect to your SFU,
 - create an offer,
-- call your transport: ``RTCTransportEvents/sendOffer(call:)``.
+- call your transport: ``RTCTransportEvents/sendSfuMessage(_:call:)`` with `packet.flag == .offer`.
 
 ### 5) Feed SFU signaling back into the SDK
 
-When your app receives the SFU answer/candidates from your signaling service:
+When your app receives the SFU answer/candidates from your signaling service (encrypted packets):
 
 ```swift
-try await groupCall.handleControlMessage(.sfuAnswer(answerSessionDescription))
-try await groupCall.handleControlMessage(.sfuCandidate(remoteCandidate))
+try await groupCall.handleControlMessage(.sfuAnswer(answerPacket))
+try await groupCall.handleControlMessage(.sfuCandidate(candidatePacket))
 ```
 
 ## Roster + demux updates

@@ -86,14 +86,46 @@ extension UIView {
             if let centerY = centerY {
                 self.centerYAnchor.constraint(equalTo: centerY).isActive = true
             }
+            // Important: width/height constraints live on `self`, so repeatedly calling this method
+            // (e.g. during rotation) can easily create conflicting duplicates. Make these idempotent.
             if width != 0 {
-                widthAnchor.constraint(equalToConstant: width).isActive = true
+                if let existing = constraints.first(where: {
+                    $0.firstItem as? UIView === self &&
+                    $0.secondItem == nil &&
+                    $0.firstAttribute == .width &&
+                    $0.relation == .equal
+                }) {
+                    existing.constant = width
+                    existing.isActive = true
+                } else {
+                    widthAnchor.constraint(equalToConstant: width).isActive = true
+                }
             }
             if height != 0 {
-                heightAnchor.constraint(equalToConstant: height).isActive = true
+                if let existing = constraints.first(where: {
+                    $0.firstItem as? UIView === self &&
+                    $0.secondItem == nil &&
+                    $0.firstAttribute == .height &&
+                    $0.relation == .equal
+                }) {
+                    existing.constant = height
+                    existing.isActive = true
+                } else {
+                    heightAnchor.constraint(equalToConstant: height).isActive = true
+                }
             }
             if lessThanEqualToWidth != 0 {
-                widthAnchor.constraint(lessThanOrEqualToConstant: width).isActive = true
+                if let existing = constraints.first(where: {
+                    $0.firstItem as? UIView === self &&
+                    $0.secondItem == nil &&
+                    $0.firstAttribute == .width &&
+                    $0.relation == .lessThanOrEqual
+                }) {
+                    existing.constant = lessThanEqualToWidth
+                    existing.isActive = true
+                } else {
+                    widthAnchor.constraint(lessThanOrEqualToConstant: lessThanEqualToWidth).isActive = true
+                }
             }
         }
 }

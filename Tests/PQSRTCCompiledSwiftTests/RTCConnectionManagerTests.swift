@@ -6,7 +6,7 @@ import NeedleTailLogger
 #if canImport(WebRTC) && !os(Android)
 import WebRTC
 
-@Suite
+@Suite(.serialized)
 struct RTCConnectionManagerTests {
     enum TestError: Error {
         case peerConnectionCreationFailed

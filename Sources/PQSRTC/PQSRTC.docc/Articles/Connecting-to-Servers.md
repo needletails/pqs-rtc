@@ -72,7 +72,7 @@ At minimum you typically need:
    - ICE server list (STUN/TURN URLs and optional TURN credentials)
    - current participant roster
 3) Client creates ``RTCSession`` + ``RTCGroupCall``, calls `join()`.
-4) `RTCGroupCall.join()` triggers ``RTCTransportEvents/sendOffer(call:)``.
+4) `RTCSession.createSFUIdentity(...)` triggers ``RTCTransportEvents/sendSfuMessage(_:call:)`` (with `packet.flag == .offer`).
 5) Backend forwards offer to SFU, receives SFU answer, forwards answer back to client.
 6) Backend relays ICE candidates between client and SFU.
 7) Backend publishes roster updates as participants join/leave.

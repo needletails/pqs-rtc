@@ -18,7 +18,7 @@
 import Foundation
 import NeedleTailLogger
 
-#if os(Android)
+#if os(Android) || SKIP
 
 /* SKIP @bridge */
 public final class AndroidPeerConnectionDelegate: @unchecked Sendable {

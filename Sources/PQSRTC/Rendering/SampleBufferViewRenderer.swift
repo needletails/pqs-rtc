@@ -86,6 +86,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     nonisolated(unsafe) private var pauseMetalRendering = false
     nonisolated(unsafe) private var streamContinuation: AsyncStream<RTCVideoFrame?>.Continuation?
     nonisolated(unsafe) private var isShutdown = false
+
     
     // MARK: - Initialization
     init(
@@ -285,23 +286,94 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             try await processFrameForMetal(pixelBuffer: pixelBuffer)
         } else {
             // Process for sample buffer display
-            try await processFrameForSampleBuffer(buffer: buffer, frame: frame, layer: layer)
+            try await processFrameForSampleBuffer(buffer: buffer, frame: frame)
         }
     }
     
     private func handleI420BufferFrame(_ buffer: RTCI420Buffer, frame: RTCVideoFrame) async throws {
-        guard !pauseMetalRendering else {
-            logger.log(level: .debug, message: "Metal rendering paused, skipping I420 frame")
-            return
-        }
-        
         // Check bounds
         guard await bounds.size != .zero else {
             logger.log(level: .debug, message: "Bounds are zero, skipping I420 frame")
             return
         }
         
-        try await processI420FrameForMetal(buffer: buffer)
+        if !pauseMetalRendering {
+            // Metal path supports I420 directly.
+            try await processI420FrameForMetal(buffer: buffer)
+            return
+        }
+        
+        // Sample-buffer path: convert I420 -> NV12 CVPixelBuffer -> CMSampleBuffer enqueue.
+        let pixelBuffer = try makeNV12PixelBuffer(fromI420: buffer)
+        let time = CMTimeMake(value: frame.timeStampNs, timescale: Int32(NSEC_PER_SEC))
+        try await processPixelBufferForSampleBuffer(pixelBuffer: pixelBuffer, time: time)
+    }
+
+    // MARK: - Pixel buffer conversion (I420 -> NV12)
+    private func makeNV12PixelBuffer(fromI420 buffer: RTCI420Buffer) throws -> CVPixelBuffer {
+        let width = Int(buffer.width)
+        let height = Int(buffer.height)
+        
+        var pixelBuffer: CVPixelBuffer?
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ]
+        
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            attrs as CFDictionary,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer else {
+            logger.log(level: .warning, message: "CVPixelBufferCreate failed (status=\(status)) for I420->NV12 conversion")
+            throw SampleBufferViewRendererError.invalidPixelBuffer
+        }
+        
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        
+        guard let yDestBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+              let uvDestBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else {
+            logger.log(level: .warning, message: "Failed to get base addresses for NV12 pixel buffer planes")
+            throw SampleBufferViewRendererError.invalidPixelBuffer
+        }
+        
+        let yDestStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let uvDestStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
+        
+        // Copy Y plane
+        let ySrcStride = Int(buffer.strideY)
+        for row in 0..<height {
+            let src = buffer.dataY.advanced(by: row * ySrcStride)
+            let dst = yDestBase.advanced(by: row * yDestStride)
+            memcpy(dst, src, width)
+        }
+        
+        // Interleave U/V into NV12 UV plane.
+        let chromaWidth = (width + 1) / 2
+        let chromaHeight = (height + 1) / 2
+        let uSrcStride = Int(buffer.strideU)
+        let vSrcStride = Int(buffer.strideV)
+        
+        for row in 0..<chromaHeight {
+            let uSrc = buffer.dataU.advanced(by: row * uSrcStride)
+            let vSrc = buffer.dataV.advanced(by: row * vSrcStride)
+            let uvDst = uvDestBase.advanced(by: row * uvDestStride)
+            
+            // Each chroma sample becomes 2 bytes: U then V.
+            let uv = uvDst.assumingMemoryBound(to: UInt8.self)
+            for col in 0..<chromaWidth {
+                uv[col * 2] = uSrc[col]
+                uv[col * 2 + 1] = vSrc[col]
+            }
+        }
+        
+        return pixelBuffer
     }
     
     private func processFrameForMetal(pixelBuffer: CVPixelBuffer) async throws {
@@ -344,22 +416,65 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             throw SampleBufferViewRendererError.metalProcessingFailed(error.localizedDescription)
         }
     }
-    
-    private func processFrameForSampleBuffer(buffer: RTCCVPixelBuffer, frame: RTCVideoFrame, layer: AVSampleBufferDisplayLayer) async throws {
-        do {
-            let time = CMTimeMake(value: frame.timeStampNs, timescale: Int32(NSEC_PER_SEC))
-            
-            guard let sampleBuffer = try await metalProcessor.createSampleBuffer(buffer.pixelBuffer, time: time) else {
-                logger.log(level: .warning, message: "Failed to create sample buffer")
-                throw SampleBufferViewRendererError.invalidSampleBuffer
-            }
-            
-            layer.sampleBufferRenderer.enqueue(sampleBuffer)
-            
-        } catch {
-            logger.log(level: .error, message: "Sample buffer processing failed: \(error)")
-            throw error
+
+    private func processFrameForSampleBuffer(buffer: RTCCVPixelBuffer, frame: RTCVideoFrame) async throws {
+        let time = CMTimeMake(value: frame.timeStampNs, timescale: Int32(NSEC_PER_SEC))
+        try await processPixelBufferForSampleBuffer(pixelBuffer: buffer.pixelBuffer, time: time)
+    }
+
+    private func processPixelBufferForSampleBuffer(pixelBuffer: CVPixelBuffer, time: CMTime) async throws {
+        // Production-safe sample-buffer path: build the CMFormatDescription from the CVPixelBuffer
+        // using CoreMedia APIs. This avoids invalid format descriptions causing Fig errors like:
+        // CMVideoFormatDescriptionGetDimensions ... kCMFormatDescriptionError_InvalidParameter.
+        var formatDescription: CMVideoFormatDescription?
+        let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &formatDescription
+        )
+        guard formatStatus == noErr, let formatDescription else {
+            logger.log(level: .warning, message: "Failed to create CMVideoFormatDescription (status=\(formatStatus))")
+            throw SampleBufferViewRendererError.invalidSampleBuffer
         }
+
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: time,
+            decodeTimeStamp: .invalid
+        )
+        var sampleBuffer: CMSampleBuffer?
+        let sbStatus = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescription: formatDescription,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer
+        )
+        guard sbStatus == noErr, let sampleBuffer else {
+            logger.log(level: .warning, message: "Failed to create CMSampleBuffer (status=\(sbStatus))")
+            throw SampleBufferViewRendererError.invalidSampleBuffer
+        }
+
+        // Hint AVSampleBufferDisplayLayer to display ASAP (avoid buffering quirks).
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
+           CFArrayGetCount(attachments) > 0,
+           let first = CFArrayGetValueAtIndex(attachments, 0) {
+            let dict = unsafeBitCast(first, to: CFMutableDictionary.self)
+            CFDictionarySetValue(
+                dict,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
+        }
+
+        // Enqueue into the display layer.
+        // Use the layer's sample-buffer renderer for presentation.
+        // Also handle the "failed" state by flushing so the layer can recover.
+        if layer.status == .failed {
+            logger.log(level: .warning, message: "AVSampleBufferDisplayLayer failed: \(String(describing: layer.error)). Flushing.")
+            layer.flush()
+        }
+        layer.sampleBufferRenderer.enqueue(sampleBuffer)
     }
     
     private func processI420FrameForMetal(buffer: RTCI420Buffer) async throws {

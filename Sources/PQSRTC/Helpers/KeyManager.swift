@@ -219,8 +219,10 @@ public actor KeyManager: SessionIdentityDelegate {
             sessionContextId: 0,
             longTermPublicKey: ltpk.publicKey.rawRepresentation,
             signingPublicKey: spk.publicKey.rawRepresentation,
-            mlKEMPublicKey: MLKEMPublicKey(kem.publicKey.rawRepresentation),
-            oneTimePublicKey: CurvePublicKey(otpk.publicKey.rawRepresentation),
+            // Important: preserve key IDs so the receiver can fetch the matching private one-time keys
+            // when a header indicates `oneTimeKeyId` / `mlKEMOneTimeKeyId`.
+            mlKEMPublicKey: MLKEMPublicKey(id: kemId, kem.publicKey.rawRepresentation),
+            oneTimePublicKey: CurvePublicKey(id: otpkId, otpk.publicKey.rawRepresentation),
             deviceName: "\(secretName)-rtc",
             isMasterDevice: true)
         

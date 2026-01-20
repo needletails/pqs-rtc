@@ -59,7 +59,13 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     private var texture: MTLTexture?
     private var streamTask: Task<Void, Error>?
     private var streamContinuation: AsyncStream<MTKView?>.Continuation?
-    weak var renderer: RendererDelegate?
+    /// Strong reference to the active renderer.
+    ///
+    /// This must NOT be `weak`. The renderer owns the `RTCVideoRenderWrapper` that the WebRTC
+    /// track retains, but the renderer's stream/task lifecycle is tied to the renderer instance.
+    /// If this were weak, the renderer could be deallocated immediately after `startRendering()`,
+    /// resulting in "track attached, but no frames rendered".
+    var renderer: RendererDelegate?
     
     lazy var renderPipelineState: MTLRenderPipelineState? = {
         guard let mtlDevice = mtlDevice else {
@@ -248,6 +254,12 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
             if let pRenderer = renderer as? PreviewViewRender {
                 pRenderer.setShouldRenderOnMetal(shouldRenderOnMetal)
             }
+            // Keep the remote/sample renderer's output mode in sync with the view mode.
+            // - shouldRenderOnMetal == true  -> renderer should output Metal textures
+            // - shouldRenderOnMetal == false -> renderer should output CMSampleBuffer to AVSampleBufferDisplayLayer
+            if let sRenderer = renderer as? SampleBufferViewRenderer {
+                sRenderer.passPause(!shouldRenderOnMetal)
+            }
             if !shouldRenderOnMetal {
                 guard let captureView else { return }
                 addSubview(captureView)
@@ -258,18 +270,17 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
                     bottom: bottomAnchor,
                     trailing: trailingAnchor)
             } else {
-                if let previewCaptureView = subviews.first(where: { $0 is PreviewCaptureView }) {
-                    if let previewCaptureView = previewCaptureView as? PreviewCaptureView {
-                        if Thread.isMainThread {
+                // Remove any embedded capture/display view. PreviewCaptureView also needs its session removed.
+                if let previewCaptureView = captureView as? PreviewCaptureView {
+                    if Thread.isMainThread {
+                        previewCaptureView.removeSession()
+                    } else {
+                        DispatchQueue.main.sync {
                             previewCaptureView.removeSession()
-                        } else {
-                            DispatchQueue.main.sync {
-                                previewCaptureView.removeSession()
-                            }
                         }
                     }
-                    previewCaptureView.removeFromSuperview()
                 }
+                captureView?.removeFromSuperview()
             }
         }
     }
@@ -316,6 +327,10 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
             await renderer.setDelegate(self)
             await renderer.startStream()
             self.renderer = renderer
+            self.logger.log(level: .debug, message: "Sample renderer installed (strong ref) and stream started")
+            // Default iOS behavior is sample-buffer rendering unless the host explicitly opts into Metal.
+            // macOS controllers already set this to true after view insertion.
+            shouldRenderOnMetal = false
         }
         
         if streamTask?.isCancelled == false { streamTask?.cancel() }
