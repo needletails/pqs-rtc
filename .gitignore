@@ -87,6 +87,10 @@ Carthage/Build/
 # Generated test artifacts
 Tests/PQSRTCTests/debug
 
+# Local manual debugging logs (never commit)
+Tests/Caller.txt
+Tests/Callee.txt
+
 # Swift build byproducts occasionally emitted at repo root (e.g. resource bundle accessor)
 resource_bundle_accessor-*.d
 resource_bundle_accessor-*.dia

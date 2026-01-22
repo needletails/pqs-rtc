@@ -21,7 +21,7 @@ let package = Package(
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.3"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.0"),
-        .package(url: "https://github.com/needletails/needletail-media-kit.git", revision: "bd2bb653fefb0b10369e6b133f5ed3d06ff98320"),
+        .package(url: "https://github.com/needletails/needletail-media-kit.git", revision: "a80a9dc9419ea6d10ff3c8becfd129f615981e9e"),
         .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "2.0.2"),
     ],
     targets: [

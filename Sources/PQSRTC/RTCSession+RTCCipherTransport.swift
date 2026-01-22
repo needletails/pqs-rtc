@@ -115,12 +115,12 @@ extension RTCSession {
             recipient = copiedSender
         }
         
-        guard let id = UUID(uuidString: call.sharedCommunicationId) else {
-            throw RTCErrors.invalidConfiguration("Shared communication ID is not a valid UUID")
-        }
-        pendingAnswerCallId = id
-        if callAnswerStatesById[id] == nil {
-            callAnswerStatesById[id] = .pending
+        // Use the same deterministic session-id derivation as the key manager so this works even if
+        // the app uses non-UUID connection ids (or prefixes with '#').
+        let callId = KeyManager.sessionId(from: call.sharedCommunicationId)
+        pendingAnswerCallId = callId
+        if callAnswerStatesById[callId] == nil {
+            callAnswerStatesById[callId] = .pending
         }
         
         try await receiveCiphertext(
@@ -155,6 +155,14 @@ extension RTCSession {
                     remoteProps: remoteProps)
                 
                 try await requireTransport().sendOneToOneMessage(packet, recipient: recipient)
+                
+                // Begin ICE trickle immediately after sending the offer (do not wait for handshakeComplete).
+                // This significantly reduces "long time to connect" when the host transport delays the ack.
+                do {
+                    try await startSendingCandidates(call: call)
+                } catch {
+                    logger.log(level: .warning, message: "Failed to start sending ICE candidates after offer (will continue buffering): \(error)")
+                }
                 return call
             default:
                 await shutdown(with: call)
@@ -181,14 +189,13 @@ extension RTCSession {
     //
     // These helpers log only metadata needed to validate directionality (Alice→Bob vs Bob→Alice):
     // - participant IDs
-    // - secretName/deviceId
     // - key IDs + key byte lengths
     //
     // They NEVER log key bytes, derived message keys, ciphertexts, or SDP.
     private func propsSummary(_ props: SessionIdentity.UnwrappedProps) -> String {
         let oneTimeId = props.oneTimePublicKey.map { String(describing: $0.id) } ?? "nil"
         let kemId = String(describing: props.mlKEMPublicKey.id)
-        return "secretName=\(props.secretName) deviceId=\(props.deviceId) oneTimeId=\(oneTimeId) mlKEMId=\(kemId) ltpkBytes=\(props.longTermPublicKey.count) spkBytes=\(props.signingPublicKey.count)"
+        return "oneTimeId=\(oneTimeId) mlKEMId=\(kemId) ltpkBytes=\(props.longTermPublicKey.count) spkBytes=\(props.signingPublicKey.count)"
     }
 
     private func logCryptoWiring(_ message: Message) {

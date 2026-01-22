@@ -98,8 +98,17 @@ extension RTCSession {
         
         for line in lines {
             var line = line
-            if line.contains("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034") { // Don't allow high level
-                line = line.replacingOccurrences(of: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034", with: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f")
+            // H264 profile-level-id guidance:
+            // - 42e034 => Constrained Baseline, level 5.2 (very high)
+            // - 42e01f => Constrained Baseline, level 3.1 (too low for 1080p; can force severe downscale or stall some pipelines)
+            //
+            // We cap at level 4.0 which supports 1080p @ ~30fps while avoiding the very-high 5.x levels.
+            // This has proven more stable than forcing 3.1 when the capture source is 1080x1920.
+            if line.contains("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034") {
+                line = line.replacingOccurrences(
+                    of: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034",
+                    with: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e028"
+                )
             }
             
             // Check if this line starts a new media section.

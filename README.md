@@ -66,6 +66,15 @@ skip android test
 - Connecting to servers: [Sources/PQSRTC/PQSRTC.docc/Articles/Connecting-to-Servers.md](Sources/PQSRTC/PQSRTC.docc/Articles/Connecting-to-Servers.md)
 - DocC: see [Sources/PQSRTC/PQSRTC.docc](Sources/PQSRTC/PQSRTC.docc)
 
+## Troubleshooting / Production notes
+
+### iOS: video stalls after a few seconds (~300 frames)
+
+If you see a sender-side stall where video capture continues but outbound RTP stops, double-check H264
+`profile-level-id` negotiation. `RTCSession.modifySDP(...)` intentionally caps Constrained Baseline
+from level 5.2 (`42e034`) down to level 4.0 (`42e028`). Do **not** change this to level 3.1 (`42e01f`)
+for 1080p sources, as it can cause encoder/sender stalls.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

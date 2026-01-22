@@ -21,6 +21,7 @@
 import NeedleTailMediaKit
 import NeedleTailLogger
 import CoreVideo
+import Foundation
 
 
 // MARK: - Sendable Extensions
@@ -82,6 +83,37 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     @MainActor var bounds: CGRect
     private weak var delegate: BufferToMetalDelegate?
     
+    // MARK: - Sample-buffer timestamping & backpressure
+    //
+    // AVSampleBufferDisplayLayer is sensitive to invalid / non-monotonic timestamps and can
+    // enter a failed state that looks like "video freezes". WebRTC frame timestamps are often
+    // large (nanoseconds since an arbitrary epoch). For display, we normalize to a small,
+    // monotonic timeline starting at 0.
+    private var baseTimestampNs: Int64?
+    private var lastPresentationNs: Int64 = -1
+    private var droppedSampleFrames: Int = 0
+    
+    // MARK: - Frame arrival / display telemetry (diagnostics)
+    //
+    // This is intentionally lightweight and uses `nonisolated(unsafe)` storage so the WebRTC
+    // callback thread can update timestamps without awaiting the actor.
+    // Used to answer: "are we still receiving frames?" vs "are we receiving but failing to render?"
+    nonisolated(unsafe) private var lastFrameCallbackUptimeNs: UInt64 = 0
+    nonisolated(unsafe) private var lastEnqueueUptimeNs: UInt64 = 0
+    nonisolated(unsafe) private var receivedFrameCount: UInt64 = 0
+    nonisolated(unsafe) private var enqueuedFrameCount: UInt64 = 0
+    private var telemetryTask: Task<Void, Never>?
+    
+    private struct TelemetrySnapshot: Sendable {
+        let cbAgeMs: Int64
+        let enqAgeMs: Int64
+        let received: UInt64
+        let enqueued: UInt64
+        let dropped: Int
+        let pauseMetal: Bool
+        let layerStatusRaw: Int
+    }
+    
     // MARK: - Thread-Safe Properties
     nonisolated(unsafe) private var pauseMetalRendering = false
     nonisolated(unsafe) private var streamContinuation: AsyncStream<RTCVideoFrame?>.Continuation?
@@ -136,6 +168,45 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             existingTask.cancel()
         }
         
+        // Expensive telemetry loop is gated behind a runtime flag.
+        if PQSRTCDiagnostics.criticalBugLoggingEnabled {
+            if let existingTelemetry = telemetryTask, !existingTelemetry.isCancelled {
+                existingTelemetry.cancel()
+            }
+            telemetryTask = Task { [weak self] in
+                guard let self else { return }
+                // Periodically log whether frames are still arriving / enqueuing.
+                // This makes "sender hung" vs "renderer stalled" immediately obvious from logs.
+                while true {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000) // 2s
+                    if Task.isCancelled { return }
+                    if self.isShutdown { return }
+                    if !PQSRTCDiagnostics.criticalBugLoggingEnabled { return }
+                    
+                    let snap = await self.makeTelemetrySnapshot()
+                    
+                    // Only emit when things look suspicious (stale), or occasionally for baseline.
+                    // - if frames are not arriving for > 1500ms, warn
+                    // - if frames arrive but enqueue stalls for > 1500ms, warn
+                    if snap.cbAgeMs > 1500 || (snap.cbAgeMs >= 0 && snap.enqAgeMs > 1500) {
+                        await self.logger.log(
+                            level: .warning,
+                            message: "Render telemetry: lastFrameCallbackMsAgo=\(snap.cbAgeMs) lastEnqueueMsAgo=\(snap.enqAgeMs) received=\(snap.received) enqueued=\(snap.enqueued) dropped=\(snap.dropped) pauseMetal=\(snap.pauseMetal) layerStatus=\(snap.layerStatusRaw)"
+                        )
+                    } else if snap.received > 0, snap.received % 600 == 0 {
+                        // Roughly every ~20s at 30fps.
+                        await self.logger.log(
+                            level: .debug,
+                            message: "Render telemetry: OK received=\(snap.received) enqueued=\(snap.enqueued) dropped=\(snap.dropped)"
+                        )
+                    }
+                }
+            }
+        } else {
+            telemetryTask?.cancel()
+            telemetryTask = nil
+        }
+        
         streamTask = Task(priority: .high) { [weak self] in
             guard let self = self else {
                 self?.logger.log(level: .error, message: "Self reference lost during stream start")
@@ -180,8 +251,20 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             logger.log(level: .debug, message: "Stream task cancelled")
         }
         
+        telemetryTask?.cancel()
+        telemetryTask = nil
+        
         // Clear frame output
         rtcVideoRenderWrapper.frameOutput = nil
+        
+        // Reset sample-buffer state for cleanliness (helps when reusing the same view instance).
+        baseTimestampNs = nil
+        lastPresentationNs = -1
+        droppedSampleFrames = 0
+        lastFrameCallbackUptimeNs = 0
+        lastEnqueueUptimeNs = 0
+        receivedFrameCount = 0
+        enqueuedFrameCount = 0
         
         logger.log(level: .info, message: "Shutdown completed")
     }
@@ -199,6 +282,8 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             self.streamContinuation = continuation
             
             self.rtcVideoRenderWrapper.frameOutput = { packet in
+                self.lastFrameCallbackUptimeNs = DispatchTime.now().uptimeNanoseconds
+                self.receivedFrameCount &+= 1
                 if let packet = packet {
                     continuation.yield(packet)
                 } else {
@@ -225,6 +310,34 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 // Continue processing other frames instead of breaking the stream
             }
         }
+    }
+    
+    private func makeTelemetrySnapshot() async -> TelemetrySnapshot {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let lastCb = lastFrameCallbackUptimeNs
+        let lastEnq = lastEnqueueUptimeNs
+        
+        // Use UInt64 math and clamp to Int64 to avoid Swift runtime overflows when casting.
+        func ageMsSince(_ last: UInt64) -> Int64 {
+            guard last != 0 else { return -1 }
+            let deltaNs: UInt64 = (now >= last) ? (now - last) : 0
+            let deltaMsU: UInt64 = deltaNs / 1_000_000
+            if deltaMsU >= UInt64(Int64.max) { return Int64.max }
+            return Int64(deltaMsU)
+        }
+        
+        let cbAgeMs = ageMsSince(lastCb)
+        let enqAgeMs = ageMsSince(lastEnq)
+        let statusRaw = await MainActor.run { layer.status.rawValue }
+        return TelemetrySnapshot(
+            cbAgeMs: cbAgeMs,
+            enqAgeMs: enqAgeMs,
+            received: receivedFrameCount,
+            enqueued: enqueuedFrameCount,
+            dropped: droppedSampleFrames,
+            pauseMetal: pauseMetalRendering,
+            layerStatusRaw: statusRaw
+        )
     }
     
 
@@ -305,7 +418,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         
         // Sample-buffer path: convert I420 -> NV12 CVPixelBuffer -> CMSampleBuffer enqueue.
         let pixelBuffer = try makeNV12PixelBuffer(fromI420: buffer)
-        let time = CMTimeMake(value: frame.timeStampNs, timescale: Int32(NSEC_PER_SEC))
+        let time = normalizedPresentationTime(for: frame)
         try await processPixelBufferForSampleBuffer(pixelBuffer: pixelBuffer, time: time)
     }
 
@@ -418,8 +531,37 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     }
 
     private func processFrameForSampleBuffer(buffer: RTCCVPixelBuffer, frame: RTCVideoFrame) async throws {
-        let time = CMTimeMake(value: frame.timeStampNs, timescale: Int32(NSEC_PER_SEC))
+        let time = normalizedPresentationTime(for: frame)
         try await processPixelBufferForSampleBuffer(pixelBuffer: buffer.pixelBuffer, time: time)
+    }
+    
+    /// Produces a small, monotonic presentation timestamp for AVSampleBufferDisplayLayer.
+    private func normalizedPresentationTime(for frame: RTCVideoFrame) -> CMTime {
+        let ts = frame.timeStampNs
+        
+        if baseTimestampNs == nil {
+            baseTimestampNs = ts
+            lastPresentationNs = 0
+            return .zero
+        }
+        
+        guard let base = baseTimestampNs else {
+            baseTimestampNs = ts
+            lastPresentationNs = 0
+            return .zero
+        }
+        
+        var rel = ts - base
+        if rel < 0 {
+            // Clock reset/rollover; rebase but keep monotonicity.
+            baseTimestampNs = ts
+            rel = max(lastPresentationNs + 1, 0)
+        }
+        if rel <= lastPresentationNs {
+            rel = lastPresentationNs + 1
+        }
+        lastPresentationNs = rel
+        return CMTimeMake(value: rel, timescale: Int32(NSEC_PER_SEC))
     }
 
     private func processPixelBufferForSampleBuffer(pixelBuffer: CVPixelBuffer, time: CMTime) async throws {
@@ -468,13 +610,32 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         }
 
         // Enqueue into the display layer.
-        // Use the layer's sample-buffer renderer for presentation.
-        // Also handle the "failed" state by flushing so the layer can recover.
-        if layer.status == .failed {
-            logger.log(level: .warning, message: "AVSampleBufferDisplayLayer failed: \(String(describing: layer.error)). Flushing.")
-            layer.flush()
+        //
+        // IMPORTANT: AVSampleBufferDisplayLayer is not reliably thread-safe. Enqueue/flush must
+        // run on the main thread to avoid sporadic Fig/CoreMedia failures that manifest as freezes.
+        let wasFailed = await MainActor.run { () -> Bool in
+            if layer.status == .failed {
+                layer.flush()
+                return true
+            }
+            return false
         }
-        layer.sampleBufferRenderer.enqueue(sampleBuffer)
+        if wasFailed {
+            logger.log(level: .warning, message: "AVSampleBufferDisplayLayer failed: \(String(describing: layer.error)). Flushed.")
+        }
+        
+        let ready = await MainActor.run { layer.isReadyForMoreMediaData }
+        guard ready else {
+            droppedSampleFrames += 1
+            if PQSRTCDiagnostics.criticalBugLoggingEnabled, droppedSampleFrames % 120 == 0 {
+                logger.log(level: .debug, message: "Dropping sample-buffer frames (not ready). dropped=\(droppedSampleFrames)")
+            }
+            return
+        }
+        
+        await MainActor.run { layer.enqueue(sampleBuffer) }
+        lastEnqueueUptimeNs = DispatchTime.now().uptimeNanoseconds
+        enqueuedFrameCount &+= 1
     }
     
     private func processI420FrameForMetal(buffer: RTCI420Buffer) async throws {

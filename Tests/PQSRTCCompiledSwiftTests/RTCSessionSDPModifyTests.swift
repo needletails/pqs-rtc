@@ -83,7 +83,10 @@ struct RTCSessionSDPModifyTests {
         let input = inputLines.joined(separator: "\n") + "\n"
 
         let output = await session.modifySDP(sdp: input, hasVideo: true)
-        #expect(output.contains("profile-level-id=42e01f"))
+        // IMPORTANT:
+        // We cap H264 Constrained Baseline from level 5.2 (42e034) down to level 4.0 (42e028),
+        // NOT down to 3.1 (42e01f). For 1080p sources, forcing 3.1 can cause sender-side stalls.
+        #expect(output.contains("profile-level-id=42e028"))
         #expect(output.contains("profile-level-id=42e034") == false)
 
         await session.shutdown(with: nil)
