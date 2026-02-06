@@ -130,7 +130,9 @@ public struct IceCandidate: Codable, Sendable {
     ///
     /// - Returns: A `RTCIceCandidate` instance with the same data
     public var rtcIceCandidate: WebRTC.RTCIceCandidate {
-        return WebRTC.RTCIceCandidate(sdp: self.sdp, sdpMLineIndex: self.sdpMLineIndex, sdpMid: self.sdpMid ?? "")
+        // Preserve `nil` mid when absent; m-line index is sufficient for many stacks.
+        // Using an empty string can cause candidates to be ignored by some implementations.
+        return WebRTC.RTCIceCandidate(sdp: self.sdp, sdpMLineIndex: self.sdpMLineIndex, sdpMid: self.sdpMid)
     }
     #else
     public init(from iceCandidate: RTCIceCandidate, id: Int) throws {

@@ -1205,6 +1205,68 @@ public final class AndroidRTCClient: @unchecked Sendable {
         guard !isClosed else { return }
         localVideoTrack?._setEnabled(enabled)
     }
+
+    // MARK: - Adaptive sender control helpers
+    //
+    // These are Android equivalents of Apple `RTCRtpSender.parameters.encodings` tuning.
+    // They are used by `RTCSession` for SFU/group calls so the sender doesn't overshoot uplink,
+    // and can ramp up quality on good internet.
+    public func setVideoSenderEncodings(maxBitrateBps: Int, maxFramerate: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { return }
+        // SKIP INSERT: val pc = this@AndroidRTCClient.peerConnection?.platformPeerConnection ?: return
+        // SKIP INSERT: val senders = pc.senders
+        // SKIP INSERT: val videoSender = senders.firstOrNull { it.track()?.kind() == "video" } ?: return
+        // SKIP INSERT: val params = videoSender.parameters
+        // SKIP INSERT: val encodings = params.encodings
+        // SKIP INSERT: if (encodings == null || encodings.isEmpty()) return
+        // SKIP INSERT: for (enc in encodings) {
+        // SKIP INSERT:   enc.maxBitrateBps = maxBitrateBps
+        // SKIP INSERT:   enc.maxFramerate = maxFramerate
+        // SKIP INSERT: }
+        // SKIP INSERT: videoSender.parameters = params
+    }
+
+    public func getAvailableOutgoingBitrateBps() async -> Double? {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            let closed = isClosed
+            let pc = peerConnection?.platformPeerConnection
+            lock.unlock()
+            guard !closed else {
+                continuation.resume(returning: nil)
+                return
+            }
+            guard pc != nil else {
+                continuation.resume(returning: nil)
+                return
+            }
+            // SKIP INSERT: val peer = pc ?: run { continuation.resume(returning: null); return }
+            // SKIP INSERT: peer.getStats { report ->
+            // SKIP INSERT:   var best: Double? = null
+            // SKIP INSERT:   val statsMap = report.statsMap
+            // SKIP INSERT:   for ((_, stat) in statsMap) {
+            // SKIP INSERT:     if (stat.type != "candidate-pair") continue
+            // SKIP INSERT:     val selected = (stat.members["selected"] as? Boolean) ?: false
+            // SKIP INSERT:     val nominated = (stat.members["nominated"] as? Boolean) ?: false
+            // SKIP INSERT:     val state = (stat.members["state"] as? String)?.lowercase() ?: ""
+            // SKIP INSERT:     if (!(selected || (nominated && state == "succeeded"))) continue
+            // SKIP INSERT:     val v = stat.members["availableOutgoingBitrate"]
+            // SKIP INSERT:     val d = when (v) {
+            // SKIP INSERT:       is Double -> v
+            // SKIP INSERT:       is Long -> v.toDouble()
+            // SKIP INSERT:       is Int -> v.toDouble()
+            // SKIP INSERT:       is Number -> v.toDouble()
+            // SKIP INSERT:       else -> null
+            // SKIP INSERT:     }
+            // SKIP INSERT:     if (d != null) { best = d; break }
+            // SKIP INSERT:   }
+            // SKIP INSERT:   continuation.resume(returning: best)
+            // SKIP INSERT: }
+            continuation.resume(returning: nil)
+        }
+    }
     
     // MARK: - Public Video APIs (no org.webrtc exposure)
     /// Ensures a video transceiver exists and attaches a local video track for send/receive.

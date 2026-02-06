@@ -90,7 +90,87 @@ public final class VideoCallViewController: NSViewController {
         stateStreamTask = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.videoCallDelegate?.passSize(.init(width: 450, height: 100))
-            guard let stateStream = await session.callState._currentCallStream.last else { return }
+            
+            // The host app may present this controller before `RTCSession.createStateStream(with:)`
+            // has run. Wait until the stream exists rather than silently returning.
+            var stateStream: AsyncStream<CallStateMachine.State>?
+            while !Task.isCancelled {
+                if let s = await session.callState._currentCallStream.last {
+                    stateStream = s
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 25_000_000) // 25ms
+            }
+            guard let stateStream else { return }
+
+            // If we subscribed late, the state machine may already be `.connected`.
+            // AsyncStream doesn't replay, so bootstrap UI from the current state.
+            if let current = await session.callState.currentState, current != self.currentCallState {
+                self.currentCallState = current
+                await videoCallDelegate?.deliverCallState(currentCallState)
+                switch current {
+                case .waiting:
+                    break
+                case .ready(let currentCall):
+                    self.currentCall = currentCall
+                    controllerView.statusLabel.stringValue = "Ready to Connect"
+                case .connecting(let callDirection, let currentCall):
+                    self.currentCall = currentCall
+                    if controllerView.calleeLabel.stringValue.isEmpty {
+                        controllerView.calleeLabel.stringValue = currentCall.sender.secretName
+                    }
+                    controllerView.statusLabel.stringValue = "Connecting..."
+                    controllerView.statusLabel.fadeInOutLoop(duration: 1.5)
+                    switch callDirection {
+                    case .inbound(let callType), .outbound(let callType):
+                        if callType == .video,
+                           videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                            upgradedToVideo = true
+                            await self.videoCallDelegate?.passSize(.init(width: 335, height: 475))
+                            controllerView.anchors(
+                                top: self.view.topAnchor,
+                                leading: self.view.leadingAnchor,
+                                bottom: self.view.bottomAnchor,
+                                trailing: self.view.trailingAnchor,
+                                minWidth: 335,
+                                minHeight: 475)
+                            await createPreviewView()
+                        }
+                    }
+                case .connected(let callDirection, let currentCall):
+                    self.currentCall = currentCall
+                    controllerView.statusLabel.stopFadeInOutLoop()
+                    switch callDirection {
+                    case .inbound(let callType), .outbound(let callType):
+                        if callType == .video {
+                            upgradedToVideo = true
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                                await createPreviewView()
+                            }
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "sample" }) == false {
+                                await createSampleView()
+                            }
+                        }
+                    }
+                    await incrementDuration()
+                case .held(_, _):
+                    controllerView.statusLabel.stringValue = "Held"
+                case .ended(_, _):
+                    controllerView.statusLabel.stringValue = "Ended"
+                    await tearDownCall()
+                case .failed(_, _, let errorMessage):
+                    controllerView.statusLabel.stringValue = "Failed"
+                    await session.stopRingtone()
+                    await videoCallDelegate?.passErrorMessage(errorMessage)
+                    if currentCall != nil {
+                        await tearDownCall()
+                    }
+                case .callAnsweredAuxDevice(_):
+                    controllerView.statusLabel.stringValue = "Answered on Auxiliary Device"
+                    currentCall = nil
+                    await tearDownCall()
+                }
+            }
             
             for await state in stateStream {
                 guard state != self.currentCallState else { continue }
@@ -127,7 +207,10 @@ public final class VideoCallViewController: NSViewController {
                                 trailing: self.view.trailingAnchor,
                                 minWidth: 335,
                                 minHeight: 475)
-                            await createPreviewView()
+                            // Defensive: `.connecting` can be re-emitted; avoid creating multiple previews.
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                                await createPreviewView()
+                            }
                         }
                     case .outbound(let callType):
                         switch callType {
@@ -144,7 +227,9 @@ public final class VideoCallViewController: NSViewController {
                                 trailing: self.view.trailingAnchor,
                                 minWidth: 335,
                                 minHeight: 475)
-                            await createPreviewView()
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                                await createPreviewView()
+                            }
                         }
                     }
                     
@@ -158,7 +243,15 @@ public final class VideoCallViewController: NSViewController {
                             break
                         case .video:
                             upgradedToVideo = true
-                            await createSampleView()
+                            // If we attach to the call-state stream late, we might miss `.connecting`
+                            // and land directly in `.connected`. Ensure local preview exists.
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                                await createPreviewView()
+                            }
+                            // Defensive: `.connected` can be re-emitted; avoid creating multiple sample renderers.
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "sample" }) == false {
+                                await createSampleView()
+                            }
                         }
                     case .outbound(let callType):
                         switch callType {
@@ -166,7 +259,12 @@ public final class VideoCallViewController: NSViewController {
                             break
                         case .video:
                             upgradedToVideo = true
-                            await createSampleView()
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                                await createPreviewView()
+                            }
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "sample" }) == false {
+                                await createSampleView()
+                            }
                         }
                     }
                     await incrementDuration()
@@ -298,6 +396,12 @@ public final class VideoCallViewController: NSViewController {
     /// - Parameter shouldQuery: If `true`, triggers a diffable-data-source refresh so the view is
     ///   inserted into the collection view before rendering begins.
     func createPreviewView(shouldQuery: Bool = true) async {
+        // Idempotency: avoid creating duplicate preview views if call-state re-emits `.connecting`.
+        if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) {
+            if shouldQuery { await performQuery() }
+            return
+        }
+        
         let localVideoView: NTMTKView
         do {
             localVideoView = try NTMTKView(type: .preview, contextName: "preview")
@@ -343,6 +447,11 @@ public final class VideoCallViewController: NSViewController {
     ///
     /// - Parameter wasAudioCall: Currently unused; retained for call-type transitions.
     func createSampleView(wasAudioCall: Bool = false) async {
+        // Idempotency: avoid creating duplicate remote renderers if call-state re-emits `.connected`.
+        if videoViews.views.contains(where: { $0.videoView.contextName == "sample" }) {
+            return
+        }
+        
         let remoteVideoView: NTMTKView
         do {
             remoteVideoView = try NTMTKView(type: .sample, contextName: "sample")

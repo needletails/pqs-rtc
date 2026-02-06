@@ -194,6 +194,7 @@ actor RTCConnectionManager {
             connections.removeAll(where: { $0.id == connection.id })
         }
         connections.append(connection)
+        print("ADDED CONNECTION WITH ID: \(connection.id)")
     }
     
     func updateConnection(id: String, with connection: RTCConnection) {

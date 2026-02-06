@@ -24,7 +24,6 @@ import NeedleTailLogger
 /// This actor intentionally does not persist keys to disk. All cached material is cleared when
 /// the process exits or when ``clearAll()`` is called.
 public actor KeyManager: SessionIdentityDelegate {
-    
     /// Cached local identity bundle for the active call/session.
     private var connectionLocalIdentity: ConnectionLocalIdentity?
     
@@ -49,13 +48,29 @@ public actor KeyManager: SessionIdentityDelegate {
     // MARK: - SessionIdentityDelegate
     
     public func updateSessionIdentity(_ identity: DoubleRatchetKit.SessionIdentity) async throws {
-        guard var connectionIdentity = connectionIdentities[identity.id.uuidString] else {
-            logger.log(level: .error, message: "Missing connection identity for updated session identity in CallKeyStore")
+        // Find the connection identity by searching through all connection identities
+        // since they're keyed by connectionId, not session identity UUID
+        var foundConnectionId: String?
+        for (connectionId, var connIdentity) in connectionIdentities {
+            if connIdentity.sessionIdentity.id == identity.id {
+                foundConnectionId = connectionId
+                connIdentity.sessionIdentity = identity
+                connectionIdentities[connectionId] = connIdentity
+                logger.log(level: .debug, message: "Updated session identity: \(identity.id) for connectionId: \(connectionId)")
+                return
+            }
+        }
+        
+        // If not found by session identity ID, try by UUID string (for backward compatibility)
+        if let connectionIdentity = connectionIdentities[identity.id.uuidString] {
+            var updated = connectionIdentity
+            updated.sessionIdentity = identity
+            connectionIdentities[identity.id.uuidString] = updated
+            logger.log(level: .debug, message: "Updated session identity: \(identity.id)")
             return
         }
-        connectionIdentity.sessionIdentity = identity
-        connectionIdentities[identity.id.uuidString] = connectionIdentity
-        logger.log(level: .debug, message: "Updated session identity: \(identity.id)")
+        
+        logger.log(level: .error, message: "Missing connection identity for updated session identity in CallKeyStore: \(identity.id)")
     }
     
     public func fetchOneTimePrivateKey(_ id: UUID?) async throws -> DoubleRatchetKit.CurvePrivateKey? {
@@ -77,17 +92,6 @@ public actor KeyManager: SessionIdentityDelegate {
     ///   - id: The key ID
     public func storeOneTimeKey(_ key: CurvePrivateKey, id: UUID) {
         oneTimeKeys[id] = key
-    }
-    
-    /// Retrieves a session identity by id.
-    /// - Parameter id: The session identity ID
-    /// - Returns: The session identity if found, nil otherwise
-    public func fetchSessionIdentity(_ id: UUID) -> SessionIdentity? {
-        guard let connectionIdentity = connectionIdentities[id.uuidString] else {
-            logger.log(level: .error, message: "Missing connection identity for fetch session identity in CallKeyStore")
-            return nil
-        }
-        return connectionIdentity.sessionIdentity
     }
     
     /// Removes a session identity.
@@ -125,27 +129,42 @@ public actor KeyManager: SessionIdentityDelegate {
     }
     
     // MARK: - CallKeyBundleStore
-    public func fetchCallKeyBundle() async throws -> ConnectionLocalIdentity? {
-        return connectionLocalIdentity
-    }
-    
-    public func removeCallKeyBundle() async {
-        connectionLocalIdentity = nil
-    }
-    
-    public func fetchConnectionIdentity(_ id: UUID) -> ConnectionSessionIdentity? {
-        guard let connectionIdentity = connectionIdentities[id.uuidString] else {
-            logger.log(level: .error, message: "Missing connection identity for fetch session identity in CallKeyStore")
-            return nil
+    public func fetchCallKeyBundle() throws -> ConnectionLocalIdentity {
+        guard let connectionIdentity = connectionLocalIdentity else {
+            throw RTCErrors.invalidConfiguration("Missing local connection identity")
         }
         return connectionIdentity
     }
     
-    /// Fetches a connection identity by its string `connectionId`.
-    /// - Parameter connectionId: The connection ID as a String
-    /// - Returns: The connection identity if found, nil otherwise
-    public func fetchConnectionIdentityByConnectionId(_ connectionId: String) -> ConnectionSessionIdentity? {
-        return connectionIdentities[connectionId]
+    public func removeCallKeyBundle() {
+        connectionLocalIdentity = nil
+    }
+    
+    /// Retrieves a session identity by id.
+    /// - Parameter id: The session identity ID
+    /// - Returns: The session identity if found, nil otherwise
+    public func fetchConnectionIdentity(connection id: String) throws -> ConnectionSessionIdentity {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let connectionIdentity = connectionIdentities[trimmed] {
+            return connectionIdentity
+        }
+        
+        // Accept IRC channel-style identifiers (e.g. "#<uuid>") by normalizing before lookup.
+        // This is important for "1:1 via SFU room" calls where signaling may carry `#uuid`
+        // but the identity store may be keyed by `uuid`.
+        let normalized: String = {
+            if trimmed.hasPrefix("#") { return String(trimmed.dropFirst()) }
+            return trimmed
+        }()
+        
+        if let connectionIdentity = connectionIdentities[normalized] {
+            return connectionIdentity
+        }
+        if let connectionIdentity = connectionIdentities["#\(normalized)"] {
+            return connectionIdentity
+        }
+        
+        throw RTCErrors.invalidConfiguration("Missing connection identity for ID: \(trimmed)")
     }
     
     /// Stores ciphertext for a connection identity.
@@ -206,9 +225,19 @@ public actor KeyManager: SessionIdentityDelegate {
             oneTime: oneTimeKey,
             mlKEM: try MLKEMPrivateKey(id: kemId, kem.encode()))
         
-        // Create session identity
-        // If recipient public keys are provided, use them; otherwise create a placeholder
-        let sessionId = UUID(uuidString: connectionId) ?? UUID()
+        // Create session identity.
+        //
+        // IMPORTANT: Group/SFU calls often use channel-style ids like "#<uuid>".
+        // The SFU server strips a leading '#' before UUID parsing; do the same here so both sides
+        // derive the same session id for ratchet compatibility.
+        let normalizedConnectionId: String = {
+            let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("#") { return String(trimmed.dropFirst()) }
+            return trimmed
+        }()
+        guard let sessionId = UUID(uuidString: normalizedConnectionId) else {
+            throw RTCErrors.invalidConfiguration("Invalid connectionId (expected UUID or #UUID): \(connectionId)")
+        }
         let sessionIdentity: SessionIdentity
         
             // Create a placeholder SessionIdentity (will be updated when recipient keys are received)
@@ -251,7 +280,16 @@ public actor KeyManager: SessionIdentityDelegate {
         connectionId: String,
         props: SessionIdentity.UnwrappedProps
     ) async throws -> ConnectionSessionIdentity {
-        let sessionId = UUID(uuidString: connectionId) ?? UUID()
+        
+        // Match sender identity derivation: strip leading '#' before UUID parsing.
+        let normalizedConnectionId: String = {
+            let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("#") { return String(trimmed.dropFirst()) }
+            return trimmed
+        }()
+        guard let sessionId = UUID(uuidString: normalizedConnectionId) else {
+            throw RTCErrors.invalidConfiguration("Invalid connectionId (expected UUID or #UUID): \(connectionId)")
+        }
         var identity = ConnectionSessionIdentity(
             connectionId: connectionId,
             symmetricKey: dbsk,

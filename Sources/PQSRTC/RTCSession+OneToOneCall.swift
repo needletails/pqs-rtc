@@ -20,17 +20,13 @@ extension RTCSession {
         connectionId: String
     ) async throws -> Data {
         
-        // Get connection identity for this 1:1 signaling channel
-        guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(connectionId) else {
-            throw EncryptionErrors.missingSessionIdentity
-        }
-        
+        // Get connection identity for this 1:1 signaling channel.
+        // Some transports (e.g. IRC/SFU) may deliver a channel-style id like "#<uuid>".
+        // The key store supports both, but we normalize here for consistency.
+        let connectionIdentity = try await pcKeyManager.fetchConnectionIdentity(connection: connectionId.normalizedConnectionId)
         // Get local identity
-        guard let callBundle = try await pcKeyManager.fetchCallKeyBundle() else {
-            throw EncryptionErrors.missingSessionIdentity
-        }
+        let callBundle = try await pcKeyManager.fetchCallKeyBundle()
         
-        // Initialize recipient ratchet if needed
         try await pcRatchetManager.recipientInitialization(
             sessionIdentity: connectionIdentity.sessionIdentity,
             sessionSymmetricKey: callBundle.symmetricKey,
@@ -45,71 +41,21 @@ extension RTCSession {
         return decrypted
     }
     
-    /// Encrypts 1:1 signaling data using the call's Double Ratchet keys.
-    ///
-    /// Uses `pcRatchetManager` (same as group calls) for transport encryption.
-    /// The connection's ratchet must be initialized first (via createCryptoSession/receiveCiphertext).
-    public func encryptOneToOneSignaling(
-        plaintext: Data,
-        connectionId: String,
-        flag: PacketFlag,
-        remoteProps: SessionIdentity.UnwrappedProps
-    ) async throws -> RatchetMessagePacket {
-
-        // Ensure the connection exists (ratchet state is scoped to connectionId).
-        guard await connectionManager.findConnection(with: connectionId) != nil else {
-            throw RTCErrors.connectionNotFound
-        }
-        
-        // Ensure we have a connection identity for this 1:1 signaling channel
-        guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(connectionId) else {
-            throw RTCErrors.invalidConfiguration("A Local Connection Identity should have been constructed by now.")
-        }
-        
-        guard let localIdentity = try await pcKeyManager.fetchCallKeyBundle() else {
-            throw RTCErrors.invalidConfiguration("A Local Connection Identity should have been constructed by now.")
-        }
-
-        try await pcRatchetManager.senderInitialization(
-            sessionIdentity: connectionIdentity.sessionIdentity,
-            sessionSymmetricKey: localIdentity.symmetricKey,
-            remoteKeys: RemoteKeys(
-                longTerm: CurvePublicKey(remoteProps.longTermPublicKey),
-                oneTime: remoteProps.oneTimePublicKey,
-                mlKEM: remoteProps.mlKEMPublicKey
-            ),
-            localKeys: localIdentity.localKeys)
-        
-        // Encrypt the plaintext
-        let message = try await pcRatchetManager.ratchetEncrypt(
-            plainText: plaintext,
-            sessionId: connectionIdentity.sessionIdentity.id)
-        
-        // For 1:1 calls, sfuIdentity is just the connectionId (not a channel format)
-        // since we send to nicks, not channels. The channelIdentity is only used
-        // internally for key management.
-        return RatchetMessagePacket(
-            sfuIdentity: connectionId,
-            header: message.header,
-            ratchetMessage: message,
-            flag: flag)
-    }
-    
     public func startCall(_ call: Call) async throws {
-        try await createStateStream(with: call)
-        await setConnectingIfReady(call: call, callDirection: .inbound(call.supportsVideo ? .video : .voice))
         shouldOffer = true
         try await requireTransport().sendStartCall(call)
         logger.log(level: .info, message: "Sent start_call message for \(call.sharedCommunicationId)")
     }
     
+    public func setupCallState(_ call: Call) async throws {
+        try await createStateStream(with: call)
+    }
+    
     /// Initiates an outbound 1:1 call.
     /// - Parameter call: The call to initiate (must have recipient's identityProps)
     public func initiateCall(with call: Call) async throws {
-        
         //Create crypto session (establishes Double Ratchet handshake)
-         try await createCryptoPeerConnection(with: call)
-
+        try await createCryptoPeerConnection(with: call)
         logger.log(level: .info, message: "Initiated 1:1 call setup for \(call.sharedCommunicationId)")
     }
     
@@ -125,26 +71,40 @@ extension RTCSession {
     public func answerCall(_ call: Call) async throws {
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).
         activeConnectionId = call.sharedCommunicationId
+        if isGroupCall {
+            shouldOffer = true
+        }
         
-
         guard let recipient = call.recipients.first else {
             throw RTCErrors.invalidConfiguration("Answering a call with no recipients is not supported.")
         }
+        let frameLocalIdentity: ConnectionLocalIdentity
+        if let foundLocalIdentity = try? await keyManager.fetchCallKeyBundle() {
+            frameLocalIdentity = foundLocalIdentity
+        } else {
+            frameLocalIdentity = try await keyManager.generateSenderIdentity(
+                connectionId: call.sharedCommunicationId,
+                secretName: recipient.secretName
+            )
+        }
         
-        // We need to create our local identities first so that the offerer has out frame cryptor identity props in order to initialize a session.
-            let frameLocalIdentity = try await generateSenderIdentity(
-                connectionId: call.sharedCommunicationId,
-                secretName: recipient.secretName)
-
-            let signalingLocalIdentity = try await pcKeyManager.generateSenderIdentity(
-                connectionId: call.sharedCommunicationId,
-                secretName: recipient.secretName)
+        let signalingLocalIdentity: ConnectionLocalIdentity
+        if let foundSignalingLocalIdentity = try? await pcKeyManager.fetchCallKeyBundle() {
+            signalingLocalIdentity = foundSignalingLocalIdentity
+        } else {
+            signalingLocalIdentity = try await pcKeyManager.generateSenderIdentity(
+               connectionId: call.sharedCommunicationId,
+               secretName: recipient.secretName)
+        }
         
         var call = call
         call.frameIdentityProps = await frameLocalIdentity.sessionIdentity.props(symmetricKey: frameLocalIdentity.symmetricKey)
         call.signalingIdentityProps = await signalingLocalIdentity.sessionIdentity.props(symmetricKey: signalingLocalIdentity.symmetricKey)
         
+        // This is the soonest place that we can create a state stream with the call built
         try await createStateStream(with: call)
+        await setConnectingIfReady(call: call, callDirection: .inbound(call.supportsVideo ? .video : .voice))
+        
         setCanAnswer(true)
         // Send call_answered notification to the caller
         try await requireTransport().sendCallAnswered(call)
@@ -173,5 +133,19 @@ extension RTCSession {
     public func endCall(_ call: Call) async throws {
         await shutdown(with: call)
         logger.log(level: .info, message: "Ended 1:1 call: \(call.sharedCommunicationId)")
+    }
+}
+
+extension String {
+    public var isGroupCall: Bool {
+        self.first == "#"
+    }
+    
+    public var normalizedConnectionId: String {
+        self.hasPrefix("#") ? String(self.dropFirst()) : self
+    }
+    
+    public var ensureIRCChannel: String {
+        self.hasPrefix("#") ? self : "#\(self)"
     }
 }

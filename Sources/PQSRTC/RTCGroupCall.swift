@@ -72,6 +72,8 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
         /// SFU signaling
         case sfuAnswer(RatchetMessagePacket)
         case sfuCandidate(RatchetMessagePacket)
+        /// Renegotiation offer from SFU (e.g. when a new peer joins and existing peers must receive their media).
+        case sfuOffer(RatchetMessagePacket)
 
         /// Roster
         case participants(RatchetMessagePacket)
@@ -81,6 +83,11 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
     private let sfuRecipientId: String
     private var call: Call
     let localIdentity: ConnectionLocalIdentity
+    
+    /// Getter for the call (used by TaskProcessor)
+    var currentCall: Call {
+        call
+    }
 
     private var state: State = .idle
     private var participantsById: [String: Participant] = [:]

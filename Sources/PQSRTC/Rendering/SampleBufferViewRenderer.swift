@@ -92,6 +92,14 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     private var baseTimestampNs: Int64?
     private var lastPresentationNs: Int64 = -1
     private var droppedSampleFrames: Int = 0
+
+    // MARK: - Sample-buffer recovery (production hardening)
+    //
+    // AVSampleBufferDisplayLayer can enter states where it will not resume decoding/rendering
+    // after upstream disruption (packet loss / missing keyframes / large gaps). In those cases,
+    // a flush (and often "flushAndRemoveImage") plus timestamp rebasing is required to recover.
+    private var consecutiveNotReadyDrops: Int = 0
+    private var lastLayerRecoveryUptimeNs: UInt64 = 0
     
     // MARK: - Frame arrival / display telemetry (diagnostics)
     //
@@ -102,6 +110,14 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     nonisolated(unsafe) private var lastEnqueueUptimeNs: UInt64 = 0
     nonisolated(unsafe) private var receivedFrameCount: UInt64 = 0
     nonisolated(unsafe) private var enqueuedFrameCount: UInt64 = 0
+    
+    // MARK: - Always-on first-frame diagnostics
+    //
+    // These are intentionally always enabled (not behind criticalBugLoggingEnabled) because
+    // they answer the primary question during bring-up:
+    // "are we receiving any remote frames at all?"
+    nonisolated(unsafe) private var didLogFirstFrameCallback: Bool = false
+    private var didLogFirstEnqueue: Bool = false
     private var telemetryTask: Task<Void, Never>?
     
     private struct TelemetrySnapshot: Sendable {
@@ -284,6 +300,16 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             self.rtcVideoRenderWrapper.frameOutput = { packet in
                 self.lastFrameCallbackUptimeNs = DispatchTime.now().uptimeNanoseconds
                 self.receivedFrameCount &+= 1
+                
+                // First-frame callback signal (runs on WebRTC callback thread).
+                if self.didLogFirstFrameCallback == false {
+                    self.didLogFirstFrameCallback = true
+                    Task { [weak self] in
+                        guard let self else { return }
+                        await self.logger.log(level: .info, message: "✅ First remote video frame received by renderer callback")
+                    }
+                }
+                
                 if let packet = packet {
                     continuation.yield(packet)
                 } else {
@@ -613,20 +639,43 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         //
         // IMPORTANT: AVSampleBufferDisplayLayer is not reliably thread-safe. Enqueue/flush must
         // run on the main thread to avoid sporadic Fig/CoreMedia failures that manifest as freezes.
-        let wasFailed = await MainActor.run { () -> Bool in
-            if layer.status == .failed {
-                layer.flush()
-                return true
+        let nowUptimeNs = DispatchTime.now().uptimeNanoseconds
+
+        // If the renderer was stalled for a while and frames start flowing again, treat that as
+        // a discontinuity and reset the display layer + timestamps. This helps avoid the "network
+        // recovered but video stays frozen" symptom.
+        let timeSinceLastEnqueueNs: UInt64 = (lastEnqueueUptimeNs > 0 && nowUptimeNs >= lastEnqueueUptimeNs)
+            ? (nowUptimeNs - lastEnqueueUptimeNs)
+            : 0
+        let didStallLongEnoughToRebase = lastEnqueueUptimeNs > 0 && timeSinceLastEnqueueNs >= 2_500_000_000 // 2.5s
+
+        // Decide whether we need to flush to resume decoding (failed state, requiresFlush, or long stall).
+        let recoveryReason = await MainActor.run { () -> String? in
+            if layer.status == .failed { return "layerFailed" }
+            if didStallLongEnoughToRebase { return "stallGap" }
+            // Some Fig failures set requiresFlushToResumeDecoding without flipping `status` to `.failed`.
+            if #available(iOS 11.0, macOS 10.13, *) {
+                if layer.requiresFlushToResumeDecoding { return "requiresFlushToResumeDecoding" }
             }
-            return false
+            return nil
         }
-        if wasFailed {
-            logger.log(level: .warning, message: "AVSampleBufferDisplayLayer failed: \(String(describing: layer.error)). Flushed.")
+
+        if let reason = recoveryReason {
+            await recoverSampleBufferLayerIfNeeded(reason: reason, nowUptimeNs: nowUptimeNs)
         }
         
         let ready = await MainActor.run { layer.isReadyForMoreMediaData }
         guard ready else {
             droppedSampleFrames += 1
+            consecutiveNotReadyDrops += 1
+
+            // If the layer stays "not ready" for too long while we're still receiving frames,
+            // proactively recover it. This tends to happen after upstream disruptions.
+            if consecutiveNotReadyDrops >= 120 { // ~4s at 30fps, ~8s at 15fps
+                await recoverSampleBufferLayerIfNeeded(reason: "notReadyTooLong", nowUptimeNs: nowUptimeNs)
+                consecutiveNotReadyDrops = 0
+            }
+
             if PQSRTCDiagnostics.criticalBugLoggingEnabled, droppedSampleFrames % 120 == 0 {
                 logger.log(level: .debug, message: "Dropping sample-buffer frames (not ready). dropped=\(droppedSampleFrames)")
             }
@@ -636,6 +685,38 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         await MainActor.run { layer.enqueue(sampleBuffer) }
         lastEnqueueUptimeNs = DispatchTime.now().uptimeNanoseconds
         enqueuedFrameCount &+= 1
+        consecutiveNotReadyDrops = 0
+        
+        if didLogFirstEnqueue == false {
+            didLogFirstEnqueue = true
+            logger.log(level: .info, message: "✅ First remote video frame enqueued to AVSampleBufferDisplayLayer")
+        }
+    }
+
+    /// Attempts to recover AVSampleBufferDisplayLayer so rendering resumes after upstream disruptions.
+    ///
+    /// This is intentionally conservative and throttled to avoid flush storms.
+    private func recoverSampleBufferLayerIfNeeded(reason: String, nowUptimeNs: UInt64) async {
+        // Throttle recovery attempts (flush is not free and can cause flicker).
+        if lastLayerRecoveryUptimeNs > 0, nowUptimeNs >= lastLayerRecoveryUptimeNs {
+            let delta = nowUptimeNs - lastLayerRecoveryUptimeNs
+            if delta < 1_000_000_000 { // 1s
+                return
+            }
+        }
+        lastLayerRecoveryUptimeNs = nowUptimeNs
+
+        // Reset timestamp normalization so the next frame starts a new monotonic timeline.
+        baseTimestampNs = nil
+        lastPresentationNs = -1
+
+        await MainActor.run {
+            // Stronger than `flush()`; clears the last displayed image as well.
+            layer.flushAndRemoveImage()
+            layer.flush()
+        }
+
+        logger.log(level: .info, message: "Recovered AVSampleBufferDisplayLayer to resume rendering (reason=\(reason))")
     }
     
     private func processI420FrameForMetal(buffer: RTCI420Buffer) async throws {

@@ -47,7 +47,11 @@ public enum SDPHandlerError: Error, Sendable {
 
 extension RTCSession {
     
-    func modifySDP(sdp: String, hasVideo: Bool = false) async -> String {
+    func modifySDP(
+        sdp: String,
+        hasVideo: Bool = false,
+        stripSsrcLines: Bool = false
+    ) async -> String {
         let sdp = sdp
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
@@ -98,6 +102,21 @@ extension RTCSession {
         
         for line in lines {
             var line = line
+            
+            // Optional SFU interoperability hardening:
+            // Some SFU-side SDP validators/parsers are overly strict and reject valid SSRC attribute
+            // lines (e.g. `a=ssrc:<ssrc> cname:<cname>`). Those lines are not required for basic
+            // RTP interop (SSRCs are conveyed in RTP headers), but removing them can break
+            // sender/track association in some 1:1 stacks. Therefore:
+            // - For 1:1 P2P calls: keep `a=ssrc:` lines.
+            // - For SFU/group calls (when requested): drop `a=ssrc:` lines but keep `a=ssrc-group:`.
+            if stripSsrcLines {
+                let lower = line.lowercased()
+                if lower.hasPrefix("a=ssrc:") {
+                    continue
+                }
+            }
+
             // H264 profile-level-id guidance:
             // - 42e034 => Constrained Baseline, level 5.2 (very high)
             // - 42e01f => Constrained Baseline, level 3.1 (too low for 1080p; can force severe downscale or stall some pipelines)

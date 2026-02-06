@@ -81,7 +81,7 @@ public actor RTCSession {
         connectionId: String,
         timeoutNanoseconds: UInt64 = 3_000_000_000
     ) async -> RTCVideoCaptureWrapper? {
-        let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
         guard !trimmed.isEmpty else { return nil }
         
         if let existing = await connectionManager.findConnection(with: trimmed)?.rtcVideoCaptureWrapper {
@@ -136,6 +136,18 @@ public actor RTCSession {
     
     /// Continuation used to push new peer-connection notifications into `peerConnectionNotificationsStream`.
     var peerConnectionNotificationsContinuation: AsyncStream<PeerConnectionNotifications?>.Continuation
+
+    // MARK: - Network quality observation (UI-agnostic)
+    //
+    // PQSRTC does not own UI, but it can surface a coarse network-quality signal that apps can
+    // map to UX (banners, icons, "audio-only" prompts, etc.).
+    private struct NetworkQualitySink: Sendable {
+        let id: UUID
+        let continuation: AsyncStream<RTCNetworkQualityUpdate>.Continuation
+    }
+    private var networkQualitySinks: [NetworkQualitySink] = []
+    private var lastEmittedNetworkQualityByConnectionId: [String: RTCNetworkQuality] = [:]
+    private var lastEmittedNetworkQualityUptimeNsByConnectionId: [String: UInt64] = [:]
     
     /// Inbound ICE candidates buffered per `connectionId`.
     ///
@@ -166,6 +178,8 @@ public actor RTCSession {
     /// Controls how frame-level E2EE keys are applied to the WebRTC key provider.
     public let frameEncryptionKeyMode: RTCFrameEncryptionKeyMode
     
+    let enableEncryption: Bool
+    
     // MARK: - Crypto state
     
     /// Manages frame/media ratchet key state.
@@ -173,6 +187,17 @@ public actor RTCSession {
     
     /// Manages peer-connection/signaling ratchet key state.
     let pcRatchetManager: DoubleRatchetStateManager<SHA256>
+    
+    /// Task processor for handling encryption/decryption tasks.
+    /// Lazy to avoid using self before all stored properties are initialized.
+    lazy var taskProcessor: TaskProcessor = {
+        TaskProcessor(
+            executor: executor,
+            keyManager: pcKeyManager,
+            logger: logger,
+            rtcSession: self,
+            ratchetManager: pcRatchetManager)
+    }()
     
     // MARK: - Delegates & callbacks
     
@@ -279,6 +304,12 @@ public actor RTCSession {
     
     /// Raw remote view snapshots used for logging/cleanup on Android.
     var remoteViewData: [Data] = []
+
+    // MARK: - Adaptive video send control (Android)
+    //
+    // Mirrors the Apple implementation but uses `org.webrtc.PeerConnection.getStats`.
+    var adaptiveVideoSendTasksByConnectionId: [String: Task<Void, Never>] = [:]
+    var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int)] = [:]
 #endif
     
     // MARK: - Platform-specific RTC clients & encryption
@@ -292,10 +323,31 @@ public actor RTCSession {
 #elseif canImport(WebRTC)
     
     /// WebRTC frame-cryptor key provider used for frame-level E2EE on Apple platforms.
-    let keyProvider: RTCFrameCryptorKeyProvider
+    var keyProvider: RTCFrameCryptorKeyProvider?
     
     /// Tracks whether audio has been activated for the current call on Apple platforms.
     nonisolated(unsafe) var isAudioActivated = false
+
+    // MARK: - RTP egress diagnostics (Apple platforms)
+    //
+    // These tasks periodically query `getStats` to answer:
+    // - are we sending outbound RTP at all?
+    // - which candidate pair is selected?
+    // - is DTLS connected?
+    //
+    // This is intentionally keyed per connection id so group-call renegotiations don't mix telemetry.
+    var outboundRtpStatsTasksByConnectionId: [String: Task<Void, Never>] = [:]
+
+    // MARK: - Adaptive video send control (Apple platforms)
+    //
+    // Group calls via SFU do not transcode. We therefore adapt the *sender* egress ceiling
+    // using `availableOutgoingBitrate` from the selected ICE candidate pair.
+    //
+    // This allows:
+    // - low bandwidth: keep bitrate/fps low to avoid freezes
+    // - good bandwidth: raise bitrate/fps automatically for better quality
+    var adaptiveVideoSendTasksByConnectionId: [String: Task<Void, Never>] = [:]
+    var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int)] = [:]
 #endif
     
     // MARK: - Teardown idempotency
@@ -329,14 +381,13 @@ public actor RTCSession {
 #else
     var pendingRemoteVideoRenderersByConnectionId: [String: RTCVideoRenderWrapper] = [:]
 #endif
-
-    // MARK: - Group-call (SFU) ratchet ingress state
-    //
-    // Group calls receive multiple control-plane messages (answer, candidates, roster updates).
-    // We only need to run `recipientInitialization` once per SFU identity; subsequent messages
-    // should simply decrypt on the advancing ratchet state.
-    // `internal` so SFU/group-call handlers in extensions can access it.
-    var sfuRecipientInitializationCompleteBySfuId: Set<String> = []
+    
+    /// Pending local video enabled state requested by UI before the connection exists.
+    ///
+    /// Some call flows can present the UI and request video enable/disable before the
+    /// `RTCConnection` has been registered (e.g. inbound CallKit answer timing). We buffer
+    /// the desired state and apply it once the peer connection is created.
+    var pendingVideoEnabledByConnectionId: [String: Bool] = [:]
 
     // MARK: - Frame key provisioning diagnostics (DEBUG-only consumers)
     //
@@ -345,6 +396,21 @@ public actor RTCSession {
     // This does not affect crypto correctness; it is purely a guardrail for production operations.
     var lastFrameKeyIndexByParticipantId: [String: Int] = [:]
 
+    public var isGroupCall = false
+
+    /// Controls sender ceilings for SFU/group call video.
+    ///
+    /// Default: `.standard`.
+    public private(set) var sfuVideoQualityProfile: RTCVideoQualityProfile = .standard
+
+    /// Updates the SFU/group-call video quality profile.
+    ///
+    /// This affects:
+    /// - the initial sender ceiling applied when a video sender is created
+    /// - adaptive sender ceilings once `availableOutgoingBitrate` is available
+    public func setSfuVideoQualityProfile(_ profile: RTCVideoQualityProfile) {
+        sfuVideoQualityProfile = profile
+    }
     // MARK: - Public configuration & delegate API
     
     /// Sets the transport delegate.
@@ -365,6 +431,74 @@ public actor RTCSession {
     
     public func setHandshakeComplete(_ handshakeComplete: Bool) {
         self.handshakeComplete = handshakeComplete
+    }
+
+    // MARK: - Public network quality API
+
+    /// Creates a stream that emits coarse network quality updates.
+    ///
+    /// The SDK emits updates only when the quality bucket changes, with a small cooldown to
+    /// avoid oscillation spam.
+    public func createNetworkQualityStream() -> AsyncStream<RTCNetworkQualityUpdate> {
+        let id = UUID()
+        let logger = self.logger
+        return AsyncStream<RTCNetworkQualityUpdate>(bufferingPolicy: .bufferingNewest(10)) { continuation in
+            networkQualitySinks.append(.init(id: id, continuation: continuation))
+            continuation.onTermination = { [weak self] _ in
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.removeNetworkQualitySink(id: id)
+                }
+                logger.log(level: .debug, message: "Network quality stream terminated (id=\(id))")
+            }
+        }
+    }
+
+    private func removeNetworkQualitySink(id: UUID) {
+        networkQualitySinks.removeAll { $0.id == id }
+    }
+
+    /// Emits a network-quality update if the bucket changed (and cooldown allows).
+    func emitNetworkQualityUpdateIfNeeded(
+        connectionId: String,
+        quality: RTCNetworkQuality,
+        availableOutgoingBitrateBps: Int?,
+        rttMs: Int?,
+        appliedVideoMaxBitrateBps: Int?,
+        appliedVideoMaxFramerate: Int?,
+        nowUptimeNs: UInt64
+    ) {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !normalizedId.isEmpty else { return }
+
+        // Dedupe: only emit when bucket changes.
+        let lastQuality = lastEmittedNetworkQualityByConnectionId[normalizedId]
+        if lastQuality == quality { return }
+
+        // Cooldown: avoid oscillation spam.
+        let lastUptime = lastEmittedNetworkQualityUptimeNsByConnectionId[normalizedId] ?? 0
+        if lastUptime > 0, nowUptimeNs >= lastUptime {
+            let delta = nowUptimeNs - lastUptime
+            if delta < 2_000_000_000 { // 2s
+                return
+            }
+        }
+
+        lastEmittedNetworkQualityByConnectionId[normalizedId] = quality
+        lastEmittedNetworkQualityUptimeNsByConnectionId[normalizedId] = nowUptimeNs
+
+        let update = RTCNetworkQualityUpdate(
+            connectionId: normalizedId,
+            quality: quality,
+            availableOutgoingBitrateBps: availableOutgoingBitrateBps,
+            rttMs: rttMs,
+            appliedVideoMaxBitrateBps: appliedVideoMaxBitrateBps,
+            appliedVideoMaxFramerate: appliedVideoMaxFramerate
+        )
+
+        for sink in networkQualitySinks {
+            sink.continuation.yield(update)
+        }
     }
 
     /// Controls how inbound receiver events map to a `participantId`.
@@ -544,6 +678,7 @@ public actor RTCSession {
         logger: NeedleTailLogger = NeedleTailLogger("[RTCSession]"),
         ratchetSalt: Data = "PQSRTCFrameEncryptionSalt".data(using: .utf8)!,
         frameEncryptionKeyMode: RTCFrameEncryptionKeyMode = .shared,
+        enableEncryption: Bool = false,
         delegate: RTCTransportEvents?
     ) async {
         let (notificationStream, notificationContinuation) = AsyncStream<PeerConnectionNotifications?>.makeStream()
@@ -555,23 +690,44 @@ public actor RTCSession {
         self.logger = logger
         self.ratchetSalt = ratchetSalt
         self.frameEncryptionKeyMode = frameEncryptionKeyMode
+        self.enableEncryption = enableEncryption
         self.delegate = delegate
         self.ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
         self.pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
 
 #if canImport(WebRTC)
-        logger.log(level: .debug, message: "RTC Encryption key mode: \(frameEncryptionKeyMode)")
-        self.keyProvider = RTCFrameCryptorKeyProvider(
+        // FrameCryptor key provider is created lazily when encryption is enabled.
+        if enableEncryption {
+            ensureFrameKeyProviderIfNeeded()
+        }
+#endif
+        
+        // taskProcessor is lazy and will be initialized on first access
+        // This avoids using self before all stored properties are initialized
+        
+        logger.log(level: .trace, message: "Created RTCSession")
+    }
+
+#if canImport(WebRTC)
+    /// Ensures the WebRTC frame-cryptor key provider exists when frame encryption is enabled.
+    ///
+    /// This is intentionally idempotent and safe to call repeatedly.
+    func ensureFrameKeyProviderIfNeeded() {
+        guard enableEncryption else { return }
+        if keyProvider != nil { return }
+        
+        logger.log(level: .debug, message: "Creating FrameCryptorKeyProvider (mode: \(frameEncryptionKeyMode))")
+        keyProvider = RTCFrameCryptorKeyProvider(
             ratchetSalt: ratchetSalt,
             ratchetWindowSize: 0,
             sharedKeyMode: frameEncryptionKeyMode == .shared,
             uncryptedMagicBytes: "PQSRTCMagicBytes".data(using: .utf8)!,
             failureTolerance: -1,
             keyRingSize: 16,
-            discardFrameWhenCryptorNotReady: true)
-#endif
-        logger.log(level: .trace, message: "Created RTCSession")
+            discardFrameWhenCryptorNotReady: true
+        )
     }
+#endif
 
     /// Recreates the peer-connection notifications stream.
     ///
@@ -746,5 +902,3 @@ public enum RTCFrameEncryptionKeyMode: Sendable {
     case shared
     case perParticipant
 }
-
-

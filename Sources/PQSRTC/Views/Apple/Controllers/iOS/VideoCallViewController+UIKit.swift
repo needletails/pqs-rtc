@@ -107,9 +107,69 @@ public final class VideoCallViewController: UICollectionViewController {
         
         stateStreamTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            guard let stateStream = await self.session.callState._currentCallStream.last else {
+            
+            // The host app may present this controller before `RTCSession.createStateStream(with:)`
+            // has run (common on inbound CallKit answer flows). Wait until the stream exists rather
+            // than failing fast and leaving the UI in a "no video" state.
+            var stateStream: AsyncStream<CallStateMachine.State>?
+            while !Task.isCancelled {
+                if let s = await self.session.callState._currentCallStream.last {
+                    stateStream = s
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 25_000_000) // 25ms
+            }
+            guard let stateStream else {
                 logger.log(level: .error, message: "No call state stream available; cannot observe call state")
                 return
+            }
+
+            // If we subscribed late, the state machine may have already advanced to `.connected`.
+            // AsyncStream does not replay past values, so bootstrap UI from the current state first.
+            if let current = await self.session.callState.currentState, current != self.currentCallState {
+                self.currentCallState = current
+                await videoCallDelegate?.deliverCallState(self.currentCallState)
+                switch current {
+                case .waiting:
+                    break
+                case .ready(let currentCall):
+                    self.currentCall = currentCall
+                case .connecting(let callDirection, let currentCall):
+                    self.currentCall = currentCall
+                    switch callDirection {
+                    case .inbound(let callType), .outbound(let callType):
+                        if callType == .video,
+                           videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                            await self.createPreviewView()
+                            self.bringControlsToFront()
+                        }
+                    }
+                case .connected(let callDirection, let currentCall):
+                    self.currentCall = currentCall
+                    switch callDirection {
+                    case .inbound(let callType), .outbound(let callType):
+                        if callType == .video {
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                                await self.createPreviewView(shouldQuery: true)
+                            }
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "sample" }) == false {
+                                await self.createSampleView()
+                            }
+                        }
+                    }
+                case .held(_, _):
+                    break
+                case .ended(_, _):
+                    await tearDownCall()
+                    dismiss(animated: true)
+                case .failed(_, _, let errorMessage):
+                    await videoCallDelegate?.passErrorMessage(errorMessage)
+                    await tearDownCall()
+                    dismiss(animated: true)
+                case .callAnsweredAuxDevice:
+                    await tearDownCall()
+                    dismiss(animated: true)
+                }
             }
             
             for await state in stateStream {
@@ -131,7 +191,12 @@ public final class VideoCallViewController: UICollectionViewController {
                         case .voice:
                             break
                         case .video:
-                            await self.createPreviewView()
+                            // Defensive: some call flows can emit `.connecting` more than once.
+                            // Creating multiple preview views leaks capture/render resources and can
+                            // explode memory. Ensure preview creation is idempotent.
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                                await self.createPreviewView()
+                            }
                             self.bringControlsToFront()
                         }
                     }
@@ -144,7 +209,18 @@ public final class VideoCallViewController: UICollectionViewController {
                         case .voice:
                             break
                         case .video:
-                            await self.createSampleView()
+                            // If we attached to the state stream late (e.g. after CallKit answer),
+                            // we may observe `.connected` before `.connecting`. Ensure we still
+                            // create the local preview so the user isn't staring at a black screen
+                            // while the remote track/renegotiation settles.
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
+                                await self.createPreviewView(shouldQuery: true)
+                            }
+                            // Defensive: `.connected` can be re-emitted; avoid creating multiple
+                            // sample renderers (each starts a render pipeline and can leak memory).
+                            if videoViews.views.contains(where: { $0.videoView.contextName == "sample" }) == false {
+                                await self.createSampleView()
+                            }
                         }
                     }
                 case .held(_, _):
@@ -217,6 +293,12 @@ public final class VideoCallViewController: UICollectionViewController {
     /// - Parameter shouldQuery: If `true`, refreshes the diffable snapshot so the view is inserted
     ///   into the collection view before rendering begins.
     func createPreviewView(shouldQuery: Bool = true) async {
+        // Idempotency: avoid creating duplicate preview views if call-state re-emits `.connecting`.
+        if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) {
+            if shouldQuery { await performQuery() }
+            return
+        }
+        
         let localVideoView: NTMTKView
         do {
             localVideoView = try NTMTKView(type: .preview, contextName: "preview")
@@ -254,6 +336,12 @@ public final class VideoCallViewController: UICollectionViewController {
     /// - Parameter removePreview: If `true`, removes the preview from the collection snapshot
     ///   so the remote video takes the full screen; the preview is instead overlaid on top.
     func createSampleView(removePreview: Bool = true) async {
+        // Idempotency: avoid creating duplicate remote renderers if call-state re-emits `.connected`.
+        if videoViews.views.contains(where: { $0.videoView.contextName == "sample" }) {
+            configureLocalPreviewIfNeeded()
+            return
+        }
+        
         let remoteVideoView: NTMTKView
         do {
             remoteVideoView = try NTMTKView(type: .sample, contextName: "sample")

@@ -32,36 +32,27 @@ extension RTCSession {
     //MARK: Public
     
     public func handleHandshakeCompleted(_ call: Call) async throws {
-        var call = call
-        guard var recipient = call.recipients.first else {
-            throw RTCErrors.invalidConfiguration("Received handshakeComplete without a recipient in call")
-        }
-
-        if recipient.secretName == sessionParticipant?.secretName {
-            recipient.deviceId = sessionParticipant?.deviceId ?? ""
-            
-            let copiedSender = call.sender
-            call.recipients = [copiedSender]
-            call.sender = recipient
-            recipient = copiedSender
-        }
-
+        let copiedSender = call.sender
+        let call = try resolveProperRecipient(call: call)
+        let recipient = copiedSender
+        
         try await startSendingCandidates(call: call)
         if !handshakeComplete {
             setHandshakeComplete(true)
             
-            guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(call.sharedCommunicationId),
-                  let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey)  else {
+            let connectionIdentity = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+            guard let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey)  else {
                 throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
             }
             
             let plaintext = try BinaryEncoder().encode(call)
-            let packet = try await encryptOneToOneSignaling(
-                plaintext: plaintext,
-                connectionId: call.sharedCommunicationId,
+            let writeTask = WriteTask(
+                data: plaintext,
+                roomId: call.sharedCommunicationId.normalizedConnectionId,
                 flag: .handshakeComplete,
-                remoteProps: remoteProps)
-            try await requireTransport().sendOneToOneMessage(packet, recipient: recipient)
+                call: call)
+            let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
+            try await taskProcessor.feedTask(task: encryptableTask)
         }
     }
     
@@ -71,10 +62,20 @@ extension RTCSession {
     public func handleOffer(
         call: Call,
         sdp: SessionDescription,
-        metadata: SDPNegotiationMetadata
+        answerDeviceId: String
     ) async throws -> Call {
+        let call = try resolveProperRecipient(call: call)
         
-        let modified = await modifySDP(sdp: sdp.sdp, hasVideo: call.supportsVideo)
+        let sdpNegotiationMetadata = try PQSRTC.SDPNegotiationMetadata(
+            offerSecretName: call.sender.secretName,
+            offerDeviceId: call.sender.deviceId,
+            answerDeviceId: answerDeviceId)
+        
+        let modified = await modifySDP(
+            sdp: sdp.sdp,
+            hasVideo: call.supportsVideo,
+            stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
+        )
         
 #if os(Android)
         try await rtcClient.setRemoteDescription(RTCSessionDescription(
@@ -95,16 +96,15 @@ extension RTCSession {
             throw RTCErrors.invalidConfiguration("Remote Props are nil")
         }
         
-        // Encrypt answer and send via encrypted transport
+        // Encrypt answer and send (roomId normalized; "#" reattached at transport).
         let plaintext = try BinaryEncoder().encode(processedCall)
-        let packet = try await encryptOneToOneSignaling(
-            plaintext: plaintext,
-            connectionId: call.sharedCommunicationId,
+        let writeTask = WriteTask(
+            data: plaintext,
+            roomId: call.sharedCommunicationId.normalizedConnectionId,
             flag: .answer,
-            remoteProps: remoteProps)
-        
-        try await requireTransport().sendOneToOneMessage(packet, recipient: processedCall.sender)
-        await setConnectingIfReady(call: call, callDirection: .inbound(call.supportsVideo ? .video : .voice))
+            call: call)
+        let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
+        try await taskProcessor.feedTask(task: encryptableTask)
         
 #if os(iOS) && canImport(AVKit)
         try setExternalAudioSession()
@@ -117,13 +117,38 @@ extension RTCSession {
         return processedCall
     }
     
+    /// Applies a renegotiation offer (remote SDP) and creates an answer.
+    /// Used when the SFU sends a renegotiation offer to an existing peer so they can receive a new peer's media.
+    /// - Returns: Call with answer SDP in metadata, ready to be encoded and sent.
+    func handleRenegotiationOffer(sdp: SessionDescription, call: Call) async throws -> Call {
+        let modified = await modifySDP(
+            sdp: sdp.sdp,
+            hasVideo: call.supportsVideo,
+            stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
+        )
+#if os(Android)
+        try await rtcClient.setRemoteDescription(RTCSessionDescription(
+            typeDescription: "OFFER",
+            sdp: modified))
+#else
+        try await setRemote(sdp:
+                                WebRTC.RTCSessionDescription(type: sdp.type.rtcSdpType, sdp: modified),
+                            call: call)
+#endif
+        return try await createAnswer(call: call)
+    }
+    
     /// Applies an inbound SDP answer (1:1).
     public func handleAnswer(
         call: Call,
         sdp: SessionDescription
     ) async throws {
-        
-        let modified = await modifySDP(sdp: sdp.sdp, hasVideo: call.supportsVideo)
+        let call = try resolveProperRecipient(call: call)
+        let modified = await modifySDP(
+            sdp: sdp.sdp,
+            hasVideo: call.supportsVideo,
+            stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
+        )
         
 #if os(Android)
         try await rtcClient.setRemoteDescription(RTCSessionDescription(
@@ -145,7 +170,7 @@ extension RTCSession {
             }
             
             var call = call
-
+            
             guard let sessionParticipant else {
                 throw RTCErrors.invalidConfiguration("Received a call without a session participant")
             }
@@ -158,19 +183,22 @@ extension RTCSession {
                 recipient = copiedSender
             }
             
-            guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(call.sharedCommunicationId),
-                  let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey)  else {
+            let connectionIdentity = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+            guard let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey) else {
                 throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
             }
             
             let plaintext = try BinaryEncoder().encode(call)
-            let packet = try await encryptOneToOneSignaling(
-                plaintext: plaintext,
-                connectionId: call.sharedCommunicationId,
+            let writeTask = WriteTask(
+                data: plaintext,
+                roomId: call.sharedCommunicationId.normalizedConnectionId,
                 flag: .handshakeComplete,
-                remoteProps: remoteProps)
+                call: call)
+            let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
+            try await taskProcessor.feedTask(task: encryptableTask)
             setHandshakeComplete(true)
-            try await requireTransport().sendOneToOneMessage(packet, recipient: recipient)
+            
+            try await startSendingCandidates(call: call)
         }
     }
     
@@ -179,6 +207,7 @@ extension RTCSession {
         call: Call,
         candidate: IceCandidate
     ) async throws {
+        let call = try resolveProperRecipient(call: call)
         try await setRemote(candidate: candidate, call: call)
     }
     
@@ -186,30 +215,7 @@ extension RTCSession {
         guard await connectionManager.findConnection(with: call.sharedCommunicationId) != nil else { return }
         if !iceDeque.isEmpty {
             for item in iceDeque {
-                // For SFU group calls, encrypt candidates via the SFU ratchet.
-                if self.groupCalls[call.sharedCommunicationId] != nil {
-                    try await sendEncryptedSfuCandidateFromDeque(item, call: call)
-                    self.logger.log(level: .info, message: "Sent encrypted SFU candidate, \(item.id)")
-                } else {
-                    // For 1:1 calls, encrypt candidates and send via encrypted transport
-                    var call = call
-                    call.metadata = try BinaryEncoder().encode(item)
-                    let plaintext = try BinaryEncoder().encode(call)
-                    guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(call.sharedCommunicationId),
-                          let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey)  else {
-                        throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
-                    }
-                    let packet = try await encryptOneToOneSignaling(
-                        plaintext: plaintext,
-                        connectionId: call.sharedCommunicationId,
-                        flag: .candidate,
-                        remoteProps: remoteProps)
-                    guard let recipient = call.recipients.first else {
-                        throw RTCErrors.invalidConfiguration("No recipients in call: \(call)")
-                    }
-                    try await self.requireTransport().sendOneToOneMessage(packet, recipient: recipient)
-                    self.logger.log(level: .info, message: "Sent encrypted 1:1 candidate, \(item.id)")
-                }
+                try await sendEncryptedSfuCandidateFromDeque(item, call: call)
             }
             iceDeque.removeAll()
         }
@@ -257,7 +263,11 @@ extension RTCSession {
             // SKIP INSERT: android.util.Log.d("RTCClient", "Android Offer SDP:\n" + description.sdp)
             
             // Modify SDP for specific requirements
-            let modified = await modifySDP(sdp: description.sdp, hasVideo: hasVideo)
+            let modified = await modifySDP(
+                sdp: description.sdp,
+                hasVideo: hasVideo,
+                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
+            )
             description = RTCSessionDescription(typeDescription: description.typeDescription, sdp: modified)
             
             // SKIP INSERT: android.util.Log.d("RTCClient", "Android Modified Offer SDP:\n" + description.sdp)
@@ -271,7 +281,11 @@ extension RTCSession {
             var description: WebRTC.RTCSessionDescription = try await generateSDPOffer(for: connection, hasAudio: true, hasVideo: hasVideo)
             
             // Modify SDP for specific requirements
-            let modified = await modifySDP(sdp: description.sdp, hasVideo: hasVideo)
+            let modified = await modifySDP(
+                sdp: description.sdp,
+                hasVideo: hasVideo,
+                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
+            )
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             
             logger.log(level: .info, message: "Apple Platform Modified Offer SDP:\n\(description.sdp)")
@@ -317,8 +331,12 @@ extension RTCSession {
         // Ensure peer-notifications consumer is running before setting descriptions.
         handleNotificationsStream()
         
-        // Wait for peer connection to be ready
-        try await loop.run(10, sleep: Duration.seconds(1)) { [weak self] in
+        // Wait for peer connection to be ready.
+        //
+        // This is on the critical inbound-call path; 1s polling introduces visible lag in UI
+        // transition and can delay remote track availability. Use a tighter polling interval
+        // while keeping the same overall timeout budget (~10s).
+        try await loop.run(200, sleep: Duration.milliseconds(50)) { [weak self] in
             guard let self else { return false }
             var canRun = true
             let state = await self.pcStateByConnectionId[call.sharedCommunicationId] ?? .none
@@ -349,7 +367,11 @@ extension RTCSession {
             // SKIP INSERT: android.util.Log.d("RTCClient", "Android Answer SDP:\n" + description.sdp)
             
             // Modify SDP for specific requirements
-            let modified = await modifySDP(sdp: description.sdp, hasVideo: call.supportsVideo)
+            let modified = await modifySDP(
+                sdp: description.sdp,
+                hasVideo: call.supportsVideo,
+                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
+            )
             description = RTCSessionDescription(typeDescription: description.typeDescription, sdp: modified)
             
             // SKIP INSERT: android.util.Log.d("RTCClient", "Android Modified Answer SDP:\n" + description.sdp)
@@ -363,7 +385,11 @@ extension RTCSession {
             var description: WebRTC.RTCSessionDescription = try await generateSDPAnswer(for: connection, hasAudio: true, hasVideo: call.supportsVideo)
             
             // Modify SDP for specific requirements
-            let modified = await modifySDP(sdp: description.sdp, hasVideo: call.supportsVideo)
+            let modified = await modifySDP(
+                sdp: description.sdp,
+                hasVideo: call.supportsVideo,
+                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
+            )
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             
             logger.log(level: .info, message: "Apple Platform Modified Answer SDP:\n\(description.sdp)")
@@ -433,7 +459,11 @@ extension RTCSession {
             
             // Modify SDP for specific requirements
             var modifiedSdp = sdp
-            let modified = await modifySDP(sdp: sdp.sdp, hasVideo: call.supportsVideo)
+            let modified = await modifySDP(
+                sdp: sdp.sdp,
+                hasVideo: call.supportsVideo,
+                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
+            )
             modifiedSdp = RTCSessionDescription(typeDescription: sdp.typeDescription, sdp: modified)
             
             // Set remote SDP using the new SDPHandler
@@ -481,7 +511,7 @@ extension RTCSession {
         handleNotificationsStream()
         
         do {
-
+            
             guard let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
                 throw RTCErrors.invalidConfiguration("Connection must be created before setting remote SDP.")
             }
@@ -490,7 +520,11 @@ extension RTCSession {
             
             // Modify SDP for specific requirements
             var modifiedSdp = sdp
-            let modified = await modifySDP(sdp: sdp.sdp, hasVideo: call.supportsVideo)
+            let modified = await modifySDP(
+                sdp: sdp.sdp,
+                hasVideo: call.supportsVideo,
+                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
+            )
             modifiedSdp = WebRTC.RTCSessionDescription(type: sdp.type, sdp: modified)
             
             // Set remote SDP using the new SDPHandler
@@ -568,7 +602,7 @@ extension RTCSession {
         }
     }
     
-    //MARK: Priavate
+    //MARK: Private
     
     private func processCandidates(connection: RTCConnection, consumer: NeedleTailAsyncConsumer<IceCandidate>) async throws {
         // Skip-compatible approach: process candidates directly from the consumer
@@ -578,7 +612,11 @@ extension RTCSession {
             //we need to find if last id contained in deq
             let iceCandidate = candidate.item
 #if canImport(WebRTC)
-            let ice: WebRTC.RTCIceCandidate = WebRTC.RTCIceCandidate(sdp: iceCandidate.sdp, sdpMLineIndex: iceCandidate.sdpMLineIndex, sdpMid: iceCandidate.sdpMid ?? "")
+            let ice: WebRTC.RTCIceCandidate = WebRTC.RTCIceCandidate(
+                sdp: iceCandidate.sdp,
+                sdpMLineIndex: iceCandidate.sdpMLineIndex,
+                sdpMid: iceCandidate.sdpMid
+            )
             try await connection.peerConnection.add(ice)
 #elseif os(Android)
             let ice: RTCIceCandidate = RTCIceCandidate(sdp: iceCandidate.sdp, sdpMLineIndex: iceCandidate.sdpMLineIndex, sdpMid: iceCandidate.sdpMid ?? "")
@@ -603,7 +641,11 @@ extension RTCSession {
             case NTASequenceStateMachine.NextNTAResult.ready(let candidate):
                 let iceCandidate = candidate.item
 #if canImport(WebRTC)
-                let ice: WebRTC.RTCIceCandidate = WebRTC.RTCIceCandidate(sdp: iceCandidate.sdp, sdpMLineIndex: iceCandidate.sdpMLineIndex, sdpMid: iceCandidate.sdpMid ?? "")
+                let ice: WebRTC.RTCIceCandidate = WebRTC.RTCIceCandidate(
+                    sdp: iceCandidate.sdp,
+                    sdpMLineIndex: iceCandidate.sdpMLineIndex,
+                    sdpMid: iceCandidate.sdpMid
+                )
                 try await connection.peerConnection.add(ice)
 #elseif os(Android)
                 let ice: RTCIceCandidate = RTCIceCandidate(sdp: iceCandidate.sdp, sdpMLineIndex: iceCandidate.sdpMLineIndex, sdpMid: iceCandidate.sdpMid ?? "")
@@ -619,5 +661,23 @@ extension RTCSession {
                 return
             }
         }
+    }
+    
+    func resolveProperRecipient(call: Call) throws -> Call {
+        var call = call
+        guard let sessionParticipant else {
+            throw RTCErrors.invalidConfiguration("Session Participant not set")
+        }
+        if call.sender.secretName == sessionParticipant.secretName {
+            call.sender.deviceId = sessionParticipant.deviceId ?? ""
+        } else {
+            let copiedSender = call.sender
+            guard let recipient = call.recipients.first else {
+                throw RTCErrors.invalidConfiguration("Received offer without a recipient in call")
+            }
+            call.recipients = [copiedSender]
+            call.sender = recipient
+        }
+        return call
     }
 }

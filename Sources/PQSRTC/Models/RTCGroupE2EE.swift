@@ -19,7 +19,10 @@ import Foundation
 import DoubleRatchetKit
 
 public enum PacketFlag: Codable, Sendable {
+    // SFU/1:1 signaling
     case offer, answer, candidate, handshakeComplete
+    // SFU group-call control (roster)
+    case participants, participantDemuxId
 }
 
 public struct RatchetMessagePacket: Codable, Sendable, Equatable {
@@ -28,8 +31,6 @@ public struct RatchetMessagePacket: Codable, Sendable, Equatable {
     ///
     /// This typically matches the group call's `sfuRecipientId` and the WebRTC PeerConnection's `connectionId`.
     public let sfuIdentity: String
-    /// The encrypted header (duplicated from `ratchetMessage.header` for convenience).
-    public let header: EncryptedHeader
     /// The encrypted ratchet message containing the payload.
     public let ratchetMessage: RatchetMessage
     
@@ -39,9 +40,9 @@ public struct RatchetMessagePacket: Codable, Sendable, Equatable {
         sfuIdentity: String,
         header: EncryptedHeader,
         ratchetMessage: RatchetMessage,
-        flag: PacketFlag) {
+        flag: PacketFlag
+    ) {
             self.sfuIdentity = sfuIdentity
-            self.header = header
             self.ratchetMessage = ratchetMessage
             self.flag = flag
         }

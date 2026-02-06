@@ -87,7 +87,14 @@ extension RTCSession {
         logger.log(level: .info, message: "Creating local audio track for connection: \(connection.id)")
         let audioConstraints = WebRTC.RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
         let audioSource = RTCSession.factory.audioSource(with: audioConstraints)
-        let audioTrack = RTCSession.factory.audioTrack(with: audioSource, trackId: "audio_\(connection.id)")
+        // IMPORTANT (SFU + E2EE):
+        // Track IDs must be unique per sender. Using only `connection.id` (room id) causes the SFU
+        // to receive multiple participants with the same `track_id` (e.g. "audio_<roomId>"), which
+        // breaks forwarding/demux and can also break frame-cryptor key routing.
+        //
+        // We use: audio_<localParticipantId>_<connectionId>
+        let audioTrackId = "audio_\(connection.localParticipantId)_\(connection.id)"
+        let audioTrack = RTCSession.factory.audioTrack(with: audioSource, trackId: audioTrackId)
         logger.log(level: .info, message: "Successfully created audio track")
         return audioTrack
     }

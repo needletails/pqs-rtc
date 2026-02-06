@@ -104,6 +104,11 @@ public actor CallStateMachine {
     }
     
     func createStreams(with call: Call) async {
+        
+        if !currentCallStream.isEmpty {
+            return
+        }
+        
         // Clean up existing streams first
         await cleanup()
         

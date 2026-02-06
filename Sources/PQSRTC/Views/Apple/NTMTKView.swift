@@ -275,7 +275,7 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
                     if Thread.isMainThread {
                         previewCaptureView.removeSession()
                     } else {
-                        DispatchQueue.main.sync {
+                        DispatchQueue.main.async {
                             previewCaptureView.removeSession()
                         }
                     }
@@ -453,7 +453,7 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
             if Thread.isMainThread {
                 previewCaptureView.removeSession()
             } else {
-                DispatchQueue.main.sync {
+                DispatchQueue.main.async {
                     previewCaptureView.removeSession()
                 }
             }

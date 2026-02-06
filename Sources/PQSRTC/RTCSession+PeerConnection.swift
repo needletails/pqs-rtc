@@ -25,6 +25,56 @@ import WebRTC
 #endif
 
 extension RTCSession {
+
+    // MARK: - SFU (group call) video sender limits
+#if canImport(WebRTC) && !os(Android)
+    /// Applies conservative send limits for SFU/group calls.
+    ///
+    /// Rationale: `swift-sfu` does not transcode, and offers show no simulcast layers.
+    /// If iOS publishes at too high a bitrate for the real uplink, receivers can freeze
+    /// until keyframes (loss/jitter + PLI recovery). Capping sender egress is the highest
+    /// impact fix for the "remote video freeze/burst" symptom on poor uplinks.
+    private func applySfuVideoSenderLimitsIfNeeded(sender: RTCRtpSender) {
+        // Only enforce for SFU/group calls (our convention: connection id prefixed with "#").
+        // Avoid changing 1:1 behavior unless explicitly needed.
+        guard sender.track?.kind == kRTCMediaStreamTrackKindVideo else { return }
+
+        // Initial ceiling comes from the selected profile.
+        let cfg = sfuVideoQualityProfile.adaptiveConfig
+        let maxBitrateBps = cfg.startingBitrateBps
+        let maxFramerate = cfg.startingFramerate
+
+        var params = sender.parameters
+        guard !params.encodings.isEmpty else { return }
+
+        for encoding in params.encodings {
+            // Keep existing active/priority semantics; set a *starting* ceiling only.
+            // The adaptive send loop will raise/lower these as network conditions change.
+            if encoding.maxBitrateBps == nil {
+                encoding.maxBitrateBps = NSNumber(value: maxBitrateBps)
+            }
+            if encoding.maxFramerate == nil {
+                encoding.maxFramerate = NSNumber(value: maxFramerate)
+            }
+            // Optional knob if you still see freezes: uncomment to force downscale.
+            // encoding.scaleResolutionDownBy = NSNumber(value: 2.0)
+        }
+        sender.parameters = params
+    }
+
+#endif
+
+    /// WebRTC SDP tokens like msid stream/track identifiers must not contain certain characters
+    /// (notably `#`), or native SDP parsing can fail on the SFU side.
+    ///
+    /// We keep `connection.id` unchanged for signaling/crypto, but sanitize what we embed into
+    /// streamIds so the generated SDP is always parseable.
+    private func sdpSafeStreamId(for rawId: String) -> String {
+        // Conservative: replace anything outside [A-Za-z0-9._-] with underscore.
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+        let sanitized = rawId.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+        return "streamId_" + String(sanitized)
+    }
     
     /// Creates and configures a new peer connection for a call.
     ///
@@ -177,6 +227,8 @@ extension RTCSession {
         handleNotificationsStream()
         
         if !willFinishNegotiation {
+            // Always perform the 1:1 ciphertext handshake so signaling can proceed.
+            // FrameCryptor (media frame encryption) is independently gated by `enableEncryption`.
             try await setMessageKey(connection: connection, call: call)
             if let foundConnection = await connectionManager.findConnection(with: connection.id) {
                 connection = foundConnection
@@ -190,8 +242,17 @@ extension RTCSession {
         
         // Update connection in manager with any changes from adding tracks
         await connectionManager.updateConnection(id: connection.id, with: connection)
+
+        // Apply any pending local video enabled state that was requested before the connection existed.
+        let normalizedId = connection.id.normalizedConnectionId
+        if let pendingVideoEnabled = pendingVideoEnabledByConnectionId.removeValue(forKey: normalizedId)
+            ?? pendingVideoEnabledByConnectionId.removeValue(forKey: connection.id) {
+            await setVideoTrack(isEnabled: pendingVideoEnabled, connectionId: normalizedId)
+        }
         
         logger.log(level: .info, message: "Successfully created peer connection with id: \(call.sharedCommunicationId)")
+        
+        await setConnectingIfReady(call: call, callDirection: .inbound(call.supportsVideo ? .video : .voice))
         return connection
     }
     
@@ -260,6 +321,14 @@ extension RTCSession {
         iceDeque.removeAll()
         pendingRemoteVideoRenderersByConnectionId.removeAll()
 
+#if canImport(WebRTC)
+        // Stop outbound RTP stats loops (diagnostic only).
+        for (_, task) in outboundRtpStatsTasksByConnectionId {
+            task.cancel()
+        }
+        outboundRtpStatsTasksByConnectionId.removeAll()
+#endif
+
         // Shutdown ratchet manager and clear all crypto/key state so the
         // next call starts from a clean slate (no pending ciphertext/keys).
         try? await ratchetManager.shutdown()
@@ -296,14 +365,20 @@ extension RTCSession {
             let audioTrack = try self.createAudioTrack(with: connection)
             
             // Add audio track to peer connection and capture the returned sender
-            let id = "streamId_\(connection.id)"
+            // IMPORTANT (SFU + E2EE):
+            // The streamId is used by remote receivers to identify the track owner in Unified Plan.
+            // Using `connection.id` (room id) collapses all participants into the same stream id.
+            // Use the local participant id instead so receivers can map streamIds -> sender.
+            let id = sdpSafeStreamId(for: connection.localParticipantId)
             let maybeAudioSender = connection.peerConnection.add(audioTrack, streamIds: [id])
             
             // CRITICAL: Create sender FrameCryptor using the returned sender
             // This ensures frames are encrypted from the start, without relying on async sender discovery
             if let audioSender = maybeAudioSender, connection.audioSenderCryptor == nil {
                 do {
-                    try await self.createEncryptedFrame(connection: connection, kind: .audioSender(audioSender))
+                    if enableEncryption {
+                        try await self.createEncryptedFrame(connection: connection, kind: .audioSender(audioSender))
+                    }
                 } catch {
                     logger.log(level: .warning, message: "⚠️ Failed to create audio sender FrameCryptor immediately - will retry in addedStream: \(error)")
                 }
@@ -345,15 +420,25 @@ extension RTCSession {
             // Use the returned updated connection so we keep rtcVideoCaptureWrapper
             updatedConnection = returnedConnection
             updatedConnection.localVideoTrack = videoTrack.track
-            let id = "streamId_\(connection.id)"
+            let id = sdpSafeStreamId(for: connection.localParticipantId)
             // Add video track to peer connection and capture the returned sender
             let maybeVideoSender = updatedConnection.peerConnection.add(videoTrack.track, streamIds: [id])
+
+#if canImport(WebRTC) && !os(Android)
+            // Apply SFU/group-call sender caps and codec preferences immediately.
+            // This prevents iOS from overshooting uplink defaults before negotiation settles.
+            if updatedConnection.id.isGroupCall, let videoSender = maybeVideoSender {
+                applySfuVideoSenderLimitsIfNeeded(sender: videoSender)
+            }
+#endif
             
             // CRITICAL: Create sender FrameCryptor using the returned sender
             // This ensures frames are encrypted from the start, without relying on async sender discovery
             if let videoSender = maybeVideoSender, updatedConnection.videoSenderCryptor == nil {
                 do {
-                    try await self.createEncryptedFrame(connection: updatedConnection, kind: .videoSender(videoSender))
+                    if enableEncryption {
+                        try await self.createEncryptedFrame(connection: updatedConnection, kind: .videoSender(videoSender))
+                    }
                 } catch {
                     logger.log(level: .warning, message: "⚠️ Failed to create sender FrameCryptor immediately - will retry in addedStream: \(error)")
                 }
@@ -433,7 +518,7 @@ extension RTCSession {
     public func createStateStream(with call: Call) async throws {
         // Treat this call's connection id as the active one.
         // This prevents late callbacks from a previous call from affecting the new call.
-        activeConnectionId = call.sharedCommunicationId
+        activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
         await callState.createStreams(with: call)
         handleStateStream()
     }
@@ -514,14 +599,14 @@ extension RTCSession {
 
         // If we're ending the currently active call, clear the active connection marker.
         if let currentCall {
-            if activeConnectionId == currentCall.sharedCommunicationId {
+            if activeConnectionId == currentCall.sharedCommunicationId.normalizedConnectionId {
                 activeConnectionId = nil
             }
         } else {
             activeConnectionId = nil
         }
         
-        let connectionId = currentCall?.sharedCommunicationId
+        let connectionId = currentCall?.sharedCommunicationId.normalizedConnectionId
 
         if let connectionId {
             pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
@@ -531,6 +616,9 @@ extension RTCSession {
         if let connectionId,
            var connection = await connectionManager.findConnection(with: connectionId) {
 #if canImport(WebRTC)
+            // Stop adaptive video sender control for this connection.
+            stopAdaptiveVideoSend(connectionId: connectionId)
+
             // Disable video tracks first to stop capture/rendering
             if connection.localVideoTrack != nil {
                 await setVideoTrack(isEnabled: false, connectionId: connectionId)
@@ -565,6 +653,8 @@ extension RTCSession {
             await connectionManager.updateConnection(id: connectionId, with: connection)
             logger.log(level: .debug, message: "Cleaned up video and crypto resources for connection: \(connectionId)")
 #elseif os(Android)
+            // Stop adaptive video sender control for this connection.
+            stopAdaptiveVideoSend(connectionId: connectionId)
             // Android cleanup is handled in rtcClient.close(), but ensure video is disabled
             await setVideoTrack(isEnabled: false, connectionId: connectionId)
 #endif
@@ -647,8 +737,12 @@ extension RTCSession {
         }
         inboundCandidateConsumers.removeAll()
         
+        // Clear any buffered media toggles.
+        pendingVideoEnabledByConnectionId.removeAll()
+        
         // Reset counters and flags
         notRunning = true
+        isGroupCall = false
         lastId = 0
         iceId = 0
         

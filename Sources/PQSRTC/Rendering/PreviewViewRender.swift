@@ -270,7 +270,20 @@ actor PreviewViewRender: RendererDelegate {
     private var rtcVideoCaptureWrapper: RTCVideoCaptureWrapper?
     func setCapture(_ rtcVideoCaptureWrapper: RTCVideoCaptureWrapper?) {
         self.rtcVideoCaptureWrapper = rtcVideoCaptureWrapper
+        if rtcVideoCaptureWrapper != nil {
+            self.logger.log(level: .info, message: "✅ Bound RTCVideoCaptureWrapper (WebRTC capture injection enabled)")
+        } else {
+            self.logger.log(level: .info, message: "⛔️ Unbound RTCVideoCaptureWrapper (WebRTC capture injection disabled)")
+        }
     }
+
+    // MARK: - Capture → WebRTC injection telemetry
+    //
+    // This answers the critical question:
+    // "Are camera frames being injected into WebRTC (and therefore eligible to become RTP)?"
+    nonisolated(unsafe) private var injectedFrameCount: UInt64 = 0
+    nonisolated(unsafe) private var didLogFirstInjection: Bool = false
+    nonisolated(unsafe) private var lastInjectionUptimeNs: UInt64 = 0
     
     enum DeviceOrientationState: Sendable {
         case wasLandscapeLeft, wasLandscapeRight, none
@@ -390,12 +403,37 @@ actor PreviewViewRender: RendererDelegate {
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(packet.sampleBuffer) else { return }
             guard let session = self.layer.session else { return }
 
-            rtcVideoCaptureWrapper?.passCapture(
-                pixelBuffer: pixelBuffer,
-                captureSession: session,
-                sampleBuffer: packet.sampleBuffer,
-                connection: packet.connection,
-                rotation: rtcRotation)
+            if let wrapper = rtcVideoCaptureWrapper {
+                wrapper.passCapture(
+                    pixelBuffer: pixelBuffer,
+                    captureSession: session,
+                    sampleBuffer: packet.sampleBuffer,
+                    connection: packet.connection,
+                    rotation: rtcRotation)
+
+                lastInjectionUptimeNs = DispatchTime.now().uptimeNanoseconds
+                injectedFrameCount &+= 1
+
+                if didLogFirstInjection == false {
+                    didLogFirstInjection = true
+                    self.logger.log(level: .info, message: "✅ First camera frame injected into WebRTC")
+                }
+
+                if PQSRTCDiagnostics.criticalBugLoggingEnabled, injectedFrameCount % 120 == 0 {
+                    // Roughly every ~4s at 30fps. Low-noise, but proves ongoing injection.
+                    let lastMsAgo: UInt64 = {
+                        let now = DispatchTime.now().uptimeNanoseconds
+                        guard now >= lastInjectionUptimeNs else { return 0 }
+                        return (now - lastInjectionUptimeNs) / 1_000_000
+                    }()
+                    self.logger.log(level: .debug, message: "Capture→WebRTC injection OK: injectedFrames=\(injectedFrameCount) lastInjectionMsAgo=\(lastMsAgo)")
+                }
+            } else {
+                // This is the "silent failure" mode: user sees local preview, but WebRTC produces no video RTP.
+                if PQSRTCDiagnostics.criticalBugLoggingEnabled {
+                    self.logger.log(level: .warning, message: "⚠️ Camera frame available but WebRTC capture wrapper is nil (no frames injected into WebRTC)")
+                }
+            }
             
             var scaleMode: ScaleMode = .none
 

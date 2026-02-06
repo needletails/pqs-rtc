@@ -12,112 +12,119 @@ import BinaryCodable
 
 
 extension RTCSession {
-    private func requireSfuSignalingProps(from call: Call) throws -> SessionIdentity.UnwrappedProps {
-        guard let props = call.signalingIdentityProps else { throw EncryptionErrors.missingProps }
-        return props
+
+    /// Resolves the group call for an SFU identity. Group calls are stored by normalized ID (no "#").
+    /// Pass any form (channel "#uuid" or UUID); lookup uses normalized key.
+    func groupCall(forSfuIdentity sfuIdentity: String) -> RTCGroupCall? {
+        groupCalls[sfuIdentity.normalizedConnectionId]
     }
-    
-    /// Ensures the SFU (group-call) sender ratchet is initialized before any `ratchetEncrypt`.
-    ///
-    /// This is safe to call multiple times; the underlying Double Ratchet manager will reuse
-    /// existing state for the same session id.
-    func ensureSfuSenderInitialization(call: Call, sfuRecipientId: String) async throws -> ConnectionSessionIdentity {
-        guard let group = groupCalls[sfuRecipientId] else {
-            throw RTCErrors.missingGroupCall
-        }
-        let props = try requireSfuSignalingProps(from: call)
-        guard let recipientIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(sfuRecipientId) else {
-            throw EncryptionErrors.missingSessionIdentity
-        }
-        
-        try await pcRatchetManager.senderInitialization(
-            sessionIdentity: recipientIdentity.sessionIdentity,
-            sessionSymmetricKey: group.localIdentity.symmetricKey,
-            remoteKeys: RemoteKeys(
-                longTerm: CurvePublicKey(props.longTermPublicKey),
-                oneTime: props.oneTimePublicKey,
-                mlKEM: props.mlKEMPublicKey
-            ),
-            localKeys: group.localIdentity.localKeys
-        )
-        return recipientIdentity
-    }
-    
-    /// Creates the room and room keys this is the entry point for group calls
-    public func join(
+
+    /// Creates the room and room keys this is the entry point for group calls.
+    /// Store and find by normalized ID (no "#"); transport layer reattaches "#" for IRC.
+    public func groupCallNegotiation(
         sender: Call.Participant,
         participants: [Call.Participant],
         sfuRecipientId: String,
         supportsVideo: Bool = true
     ) async throws {
-        
+        isGroupCall = true
+        let normalizedId = sfuRecipientId.normalizedConnectionId
         // Allow joining an SFU room even if the participant list is currently empty.
         var call = try Call(
-            groupSharedCommunicationId: sfuRecipientId,
+            groupSharedCommunicationId: normalizedId,
             sender: sender,
             recipients: participants,
             supportsVideo: supportsVideo,
-            isActive: true
-        )
+            isActive: true)
         
-        let localIdentity: ConnectionLocalIdentity
-        if let existingIdentity = try await pcKeyManager.fetchCallKeyBundle() {
-            localIdentity = existingIdentity
+        let signalingLocalIdentity: ConnectionLocalIdentity
+        if let foundSignalingLocalIdentity = try? await pcKeyManager.fetchCallKeyBundle() {
+            signalingLocalIdentity = foundSignalingLocalIdentity
         } else {
-            // Group calls use the SFU/control-plane key store (`pcKeyManager`) consistently.
-            // This prevents symmetric-key mismatches when the Double Ratchet state manager
-            // unwraps/stores session identity props.
-            localIdentity = try await pcKeyManager.generateSenderIdentity(
-                connectionId: sfuRecipientId,
-                secretName: sender.secretName
-            )
+            signalingLocalIdentity = try await pcKeyManager.generateSenderIdentity(
+               connectionId: call.sharedCommunicationId,
+               secretName: sender.secretName)
         }
         
         // For group calls, these props are used for SFU signaling ratchet remoteKeys.
-        call.signalingIdentityProps = await localIdentity.sessionIdentity.props(symmetricKey: localIdentity.symmetricKey)
+        call.signalingIdentityProps = await signalingLocalIdentity.sessionIdentity.props(symmetricKey: signalingLocalIdentity.symmetricKey)
         guard call.signalingIdentityProps != nil else {
             throw EncryptionErrors.missingProps
         }
-        
-        // Create Group call with needed metadata
+
+        // Create Group call with needed metadata (key by normalized ID).
         let group = createGroupCall(
             call: call,
-            sfuRecipientId: sfuRecipientId,
-            localIdentity: localIdentity)
+            sfuRecipientId: normalizedId,
+            localIdentity: signalingLocalIdentity)
         
-        groupCalls[sfuRecipientId] = group
+        groupCalls[normalizedId] = group
         
         setMediaDelegate(group)
         try await group.join()
         
+        // Transport uses IRC channel format (with "#").
         try await delegate?.negotiateGroupIdentity(
             call: call,
-            sfuRecipientId: sfuRecipientId)
+            sfuRecipientId: sfuRecipientId.ensureIRCChannel)
     }
     
     public func leave(sfuRecipientId: String, call: Call) async throws {
-        guard let group = groupCalls[sfuRecipientId] else {
+        let normalizedId = sfuRecipientId.normalizedConnectionId
+        guard let group = groupCalls[normalizedId] else {
             throw RTCErrors.missingGroupCall
         }
         await group.leave()
-        groupCalls.removeValue(forKey: sfuRecipientId)
+        groupCalls.removeValue(forKey: normalizedId)
         await shutdown(with: call)
     }
     
+    public func sendGroupCallOffer(_ call: Call) async throws -> Call {
+        var call = call
+        
+        // Mark this call's PeerConnection as the active one (SFU uses a single PC).
+        activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
+
+        // Create the offer (sets local SDP, triggers ICE gathering).
+        call = try await createOffer(call: call)
+        
+        // Encrypt and send; roomId stored normalized, "#" reattached at transport.
+        let offerPlaintext = try BinaryEncoder().encode(call)
+        let writeTask = WriteTask(
+            data: offerPlaintext,
+            roomId: call.sharedCommunicationId,
+            flag: .offer,
+            call: call)
+        let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
+        try await taskProcessor.feedTask(task: encryptableTask)
+
+        do {
+            try await startSendingCandidates(call: call)
+        } catch {
+            logger.log(level: .warning, message: "Failed to start sending SFU ICE candidates after offer (will continue buffering): \(error)")
+        }
+        
+        return call
+    }
     
     public func createSFUIdentity(
         sfuRecipientId: String,
         call: Call
     ) async throws {
-        
-        guard groupCalls[sfuRecipientId] != nil else {
+
+        guard let group = groupCall(forSfuIdentity: sfuRecipientId) else {
             throw RTCErrors.missingGroupCall
         }
-        
+        print("CREATE WITH PROPS", call.signalingIdentityProps?.secretName)
         // Identity props must be sent back from the SFU Server's group identity.
-        let props = try requireSfuSignalingProps(from: call)
-        _ = try await pcKeyManager.createRecipientIdentity(connectionId: sfuRecipientId, props: props)
-        _ = try await startGroupCall(call: call, sfuRecipientId: sfuRecipientId)
+        guard let props = call.signalingIdentityProps else { throw EncryptionErrors.missingProps }
+        do {
+            try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId.normalizedConnectionId)
+        } catch {
+            _ = try await pcKeyManager.createRecipientIdentity(
+                connectionId: call.sharedCommunicationId.normalizedConnectionId,
+                props: props)
+        }
     }
     
     /// Starts a group call by creating a single PeerConnection intended to connect to an SFU.
@@ -132,51 +139,29 @@ extension RTCSession {
         var call = call
         
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).
-        activeConnectionId = call.sharedCommunicationId
-        
-        // Ensure state streams are created so the UI can observe call state.
-        try await createStateStream(with: call)
-        
-        let localIdentity: ConnectionLocalIdentity
-        if let existingIdentity = try await pcKeyManager.fetchCallKeyBundle() {
-            localIdentity = existingIdentity
-        } else {
-            localIdentity = try await pcKeyManager.generateSenderIdentity(
-                connectionId: sfuRecipientId,
-                secretName: call.sender.secretName
-            )
-        }
-        
-        // Use a placeholder session identity: group calls do not use this for key agreement.
-        _ = try await createPeerConnection(
-            with: call,
-            sender: call.sender.secretName,
-            recipient: sfuRecipientId,
-            localIdentity: localIdentity,
-            willFinishNegotiation: true
-        )
-        
-        // Initialize ratchet state BEFORE setting the local SDP (createOffer) so early ICE candidates
-        // can be encrypted immediately during gathering.
-        let recipientIdentity = try await ensureSfuSenderInitialization(call: call, sfuRecipientId: sfuRecipientId)
-        
+        activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
+
         // Create the offer (sets local SDP, triggers ICE gathering).
         call = try await createOffer(call: call)
         
-        // Encrypt the offer call payload for the SFU and emit via transport.
+        // Encrypt and send; roomId normalized, "#" reattached at transport.
         let offerPlaintext = try BinaryEncoder().encode(call)
-        let offerMessage = try await pcRatchetManager.ratchetEncrypt(
-            plainText: offerPlaintext,
-            sessionId: recipientIdentity.sessionIdentity.id
-        )
-        let offerPacket = RatchetMessagePacket(
-            sfuIdentity: sfuRecipientId,
-            header: offerMessage.header,
-            ratchetMessage: offerMessage,
-            flag: .offer)
+        let writeTask = WriteTask(
+            data: offerPlaintext,
+            roomId: sfuRecipientId.normalizedConnectionId,
+            flag: .offer,
+            call: call)
+        let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
+        try await taskProcessor.feedTask(task: encryptableTask)
         
-        await setConnectingIfReady(call: call, callDirection: .outbound(call.supportsVideo ? .video : .voice))
-        try await requireTransport().sendSfuMessage(offerPacket, call: call)
+        // Enable ICE trickle for SFU calls.
+        // Without this, candidates remain buffered (readyForCandidates stays false) and ICE can stall in `checking`.
+        do {
+            try await startSendingCandidates(call: call)
+        } catch {
+            logger.log(level: .warning, message: "Failed to start sending SFU ICE candidates after offer (will continue buffering): \(error)")
+        }
+        
         return call
     }
     
@@ -194,6 +179,8 @@ extension RTCSession {
             try await handleSfuAnswer(packet)
         case .sfuCandidate(let packet):
             try await handleSfuCandidate(packet)
+        case .sfuOffer(let packet):
+            try await handleSfuOffer(packet)
         case .participants(let packet):
             try await handleParticpants(packet)
         case .participantDemuxId(let packet):
@@ -203,107 +190,188 @@ extension RTCSession {
     
     // MARK: - Signaling ingress (SFU)
     
-    private func ensureSfuRecipientInitializationIfNeeded(sfuIdentity: String, header: EncryptedHeader) async throws {
-        if sfuRecipientInitializationCompleteBySfuId.contains(sfuIdentity) { return }
-        
-        guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(sfuIdentity) else {
-            throw EncryptionErrors.missingSessionIdentity
-        }
-        guard let callBundle = try await pcKeyManager.fetchCallKeyBundle() else {
-            throw EncryptionErrors.missingSessionIdentity
-        }
-        
-        try await pcRatchetManager.recipientInitialization(
-            sessionIdentity: connectionIdentity.sessionIdentity,
-            sessionSymmetricKey: callBundle.symmetricKey,
-            header: header,
-            localKeys: callBundle.localKeys
-        )
-        sfuRecipientInitializationCompleteBySfuId.insert(sfuIdentity)
-    }
-    
     /// Applies an inbound SFU SDP answer to the underlying PeerConnection.
     func handleSfuAnswer(_ packet: RatchetMessagePacket) async throws {
         
-        //1. decrypt
-        try await ensureSfuRecipientInitializationIfNeeded(sfuIdentity: packet.sfuIdentity, header: packet.header)
-        
-        guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(packet.sfuIdentity) else {
-            throw EncryptionErrors.missingSessionIdentity
+        // Get call from groupCalls or connectionManager
+        var call: Call
+        if let group = groupCall(forSfuIdentity: packet.sfuIdentity) {
+            call = await group.currentCall
+        } else if let connection = await connectionManager.findConnection(with: packet.sfuIdentity.normalizedConnectionId) {
+            call = connection.call
+        } else {
+            // Create placeholder (store by normalized ID).
+            call = try Call(
+                sharedCommunicationId: packet.sfuIdentity.normalizedConnectionId,
+                sender: Call.Participant(secretName: "", nickname: "", deviceId: UUID().uuidString),
+                recipients: [Call.Participant(secretName: "placeholder", nickname: "", deviceId: UUID().uuidString)],
+                supportsVideo: true,
+                isActive: true)
         }
         
-        let decrypted = try await pcRatchetManager.ratchetDecrypt(packet.ratchetMessage, sessionId: connectionIdentity.sessionIdentity.id)
-        
-        //2. decode
-        let call = try BinaryDecoder().decode(Call.self, from: decrypted)
-        
-        guard let metadata = call.metadata else {
-            throw EncryptionErrors.missingMetadata
+        // TaskProcessor will handle recipient initialization
+        let streamTask = StreamTask(
+            senderSecretName: "",
+            senderDeviceId: nil,
+            packet: packet,
+            call: call)
+        let encryptableTask = EncryptableTask(task: .streamMessage(streamTask))
+        try await taskProcessor.feedTask(task: encryptableTask)
+    }
+    
+    /// Applies an inbound SFU renegotiation offer (e.g. when a new peer joins) and feeds to TaskProcessor for decrypt then handle.
+    func handleSfuOffer(_ packet: RatchetMessagePacket) async throws {
+        var call: Call
+        if let group = groupCall(forSfuIdentity: packet.sfuIdentity) {
+            call = await group.currentCall
+        } else if let connection = await connectionManager.findConnection(with: packet.sfuIdentity.normalizedConnectionId) {
+            call = connection.call
+        } else {
+            call = try Call(
+                groupSharedCommunicationId: packet.sfuIdentity.normalizedConnectionId,
+                sender: Call.Participant(secretName: "", nickname: "", deviceId: UUID().uuidString),
+                recipients: [],
+                supportsVideo: true,
+                isActive: true)
         }
-        let sdp = try BinaryDecoder().decode(SessionDescription.self, from: metadata)
-        // handle
-        try await handleAnswer(call: call, sdp: sdp)
+        let streamTask = StreamTask(
+            senderSecretName: "",
+            senderDeviceId: nil,
+            packet: packet,
+            call: call)
+        let encryptableTask = EncryptableTask(task: .streamMessage(streamTask))
+        try await taskProcessor.feedTask(task: encryptableTask)
     }
     
     /// Applies an inbound SFU ICE candidate to the underlying PeerConnection.
     func handleSfuCandidate(_ packet: RatchetMessagePacket) async throws {
         
-        //1. decrypt
-        try await ensureSfuRecipientInitializationIfNeeded(sfuIdentity: packet.sfuIdentity, header: packet.header)
-        
-        guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(packet.sfuIdentity) else {
-            throw EncryptionErrors.missingSessionIdentity
+        // Get call from groupCalls or connectionManager
+        var call: Call
+        if let group = groupCall(forSfuIdentity: packet.sfuIdentity) {
+            call = await group.currentCall
+        } else if let connection = await connectionManager.findConnection(with: packet.sfuIdentity.normalizedConnectionId) {
+            call = connection.call
+        } else {
+            call = try Call(
+                groupSharedCommunicationId: packet.sfuIdentity.normalizedConnectionId,
+                sender: Call.Participant(secretName: "", nickname: "", deviceId: UUID().uuidString),
+                recipients: [],
+                supportsVideo: true,
+                isActive: true)
         }
         
-        let decrypted = try await pcRatchetManager.ratchetDecrypt(packet.ratchetMessage, sessionId: connectionIdentity.sessionIdentity.id)
-        
-        //2. decode
-        let call = try BinaryDecoder().decode(Call.self, from: decrypted)
-        
-        guard let metadata = call.metadata else {
-            throw EncryptionErrors.missingMetadata
-        }
-        let candidate = try BinaryDecoder().decode(IceCandidate.self, from: metadata)
-        try await handleCandidate(call: call, candidate: candidate)
+        // TaskProcessor will handle recipient initialization
+        let streamTask = StreamTask(
+            senderSecretName: "",
+            senderDeviceId: nil,
+            packet: packet,
+            call: call)
+        let encryptableTask = EncryptableTask(task: .streamMessage(streamTask))
+        try await taskProcessor.feedTask(task: encryptableTask)
     }
     
     // MARK: Roster
     func handleParticpants(_ packet: RatchetMessagePacket) async throws {
-        //1. decrypt
-        try await ensureSfuRecipientInitializationIfNeeded(sfuIdentity: packet.sfuIdentity, header: packet.header)
-        
-        guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(packet.sfuIdentity) else {
-            throw EncryptionErrors.missingSessionIdentity
-        }
-        
-        let decrypted = try await pcRatchetManager.ratchetDecrypt(packet.ratchetMessage, sessionId: connectionIdentity.sessionIdentity.id)
-        
-        //2. decode
-        let participants: [RTCGroupCall.Participant] = try BinaryDecoder().decode([RTCGroupCall.Participant].self, from: decrypted)
-        
-        guard let group = groupCalls[packet.sfuIdentity] else {
+        // Get call from groupCalls
+        guard let group = groupCall(forSfuIdentity: packet.sfuIdentity) else {
             throw RTCErrors.missingGroupCall
         }
-        await group.updateParticipants(participants)
+        let call = await group.currentCall
+        
+        // TaskProcessor will handle recipient initialization
+        let streamTask = StreamTask(
+            senderSecretName: "",
+            senderDeviceId: nil,
+            packet: packet,
+            call: call)
+        let encryptableTask = EncryptableTask(task: .streamMessage(streamTask))
+        try await taskProcessor.feedTask(task: encryptableTask)
     }
     
     func handleParticpant(_ packet: RatchetMessagePacket) async throws {
-        //1. decrypt
-        try await ensureSfuRecipientInitializationIfNeeded(sfuIdentity: packet.sfuIdentity, header: packet.header)
-        
-        guard let connectionIdentity = await pcKeyManager.fetchConnectionIdentityByConnectionId(packet.sfuIdentity) else {
-            throw EncryptionErrors.missingSessionIdentity
-        }
-        
-        let decrypted = try await pcRatchetManager.ratchetDecrypt(packet.ratchetMessage, sessionId: connectionIdentity.sessionIdentity.id)
-        
-        //2. decode
-        let participant: RTCGroupCall.Participant = try BinaryDecoder().decode(RTCGroupCall.Participant.self, from: decrypted)
-        
-        guard let group = groupCalls[packet.sfuIdentity] else {
+        // Get call from groupCalls
+        guard let group = groupCall(forSfuIdentity: packet.sfuIdentity) else {
             throw RTCErrors.missingGroupCall
         }
-        await group.setDemuxId(participant.demuxId, for: participant.id)
+        let call = await group.currentCall
+        
+        // TaskProcessor will handle recipient initialization
+        let streamTask = StreamTask(
+            senderSecretName: "",
+            senderDeviceId: nil,
+            packet: packet,
+            call: call)
+        let encryptableTask = EncryptableTask(task: .streamMessage(streamTask))
+        try await taskProcessor.feedTask(task: encryptableTask)
+    }
+    
+    // MARK: - TaskProcessor Helpers
+    
+    /// Sends an encrypted packet via transport (used by TaskProcessor).
+    func sendEncryptedPacket(packet: RatchetMessagePacket, call: Call) async throws {
+        if isGroupCall {
+            try await requireTransport().sendSfuMessage(packet, call: call)
+        } else {
+            guard let recipient = call.recipients.first else {
+                throw RTCErrors.invalidConfiguration("Recipient not set for one-on-one call")
+            }
+            try await requireTransport().sendOneToOneMessage(packet, recipient: recipient)
+        }
+    }
+    
+    /// Handles a decrypted packet (used by TaskProcessor).
+    func handleDecryptedPacket(plaintext: Data, packet: RatchetMessagePacket, call: Call) async throws {
+        switch packet.flag {
+        case .answer:
+            let call = try BinaryDecoder().decode(Call.self, from: plaintext)
+            guard let metadata = call.metadata else {
+                throw EncryptionErrors.missingMetadata
+            }
+            let sdp = try BinaryDecoder().decode(SessionDescription.self, from: metadata)
+            try await handleAnswer(call: call, sdp: sdp)
+        case .candidate:
+            let call = try BinaryDecoder().decode(Call.self, from: plaintext)
+            guard let metadata = call.metadata else {
+                throw EncryptionErrors.missingMetadata
+            }
+            let candidate = try BinaryDecoder().decode(IceCandidate.self, from: metadata)
+            try await handleCandidate(call: call, candidate: candidate)
+        case .offer:
+            // Renegotiation offer from SFU: set remote offer, create answer, send it back.
+            let decodedCall = try BinaryDecoder().decode(Call.self, from: plaintext)
+            guard let metadata = decodedCall.metadata else {
+                throw EncryptionErrors.missingMetadata
+            }
+            let sdp = try BinaryDecoder().decode(SessionDescription.self, from: metadata)
+            guard let group = groupCall(forSfuIdentity: packet.sfuIdentity) else {
+                throw RTCErrors.missingGroupCall
+            }
+            let call = await group.currentCall
+            let processedCall = try await handleRenegotiationOffer(sdp: sdp, call: call)
+            let answerPlaintext = try BinaryEncoder().encode(processedCall)
+            let writeTask = WriteTask(
+                data: answerPlaintext,
+                roomId: call.sharedCommunicationId.normalizedConnectionId,
+                flag: .answer,
+                call: processedCall)
+            try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+            logger.log(level: .info, message: "Handled SFU renegotiation offer for group call: \(packet.sfuIdentity)")
+        case .participants:
+            let participants: [RTCGroupCall.Participant] = try BinaryDecoder().decode([RTCGroupCall.Participant].self, from: plaintext)
+            guard let group = groupCall(forSfuIdentity: packet.sfuIdentity) else {
+                throw RTCErrors.missingGroupCall
+            }
+            await group.updateParticipants(participants)
+        case .participantDemuxId:
+            let participant: RTCGroupCall.Participant = try BinaryDecoder().decode(RTCGroupCall.Participant.self, from: plaintext)
+            guard let group = groupCall(forSfuIdentity: packet.sfuIdentity) else {
+                throw RTCErrors.missingGroupCall
+            }
+            await group.setDemuxId(participant.demuxId, for: participant.id)
+        case .handshakeComplete:
+            logger.log(level: .info, message: "Handshake complete")
+        }
     }
     
 }

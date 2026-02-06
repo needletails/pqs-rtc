@@ -107,8 +107,12 @@ internal class PreviewCaptureView: UIView {
             if Thread.isMainThread {
                 previewLayer.session = nil
             } else {
-                DispatchQueue.main.sync {
-                    self.previewLayer.session = nil
+                // Avoid blocking here. Deinit can occur on WebRTC/crypto queues; synchronously
+                // waiting for main can cause watchdog "hang detected" and can deadlock if main is
+                // awaiting teardown work scheduled from those same queues.
+                let layer = previewLayer
+                DispatchQueue.main.async {
+                    layer.session = nil
                 }
             }
             didShutdown = true
@@ -194,10 +198,16 @@ internal class PreviewCaptureView: NSView {
     // MARK: - Memory Management
     
     deinit {
-        // NSView deinit may not be on main thread - use captured layer reference
-        DispatchQueue.main.sync {
-            let layer = self.previewLayer
+        // NSView deinit may not be on main thread.
+        // Avoid `DispatchQueue.main.sync` here: if deinit happens on main (or if the main
+        // thread is blocked by WebRTC work), this can deadlock and trigger libdispatch breakpoints.
+        let layer = self.previewLayer
+        if Thread.isMainThread {
             layer.session = nil
+        } else {
+            DispatchQueue.main.async {
+                layer.session = nil
+            }
         }
         
         #if DEBUG
