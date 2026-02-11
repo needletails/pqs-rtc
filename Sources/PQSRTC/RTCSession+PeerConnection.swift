@@ -660,10 +660,11 @@ extension RTCSession {
 #endif
         }
 
-        // Remove per-connection identity and any pending ciphertext so the next call
+        // Remove per-connection identities and any pending ciphertext so the next call
         // starts with a fresh crypto state. This is platform independent.
         if let connectionId {
             await keyManager.removeConnectionIdentity(connectionId: connectionId)
+            await pcKeyManager.removeConnectionIdentity(connectionId: connectionId)
         }
         
         func cleanup(connection: RTCConnection) async {

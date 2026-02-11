@@ -24,7 +24,7 @@ import NeedleTailLogger
 /// This actor intentionally does not persist keys to disk. All cached material is cleared when
 /// the process exits or when ``clearAll()`` is called.
 public actor KeyManager: SessionIdentityDelegate {
-    /// Cached local identity bundle for the active call/session.
+
     private var connectionLocalIdentity: ConnectionLocalIdentity?
     
     private var connectionIdentities: [String: ConnectionSessionIdentity] = [:]

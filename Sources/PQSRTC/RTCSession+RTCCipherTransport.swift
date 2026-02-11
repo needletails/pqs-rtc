@@ -190,6 +190,15 @@ extension RTCSession {
         }
         // Track provisioning for diagnostics (safe metadata only).
         lastFrameKeyIndexByParticipantId[participantId] = index
+
+        // Diagnostics: prove which participantId/index we provisioned (without logging key bytes).
+        // Keep at debug to avoid log noise in production.
+        let mode = frameEncryptionKeyMode
+        if mode == .shared {
+            logger.log(level: .debug, message: "🔑 Provisioned shared frame key index=\(index) (participantId ignored)")
+        } else {
+            logger.log(level: .debug, message: "🔑 Provisioned per-participant frame key index=\(index) for participantId='\(participantId)'")
+        }
     }
     
     /// Ratchets and returns the next key for a participant/index.
@@ -387,6 +396,13 @@ extension RTCSession {
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.localParticipantId)
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.remoteParticipantId)
             }
+
+            // Diagnostics: show which participant ids got provisioned from the 1:1 ratchet-derived key.
+            if frameEncryptionKeyMode == .shared {
+                logger.log(level: .debug, message: "🔑 Derived+provisioned shared frame key (setMessageKey) index=\(index) connId=\(connection.id)")
+            } else {
+                logger.log(level: .debug, message: "🔑 Derived+provisioned per-participant frame key (setMessageKey) index=\(index) connId=\(connection.id) local='\(connection.localParticipantId)' remote='\(connection.remoteParticipantId)'")
+            }
         }
 #elseif os(Android)
         // Only provision frame keys on Android when frame encryption is enabled.
@@ -440,6 +456,13 @@ extension RTCSession {
                 // For 1:1-group (room connection), remoteTrackOwnerParticipantId is the cipher sender (track owner).
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.localParticipantId)
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: remoteParticipantId)
+            }
+
+            // Diagnostics: show which ids got provisioned for receiving.
+            if frameEncryptionKeyMode == .shared {
+                logger.log(level: .debug, message: "🔑 Derived+provisioned shared frame key (setReceivingMessageKey) index=\(index) connId=\(connection.id)")
+            } else {
+                logger.log(level: .debug, message: "🔑 Derived+provisioned per-participant frame key (setReceivingMessageKey) index=\(index) connId=\(connection.id) local='\(connection.localParticipantId)' remoteTrackOwner='\(remoteParticipantId)'")
             }
         }
 #elseif os(Android)

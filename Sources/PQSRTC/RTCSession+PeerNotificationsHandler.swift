@@ -21,6 +21,54 @@ import WebRTC
 import BinaryCodable
 
 extension RTCSession {
+
+    /// Resolves which participantId to bind receiver FrameCryptors to.
+    ///
+    /// - For 1:1 calls:
+    ///   - `.perParticipant`: use `connection.remoteParticipantId` (keys are provisioned under real participant ids)
+    ///   - `.shared`: participantId is irrelevant → `nil`
+    /// - For SFU/group calls:
+    ///   - default: use the participantId derived from `streamIds` (track owner)
+    ///   - production fallback (1:1 SFU rooms): if the SFU emits a UUID-like streamId that doesn't match
+    ///     the real remote participant id, use `connection.remoteParticipantId` so E2EE keys line up.
+    private func receiverParticipantIdOverrideForE2EE(
+        connection: RTCConnection,
+        participantIdFromStreamIds: String
+    ) -> (override: String?, didOverrideToRemote: Bool) {
+        let isGroup = groupCalls[connection.id] != nil
+        let remoteId = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let streamId = participantIdFromStreamIds.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !isGroup {
+            // 1:1 call
+            if frameEncryptionKeyMode == .perParticipant {
+                return (remoteId.isEmpty ? nil : remoteId, false)
+            }
+            return (nil, false)
+        }
+
+        // Group call (SFU)
+        guard frameEncryptionKeyMode == .perParticipant else {
+            // Shared mode: participantId does not affect key lookup
+            return (nil, false)
+        }
+
+        guard !streamId.isEmpty else {
+            return (nil, false)
+        }
+
+        // Safe fallback for 1:1 SFU rooms where SFU stream ids are random UUIDs.
+        let isOneToOneSfuRoom = connection.call.recipients.count <= 1
+        let streamLooksLikeUuid = UUID(uuidString: streamId) != nil
+        if isOneToOneSfuRoom,
+           streamLooksLikeUuid,
+           !remoteId.isEmpty,
+           streamId != remoteId {
+            return (remoteId, true)
+        }
+
+        return (streamId, false)
+    }
     
     func handlePeerConnectionNotifications(generation: UInt64) async {
         notificationsConsumerIsRunning = true
@@ -203,16 +251,38 @@ extension RTCSession {
                         // Determine the correct participant ID for the receiver cryptor:
                         // - For group calls: use participantId from streamIds (identifies the track owner)
                         // - For 1:1 calls in perParticipant mode: use connection.remoteParticipantId (matches the key that was set)
-                        let receiverParticipantId: String?
-                        if self.groupCalls[connection.id] != nil {
-                            // Group call: use the participantId from streamIds
-                            receiverParticipantId = participantId.isEmpty ? nil : participantId
-                        } else if self.frameEncryptionKeyMode == .perParticipant {
-                            // 1:1 call in perParticipant mode: use remoteParticipantId to match the key
-                            receiverParticipantId = connection.remoteParticipantId
-                        } else {
-                            // 1:1 call in shared mode: participantId doesn't matter, but use remoteParticipantId for consistency
-                            receiverParticipantId = nil
+                        let resolved = receiverParticipantIdOverrideForE2EE(
+                            connection: connection,
+                            participantIdFromStreamIds: participantId
+                        )
+                        let receiverParticipantId = resolved.override
+                        if enableEncryption, resolved.didOverrideToRemote {
+                            self.logger.log(
+                                level: .warning,
+                                message: "⚠️ SFU streamId '\(participantId)' looks UUID-like in 1:1 room; overriding receiver participantId -> '\(connection.remoteParticipantId)' for E2EE key alignment"
+                            )
+                        }
+
+                        // Diagnostics: prove which participantId we bind the receiver FrameCryptor to,
+                        // and whether we've ever provisioned a frame key for that participant id.
+                        if enableEncryption {
+                            let isGroup = self.groupCalls[connection.id] != nil
+                            let resolved = receiverParticipantId ?? "<nil>"
+                            let lastIdx = receiverParticipantId.flatMap { self.lastFrameKeyIndexByParticipantId[$0] }
+                            self.logger.log(
+                                level: .debug,
+                                message: "🔎 E2EE receiver mapping (video): connId=\(updated.id) isGroup=\(isGroup) frameKeyMode=\(self.frameEncryptionKeyMode) streamIds=\(streamIds) resolvedParticipantId=\(resolved) connection.remoteParticipantId=\(connection.remoteParticipantId) lastProvisionedKeyIndex=\(lastIdx.map(String.init) ?? "<none>")"
+                            )
+                            if isGroup,
+                               self.frameEncryptionKeyMode == .perParticipant,
+                               receiverParticipantId != nil,
+                               lastIdx == nil,
+                               UUID(uuidString: participantId) != nil {
+                                self.logger.log(
+                                    level: .warning,
+                                    message: "⚠️ No frame key provisioned for resolvedParticipantId=\(resolved) yet. If SFU uses streamId UUIDs, expect FrameCryptor missingKey until keys are injected for that exact participantId (or resolver maps to real participant ids)."
+                                )
+                            }
                         }
                         if enableEncryption {
                         try await self.createEncryptedFrame(
@@ -238,16 +308,38 @@ extension RTCSession {
                         // Determine the correct participant ID for the receiver cryptor:
                         // - For group calls: use participantId from streamIds (identifies the track owner)
                         // - For 1:1 calls in perParticipant mode: use connection.remoteParticipantId (matches the key that was set)
-                        let receiverParticipantId: String?
-                        if self.groupCalls[connection.id] != nil {
-                            // Group call: use the participantId from streamIds
-                            receiverParticipantId = participantId.isEmpty ? nil : participantId
-                        } else if self.frameEncryptionKeyMode == .perParticipant {
-                            // 1:1 call in perParticipant mode: use remoteParticipantId to match the key
-                            receiverParticipantId = connection.remoteParticipantId
-                        } else {
-                            // 1:1 call in shared mode: participantId doesn't matter, but use remoteParticipantId for consistency
-                            receiverParticipantId = nil
+                        let resolved = receiverParticipantIdOverrideForE2EE(
+                            connection: connection,
+                            participantIdFromStreamIds: participantId
+                        )
+                        let receiverParticipantId = resolved.override
+                        if enableEncryption, resolved.didOverrideToRemote {
+                            self.logger.log(
+                                level: .warning,
+                                message: "⚠️ SFU streamId '\(participantId)' looks UUID-like in 1:1 room; overriding receiver participantId -> '\(connection.remoteParticipantId)' for E2EE key alignment"
+                            )
+                        }
+
+                        // Diagnostics: prove which participantId we bind the receiver FrameCryptor to,
+                        // and whether we've ever provisioned a frame key for that participant id.
+                        if enableEncryption {
+                            let isGroup = self.groupCalls[connection.id] != nil
+                            let resolved = receiverParticipantId ?? "<nil>"
+                            let lastIdx = receiverParticipantId.flatMap { self.lastFrameKeyIndexByParticipantId[$0] }
+                            self.logger.log(
+                                level: .debug,
+                                message: "🔎 E2EE receiver mapping (audio): connId=\(updated.id) isGroup=\(isGroup) frameKeyMode=\(self.frameEncryptionKeyMode) streamIds=\(streamIds) resolvedParticipantId=\(resolved) connection.remoteParticipantId=\(connection.remoteParticipantId) lastProvisionedKeyIndex=\(lastIdx.map(String.init) ?? "<none>")"
+                            )
+                            if isGroup,
+                               self.frameEncryptionKeyMode == .perParticipant,
+                               receiverParticipantId != nil,
+                               lastIdx == nil,
+                               UUID(uuidString: participantId) != nil {
+                                self.logger.log(
+                                    level: .warning,
+                                    message: "⚠️ No frame key provisioned for resolvedParticipantId=\(resolved) yet. If SFU uses streamId UUIDs, expect FrameCryptor missingKey until keys are injected for that exact participantId (or resolver maps to real participant ids)."
+                                )
+                            }
                         }
                         if enableEncryption {
                         try await self.createEncryptedFrame(

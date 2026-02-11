@@ -115,7 +115,6 @@ extension RTCSession {
         guard let group = groupCall(forSfuIdentity: sfuRecipientId) else {
             throw RTCErrors.missingGroupCall
         }
-        print("CREATE WITH PROPS", call.signalingIdentityProps?.secretName)
         // Identity props must be sent back from the SFU Server's group identity.
         guard let props = call.signalingIdentityProps else { throw EncryptionErrors.missingProps }
         do {
