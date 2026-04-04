@@ -65,11 +65,14 @@ public actor AndroidVideoCallController: CallActionDelegate {
         self.remoteViews = remotes
         self.remoteView = remotes.first
         logger.log(level: .debug, message: "SET REMOTE VIEWS \(remotes)")
+        await syncWithCurrentState(reason: "setRemoteViews")
     }
     
     /// Sets the local preview capture view used for outbound video.
     public func setLocalView(local: AndroidPreviewCaptureView) async {
         self.localView = local
+        logger.log(level: .debug, message: "SET LOCAL VIEW \(local)")
+        await syncWithCurrentState(reason: "setLocalView")
     }
     
     /// Sets (or clears) the delegate that receives UI-facing call events.
@@ -83,57 +86,102 @@ public actor AndroidVideoCallController: CallActionDelegate {
     public func start() async {
         guard stateStreamTask == nil else {
             logger.log(level: .warning, message: "AndroidVideoCallController.start() called while already running; ignoring")
+            await syncWithCurrentState(reason: "start-already-running")
             return
         }
+        isRunning = true
+        logger.log(level: .info, message: "AndroidVideoCallController starting")
         stateStreamTask = Task { [weak self] in
             guard let self else { return }
-            let lastStream = await session.callState.currentCallStream.last
-            guard let stateStream = lastStream else { return }
+
+            // Mirror the Apple controllers: the host app may present the Android call UI
+            // before `RTCSession.createStateStream(with:)` has run.
+            var stateStream: AsyncStream<CallStateMachine.State>?
+            while !Task.isCancelled {
+                if let stream = await self.session.callState._currentCallStream.last {
+                    stateStream = stream
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 25_000_000) // 25ms
+            }
+            guard let stateStream else {
+                logger.log(level: .error, message: "No call state stream available; cannot observe call state")
+                return
+            }
+
+            // AsyncStream does not replay prior values. If we subscribed after the state machine
+            // advanced, bootstrap from the current state so Android matches Apple behavior.
+            let bootstrapState = await self._currentCallState
+            if let current = await self.session.callState.currentState,
+               current != bootstrapState {
+                logger.log(level: .info, message: "AndroidVideoCallController bootstrapping state: \(current)")
+                await self.handleObservedState(current)
+            }
+
             for await state in stateStream {
                 let currentState = await self._currentCallState
                 guard state != currentState else { continue }
-                await setCurrentCallState(state)
-                await videoCallDelegate?.deliverCallState(state)
-                switch state {
-                case .waiting:
+                logger.log(level: .info, message: "AndroidVideoCallController observed state: \(state)")
+                await self.handleObservedState(state)
+            }
+        }
+    }
+
+    private func syncWithCurrentState(reason: String) async {
+        guard let state = await session.callState.currentState else {
+            logger.log(level: .debug, message: "AndroidVideoCallController sync skipped (\(reason)): no current state")
+            return
+        }
+        logger.log(level: .info, message: "AndroidVideoCallController syncing with state (\(reason)): \(state)")
+        await handleObservedState(state)
+    }
+
+    private func handleObservedState(_ state: CallStateMachine.State) async {
+        logger.log(level: .info, message: "AndroidVideoCallController handling state: \(state)")
+        await setCurrentCallState(state)
+        await videoCallDelegate?.deliverCallState(state)
+
+        switch state {
+        case .waiting:
+            break
+        case .ready(let call):
+            await setCurrentCall(call)
+        case .connecting(let direction, let call):
+            await setCurrentCall(call)
+            switch direction {
+            case .inbound(let type), .outbound(let type):
+                switch type {
+                case .voice:
                     break
-                case .ready:
-                    break
-                case .connecting(let direction, let call):
-                    await setCurrentCall(call)
-                    switch direction {
-                    case .inbound(let type), .outbound(let type):
-                        switch type {
-                        case .voice:
-                            break
-                        case .video:
-                            await upgradedVideo(true)
-                            await self.createPreviewView()
-                        }
-                    }
-                case .connected(let direction, let call):
-                    await setCurrentCall(call)
-                    
-                    switch direction {
-                    case .inbound(let type), .outbound(let type):
-                        switch type {
-                        case .voice:
-                            break
-                        case .video:
-                            await self.createSampleView()
-                        }
-                    }
-                case .held:
-                    break
-                case .ended:
-                    await tearDownCall()
-                case .failed(_, _, let errorMessage):
-                    await videoCallDelegate?.passErrorMessage(errorMessage)
-                    await tearDownCall()
-                case .callAnsweredAuxDevice:
-                    await tearDownCall()
+                case .video:
+                    await upgradedVideo(true)
+                    await self.createPreviewView()
                 }
             }
+        case .connected(let direction, let call):
+            await setCurrentCall(call)
+
+            switch direction {
+            case .inbound(let type), .outbound(let type):
+                switch type {
+                case .voice:
+                    break
+                case .video:
+                    // Match Apple: if Android attaches late and misses `.connecting`,
+                    // still ensure the preview exists before rendering the remote tile.
+                    await self.createPreviewView()
+                    await self.createSampleView()
+                }
+            }
+        case .held:
+            break
+        case .ended:
+            await tearDownCall()
+        case .failed(_, _, let errorMessage):
+            await videoCallDelegate?.passErrorMessage(errorMessage)
+            await tearDownCall()
+        case .callAnsweredAuxDevice:
+            await tearDownCall()
         }
     }
     
@@ -198,13 +246,25 @@ public actor AndroidVideoCallController: CallActionDelegate {
     
     // MARK: - View Management
     private func createPreviewView(shouldQuery: Bool = true) async {
-        guard let connectionId = currentCall?.sharedCommunicationId, let localView else { return }
+        guard let connectionId = currentCall?.sharedCommunicationId else {
+            logger.log(level: .debug, message: "createPreviewView skipped: missing currentCall")
+            return
+        }
+        guard let localView else {
+            logger.log(level: .debug, message: "createPreviewView skipped: missing localView")
+            return
+        }
+        logger.log(level: .info, message: "AndroidVideoCallController creating preview for connection: \(connectionId)")
         await session.renderLocalVideo(to: localView, connectionId: connectionId)
         await session.setVideoTrack(isEnabled: true, connectionId: connectionId)
     }
     
     private func createSampleView() async {
-        guard let connectionId = currentCall?.sharedCommunicationId else { return }
+        guard let connectionId = currentCall?.sharedCommunicationId else {
+            logger.log(level: .debug, message: "createSampleView skipped: missing currentCall")
+            return
+        }
+        logger.log(level: .info, message: "AndroidVideoCallController creating sample view for connection: \(connectionId)")
         logger.log(level: .debug, message: "CREATE SAMPLE VIEW \(remoteViews)")
         if !remoteViews.isEmpty {
             for view in remoteViews {

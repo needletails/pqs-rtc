@@ -48,6 +48,7 @@ extension RTCSession {
     }
     
     public func setupCallState(_ call: Call) async throws {
+        resetAttemptFlagsForNewCall(connectionId: call.sharedCommunicationId)
         try await createStateStream(with: call)
     }
     
@@ -133,6 +134,13 @@ extension RTCSession {
     public func endCall(_ call: Call) async throws {
         await shutdown(with: call)
         logger.log(level: .info, message: "Ended 1:1 call: \(call.sharedCommunicationId)")
+    }
+
+    /// Delivers user-initiated hangup to the transport delegate (`didEnd`) without tearing down the session.
+    /// Use with ``shutdown(with:)`` when call UI is dismissed without ``VideoCallViewController``/``tearDownCall`` (e.g. window chrome close).
+    public func notifyTransportUserEndedCall(_ call: Call) async throws {
+        let transport = try requireTransport()
+        try await transport.didEnd(call: call, endState: .userInitiated)
     }
 }
 

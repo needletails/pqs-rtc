@@ -23,6 +23,8 @@ final class RTCVideoCaptureWrapper: RTCVideoCapturer, @unchecked Sendable {
     private let lock = NSLock()
     private var nanoseconds: Float64 = 0
     private let kNanosecondsPerSecond: Float64 = 1000000000
+    private var capturedFrameCount: UInt64 = 0
+    private var lastCaptureUptimeNanoseconds: UInt64 = 0
     
     override internal init(delegate: RTCVideoCapturerDelegate) {
         super.init(delegate: delegate)
@@ -43,6 +45,24 @@ final class RTCVideoCaptureWrapper: RTCVideoCapturer, @unchecked Sendable {
         let rtcPixelBuffer = RTCCVPixelBuffer(pixelBuffer: pixelBuffer)
         let rtcVideoFrame = RTCVideoFrame(buffer: rtcPixelBuffer, rotation: rotation, timeStampNs: Int64(timeStampNs))
         self.delegate?.capturer(self, didCapture: rtcVideoFrame)
+        capturedFrameCount &+= 1
+        lastCaptureUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+    }
+
+    func updateCaptureDelegate(_ delegate: RTCVideoCapturerDelegate) {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        self.delegate = delegate
+    }
+
+    func captureTelemetrySnapshot() -> (capturedFrameCount: UInt64, lastCaptureUptimeNanoseconds: UInt64) {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        return (capturedFrameCount, lastCaptureUptimeNanoseconds)
     }
 }
 #endif

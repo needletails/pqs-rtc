@@ -157,13 +157,23 @@ internal class PreviewCaptureView: NSView {
     // MARK: - Layer Configuration
     
     private func setupPreviewLayer() {
+        translatesAutoresizingMaskIntoConstraints = false
+        autoresizingMask = []
+        wantsLayer = true
         let layer = AVCaptureVideoPreviewLayer()
-        layer.videoGravity = .resizeAspectFill
+        layer.videoGravity = .resizeAspect
+        layer.masksToBounds = true
         self.layer = layer
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
         
         #if DEBUG
         logger.log(level: .debug, message: "PreviewCaptureView initialized with frame: \(frame)")
         #endif
+    }
+    
+    override func layout() {
+        super.layout()
+        layer?.frame = bounds
     }
     
     // MARK: - Public Methods

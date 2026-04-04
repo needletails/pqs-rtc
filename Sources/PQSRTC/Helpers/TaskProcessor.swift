@@ -388,7 +388,9 @@ extension NeedleTailAsyncConsumer {
     private func insertSequence(_ taskJob: TaskJob<T>, sequenceId: Int) async {
         // Since NeedleTailAsyncConsumer is an actor, all operations are atomic
         // Find the index where the new job should be inserted
-        let index = await deque.firstAsyncIndex(where: {
+        // See post-quantum-solace `NeedleTailAsyncConsumer+Extension.insertSequence`: `await` in the
+        // predicate allows actor reentrancy; the deque may shrink before insert — clamp the offset.
+        let rawIndex = await deque.firstAsyncIndex(where: {
             guard let job = $0.item as? Job else {
                 return false
             }
@@ -396,9 +398,8 @@ extension NeedleTailAsyncConsumer {
             return currentJobSequenceId >= sequenceId // Find the first job with a sequence ID greater than or equal to the new job
         }) ?? deque.count // If no such index is found, use the end of the deque
 
-        // Insert the new job at the found index
-        // This operation is atomic since NeedleTailAsyncConsumer is an actor
-        deque.insert(taskJob, at: index)
+        let insertIndex = min(max(0, rawIndex), deque.count)
+        deque.insert(taskJob, at: insertIndex)
     }
 
     func gracefulShutdown() async {

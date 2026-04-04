@@ -67,8 +67,17 @@ public protocol VideoCallDelegate: AnyObject, Sendable {
 
     /// Indicates that a call has ended (or is considered ended by the UI layer).
     func endedCall(_ didEnd: Bool) async
+
+    /// Pushes the controller’s mic/camera mute flags to SwiftUI chrome (see ``VideoCallViewControllerRepresentable``).
+    ///
+    /// Default implementation is a no-op for hosts that do not mirror mute into `@State`.
+    func localMuteDisplayDidChange(videoMuted: Bool, audioMuted: Bool) async
 #if os(macOS)
     /// Provides the updated view size (macOS only).
     func passSize(_ size: NSSize) async
 #endif
+}
+
+public extension VideoCallDelegate {
+    func localMuteDisplayDidChange(videoMuted: Bool, audioMuted: Bool) async {}
 }

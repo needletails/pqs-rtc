@@ -168,6 +168,9 @@ public actor RTCSession {
     
     /// TURN/STUN password associated with `iceServers`.
     public let password: String
+
+    /// Controls how the session selects ICE transport policy for new outbound attempts.
+    public let iceTransportPolicyStrategy: RTCIceTransportPolicyStrategy
     
     /// Logger used for all RTCSession-related logging.
     public let logger: NeedleTailLogger
@@ -267,6 +270,14 @@ public actor RTCSession {
     /// We use this to avoid acting on late WebRTC callbacks from a previous call after
     /// a new call has already started.
     var activeConnectionId: String?
+
+    /// Normalized active id for in-call UI (mute, etc.) when the view controller’s `Call` isn’t populated yet.
+    internal func fallbackConnectionIdForMuteControls() async -> String? {
+        guard let raw = activeConnectionId?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        return raw.normalizedConnectionId
+    }
     
     /// Legacy/global peer-connection state (kept for compatibility).
     ///
@@ -284,6 +295,9 @@ public actor RTCSession {
     
     /// Tracks whether the notifications consumer is currently processing events.
     var notificationsConsumerIsRunning = false
+
+    /// Per-connection outbound retry state for `.all` -> `.relay` fallback.
+    var connectionFallbackStateByConnectionId: [String: RTCConnectionFallbackState] = [:]
     
     /// Task that mirrors high-level RTC state into `callState`.
     var stateTask: Task<Void, Error>?
@@ -368,6 +382,17 @@ public actor RTCSession {
 #if canImport(WebRTC)
     /// Delegate that surfaces frame-cryptor events for debugging and monitoring.
     var frameCryptorDelegate = FrameCryptorDelegate()
+
+    /// Last inbound media counters snapshot per connection, used to verify whether remote media is still arriving.
+    var lastInboundVideoCountersByConnectionId: [String: InboundVideoCounters] = [:]
+    /// Last outbound media counters snapshot per connection, used to verify whether local media is still leaving this client.
+    var lastOutboundVideoCountersByConnectionId: [String: OutboundVideoCounters] = [:]
+    /// Non-gated periodic inbound video probes for remote-render bring-up diagnostics.
+    var inboundVideoFlowProbeTasksByConnectionId: [String: Task<Void, Never>] = [:]
+    /// Non-gated periodic outbound video probes (cross-platform caller/callee diagnostics).
+    var outboundVideoFlowProbeTasksByConnectionId: [String: Task<Void, Never>] = [:]
+    /// Last time we attempted sender-side outbound video self-recovery per connection.
+    var lastOutboundVideoRecoveryUptimeNsByConnectionId: [String: UInt64] = [:]
 #endif
     
     /// Remote renderers requested by the UI before the remote track exists.
@@ -378,6 +403,12 @@ public actor RTCSession {
     /// We buffer the renderer request here and attach it once the remote video track becomes available.
 #if os(Android)
     var pendingRemoteVideoRenderersByConnectionId: [String: Any] = [:]
+    /// Local preview renderers requested before the local video track exists.
+    ///
+    /// Android can request preview rendering during `.connecting` before
+    /// `addVideoToStream(...)` has created and stored `localVideoTrack`.
+    /// Buffer the view so we can attach as soon as the track is available.
+    var pendingLocalVideoRenderersByConnectionId: [String: AndroidPreviewCaptureView] = [:]
 #else
     var pendingRemoteVideoRenderersByConnectionId: [String: RTCVideoRenderWrapper] = [:]
 #endif
@@ -493,8 +524,7 @@ public actor RTCSession {
             availableOutgoingBitrateBps: availableOutgoingBitrateBps,
             rttMs: rttMs,
             appliedVideoMaxBitrateBps: appliedVideoMaxBitrateBps,
-            appliedVideoMaxFramerate: appliedVideoMaxFramerate
-        )
+            appliedVideoMaxFramerate: appliedVideoMaxFramerate)
 
         for sink in networkQualitySinks {
             sink.continuation.yield(update)
@@ -613,6 +643,19 @@ public actor RTCSession {
         endedConnectionIds.removeAll()
     }
 
+    func resetTeardownIdempotency(forConnectionId connectionId: String) {
+        let rawTrimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedId = rawTrimmed.normalizedConnectionId
+
+        finishingConnectionIds.remove(rawTrimmed)
+        endedConnectionIds.remove(rawTrimmed)
+        recentlyEndedConnectionIds.removeAll { $0 == rawTrimmed }
+
+        finishingConnectionIds.remove(normalizedId)
+        endedConnectionIds.remove(normalizedId)
+        recentlyEndedConnectionIds.removeAll { $0 == normalizedId }
+    }
+
     func beginEnding(callKey: String) -> Bool {
         if endedCallKeys.contains(callKey) { return false }
         if finishingCallKeys.contains(callKey) { return false }
@@ -663,9 +706,20 @@ public actor RTCSession {
     static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
         let videoEncoderFactory = RTCDefaultVideoEncoderFactory()
-        if let preferredCodec = videoEncoderFactory.supportedCodecs().first(where: { $0.parameters["profile-level-id"] == kRTCMaxSupportedH264ProfileLevelConstrainedBaseline }) {
+        let supportedCodecs = videoEncoderFactory.supportedCodecs()
+#if os(iOS)
+        // iOS sender freezes are strongly correlated with VideoToolbox/H264 stalls
+        // (outbound frames flat while capture continues). Prefer VP8 to avoid VT path.
+        if let preferredCodec = supportedCodecs.first(where: { $0.name.uppercased() == "VP8" }) {
+            videoEncoderFactory.preferredCodec = preferredCodec
+        } else if let preferredCodec = supportedCodecs.first(where: { $0.parameters["profile-level-id"] == kRTCMaxSupportedH264ProfileLevelConstrainedBaseline }) {
             videoEncoderFactory.preferredCodec = preferredCodec
         }
+#else
+        if let preferredCodec = supportedCodecs.first(where: { $0.parameters["profile-level-id"] == kRTCMaxSupportedH264ProfileLevelConstrainedBaseline }) {
+            videoEncoderFactory.preferredCodec = preferredCodec
+        }
+#endif
         let videoDecoderFactory = RTCDefaultVideoDecoderFactory()
         return RTCPeerConnectionFactory(encoderFactory: videoEncoderFactory, decoderFactory: videoDecoderFactory)
     }()
@@ -675,6 +729,7 @@ public actor RTCSession {
         iceServers: [String],
         username: String,
         password: String,
+        iceTransportPolicyStrategy: RTCIceTransportPolicyStrategy = .allThenRelay(timeoutMilliseconds: 4_000),
         logger: NeedleTailLogger = NeedleTailLogger("[RTCSession]"),
         ratchetSalt: Data = "PQSRTCFrameEncryptionSalt".data(using: .utf8)!,
         frameEncryptionKeyMode: RTCFrameEncryptionKeyMode = .shared,
@@ -687,6 +742,7 @@ public actor RTCSession {
         self.iceServers = iceServers
         self.username = username
         self.password = password
+        self.iceTransportPolicyStrategy = iceTransportPolicyStrategy
         self.logger = logger
         self.ratchetSalt = ratchetSalt
         self.frameEncryptionKeyMode = frameEncryptionKeyMode
@@ -750,6 +806,44 @@ public actor RTCSession {
             throw RTCErrors.invalidConfiguration("RTCTransportEvents delegate not set")
         }
         return delegate
+    }
+}
+
+#if canImport(WebRTC)
+extension RTCSession {
+    struct InboundVideoCounters: Sendable {
+        let audioPacketsReceived: Int64
+        let packetsReceived: Int64
+        let framesReceived: Int64
+        let framesDecoded: Int64
+    }
+
+    struct OutboundVideoCounters: Sendable {
+        let audioPacketsSent: Int64
+        let packetsSent: Int64
+        let framesEncoded: Int64
+        let framesSent: Int64
+    }
+}
+#endif
+
+extension RTCSession {
+    /// Resolves whether the given call should be treated as inbound or outbound for local UI/state.
+    ///
+    /// We prefer the session participant identity when available so both Apple and Android use the
+    /// same shared-state logic regardless of transport details (direct or SFU-relayed 1:1).
+    func inferredCallDirection(for call: Call) -> CallStateMachine.CallDirection {
+        let callType: CallStateMachine.CallType = call.supportsVideo ? .video : .voice
+
+        guard let sessionParticipant else {
+            return .inbound(callType)
+        }
+
+        let isLocalSender =
+            call.sender.secretName == sessionParticipant.secretName ||
+            (!call.sender.deviceId.isEmpty && call.sender.deviceId == sessionParticipant.deviceId)
+
+        return isLocalSender ? .outbound(callType) : .inbound(callType)
     }
 }
 
@@ -901,4 +995,27 @@ public struct RTCDataChannelMessage: Sendable {
 public enum RTCFrameEncryptionKeyMode: Sendable {
     case shared
     case perParticipant
+}
+
+/* SKIP @bridge */ public enum RTCIceTransportPolicyStrategy: Sendable, Equatable {
+    case all
+    case relayOnly
+    case allThenRelay(timeoutMilliseconds: UInt64)
+}
+
+/* SKIP @bridge */ public enum RTCIceTransportSelection: String, Sendable, Codable {
+    case all
+    case relay
+}
+
+struct RTCConnectionFallbackState {
+    let connectionId: String
+    let sender: String
+    let recipient: String
+    let localIdentity: ConnectionLocalIdentity
+    let direction: CallStateMachine.CallDirection
+    var latestCall: Call
+    var currentPolicy: RTCIceTransportSelection
+    var hasRetriedToRelay: Bool
+    var timeoutTask: Task<Void, Never>?
 }

@@ -25,6 +25,26 @@ import AppKit
 /// - disables scroll chrome for embedded scroll views
 /// - hides visual effect views that would otherwise add blur/vibrancy
 final class VideoCallCollectionView: NSCollectionView {
+    private var lastKnownSize: CGSize = .zero
+    private var layoutInvalidationScheduled = false
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureCollectionView()
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureCollectionView()
+    }
+    
+    private func configureCollectionView() {
+        wantsLayer = true
+        layer?.backgroundColor = Constants.DARK_CHARCOAL_COLOR
+        autoresizingMask = [.width, .height]
+        isSelectable = false
+        lastKnownSize = bounds.size
+    }
     
     /// Intercepts subview attachment to normalize appearance.
     ///
@@ -43,6 +63,30 @@ final class VideoCallCollectionView: NSCollectionView {
             vxf.isHidden = true
         }
         super.addSubview(view)
+    }
+    
+    override func layout() {
+        super.layout()
+        invalidateLayoutIfNeeded()
+    }
+    
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        invalidateLayoutIfNeeded()
+    }
+    
+    private func invalidateLayoutIfNeeded() {
+        guard bounds.size != lastKnownSize else { return }
+        lastKnownSize = bounds.size
+        guard layoutInvalidationScheduled == false else { return }
+        layoutInvalidationScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.layoutInvalidationScheduled = false
+            // Skip transient zero-sized layouts during live resize; a later pass will invalidate again.
+            guard self.bounds.width > 0, self.bounds.height > 0 else { return }
+            self.collectionViewLayout?.invalidateLayout()
+        }
     }
 }
 #endif

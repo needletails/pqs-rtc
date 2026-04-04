@@ -29,6 +29,7 @@ extension RTCSession {
     ) async throws {
         isGroupCall = true
         let normalizedId = sfuRecipientId.normalizedConnectionId
+        resetAttemptFlagsForNewCall(connectionId: normalizedId)
         // Allow joining an SFU room even if the participant list is currently empty.
         var call = try Call(
             groupSharedCommunicationId: normalizedId,
@@ -111,14 +112,14 @@ extension RTCSession {
         sfuRecipientId: String,
         call: Call
     ) async throws {
-
-        guard let group = groupCall(forSfuIdentity: sfuRecipientId) else {
-            throw RTCErrors.missingGroupCall
-        }
+        
+//        guard let group = groupCall(forSfuIdentity: sfuRecipientId) else {
+//            throw RTCErrors.missingGroupCall
+//        }
         // Identity props must be sent back from the SFU Server's group identity.
         guard let props = call.signalingIdentityProps else { throw EncryptionErrors.missingProps }
         do {
-            try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId.normalizedConnectionId)
+            _ = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId.normalizedConnectionId)
         } catch {
             _ = try await pcKeyManager.createRecipientIdentity(
                 connectionId: call.sharedCommunicationId.normalizedConnectionId,

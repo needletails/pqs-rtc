@@ -102,6 +102,8 @@ import FoundationEssentials
     public let peerConnection: WebRTC.RTCPeerConnection
     internal var rtcVideoCaptureWrapper: RTCVideoCaptureWrapper?
     public var localVideoTrack: WebRTC.RTCVideoTrack?
+    /// Local mic publish track (Apple). Stored so mute can target the same object WebRTC captures from when `RTCRtpSender.track` is nil or swapped during negotiation.
+    public var localAudioTrack: WebRTC.RTCAudioTrack?
     public var remoteVideoTrack: WebRTC.RTCVideoTrack?
     var dataChannels: [String: RTCDataChannel] = [:]
 
@@ -147,6 +149,7 @@ import FoundationEssentials
         peerConnection: WebRTC.RTCPeerConnection,
         delegateWrapper: RTCPeerConnectionDelegateWrapper,
         localVideoTrack: WebRTC.RTCVideoTrack? = nil,
+        localAudioTrack: WebRTC.RTCAudioTrack? = nil,
         remoteVideoTrack: WebRTC.RTCVideoTrack? = nil,
         rtcVideoCaptureWrapper: RTCVideoCaptureWrapper? = nil,
         sender: String,
@@ -161,6 +164,7 @@ import FoundationEssentials
         self.peerConnection = peerConnection
         self.delegateWrapper = delegateWrapper
         self.localVideoTrack = localVideoTrack
+        self.localAudioTrack = localAudioTrack
         self.remoteVideoTrack = remoteVideoTrack
         self.sender = sender
         self.recipient = recipient
@@ -187,24 +191,41 @@ actor RTCConnectionManager {
         self.logger = logger
         logger.log(level: .debug, message: "RTCConnectionManager initialized")
     }
+
+    /// Group / SFU connections keep `Call.sharedCommunicationId` as stored `RTCConnection.id`, often with a `#` prefix.
+    /// Many APIs (mute, render helpers) pass ``String/normalizedConnectionId`` without `#`. Match both forms.
+    private func normalizedLookupKey(_ id: String) -> String {
+        id.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+    }
+
+    private func indexOfConnection(matchingLookupId lookupId: String) -> Int? {
+        let key = normalizedLookupKey(lookupId)
+        return connections.firstIndex {
+            normalizedLookupKey($0.id) == key
+        }
+    }
     
     func addConnection(_ connection: RTCConnection) {
-        if connections.contains(where: { $0.id == connection.id }) {
-            logger.log(level: .warning, message: "Replacing existing connection with id: \(connection.id)")
-            connections.removeAll(where: { $0.id == connection.id })
+        if let index = indexOfConnection(matchingLookupId: connection.id) {
+            let previous = connections[index].id
+            logger.log(level: .warning, message: "Replacing existing connection id=\(previous) (new id=\(connection.id), same normalized key)")
+            connections.remove(at: index)
         }
         connections.append(connection)
     }
     
     func updateConnection(id: String, with connection: RTCConnection) {
-        if let index = connections.firstIndex(where: { $0.id == id }) {
+        if let index = indexOfConnection(matchingLookupId: id) {
             connections[index] = connection
             logger.log(level: .info, message: "Updated connection with id \(connection.id)")
+        } else {
+            logger.log(level: .warning, message: "updateConnection: no match for lookup id=\(id) (normalized=\(normalizedLookupKey(id)))")
         }
     }
     
     func findConnection(with id: String) -> RTCConnection? {
-        return connections.first(where: { $0.id == id })
+        guard let index = indexOfConnection(matchingLookupId: id) else { return nil }
+        return connections[index]
     }
     
     func findAllConnections() -> [RTCConnection] {
@@ -212,7 +233,8 @@ actor RTCConnectionManager {
     }
     
     func removeConnection(with id: String) {
-        connections.removeAll(where: { $0.id == id })
+        guard let index = indexOfConnection(matchingLookupId: id) else { return }
+        connections.remove(at: index)
     }
     
     func removeAllConnections() {

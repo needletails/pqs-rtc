@@ -127,5 +127,18 @@ struct RTCConnectionManagerTests {
         let foundId = await manager.findConnectionId(for: conn.peerConnection)
         #expect(foundId == "c1")
     }
+
+    @Test
+    func findConnectionMatchesGroupIdWithOrWithoutHashPrefix() async throws {
+        let manager = RTCConnectionManager(logger: NeedleTailLogger("[test]"))
+        let conn = try await makeConnection(id: "#group-room", recipient: "sfu")
+
+        await manager.addConnection(conn)
+
+        let byHash = await manager.findConnection(with: "#group-room")
+        let byStripped = await manager.findConnection(with: "group-room")
+        #expect(byHash?.peerConnection === conn.peerConnection)
+        #expect(byStripped?.peerConnection === conn.peerConnection)
+    }
 }
 #endif

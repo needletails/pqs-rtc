@@ -153,13 +153,20 @@ internal class SampleCaptureView: NSView {
     // MARK: - Layer Configuration
     
     private func setupSampleBufferLayer() {
+        wantsLayer = true
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = .resizeAspectFill
         self.layer = layer
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
         
         #if DEBUG
         logger.log(level: .debug, message: "SampleCaptureView initialized with frame: \(frame)")
         #endif
+    }
+    
+    override func layout() {
+        super.layout()
+        layer?.frame = bounds
     }
     
     // MARK: - Public Methods

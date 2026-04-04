@@ -14,12 +14,8 @@
 //  Frame Encrypted VoIP Capabilities
 //
 
-import SkipUI
-import SwiftUI
+import SkipFuseUI
 import NeedleTailLogger
-#if canImport(SkipSwiftUI)
-import SkipSwiftUI
-#endif
 #if SKIP
 import androidx.compose.runtime.__
 import androidx.compose.ui.__
@@ -42,25 +38,23 @@ import android.view.__
 public struct AndroidLocalVideoCompose: ContentComposer {
     
     private let client: AndroidRTCClient
-    private let onLaunchEffect: (AndroidPreviewCaptureView) -> Void
+    private let captureView: AndroidPreviewCaptureView
     private let onDisposeCallback: () -> Void
-    
-    private lazy var localCaptureView: AndroidPreviewCaptureView = {
-        return AndroidCaptureViewFactory.createPreviewCaptureView(client: client)
-    }()
     
     public init(
         client: AndroidRTCClient,
-        onLaunchEffect: @escaping (AndroidPreviewCaptureView) -> Void,
+        captureView: AndroidPreviewCaptureView,
         onDispose: @escaping () -> Void) {
             self.client = client
-            self.onLaunchEffect = onLaunchEffect
+            self.captureView = captureView
             self.onDisposeCallback = onDispose
         }
     
     @Composable
     public func Compose(context: ComposeContext) {
-        androidx.compose.runtime.DisposableEffect(true) {
+        let localCaptureView = captureView
+
+        androidx.compose.runtime.DisposableEffect(localCaptureView) {
             onDispose {
                 client.removeRenderer(localCaptureView.surfaceViewRenderer)
                 client.safeReleaseRenderer(localCaptureView.surfaceViewRenderer)
@@ -75,8 +69,6 @@ public struct AndroidLocalVideoCompose: ContentComposer {
                     client.initializeSurfaceRenderer(localCaptureView.surfaceViewRenderer, mirror: true)
                     // Match content to parent container by filling while preserving aspect
                     localCaptureView.surfaceViewRenderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-                    // Signal to controller after renderer is initialized to avoid race conditions
-                    onLaunchEffect(localCaptureView)
                     localCaptureView.surfaceViewRenderer
                 },
                 modifier: Modifier
@@ -84,11 +76,6 @@ public struct AndroidLocalVideoCompose: ContentComposer {
                 update: { _ in }
             )
         }
-    }
-    
-    /// Returns the underlying preview capture view.
-    public func getCaptureView() -> AndroidPreviewCaptureView {
-        return localCaptureView
     }
 }
 
@@ -98,15 +85,14 @@ public struct AndroidLocalVideoCompose: ContentComposer {
 /// This is the Android equivalent of `SampleCaptureView`.
 public struct AndroidRemoteVideoCompose: ContentComposer {
     private let client: AndroidRTCClient
-    let captureView: AndroidSampleCaptureView
 
     public init(client: AndroidRTCClient) {
         self.client = client
-        self.captureView = AndroidCaptureViewFactory.createSampleCaptureView(client: client)
     }
 
     @Composable
     public func Compose(context: ComposeContext) {
+        let captureView = remember { AndroidCaptureViewFactory.createSampleCaptureView(client: client) }
         let renderer = remember { captureView.surfaceViewRenderer }
 
         androidx.compose.runtime.DisposableEffect(renderer) {
@@ -131,10 +117,6 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
             )
         }
     }
-
-    public func getCaptureView() -> AndroidSampleCaptureView {
-        return captureView
-    }
 }
 
 
@@ -148,40 +130,22 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
 public struct AndroidRemoteGridCompose: ContentComposer {
     
     private let client: AndroidRTCClient
-    private let remoteCount: Int
-    private let onLaunchEffect: ([AndroidSampleCaptureView]) -> Void
+    private let remoteCaptureViews: [AndroidSampleCaptureView]
     private let onDispose: () -> Void
-    
-    // Lazy initialization to prevent multiple creation
-    private lazy var remoteCaptureViews: [AndroidSampleCaptureView] = {
-        var remotes: [AndroidSampleCaptureView] = []
-        if remoteCount > 0 {
-            for _ in 0..<remoteCount {
-                remotes.append(AndroidCaptureViewFactory.createSampleCaptureView(client: client))
-            }
-        }
-        return remotes
-    }()
     
     public init(
         client: AndroidRTCClient,
-        remoteCount: Int = 1,
-        onLaunchEffect: @escaping ([AndroidSampleCaptureView]) -> Void,
+        remoteCaptureViews: [AndroidSampleCaptureView],
         onDispose: @escaping () -> Void
     ) {
         self.client = client
-        self.remoteCount = remoteCount
-        self.onLaunchEffect = onLaunchEffect
+        self.remoteCaptureViews = remoteCaptureViews
         self.onDispose = onDispose
     }
     
     @Composable
     public func Compose(context: ComposeContext) {
-        // Start/stop controller with attached views
-        androidx.compose.runtime.LaunchedEffect(key1: true) {
-            onLaunchEffect(remoteCaptureViews)
-        }
-        androidx.compose.runtime.DisposableEffect(true) {
+        androidx.compose.runtime.DisposableEffect(remoteCaptureViews) {
             onDispose {
                 for view in remoteCaptureViews {
                     client.removeRenderer(view.surfaceViewRenderer)
@@ -209,114 +173,162 @@ public struct AndroidRemoteGridCompose: ContentComposer {
             }
         }
     }
-    
-    public func getCaptureViews() -> [AndroidSampleCaptureView] {
-        return remoteCaptureViews
-    }
 }
 #endif
 
-#if canImport(SkipSwiftUI)
-extension SkipSwiftUI.View {
-    func roundedAndroidVideoCall() -> some SkipSwiftUI.View {
-        self.clipShape(RoundedRectangle(cornerRadius: 12))
-    }
-}
-#else
-extension SwiftUI.View {
-    func roundedAndroidVideoCall() -> some SwiftUI.View {
-        self.clipShape(RoundedRectangle(cornerRadius: 12))
-    }
-}
-#endif
+#if os(Android) || SKIP
+@MainActor
+fileprivate final class AndroidVideoCallCoordinator: VideoCallDelegate {
+    private var errorMessage: Binding<String>
+    private var endedCall: Binding<Bool>
+    private var callState: Binding<CallStateMachine.State>
 
-#if os(Android)
+    init(
+        errorMessage: Binding<String>,
+        endedCall: Binding<Bool>,
+        callState: Binding<CallStateMachine.State>
+    ) {
+        self.errorMessage = errorMessage
+        self.endedCall = endedCall
+        self.callState = callState
+    }
+
+    func update(
+        errorMessage: Binding<String>,
+        endedCall: Binding<Bool>,
+        callState: Binding<CallStateMachine.State>
+    ) {
+        self.errorMessage = errorMessage
+        self.endedCall = endedCall
+        self.callState = callState
+    }
+
+    public func passErrorMessage(_ message: String) async {
+        errorMessage.wrappedValue = message
+    }
+
+    public func deliverCallState(_ state: CallStateMachine.State) async {
+        callState.wrappedValue = state
+    }
+
+    public func endedCall(_ didEnd: Bool) async {
+        endedCall.wrappedValue = didEnd
+    }
+}
+
+@MainActor
+fileprivate final class AndroidVideoCallResources {
+    let controller: AndroidVideoCallController
+    let localCaptureView: AndroidPreviewCaptureView
+    let remoteCaptureViews: [AndroidSampleCaptureView]
+    var coordinator: AndroidVideoCallCoordinator?
+
+    init(session: RTCSession, remoteCount: Int) {
+        self.controller = AndroidVideoCallController(session: session)
+        self.localCaptureView = AndroidCaptureViewFactory.createPreviewCaptureView(client: session.rtcClient)
+
+        var remotes: [AndroidSampleCaptureView] = []
+        if remoteCount > 0 {
+            for _ in 0..<remoteCount {
+                remotes.append(AndroidCaptureViewFactory.createSampleCaptureView(client: session.rtcClient))
+            }
+        }
+        self.remoteCaptureViews = remotes
+    }
+}
+
+@MainActor
+fileprivate enum AndroidVideoCallResourceStore {
+    private static var storage: [String: AndroidVideoCallResources] = [:]
+
+    static func resources(
+        for key: String,
+        session: RTCSession,
+        remoteCount: Int
+    ) -> AndroidVideoCallResources {
+        if let existing = storage[key] {
+            return existing
+        }
+
+        let created = AndroidVideoCallResources(session: session, remoteCount: remoteCount)
+        storage[key] = created
+        return created
+    }
+
+    static func remove(for key: String) {
+        storage.removeValue(forKey: key)
+    }
+}
+
 // MARK: - SwiftUI Wrappers
 /// SwiftUI wrapper for local video preview.
 ///
 /// This is the SwiftUI-facing wrapper around `AndroidLocalVideoCompose`.
-public struct AndroidLocalVideoView: SkipSwiftUI.View {
-    @State var composeView: AndroidLocalVideoCompose
-    
-    private let onLaunchEffect: (AndroidPreviewCaptureView) -> Void
+public struct AndroidLocalVideoView: View {
+    private let client: AndroidRTCClient
+    private let captureView: AndroidPreviewCaptureView
     private let onDispose: () -> Void
     
     public init(
         client: AndroidRTCClient,
-        onLaunchEffect: @escaping (AndroidPreviewCaptureView) -> Void,
+        captureView: AndroidPreviewCaptureView,
         onDispose: @escaping () -> Void
     ) {
-        self.onLaunchEffect = onLaunchEffect
+        self.client = client
+        self.captureView = captureView
         self.onDispose = onDispose
-        self._composeView = State(initialValue: AndroidLocalVideoCompose(
-            client: client,
-            onLaunchEffect: onLaunchEffect,
-            onDispose: onDispose))
     }
     
-    public var body: some SkipSwiftUI.View {
+    public var body: some View {
         ComposeView {
-            composeView
+            AndroidLocalVideoCompose(
+                client: client,
+                captureView: captureView,
+                onDispose: onDispose
+            )
         }
-    }
-    
-    /// Returns the underlying preview capture view.
-    public func getCaptureView() -> AndroidPreviewCaptureView {
-        return composeView.getCaptureView()
     }
 }
 
 /// SwiftUI wrapper for remote video rendering.
-public struct AndroidRemoteVideoView: SkipSwiftUI.View {
-    @State var composeView: AndroidRemoteVideoCompose
+public struct AndroidRemoteVideoView: View {
+    private let client: AndroidRTCClient
     
     public init(client: AndroidRTCClient) {
-        self._composeView = State(initialValue: AndroidRemoteVideoCompose(client: client))
+        self.client = client
     }
     
-    public var body: some SkipSwiftUI.View {
+    public var body: some View {
         ComposeView {
-            composeView
+            AndroidRemoteVideoCompose(client: client)
         }
-    }
-    
-    /// Returns the underlying sample capture view.
-    public func getCaptureView() -> AndroidSampleCaptureView {
-        return composeView.getCaptureView()
     }
 }
 
 /// SwiftUI wrapper that hosts a grid of remote video renderers.
-public struct AndroidRemoteGrid: SkipSwiftUI.View {
-    @State var composeView: AndroidRemoteGridCompose
+public struct AndroidRemoteGrid: View {
+    private let client: AndroidRTCClient
+    private let remoteCaptureViews: [AndroidSampleCaptureView]
+    private let onDispose: () -> Void
     
     public init(
         client: AndroidRTCClient,
-        remoteCount: Int,
-        onLaunchEffect: @escaping ([AndroidSampleCaptureView]) -> Void,
+        remoteCaptureViews: [AndroidSampleCaptureView],
         onDispose: @escaping () -> Void
     ) {
-        self._composeView = State(initialValue:
-                                    AndroidRemoteGridCompose(
-                                        client: client,
-                                        remoteCount: remoteCount) { (remoteCaptureViews) in
-                                            onLaunchEffect(remoteCaptureViews)
-                                        } onDispose: {
-                                            onDispose()
-                                        }
-                                  
-        )
+        self.client = client
+        self.remoteCaptureViews = remoteCaptureViews
+        self.onDispose = onDispose
     }
     
-    public var body: some SkipSwiftUI.View {
+    public var body: some View {
         ComposeView {
-            composeView
+            AndroidRemoteGridCompose(
+                client: client,
+                remoteCaptureViews: remoteCaptureViews,
+                onDispose: onDispose
+            )
         }
-    }
-    
-    /// Returns the underlying remote capture views.
-    public func getCaptureViews() -> [AndroidSampleCaptureView] {
-        return composeView.getCaptureViews()
     }
 }
 
@@ -324,12 +336,11 @@ public struct AndroidRemoteGrid: SkipSwiftUI.View {
 ///
 /// This view composes the remote grid and local preview overlay, and wires them to an
 /// `AndroidVideoCallController` that drives media rendering and user actions.
-public struct AndroidVideoCallView: SkipSwiftUI.View {
+public struct AndroidVideoCallView: View {
     
     private let remoteCount: Int
     private let session: RTCSession
-    private let controller: AndroidVideoCallController
-    @State var coordinator: Coordinator?
+    @State var resourceKey: String
     @State var localViewSize: CGSize = .zero
     @Binding var delegate: CallActionDelegate?
     @Binding var errorMessage: String
@@ -356,36 +367,33 @@ public struct AndroidVideoCallView: SkipSwiftUI.View {
         self._width = width
         self._height = height
         self._callState = callState
-        
-        self.controller = AndroidVideoCallController(session: session)
+        self._resourceKey = State(initialValue: UUID().uuidString)
     }
     
-    public var body: some SkipSwiftUI.View {
+    public var body: some View {
+        let resources = AndroidVideoCallResourceStore.resources(
+            for: resourceKey,
+            session: session,
+            remoteCount: remoteCount
+        )
+
         ZStack {
             GeometryReader { geo in
                 AndroidRemoteGrid(
                     client: session.rtcClient,
-                    remoteCount: remoteCount) { views in
-                        NeedleTailLogger().log(level: .debug, message: "GRID VIEWS \(views)")
+                    remoteCaptureViews: resources.remoteCaptureViews,
+                    onDispose: {
                         Task { @MainActor in
-                            let coord = Coordinator(self)
-                            coordinator = coord
-                            await controller.setVideoCallDelegate(coord)
-                            delegate = controller
-                            await controller.setRemoteViews(remotes: views)
-                        }
-                    } onDispose: {
-                        Task { @MainActor in
-                            await controller.stop()
+                            await resources.controller.stop()
                         }
                     }
+                )
                 
-                AndroidLocalVideoView(client: session.rtcClient) { (localCaptureView) in
-                    Task { @MainActor in
-                        await controller.setLocalView(local: localCaptureView)
-                        await controller.start()
-                    }
-                } onDispose: {}
+                AndroidLocalVideoView(
+                    client: session.rtcClient,
+                    captureView: resources.localCaptureView,
+                    onDispose: {}
+                )
                     .frame(width: localViewSize.width, height: localViewSize.height)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     .clipped()
@@ -403,6 +411,42 @@ public struct AndroidVideoCallView: SkipSwiftUI.View {
                     }
             }
         }
+        .ignoresSafeArea()
+        .onAppear {
+            Task { @MainActor in
+                await configureController(resources: resources)
+            }
+        }
+        .onDisappear {
+            Task { @MainActor in
+                await resources.controller.stop()
+                AndroidVideoCallResourceStore.remove(for: resourceKey)
+            }
+        }
+    }
+
+    @MainActor
+    private func configureController(resources: AndroidVideoCallResources) async {
+        if let coordinator = resources.coordinator {
+            coordinator.update(
+                errorMessage: $errorMessage,
+                endedCall: $endedCall,
+                callState: $callState
+            )
+        } else {
+            let coordinator = AndroidVideoCallCoordinator(
+                errorMessage: $errorMessage,
+                endedCall: $endedCall,
+                callState: $callState
+            )
+            resources.coordinator = coordinator
+            await resources.controller.setVideoCallDelegate(coordinator)
+        }
+
+        delegate = resources.controller
+        await resources.controller.setRemoteViews(remotes: resources.remoteCaptureViews)
+        await resources.controller.setLocalView(local: resources.localCaptureView)
+        await resources.controller.start()
     }
     
     // MARK: - Size Management
@@ -441,25 +485,5 @@ public struct AndroidVideoCallView: SkipSwiftUI.View {
         return max(width, height) / min(width, height)
     }
     
-    @MainActor
-    /// Delegate that bridges controller events into SwiftUI bindings.
-    public final class Coordinator: VideoCallDelegate {
-        var parent: AndroidVideoCallView
-        
-        init(_ parent: AndroidVideoCallView) {
-            self.parent = parent
-        }
-        
-        public func passErrorMessage(_ message: String) async {
-            self.parent.errorMessage = message
-        }
-
-        public func deliverCallState(_ state: CallStateMachine.State) async {
-            self.parent.callState = state
-        }
-        public func endedCall(_ didEnd: Bool) async {
-            self.parent.endedCall = didEnd
-        }
-    }
 }
 #endif

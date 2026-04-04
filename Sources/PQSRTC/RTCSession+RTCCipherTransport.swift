@@ -23,7 +23,7 @@ import DoubleRatchetKit
 
 extension RTCSession {
     
-    public func createCryptoPeerConnection(with call: Call) async throws  {
+    public func createCryptoPeerConnection(with call: Call) async throws {
         logger.log(level: .info, message: "Starting CreateCryptoPeerConnection")
         var call = call
         call.sharedCommunicationId = call.sharedCommunicationId.normalizedConnectionId
@@ -45,7 +45,7 @@ extension RTCSession {
         }
         
         do {
-            try await keyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+            _ = try await keyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
         } catch {
             _ = try await keyManager.createRecipientIdentity(
                 connectionId: call.sharedCommunicationId,
@@ -53,13 +53,13 @@ extension RTCSession {
         }
         
         do {
-            try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+            _ = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
         } catch {
             _ = try await pcKeyManager.createRecipientIdentity(
                 connectionId: call.sharedCommunicationId,
                 props: remoteSignalingProps)
         }
-
+        
         let frameLocalIdentity: ConnectionLocalIdentity
         if let existingIdentity = try? await keyManager.fetchCallKeyBundle() {
             frameLocalIdentity = existingIdentity
@@ -107,7 +107,30 @@ extension RTCSession {
         ciphertext: Data,
         call: Call
     ) async throws -> Call {
-        let resolvedCall = try resolveProperRecipient(call: call)
+        let resolvedCall: Call
+        if sessionParticipant == nil {
+            // Some inbound 1:1 flows can receive `call_cipher` before the app has restored the
+            // local session participant into RTCSession. Avoid aborting the entire handshake:
+            // infer direction from `shouldOffer` and normalize the call shape just for this step.
+            logger.log(
+                level: .warning,
+                message: "Session participant missing while finishing crypto session for \(call.sharedCommunicationId); inferring local/remote participants from current call direction"
+            )
+            if shouldOffer {
+                resolvedCall = call
+            } else {
+                guard let recipient = call.recipients.first else {
+                    throw RTCErrors.invalidConfiguration("Received ciphertext without a recipient in call")
+                }
+                var normalizedCall = call
+                let remoteSender = normalizedCall.sender
+                normalizedCall.sender = recipient
+                normalizedCall.recipients = [remoteSender]
+                resolvedCall = normalizedCall
+            }
+        } else {
+            resolvedCall = try resolveProperRecipient(call: call)
+        }
         let recipient = call.sender
         
         // Treat `sharedCommunicationId` as a UUID; SFU room IDs use "#uuid" channel format.
@@ -132,9 +155,9 @@ extension RTCSession {
             case .complete:
                 var resolvedCall = try await createOffer(call: resolvedCall)
                 
-                guard let remoteProps = resolvedCall.signalingIdentityProps else {
-                    throw RTCErrors.invalidConfiguration("Remote Props are missing")
-                }
+                //                guard let remoteProps = resolvedCall.signalingIdentityProps else {
+                //                    throw RTCErrors.invalidConfiguration("Remote Props are missing")
+                //                }
                 
                 let keyBundle = try await pcKeyManager.fetchCallKeyBundle()
                 guard let localProps = await keyBundle.sessionIdentity.props(symmetricKey: keyBundle.symmetricKey) else {
@@ -155,8 +178,15 @@ extension RTCSession {
                 try await taskProcessor.feedTask(task: encryptableTask)
                 return resolvedCall
             default:
-                await shutdown(with: resolvedCall)
-                throw ConnectionErrors.connectionNotFound
+                // Transient race: peer connection may exist but cipher negotiation can still be
+                // catching up (or recovering from key reconciliation). Tearing down the whole call
+                // here causes "capture started then stopped" and drops otherwise recoverable calls.
+                // Keep the call alive and let the next signaling/cipher tick retry offer creation.
+                logger.log(
+                    level: .warning,
+                    message: "Skipping offer creation because cipherNegotiationState is not complete yet for call \(resolvedCall.sharedCommunicationId); preserving active call for retry"
+                )
+                return resolvedCall
             }
         } else {
             return resolvedCall
@@ -167,14 +197,15 @@ extension RTCSession {
     enum TrackKind: Sendable {
         case videoSender(RTCRtpSender), videoReceiver(RTCRtpReceiver), audioSender(RTCRtpSender), audioReceiver(RTCRtpReceiver)
     }
-
+#endif
+    
     //MARK: Key Derivation & Cleanup
     
     /// Applies a frame-encryption key for a participant.
     ///
     /// In `shared` mode the participantId is ignored and the key is applied to the shared key ring.
     /// In `perParticipant` mode the key is applied to the given participant.
-    public func setFrameEncryptionKey(_ key: Data, index: Int, for participantId: String) {
+    public func setFrameEncryptionKey(_ key: Data, index: Int, for participantId: String) async {
 #if canImport(WebRTC)
         guard enableEncryption else { return }
         ensureFrameKeyProviderIfNeeded()
@@ -182,15 +213,29 @@ extension RTCSession {
             logger.log(level: .error, message: "❌ FrameCryptorKeyProvider is nil; cannot set frame key (enableEncryption=true)")
             return
         }
-#endif
         if frameEncryptionKeyMode == .shared {
             keyProvider.setSharedKey(key, with: Int32(index))
         } else {
             keyProvider.setKey(key, with: Int32(index), forParticipant: participantId)
         }
+#elseif os(Android)
+        guard enableEncryption else { return }
+        if frameEncryptionKeyMode == .shared {
+            rtcClient.setSharedKey(
+                key,
+                with: Int32(index),
+                ratchetSalt: ratchetSalt)
+        } else {
+            rtcClient.setKey(
+                key,
+                with: Int32(index),
+                forParticipant: participantId,
+                ratchetSalt: ratchetSalt)
+        }
+#endif
         // Track provisioning for diagnostics (safe metadata only).
         lastFrameKeyIndexByParticipantId[participantId] = index
-
+        
         // Diagnostics: prove which participantId/index we provisioned (without logging key bytes).
         // Keep at debug to avoid log noise in production.
         let mode = frameEncryptionKeyMode
@@ -201,19 +246,18 @@ extension RTCSession {
         }
     }
     
+#if canImport(WebRTC)
     /// Ratchets and returns the next key for a participant/index.
     ///
     /// Note: This is optional for some designs; many deployments distribute derived
     /// keys via the control plane instead of requiring local ratcheting by receivers.
     public func ratchetFrameEncryptionKey(index: Int, for participantId: String) -> Data {
-#if canImport(WebRTC)
         guard enableEncryption else { return Data() }
         ensureFrameKeyProviderIfNeeded()
         guard let keyProvider else {
             logger.log(level: .error, message: "❌ FrameCryptorKeyProvider is nil; cannot ratchet frame key (enableEncryption=true)")
             return Data()
         }
-#endif
         if frameEncryptionKeyMode == .shared {
             return keyProvider.ratchetSharedKey(Int32(index))
         } else {
@@ -223,14 +267,12 @@ extension RTCSession {
     
     /// Exports the current key for a participant/index.
     public func exportFrameEncryptionKey(index: Int, for participantId: String) -> Data {
-#if canImport(WebRTC)
         guard enableEncryption else { return Data() }
         ensureFrameKeyProviderIfNeeded()
         guard let keyProvider else {
             logger.log(level: .error, message: "❌ FrameCryptorKeyProvider is nil; cannot export frame key (enableEncryption=true)")
             return Data()
         }
-#endif
         if frameEncryptionKeyMode == .shared {
             return keyProvider.exportSharedKey(Int32(index))
         } else {
@@ -313,7 +355,7 @@ extension RTCSession {
             audioCryptor.enabled = true
             connection.audioSenderCryptor = audioCryptor
         case .audioReceiver(let receiver):
-
+            
             let audioCryptor = RTCFrameCryptor(
                 factory: Self.factory,
                 rtpReceiver: receiver,
@@ -335,17 +377,8 @@ extension RTCSession {
         }
         await connectionManager.updateConnection(id: connection.id, with: connection)
     }
-#elseif os(Android)
-    public func setFrameEncryptionKey(_ key: Data, index: Int, for participantId: String) async {
-        if frameEncryptionKeyMode == .shared {
-            rtcClient.setSharedKey(key, with: Int32(index), ratchetSalt: ratchetSalt)
-        } else {
-            rtcClient.setKey(key, with: Int32(index), forParticipant: participantId, ratchetSalt: ratchetSalt)
-        }
-        // Track provisioning for diagnostics (safe metadata only).
-        lastFrameKeyIndexByParticipantId[participantId] = index
-    }
     
+#elseif os(Android)
     public func ratchetFrameEncryptionKey(index: Int, for participantId: String) async -> Data {
         if frameEncryptionKeyMode == .shared {
             // Shared ratchet is modeled as a key update via control plane.
@@ -378,7 +411,7 @@ extension RTCSession {
         let (messageKey, index) = try await deriveMessageKey(
             connection: connection,
             call: call)
-
+        
 #if canImport(WebRTC)
         // Only apply media key to the WebRTC FrameCryptorKeyProvider when frame encryption is enabled.
         if enableEncryption {
@@ -396,7 +429,7 @@ extension RTCSession {
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.localParticipantId)
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.remoteParticipantId)
             }
-
+            
             // Diagnostics: show which participant ids got provisioned from the 1:1 ratchet-derived key.
             if frameEncryptionKeyMode == .shared {
                 logger.log(level: .debug, message: "🔑 Derived+provisioned shared frame key (setMessageKey) index=\(index) connId=\(connection.id)")
@@ -406,14 +439,28 @@ extension RTCSession {
         }
 #elseif os(Android)
         // Only provision frame keys on Android when frame encryption is enabled.
+        // JNI keyProvider calls must run on main thread; MainActor ensures that.
         if enableEncryption {
             if frameEncryptionKeyMode == .shared {
-                rtcClient.setSharedKey(messageKey, with: Int32(index), ratchetSalt: ratchetSalt)
+                rtcClient.setSharedKey(
+                    messageKey,
+                    with: Int32(index),
+                    ratchetSalt: ratchetSalt)
             } else {
                 // For 1:1, provision both local+remote IDs with the same key so send/recv match.
-                rtcClient.setKey(messageKey, with: Int32(index), forParticipant: connection.localParticipantId, ratchetSalt: ratchetSalt)
-                rtcClient.setKey(messageKey, with: Int32(index), forParticipant: connection.remoteParticipantId, ratchetSalt: ratchetSalt)
+                rtcClient.setKey(
+                    messageKey,
+                    with: Int32(index),
+                    forParticipant: connection.localParticipantId,
+                    ratchetSalt: ratchetSalt)
+                rtcClient.setKey(
+                    messageKey,
+                    with: Int32(index),
+                    forParticipant: connection.remoteParticipantId,
+                    ratchetSalt: ratchetSalt)
             }
+            // Mirror Apple: attach sender FrameCryptors once the key is set (in case tracks were added before key derivation).
+            try await createEncryptedFrame(connection: connection)
         }
 #endif
     }
@@ -457,7 +504,7 @@ extension RTCSession {
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.localParticipantId)
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: remoteParticipantId)
             }
-
+            
             // Diagnostics: show which ids got provisioned for receiving.
             if frameEncryptionKeyMode == .shared {
                 logger.log(level: .debug, message: "🔑 Derived+provisioned shared frame key (setReceivingMessageKey) index=\(index) connId=\(connection.id)")
@@ -467,22 +514,33 @@ extension RTCSession {
         }
 #elseif os(Android)
         if enableEncryption {
+            // JNI keyProvider calls must run on main thread; MainActor ensures that.
             if frameEncryptionKeyMode == .shared {
                 // Match Apple as closely as possible: set the shared media key at the moment
                 // we derive it for receiving.
-                rtcClient.setSharedKey(messageKey, with: Int32(index), ratchetSalt: ratchetSalt)
+                rtcClient.setSharedKey(
+                    messageKey,
+                    with: Int32(index),
+                    ratchetSalt: ratchetSalt)
             } else {
                 // For 1:1 / 1:1-group, provision both local+remote IDs with the same key.
-                rtcClient.setKey(messageKey, with: Int32(index), forParticipant: connection.localParticipantId, ratchetSalt: ratchetSalt)
-                rtcClient.setKey(messageKey, with: Int32(index), forParticipant: remoteParticipantId, ratchetSalt: ratchetSalt)
+                rtcClient.setKey(
+                    messageKey,
+                    with: Int32(index),
+                    forParticipant: connection.localParticipantId,
+                    ratchetSalt: ratchetSalt)
+                rtcClient.setKey(
+                    messageKey,
+                    with: Int32(index),
+                    forParticipant:remoteParticipantId,
+                    ratchetSalt: ratchetSalt)
             }
             
             // Attach receiver cryptors (Android needs explicit receiver attachment).
             // For inbound media, participantId must be the REMOTE track owner.
             rtcClient.createReceiverEncryptedFrame(
                 participant: remoteParticipantId,
-                connectionId: connection.id
-            )
+                connectionId: connection.id)
         }
 #endif
     }
@@ -498,8 +556,8 @@ extension RTCSession {
             throw RTCErrors.invalidConfiguration("Remote peer did not provide a valid connection identity")
         }
         
-        let lltk = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: connection.localKeys.longTerm.rawRepresentation).publicKey.rawRepresentation.base64EncodedString().prefix(10)
-        logger.log(level: .info, message: "WILL DO SENDER INITIALIZATION:\n Local LTK: \(lltk)\n Local OTK: \(connection.localKeys.oneTime?.id)\n Local MLK: \(connection.localKeys.mlKEM.id)\n Remote LTK: \(remoteProps.longTermPublicKey.base64EncodedString().prefix(10))\n Remote OTK: \(remoteProps.oneTimePublicKey?.id)\n Remote MLK: \(remoteProps.mlKEMPublicKey.id)")
+        //        let lltk = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: connection.localKeys.longTerm.rawRepresentation).publicKey.rawRepresentation.base64EncodedString().prefix(10)
+        //        logger.log(level: .info, message: "WILL DO SENDER INITIALIZATION:\n Local LTK: \(lltk)\n Local OTK: \(connection.localKeys.oneTime?.id)\n Local MLK: \(connection.localKeys.mlKEM.id)\n Remote LTK: \(remoteProps.longTermPublicKey.base64EncodedString().prefix(10))\n Remote OTK: \(remoteProps.oneTimePublicKey?.id)\n Remote MLK: \(remoteProps.mlKEMPublicKey.id)")
         
         try await ratchetManager.senderInitialization(
             sessionIdentity: connection.sessionIdentity,
@@ -550,21 +608,21 @@ extension RTCSession {
         ciphertext: Data
     ) async throws -> (Data, Int) {
         
-        guard let localProps = await sessionIdentity.props(symmetricKey: symmetricKey) else {
-            throw EncryptionErrors.missingProps
-        }
-        
+        //        guard let localProps = await sessionIdentity.props(symmetricKey: symmetricKey) else {
+        //            throw EncryptionErrors.missingProps
+        //        }
+        //        
         let remoteConnectionIdentity = try await keyManager.fetchConnectionIdentity(connection: connectionId)
         guard let remoteProps = await remoteConnectionIdentity.sessionIdentity.props(symmetricKey: remoteConnectionIdentity.symmetricKey) else {
             throw RTCErrors.invalidConfiguration("Remote peer did not provide a valid connection identity")
         }
-
+        
         guard !ciphertext.isEmpty else {
             throw EncryptionErrors.missingCipherText
         }
         
-        let lltk = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: localKeys.longTerm.rawRepresentation).publicKey.rawRepresentation.base64EncodedString().prefix(10)
-        logger.log(level: .info, message: "WILL DO RECIPIENT INITIALIZATION:\n Local LTK: \(lltk)\n Local OTK: \(localKeys.oneTime?.id)\n Local MLK: \(localKeys.mlKEM.id)\n Remote LTK: \(remoteProps.longTermPublicKey.base64EncodedString().prefix(10))\n Remote OTK: \(remoteProps.oneTimePublicKey?.id)\n Remote MLK: \(remoteProps.mlKEMPublicKey.id)")
+        //        let lltk = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: localKeys.longTerm.rawRepresentation).publicKey.rawRepresentation.base64EncodedString().prefix(10)
+        //        logger.log(level: .info, message: "WILL DO RECIPIENT INITIALIZATION:\n Local LTK: \(lltk)\n Local OTK: \(localKeys.oneTime?.id)\n Local MLK: \(localKeys.mlKEM.id)\n Remote LTK: \(remoteProps.longTermPublicKey.base64EncodedString().prefix(10))\n Remote OTK: \(remoteProps.oneTimePublicKey?.id)\n Remote MLK: \(remoteProps.mlKEMPublicKey.id)")
         
         try await ratchetManager.recipientInitialization(
             sessionIdentity: sessionIdentity,
@@ -603,7 +661,7 @@ extension RTCSession {
         }
         
         do {
-            try await keyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+            _ = try await keyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
         } catch {
             _ = try await keyManager.createRecipientIdentity(
                 connectionId: call.sharedCommunicationId,
@@ -611,7 +669,7 @@ extension RTCSession {
         }
         
         do {
-            try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+            _ = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
         } catch {
             _ = try await pcKeyManager.createRecipientIdentity(
                 connectionId: call.sharedCommunicationId,
@@ -686,7 +744,7 @@ extension RTCSession {
                 if groupCall(forSfuIdentity: call.sharedCommunicationId) != nil { return call.sender.secretName }
                 return nil
             }()
-
+            
 #if canImport(WebRTC)
             let hasVideoReceiver = connection.peerConnection.receivers.contains { $0.track?.kind == kRTCMediaStreamTrackKindVideo }
             let hasAudioReceiver = connection.peerConnection.receivers.contains { $0.track?.kind == kRTCMediaStreamTrackKindAudio }

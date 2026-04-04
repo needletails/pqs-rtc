@@ -20,15 +20,11 @@ import MetalKit
 
 @MainActor
 final class MTKViewDelegateWrapper: NSObject, MTKViewDelegate {
-
-    private let lock = NSLock()
     var capturedView: ((MTKView?) -> Void)?
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
     
     func draw(in view: MTKView) {
-        lock.lock()
-        defer { lock.unlock() }
         capturedView?(view)
     }
     deinit {

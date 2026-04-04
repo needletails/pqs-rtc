@@ -399,7 +399,7 @@ public enum ClientPCEvent: Sendable {
 public final class AndroidRTCClient: @unchecked Sendable {
     
     /// Callback used to deliver newly created local SDP.
-    public typealias OnLocalSDP = @Sendable (RTCSessionDescription) -> Void
+    private typealias OnLocalSDP = @Sendable (RTCSessionDescription) -> Void
     
     // Thread safety
     private let lock = NSLock()
@@ -419,11 +419,59 @@ public final class AndroidRTCClient: @unchecked Sendable {
     }
     
     /// Delivers a WebRTC event to the delegate, if the client is not closed.
-    func triggerRTCEvent(_ event: ClientPCEvent) {
+    public func triggerRTCEvent(_ event: ClientPCEvent) {
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            return
+        }
+        let delegate = delegate
+        lock.unlock()
+        guard let delegate else { return }
+        switch event {
+        case .candidate(let candidate):
+            delegate.handleIceCandidateEvent(candidate)
+        case .videoTrack(let videoTrack):
+            delegate.handleRemoteVideoTrackEvent(videoTrack)
+        case .audioTrack(let audioTrack):
+            delegate.handleRemoteAudioTrackEvent(audioTrack)
+        case .signalingStateChange(let stateDesc):
+            delegate.handleSignalingStateChangeEvent(stateDesc)
+        case .iceConnectionStateChange(let stateDesc):
+            delegate.handleIceConnectionStateChangeEvent(stateDesc)
+        case .standardizedIceConnectionStateChange(let stateDesc):
+            delegate.handleStandardizedIceConnectionStateChangeEvent(stateDesc)
+        case .peerConnectionStateChange(let stateDesc):
+            delegate.handlePeerConnectionStateChangeEvent(stateDesc)
+        case .iceConnectionReceivingChange(let receiving):
+            delegate.handleIceConnectionReceivingChangeEvent(receiving)
+        case .iceGatheringStateChange(let stateDesc):
+            delegate.handleIceGatheringStateChangeEvent(stateDesc)
+        case .iceCandidatesRemoved(let count):
+            delegate.handleIceCandidatesRemovedEvent(count)
+        case .addStream(let streamId):
+            delegate.handleAddStreamEvent(streamId)
+        case .removeStream(let streamId):
+            delegate.handleRemoveStreamEvent(streamId)
+        case .dataChannel(let label):
+            delegate.handleDataChannelEvent(label)
+        case .shouldNegotiate:
+            delegate.handleShouldNegotiateEvent()
+        case .addTrack(let trackKind):
+            delegate.handleAddTrackEvent(trackKind)
+        case .removeTrack(let trackKind):
+            delegate.handleRemoveTrackEvent(trackKind)
+        }
+    }
+    
+    /// Returns whether frame-cryptor key provider has been initialized.
+    ///
+    /// On Android this can lag media track creation; callers should gate cryptor attachment
+    /// on this state and retry after key provisioning.
+    public func isFrameKeyProviderReady() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard !isClosed else { return }
-        delegate?.handleRTCEvent(event)
+        return !isClosed && keyProviderReady
     }
     
     // Retain SDP observers until their callbacks fire (avoid premature disposal)
@@ -435,13 +483,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
     private var iceServers = [String]()
     private var factory: org.webrtc.PeerConnectionFactory?
     /// The current peer connection wrapper, if initialized.
-    public var peerConnection: RTCPeerConnection?
+    private var peerConnection: RTCPeerConnection?
     private var eglBase: org.webrtc.EglBase?
     private var videoSource: RTCVideoSource?
     private var audioSource: RTCAudioSource?
     private var localAudioTrack: RTCAudioTrack?
     /// The current local video track wrapper, if created.
-    private(set) var localVideoTrack: RTCVideoTrack?
+    private var localVideoTrack: RTCVideoTrack?
     private var videoCapturer: org.webrtc.Camera2Capturer?
     private var surfaceTextureHelper: org.webrtc.SurfaceTextureHelper?
     
@@ -449,17 +497,19 @@ public final class AndroidRTCClient: @unchecked Sendable {
     private var activeSurfaceRenderers: Set<org.webrtc.SurfaceViewRenderer> = []
     
     // MARK: E2EE
-    var keyProvider: org.webrtc.FrameCryptorKeyProvider?
+    private var keyProvider: org.webrtc.FrameCryptorKeyProvider?
     private var keyProviderIsSharedKeyMode: Bool?
-    var videoSenderCryptor: org.webrtc.FrameCryptor?
-    var audioSenderCryptor: org.webrtc.FrameCryptor?
-    var videoReceiverCryptor: org.webrtc.FrameCryptor?
-    var audioReceiverCryptor: org.webrtc.FrameCryptor?
+    /// Swift-only: true when keyProvider has been set (by Kotlin). Use this instead of reading keyProvider in Swift to avoid triggering JNI method resolution (setKey/setSharedKey) which crashes.
+    private var keyProviderReady: Bool = false
+    private var videoSenderCryptor: org.webrtc.FrameCryptor?
+    private var audioSenderCryptor: org.webrtc.FrameCryptor?
+    private var videoReceiverCryptor: org.webrtc.FrameCryptor?
+    private var audioReceiverCryptor: org.webrtc.FrameCryptor?
 
     // Group-call support: multiple remote participants can be received on a single PeerConnection.
     // Keep per-participant receiver cryptors so we don't dispose previous ones.
-    var videoReceiverCryptorsByParticipantId: [String: org.webrtc.FrameCryptor] = [:]
-    var audioReceiverCryptorsByParticipantId: [String: org.webrtc.FrameCryptor] = [:]
+    private var videoReceiverCryptorsByParticipantId: [String: org.webrtc.FrameCryptor] = [:]
+    private var audioReceiverCryptorsByParticipantId: [String: org.webrtc.FrameCryptor] = [:]
 
     private var pendingSharedKey: Data?
     private var pendingSharedKeyIndex: Int32?
@@ -470,35 +520,61 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///
     /// If the Android `FrameCryptorKeyProvider` hasn't been created yet, we stash the key/index
     /// and apply it as soon as `setSharedKey(..., ratchetSalt:)` (or `setupCryptor`) creates the provider.
-    func setSharedKey(_ key: Data, with index: Int32) {
+    public func setSharedKey(_ key: Data, with index: Int32) {
         lock.lock()
         if isClosed {
             lock.unlock()
             // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Cannot set shared key: AndroidRTCClient has been closed")
             return
         }
+        pendingSharedKey = key
+        pendingSharedKeyIndex = index
 
-        guard let keyProvider else {
-            pendingSharedKey = key
-            pendingSharedKeyIndex = index
-            lock.unlock()
-            // SKIP INSERT: android.util.Log.w("AndroidRTCClient", "FrameCryptorKeyProvider not ready; stashing shared key index $index")
-            return
-        }
-
-        // SKIP INSERT: val keySize = key.count
-        // SKIP INSERT: val keyBytesUInt8 = kotlin.UByteArray(keySize) { key.bytes[it] }
-        // SKIP INSERT: val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
-        // SKIP INSERT: val success = keyProvider?.setSharedKey(index.toInt(), keyBytes) ?: false
-        // SKIP INSERT: if (!success) {
-        // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "❌ Failed to set shared media key at index $index")
+        // Reflection-only Android path to avoid SwiftJNI method-ID traps.
+        // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
+        // SKIP INSERT: if (keyProvider == null) {
+        // SKIP INSERT:   android.util.Log.w("AndroidRTCClient", "FrameCryptorKeyProvider not ready; stashing shared key index $index")
         // SKIP INSERT: } else {
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Shared media key set at index $index")
+        // SKIP INSERT:   val keyBytes = ByteArray(key.count) { key.bytes[it].toByte() }
+        // SKIP INSERT:   fun invokeSetSharedKeyReflect(i: Int, bytes: ByteArray): Boolean {
+        // SKIP INSERT:     return try {
+        // SKIP INSERT:       val m = keyProvider.javaClass.methods.firstOrNull { it.name == "setSharedKey" && it.parameterTypes.size == 2 }
+        // SKIP INSERT:       if (m == null) false
+        // SKIP INSERT:       else {
+        // SKIP INSERT:         val p0 = m.parameterTypes[0]
+        // SKIP INSERT:         val p1 = m.parameterTypes[1]
+        // SKIP INSERT:         val r = when {
+        // SKIP INSERT:           (p0 == java.lang.Integer.TYPE || p0 == java.lang.Integer::class.java) && p1 == ByteArray::class.java ->
+        // SKIP INSERT:             m.invoke(keyProvider, i, bytes)
+        // SKIP INSERT:           p0 == ByteArray::class.java && (p1 == java.lang.Integer.TYPE || p1 == java.lang.Integer::class.java) ->
+        // SKIP INSERT:             m.invoke(keyProvider, bytes, i)
+        // SKIP INSERT:           else -> null
+        // SKIP INSERT:         }
+        // SKIP INSERT:         (r as? Boolean) ?: false
+        // SKIP INSERT:       }
+        // SKIP INSERT:     } catch (e: java.lang.Exception) {
+        // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "❌ Reflection setSharedKey exception: ${e.message}", e)
+        // SKIP INSERT:       false
+        // SKIP INSERT:     }
+        // SKIP INSERT:   }
+        // SKIP INSERT:   val mainLooper = android.os.Looper.getMainLooper()
+        // SKIP INSERT:   val apply = { 
+        // SKIP INSERT:     val ok = invokeSetSharedKeyReflect(index.toInt(), keyBytes)
+        // SKIP INSERT:     if (ok) {
+        // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKey = null
+        // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKeyIndex = null
+        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "✅ Shared media key set at index $index")
+        // SKIP INSERT:     } else android.util.Log.e("AndroidRTCClient", "❌ Failed to set shared media key at index $index")
+        // SKIP INSERT:   }
+        // SKIP INSERT:   if (android.os.Looper.myLooper() == mainLooper) apply()
+        // SKIP INSERT:   else {
+        // SKIP INSERT:     val latch = java.util.concurrent.CountDownLatch(1)
+        // SKIP INSERT:     android.os.Handler(mainLooper).post { try { apply() } finally { latch.countDown() } }
+        // SKIP INSERT:     latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        // SKIP INSERT:   }
         // SKIP INSERT: }
 
         // Clear any pending shared key; this call is now authoritative.
-        pendingSharedKey = nil
-        pendingSharedKeyIndex = nil
         lock.unlock()
     }
 
@@ -506,7 +582,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///
     /// This is the closest equivalent to the Apple behavior where a keyProvider is always present
     /// and `setSharedKey` immediately updates the active key ring.
-    func setSharedKey(_ key: Data, with index: Int32, ratchetSalt: Data) {
+    public func setSharedKey(_ key: Data, with index: Int32, ratchetSalt: Data) {
         // Ensure the provider exists, but do NOT install a dummy key as a side effect.
         ensureSharedKeyProvider(ratchetSalt: ratchetSalt)
 
@@ -517,28 +593,52 @@ public final class AndroidRTCClient: @unchecked Sendable {
             return
         }
 
-        guard let keyProvider else {
-            // Provider creation failed; stash for later.
-            pendingSharedKey = key
-            pendingSharedKeyIndex = index
-            lock.unlock()
-            // SKIP INSERT: android.util.Log.w("AndroidRTCClient", "FrameCryptorKeyProvider not ready; stashing shared key index $index")
-            return
-        }
+        pendingSharedKey = key
+        pendingSharedKeyIndex = index
 
-        // Apply the requested key.
-        // SKIP INSERT: val keySize = key.count
-        // SKIP INSERT: val keyBytesUInt8 = kotlin.UByteArray(keySize) { key.bytes[it] }
-        // SKIP INSERT: val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
-        // SKIP INSERT: val success = keyProvider?.setSharedKey(index.toInt(), keyBytes) ?: false
-        // SKIP INSERT: if (!success) {
-        // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "❌ Failed to set shared media key at index $index")
+        // Reflection-only Android path to avoid SwiftJNI method-ID traps.
+        // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
+        // SKIP INSERT: if (keyProvider == null) {
+        // SKIP INSERT:   android.util.Log.w("AndroidRTCClient", "FrameCryptorKeyProvider not ready; stashing shared key index $index")
         // SKIP INSERT: } else {
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Shared media key set at index $index")
+        // SKIP INSERT:   val keyBytes = ByteArray(key.count) { key.bytes[it].toByte() }
+        // SKIP INSERT:   fun invokeSetSharedKeyReflect(i: Int, bytes: ByteArray): Boolean {
+        // SKIP INSERT:     return try {
+        // SKIP INSERT:       val m = keyProvider.javaClass.methods.firstOrNull { it.name == "setSharedKey" && it.parameterTypes.size == 2 }
+        // SKIP INSERT:       if (m == null) false
+        // SKIP INSERT:       else {
+        // SKIP INSERT:         val p0 = m.parameterTypes[0]
+        // SKIP INSERT:         val p1 = m.parameterTypes[1]
+        // SKIP INSERT:         val r = when {
+        // SKIP INSERT:           (p0 == java.lang.Integer.TYPE || p0 == java.lang.Integer::class.java) && p1 == ByteArray::class.java ->
+        // SKIP INSERT:             m.invoke(keyProvider, i, bytes)
+        // SKIP INSERT:           p0 == ByteArray::class.java && (p1 == java.lang.Integer.TYPE || p1 == java.lang.Integer::class.java) ->
+        // SKIP INSERT:             m.invoke(keyProvider, bytes, i)
+        // SKIP INSERT:           else -> null
+        // SKIP INSERT:         }
+        // SKIP INSERT:         (r as? Boolean) ?: false
+        // SKIP INSERT:       }
+        // SKIP INSERT:     } catch (e: java.lang.Exception) {
+        // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "❌ Reflection setSharedKey exception: ${e.message}", e)
+        // SKIP INSERT:       false
+        // SKIP INSERT:     }
+        // SKIP INSERT:   }
+        // SKIP INSERT:   val mainLooper = android.os.Looper.getMainLooper()
+        // SKIP INSERT:   val apply = { 
+        // SKIP INSERT:     val ok = invokeSetSharedKeyReflect(index.toInt(), keyBytes)
+        // SKIP INSERT:     if (ok) {
+        // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKey = null
+        // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKeyIndex = null
+        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "✅ Shared media key set at index $index")
+        // SKIP INSERT:     } else android.util.Log.e("AndroidRTCClient", "❌ Failed to set shared media key at index $index")
+        // SKIP INSERT:   }
+        // SKIP INSERT:   if (android.os.Looper.myLooper() == mainLooper) apply()
+        // SKIP INSERT:   else {
+        // SKIP INSERT:     val latch = java.util.concurrent.CountDownLatch(1)
+        // SKIP INSERT:     android.os.Handler(mainLooper).post { try { apply() } finally { latch.countDown() } }
+        // SKIP INSERT:     latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        // SKIP INSERT:   }
         // SKIP INSERT: }
-
-        pendingSharedKey = nil
-        pendingSharedKeyIndex = nil
         lock.unlock()
     }
 
@@ -566,6 +666,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: if (keyProvider == null || !modeMatches) {
         // SKIP INSERT:     // If the mode changes (shared vs per-participant), recreate the provider.
         // SKIP INSERT:     this@AndroidRTCClient.keyProvider = null
+        // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = false
         // SKIP INSERT:     keyProvider = null
         // SKIP INSERT:     val ratchetSaltSize = ratchetSalt.count
         // SKIP INSERT:     val ratchetSaltBytes = kotlin.UByteArray(ratchetSaltSize) { ratchetSalt.bytes[it] }
@@ -580,25 +681,39 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:         discardFrameWhenCryptorNotReady
         // SKIP INSERT:     )
         // SKIP INSERT:     this@AndroidRTCClient.keyProvider = keyProvider
+        // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderIsSharedKeyMode = sharedKeyMode
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyMode)")
         // SKIP INSERT: }
 
-        // If we stashed a key earlier, apply it now that a provider exists.
+        // If we stashed a key earlier, apply it now that a provider exists. JNI requires main thread.
         // SKIP INSERT: val pendingKey = this@AndroidRTCClient.pendingSharedKey
         // SKIP INSERT: val pendingIndex = this@AndroidRTCClient.pendingSharedKeyIndex
         // SKIP INSERT: if (pendingKey != null && pendingIndex != null && keyProvider != null) {
-        // SKIP INSERT:     val keySize = pendingKey.count
-        // SKIP INSERT:     val keyBytesUInt8 = kotlin.UByteArray(keySize) { pendingKey.bytes[it] }
-        // SKIP INSERT:     val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
-        // SKIP INSERT:     val ok = keyProvider.setSharedKey(pendingIndex.toInt(), keyBytes)
-        // SKIP INSERT:     if (ok) {
-        // SKIP INSERT:         android.util.Log.i("AndroidRTCClient", "✅ Applied stashed shared media key at index $pendingIndex")
-        // SKIP INSERT:         this@AndroidRTCClient.pendingSharedKey = null
-        // SKIP INSERT:         this@AndroidRTCClient.pendingSharedKeyIndex = null
-        // SKIP INSERT:     } else {
-        // SKIP INSERT:         android.util.Log.e("AndroidRTCClient", "❌ Failed to apply stashed shared media key at index $pendingIndex")
+        // SKIP INSERT:   val keySize = pendingKey.count
+        // SKIP INSERT:   val keyBytesUInt8 = kotlin.UByteArray(keySize) { pendingKey.bytes[it] }
+        // SKIP INSERT:   val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
+        // SKIP INSERT:   val mainLooper = android.os.Looper.getMainLooper()
+        // SKIP INSERT:   fun applyPending() {
+        // SKIP INSERT:     val ok = try {
+        // SKIP INSERT:       val m = keyProvider.javaClass.methods.firstOrNull { it.name == "setSharedKey" && it.parameterTypes.size == 2 }
+        // SKIP INSERT:       if (m != null) (m.invoke(keyProvider, pendingIndex.toInt(), keyBytes) as? Boolean) ?: false else false
+        // SKIP INSERT:     } catch (e: java.lang.Exception) {
+        // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "❌ Exception applying pending shared key: ${e.message}", e)
+        // SKIP INSERT:       false
         // SKIP INSERT:     }
+        // SKIP INSERT:     if (ok) {
+        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "✅ Applied stashed shared media key at index $pendingIndex")
+        // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKey = null
+        // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKeyIndex = null
+        // SKIP INSERT:     } else android.util.Log.e("AndroidRTCClient", "❌ Failed to apply stashed shared media key at index $pendingIndex")
+        // SKIP INSERT:   }
+        // SKIP INSERT:   if (android.os.Looper.myLooper() == mainLooper) applyPending()
+        // SKIP INSERT:   else {
+        // SKIP INSERT:     val latch = java.util.concurrent.CountDownLatch(1)
+        // SKIP INSERT:     android.os.Handler(mainLooper).post { try { applyPending() } finally { latch.countDown() } }
+        // SKIP INSERT:     latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        // SKIP INSERT:   }
         // SKIP INSERT: }
 
         lock.unlock()
@@ -641,13 +756,21 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:         discardFrameWhenCryptorNotReady
         // SKIP INSERT:     )
         // SKIP INSERT:     this@AndroidRTCClient.keyProvider = keyProvider
+        // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderIsSharedKeyMode = sharedKeyModeK
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyModeK)")
         // SKIP INSERT: }
     }
 
     /// Per-participant key setter (participant-scoped key ring).
-    func setKey(_ key: Data, with index: Int32, forParticipant participantId: String, ratchetSalt: Data) {
+    /// IMPORTANT: All keyProvider usage MUST be in SKIP INSERT. Swift/JNI bridge crashes when
+    /// resolving setKey (wrong signature). Kotlin reflection avoids the bridge entirely.
+    public func setKey(
+        _ key: Data,
+        with index: Int32,
+        forParticipant participantId: String,
+        ratchetSalt: Data
+    ) {
         ensureKeyProvider(sharedKeyMode: false, ratchetSalt: ratchetSalt)
 
         lock.lock()
@@ -655,7 +778,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
         guard !isClosed else { return }
 
-        guard let keyProvider else {
+        // Do not read keyProvider in Swift: it triggers JNI resolution of setKey and crashes (SIGTRAP). Use keyProviderReady instead.
+        guard keyProviderReady else {
             var byIndex = pendingPerParticipantKeys[participantId] ?? [:]
             byIndex[index] = key
             pendingPerParticipantKeys[participantId] = byIndex
@@ -663,36 +787,39 @@ public final class AndroidRTCClient: @unchecked Sendable {
             return
         }
 
-        // SKIP INSERT: try {
-        // SKIP INSERT:   val keySize = key.count
-        // SKIP INSERT:   val keyBytesUInt8 = kotlin.UByteArray(keySize) { key.bytes[it] }
-        // SKIP INSERT:   val keyBytes: ByteArray = kotlin.ByteArray(size = keyBytesUInt8.size) { idx -> keyBytesUInt8[idx].toByte() }
-        // SKIP INSERT:   // Use reflection for compatibility across WebRTC versions.
-        // SKIP INSERT:   val m = keyProvider?.javaClass?.methods?.firstOrNull { it.name == "setKey" && it.parameterTypes.size == 3 }
-        // SKIP INSERT:   val success = if (m != null && keyProvider != null) {
-        // SKIP INSERT:     (m.invoke(keyProvider, participantId, index.toInt(), keyBytes) as? Boolean) ?: false
-        // SKIP INSERT:   } else {
-        // SKIP INSERT:     false
-        // SKIP INSERT:   }
-        // SKIP INSERT:   if (!success) {
-        // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "❌ Failed to set per-participant key for '$participantId' index $index")
-        // SKIP INSERT:   } else {
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Per-participant key set for '$participantId' index $index")
-        // SKIP INSERT:   }
-        // SKIP INSERT: } catch (e: java.lang.Exception) {
-        // SKIP INSERT:   android.util.Log.e("AndroidRTCClient", "❌ Exception setting per-participant key: ${e.message}", e)
+        // JNI method lookup for setKey can crash when invoked through the Swift bridge.
+        // Keep the actual setKey call in Kotlin reflection.
+        // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider ?: return
+        // SKIP INSERT: val keyBytes = ByteArray(key.count) { key.bytes[it].toByte() }
+        // SKIP INSERT: fun doSetKey() {
+        // SKIP INSERT:   try {
+        // SKIP INSERT:     val m = keyProvider.javaClass.methods.firstOrNull { it.name == "setKey" && it.parameterTypes.size == 3 }
+        // SKIP INSERT:     val success = if (m != null) (m.invoke(keyProvider, participantId, index.toInt(), keyBytes) as? Boolean) ?: false else false
+        // SKIP INSERT:     if (!success) android.util.Log.e("AndroidRTCClient", "❌ Failed to set per-participant key for '$participantId' index $index")
+        // SKIP INSERT:     else android.util.Log.i("AndroidRTCClient", "✅ Per-participant key set for '$participantId' index $index")
+        // SKIP INSERT:   } catch (e: java.lang.Exception) { android.util.Log.e("AndroidRTCClient", "❌ Exception setting per-participant key: ${e.message}", e) }
+        // SKIP INSERT: }
+        // SKIP INSERT: val mainLooper = android.os.Looper.getMainLooper()
+        // SKIP INSERT: if (android.os.Looper.myLooper() == mainLooper) doSetKey()
+        // SKIP INSERT: else {
+        // SKIP INSERT:   // Do not block the caller waiting on the UI thread here.
+        // SKIP INSERT:   // The synchronous wait was causing multi-second stalls during
+        // SKIP INSERT:   // call setup on Android, which then delayed offer creation and
+        // SKIP INSERT:   // renderer startup. Key installation is safe to complete
+        // SKIP INSERT:   // asynchronously on the main looper.
+        // SKIP INSERT:   android.os.Handler(mainLooper).post { doSetKey() }
         // SKIP INSERT: }
     }
 
     /// Best-effort export of the current key. If the underlying WebRTC API doesn't support it,
     /// this returns empty `Data`.
-    func exportKey(forParticipant participantId: String, index: Int32) -> Data {
+    public func exportKey(forParticipant participantId: String, index: Int32) -> Data {
         lock.lock()
         if isClosed {
             lock.unlock()
             return Data()
         }
-        guard let keyProvider else {
+        guard keyProviderReady else {
             lock.unlock()
             return Data()
         }
@@ -720,13 +847,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
     }
 
     /// Best-effort ratchet; returns the newly derived key if available, else empty `Data`.
-    func ratchetKey(forParticipant participantId: String, index: Int32) -> Data {
+    public func ratchetKey(forParticipant participantId: String, index: Int32) -> Data {
         lock.lock()
         if isClosed {
             lock.unlock()
             return Data()
         }
-        guard let keyProvider else {
+        guard keyProviderReady else {
             lock.unlock()
             return Data()
         }
@@ -760,13 +887,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Notes:
     /// - We use shared-key mode to mirror the Apple implementation (`RTCFrameCryptorKeyProvider.setSharedKey`).
     /// - `participant` is kept for API symmetry but is not required in shared-key mode.
-    func setupCryptor(key: Data, index: Int, participant: String, ratchetSalt: Data) {
+    private func setupCryptor(key: Data, index: Int, participant: String, ratchetSalt: Data) {
         // Kept for backwards call-sites: create/ensure key provider and set the shared key.
         setSharedKey(key, with: Int32(index), ratchetSalt: ratchetSalt)
     }
 
     /// Attaches FrameCryptor encryptors to current RTP senders (audio/video) on the active PeerConnection.
-    func createSenderEncryptedFrame(participant: String, connectionId: String) {
+    public func createSenderEncryptedFrame(participant: String, connectionId: String) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -775,6 +902,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
             return
         }
 
+        // SKIP INSERT: val mainLooper = android.os.Looper.getMainLooper()
+        // SKIP INSERT: fun doCreateSenderCryptors() {
         // SKIP INSERT: run {
         // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
         // SKIP INSERT: val pc = this@AndroidRTCClient.peerConnection?.platformPeerConnection
@@ -846,10 +975,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Audio sender cryptor attached")
         // SKIP INSERT: }
         // SKIP INSERT: }
+        // SKIP INSERT: }
+        // SKIP INSERT: if (android.os.Looper.myLooper() == mainLooper) doCreateSenderCryptors()
+        // SKIP INSERT: else android.os.Handler(mainLooper).post { doCreateSenderCryptors() }
     }
 
     /// Attaches FrameCryptor decryptors to current RTP receivers (audio/video) on the active PeerConnection.
-    func createReceiverEncryptedFrame(participant: String, connectionId: String, trackKind: String? = nil, trackId: String? = nil) {
+    public func createReceiverEncryptedFrame(participant: String, connectionId: String, trackKind: String? = nil, trackId: String? = nil) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -858,6 +990,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
             return
         }
 
+        // SKIP INSERT: val mainLooper = android.os.Looper.getMainLooper()
+        // SKIP INSERT: fun doCreateReceiverCryptors() {
         // SKIP INSERT: run {
         // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
         // SKIP INSERT: val pc = this@AndroidRTCClient.peerConnection?.platformPeerConnection
@@ -908,6 +1042,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     attachObserver("video-receiver", cryptor)
         // SKIP INSERT:     cryptor?.setEnabled(true)
         // SKIP INSERT:     this@AndroidRTCClient.videoReceiverCryptorsByParticipantId[participant] = cryptor
+        // SKIP INSERT:     this@AndroidRTCClient.videoReceiverCryptor = cryptor
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Video receiver cryptor attached")
         // SKIP INSERT: }
 
@@ -924,13 +1059,17 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     attachObserver("audio-receiver", cryptor)
         // SKIP INSERT:     cryptor?.setEnabled(true)
         // SKIP INSERT:     this@AndroidRTCClient.audioReceiverCryptorsByParticipantId[participant] = cryptor
+        // SKIP INSERT:     this@AndroidRTCClient.audioReceiverCryptor = cryptor
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Audio receiver cryptor attached")
         // SKIP INSERT: }
         // SKIP INSERT: }
+        // SKIP INSERT: }
+        // SKIP INSERT: if (android.os.Looper.myLooper() == mainLooper) doCreateReceiverCryptors()
+        // SKIP INSERT: else android.os.Handler(mainLooper).post { doCreateReceiverCryptors() }
     }
 
     /// Updates the current shared media key (manual re-key / ratchet advance).
-    func ratchetAdvanced(with newKey: Data, index: Int, participant: String) {
+    private func ratchetAdvanced(with newKey: Data, index: Int, participant: String) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -939,20 +1078,31 @@ public final class AndroidRTCClient: @unchecked Sendable {
             return
         }
 
+        // JNI requires main thread.
         // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
         // SKIP INSERT: if (keyProvider != null) {
-        // SKIP INSERT:     val newKeySize = newKey.count
-        // SKIP INSERT:     val newKeyBytesUInt8 = kotlin.UByteArray(newKeySize) { newKey.bytes[it] }
-        // SKIP INSERT:     val keyBytes: ByteArray = kotlin.ByteArray(size = newKeyBytesUInt8.size) { idx -> newKeyBytesUInt8[idx].toByte() }
-        // SKIP INSERT:     val success = keyProvider.setSharedKey(index, keyBytes)
-        // SKIP INSERT:     if (success) {
-        // SKIP INSERT:         android.util.Log.i("AndroidRTCClient", "🔑 Updated shared media key index $index")
-        // SKIP INSERT:     } else {
-        // SKIP INSERT:         android.util.Log.e("AndroidRTCClient", "❌ Failed to update shared media key index $index")
+        // SKIP INSERT:   val newKeySize = newKey.count
+        // SKIP INSERT:   val newKeyBytesUInt8 = kotlin.UByteArray(newKeySize) { newKey.bytes[it] }
+        // SKIP INSERT:   val keyBytes: ByteArray = kotlin.ByteArray(size = newKeyBytesUInt8.size) { idx -> newKeyBytesUInt8[idx].toByte() }
+        // SKIP INSERT:   val mainLooper = android.os.Looper.getMainLooper()
+        // SKIP INSERT:   fun doRatchet() {
+        // SKIP INSERT:     val success = try {
+        // SKIP INSERT:       val m = keyProvider.javaClass.methods.firstOrNull { it.name == "setSharedKey" && it.parameterTypes.size == 2 }
+        // SKIP INSERT:       if (m != null) (m.invoke(keyProvider, index, keyBytes) as? Boolean) ?: false else false
+        // SKIP INSERT:     } catch (e: java.lang.Exception) {
+        // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "❌ Exception in ratchet setSharedKey: ${e.message}", e)
+        // SKIP INSERT:       false
         // SKIP INSERT:     }
-        // SKIP INSERT: } else {
-        // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "KeyProvider not initialized before ratchetAdvanced()")
-        // SKIP INSERT: }
+        // SKIP INSERT:     if (success) android.util.Log.i("AndroidRTCClient", "🔑 Updated shared media key index $index")
+        // SKIP INSERT:     else android.util.Log.e("AndroidRTCClient", "❌ Failed to update shared media key index $index")
+        // SKIP INSERT:   }
+        // SKIP INSERT:   if (android.os.Looper.myLooper() == mainLooper) doRatchet()
+        // SKIP INSERT:   else {
+        // SKIP INSERT:     val latch = java.util.concurrent.CountDownLatch(1)
+        // SKIP INSERT:     android.os.Handler(mainLooper).post { try { doRatchet() } finally { latch.countDown() } }
+        // SKIP INSERT:     latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        // SKIP INSERT:   }
+        // SKIP INSERT: } else android.util.Log.e("AndroidRTCClient", "KeyProvider not initialized before ratchetAdvanced()")
     }
     
     /// Creates a new Android RTC client instance.
@@ -1006,7 +1156,31 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       .setFieldTrials("WebRTC-H264HighProfile/Enabled/")
         // SKIP INSERT:       .createInitializationOptions()
         // SKIP INSERT:     try {
-        // SKIP INSERT:       org.webrtc.PeerConnectionFactory.initialize(init)
+        // SKIP INSERT:       // WebRTC native bootstrap is process-global; serialize and run it on main thread.
+        // SKIP INSERT:       synchronized(AndroidRTCClient::class.java) {
+        // SKIP INSERT:         val alreadyInitialized = java.lang.System.getProperty("pqsrtc.webrtc.initialized") == "1"
+        // SKIP INSERT:         if (!alreadyInitialized) {
+        // SKIP INSERT:           val mainLooper = android.os.Looper.getMainLooper()
+        // SKIP INSERT:           if (android.os.Looper.myLooper() == mainLooper) {
+        // SKIP INSERT:             org.webrtc.PeerConnectionFactory.initialize(init)
+        // SKIP INSERT:           } else {
+        // SKIP INSERT:             val latch = java.util.concurrent.CountDownLatch(1)
+        // SKIP INSERT:             var initError: Throwable? = null
+        // SKIP INSERT:             android.os.Handler(mainLooper).post {
+        // SKIP INSERT:               try {
+        // SKIP INSERT:                 org.webrtc.PeerConnectionFactory.initialize(init)
+        // SKIP INSERT:               } catch (t: Throwable) {
+        // SKIP INSERT:                 initError = t
+        // SKIP INSERT:               } finally {
+        // SKIP INSERT:                 latch.countDown()
+        // SKIP INSERT:               }
+        // SKIP INSERT:             }
+        // SKIP INSERT:             latch.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        // SKIP INSERT:             if (initError != null) throw initError as Throwable
+        // SKIP INSERT:           }
+        // SKIP INSERT:           java.lang.System.setProperty("pqsrtc.webrtc.initialized", "1")
+        // SKIP INSERT:         }
+        // SKIP INSERT:       }
         // SKIP INSERT:     } catch (e: java.lang.ClassNotFoundException) {
         // SKIP INSERT:       this@AndroidRTCClient.initializationFailed = true
         // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "WebRTC native library not found: ${e.message}", e)
@@ -1045,7 +1219,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
     }
     
     /// Creates an Android `PeerConnection` with Unified Plan semantics and continual ICE gathering.
-    private func createPeerConnection(iceServers: [String], username: String? = nil, password: String? = nil) throws -> org.webrtc.PeerConnection? {
+    private func createPeerConnection(
+        iceServers: [String],
+        username: String? = nil,
+        password: String? = nil,
+        iceTransportPolicy: RTCIceTransportSelection = .all
+    ) throws -> org.webrtc.PeerConnection? {
         // SKIP INSERT: try {
         // SKIP INSERT:   val factory = createFactory()
         // SKIP INSERT:   val servers = kotlin.collections.mutableListOf<org.webrtc.PeerConnection.IceServer>()
@@ -1060,6 +1239,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   }
         // SKIP INSERT:   val config = org.webrtc.PeerConnection.RTCConfiguration(servers)
         // SKIP INSERT:   config.sdpSemantics = org.webrtc.PeerConnection.SdpSemantics.UNIFIED_PLAN
+        // SKIP INSERT:   config.iceTransportsType = if (iceTransportPolicy == RTCIceTransportSelection.relay) org.webrtc.PeerConnection.IceTransportsType.RELAY else org.webrtc.PeerConnection.IceTransportsType.ALL
         // SKIP INSERT:   config.enableDscp = true
         // SKIP INSERT:   config.continualGatheringPolicy = org.webrtc.PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
         // SKIP INSERT:   val obs = RTCClientPeerObserver(this@AndroidRTCClient)
@@ -1083,7 +1263,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///   - password: Optional ICE credential/password.
     /// - Returns: The underlying `org.webrtc.PeerConnection` instance.
     /// - Throws: `RTCClientErrors` if initialization fails or the client is closed.
-    public func initializeFactory(iceServers: [String], username: String? = nil, password: String? = nil) throws -> org.webrtc.PeerConnection {
+    public func initializeFactory(
+        iceServers: [String],
+        username: String? = nil,
+        password: String? = nil,
+        iceTransportPolicy: RTCIceTransportSelection = .all
+    ) throws -> org.webrtc.PeerConnection {
         lock.lock()
         let closed = isClosed
         let failed = initializationFailed
@@ -1098,7 +1283,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
         }
         
         do {
-            let pc = try createPeerConnection(iceServers: iceServers, username: username, password: password)
+            let pc = try createPeerConnection(
+                iceServers: iceServers,
+                username: username,
+                password: password,
+                iceTransportPolicy: iceTransportPolicy)
             
             guard let peerConnection = pc else {
                 // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Failed to create PeerConnection - returned null")
@@ -1229,43 +1418,38 @@ public final class AndroidRTCClient: @unchecked Sendable {
     }
 
     public func getAvailableOutgoingBitrateBps() async -> Double? {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            let closed = isClosed
-            let pc = peerConnection?.platformPeerConnection
-            lock.unlock()
-            guard !closed else {
-                continuation.resume(returning: nil)
-                return
-            }
-            guard pc != nil else {
-                continuation.resume(returning: nil)
-                return
-            }
-            // SKIP INSERT: val peer = pc ?: run { continuation.resume(returning: null); return }
-            // SKIP INSERT: peer.getStats { report ->
-            // SKIP INSERT:   var best: Double? = null
-            // SKIP INSERT:   val statsMap = report.statsMap
-            // SKIP INSERT:   for ((_, stat) in statsMap) {
-            // SKIP INSERT:     if (stat.type != "candidate-pair") continue
-            // SKIP INSERT:     val selected = (stat.members["selected"] as? Boolean) ?: false
-            // SKIP INSERT:     val nominated = (stat.members["nominated"] as? Boolean) ?: false
-            // SKIP INSERT:     val state = (stat.members["state"] as? String)?.lowercase() ?: ""
-            // SKIP INSERT:     if (!(selected || (nominated && state == "succeeded"))) continue
-            // SKIP INSERT:     val v = stat.members["availableOutgoingBitrate"]
-            // SKIP INSERT:     val d = when (v) {
-            // SKIP INSERT:       is Double -> v
-            // SKIP INSERT:       is Long -> v.toDouble()
-            // SKIP INSERT:       is Int -> v.toDouble()
-            // SKIP INSERT:       is Number -> v.toDouble()
-            // SKIP INSERT:       else -> null
-            // SKIP INSERT:     }
-            // SKIP INSERT:     if (d != null) { best = d; break }
-            // SKIP INSERT:   }
-            // SKIP INSERT:   continuation.resume(returning: best)
-            // SKIP INSERT: }
-            continuation.resume(returning: nil)
-        }
+        // SKIP INSERT: lock.lock()
+        // SKIP INSERT: val closed = isClosed
+        // SKIP INSERT: val pc = peerConnection?.platformPeerConnection
+        // SKIP INSERT: lock.unlock()
+        // SKIP INSERT: val shouldReadStats = !closed && pc != null
+        // SKIP INSERT: var best: Double? = null
+        // SKIP INSERT: if (shouldReadStats) {
+        // SKIP INSERT:   val peer = pc!!
+        // SKIP INSERT:   val latch = java.util.concurrent.CountDownLatch(1)
+        // SKIP INSERT:   peer.getStats { report ->
+        // SKIP INSERT:     val statsMap = report.statsMap
+        // SKIP INSERT:     for ((_, stat) in statsMap) {
+        // SKIP INSERT:       if (stat.type != "candidate-pair") continue
+        // SKIP INSERT:       val selected = (stat.members["selected"] as? Boolean) ?: false
+        // SKIP INSERT:       val nominated = (stat.members["nominated"] as? Boolean) ?: false
+        // SKIP INSERT:       val state = (stat.members["state"] as? String)?.lowercase() ?: ""
+        // SKIP INSERT:       if (!(selected || (nominated && state == "succeeded"))) continue
+        // SKIP INSERT:       val v = stat.members["availableOutgoingBitrate"]
+        // SKIP INSERT:       val d = when (v) {
+        // SKIP INSERT:         is Double -> v
+        // SKIP INSERT:         is Long -> v.toDouble()
+        // SKIP INSERT:         is Int -> v.toDouble()
+        // SKIP INSERT:         is Number -> v.toDouble()
+        // SKIP INSERT:         else -> null
+        // SKIP INSERT:       }
+        // SKIP INSERT:       if (d != null) { best = d; break }
+        // SKIP INSERT:     }
+        // SKIP INSERT:     latch.countDown()
+        // SKIP INSERT:   }
+        // SKIP INSERT:   latch.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+        // SKIP INSERT: }
+        return nil
     }
     
     // MARK: - Public Video APIs (no org.webrtc exposure)
@@ -1279,17 +1463,21 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// - Returns: The local video track wrapper (if created).
     /// - Throws: `RTCClientErrors` if the peer connection is unavailable or the client is closed.
     public func prepareVideoSendRecv(id: String = UUID().uuidString, useFrontCamera: Bool = true) throws -> RTCVideoTrack? {
-        // First, do all the setup work while holding the lock
+        // Only use the lock to read/update local state. Do not hold it while calling WebRTC APIs
+        // like `addTrack`/`addTransceiver`, because those can synchronously re-enter our observer
+        // callbacks and deadlock on this same lock.
+        let platformPeerConnection: org.webrtc.PeerConnection
         let trackToReturn: RTCVideoTrack?
+        let shouldStartCapture: Bool
         do {
             lock.lock()
-            defer { lock.unlock() }
-            
             guard !isClosed else {
+                lock.unlock()
                 throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
             }
             
-            guard let peerConnection = peerConnection?.platformPeerConnection else {
+            guard let pc = self.peerConnection?.platformPeerConnection else {
+                lock.unlock()
                 throw RTCClientErrors.peerConnectionError("PeerConnection not yet established")
             }
             
@@ -1300,40 +1488,51 @@ public final class AndroidRTCClient: @unchecked Sendable {
                 _ = createVideoTrack(id: id, videoSource)
             }
             
-            // Ensure a video transceiver exists
-            let transceivers = peerConnection.getTransceivers()
-            let hasVideo = transceivers.firstOrNull { t in t.mediaType == org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO } != nil
-            if !hasVideo {
-                let initOpts = org.webrtc.RtpTransceiver.RtpTransceiverInit(org.webrtc.RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
-                peerConnection.addTransceiver(org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, initOpts)
-            }
-            
-            if let track = localVideoTrack {
-                var ids = [String]()
-                ids.append("stream_\(id)")
-                _ = peerConnection.addTrack(track.platformTrack, ids.toList())
-            }
-            
+            platformPeerConnection = pc
             trackToReturn = localVideoTrack
+            shouldStartCapture = (videoCapturer == nil)
+            lock.unlock()
         }
         
-        // Now call startLocalVideo (it will lock internally)
-        do {
-            try startLocalVideo(useFrontCamera: useFrontCamera)
-        } catch {
-            throw RTCClientErrors.peerConnectionError("Failed to start local video: \(error.localizedDescription)")
+        // Ensure a video transceiver exists
+        let transceivers = platformPeerConnection.getTransceivers()
+        let hasVideo = transceivers.firstOrNull { t in t.mediaType == org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO } != nil
+        if !hasVideo {
+            let initOpts = org.webrtc.RtpTransceiver.RtpTransceiverInit(org.webrtc.RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+            platformPeerConnection.addTransceiver(org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, initOpts)
+        }
+        
+        if let track = trackToReturn {
+            var ids = [String]()
+            ids.append("stream_\(id)")
+            _ = platformPeerConnection.addTrack(track.platformTrack, ids.toList())
+        }
+        
+        // Do not block peer-connection setup on camera startup. Create and attach the local
+        // track immediately so negotiation can continue, then start capture asynchronously.
+        if shouldStartCapture {
+            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Launching async local video capture startup")
+            Task.detached { [weak self] in
+                guard let self else { return }
+                do {
+                    try self.startLocalVideo(useFrontCamera: useFrontCamera)
+                    // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Local video capture started")
+                } catch {
+                    // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Failed to start local video asynchronously")
+                }
+            }
         }
         
         return trackToReturn
     }
     
-    struct Format: Hashable, Sendable {
+    private struct Format: Hashable, Sendable {
         let isLandscape: Bool
         let width: Int
         let height: Int
     }
     
-    var formats = Set<Format>()
+    private var formats = Set<Format>()
     
     /// Starts camera capture and feeds frames into the current local video source.
     ///
@@ -1341,42 +1540,62 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///   - fps: Target capture framerate.
     ///   - useFrontCamera: Whether to prefer the front-facing camera.
     /// - Throws: `RTCClientErrors` if capture cannot be started.
-    public func startLocalVideo(fps: Int = 30, useFrontCamera: Bool = true) throws {
+    private func startLocalVideo(fps: Int = 30, useFrontCamera: Bool = true) throws {
+        let existingVideoSource: RTCVideoSource
+        let staleHelper: org.webrtc.SurfaceTextureHelper?
+
         lock.lock()
-        defer { lock.unlock() }
-        
         guard !isClosed else {
+            lock.unlock()
             throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
         }
-        
+
         guard let ctx = ProcessInfo.processInfo.androidContext else {
+            lock.unlock()
             throw RTCClientErrors.peerConnectionError("Android context not available")
         }
-        
+
         guard let videoSource = videoSource else {
+            lock.unlock()
             throw RTCClientErrors.peerConnectionError("Video source not initialized")
         }
-        
+
+        if videoCapturer != nil {
+            lock.unlock()
+            return
+        }
+
+        existingVideoSource = videoSource
+        staleHelper = surfaceTextureHelper
+        surfaceTextureHelper = nil
+        lock.unlock()
+
         // Ensure EGL base exists for SurfaceTextureHelper
         do {
             try ensureEglBase()
         } catch {
             throw RTCClientErrors.peerConnectionError("Failed to ensure EGL base: \(error.localizedDescription)")
         }
-        
-        // Dispose old helper if any
-        surfaceTextureHelper?.dispose()
-        
+
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
+        }
         guard let eglBase = eglBase else {
+            lock.unlock()
             throw RTCClientErrors.peerConnectionError("EGL base is nil after ensureEglBase")
         }
-        
-        surfaceTextureHelper = org.webrtc.SurfaceTextureHelper.create("WebRTCCapture", eglBase.eglBaseContext)
-        
-        guard let helper = surfaceTextureHelper else {
+        lock.unlock()
+
+        // Dispose old helper outside the lock; disposal can call into EGL/GL code.
+        staleHelper?.dispose()
+
+        let helper = org.webrtc.SurfaceTextureHelper.create("WebRTCCapture", eglBase.eglBaseContext)
+        guard let helper else {
             throw RTCClientErrors.peerConnectionError("Failed to create SurfaceTextureHelper")
         }
-        
+
         // Select camera
         let enumerator = org.webrtc.Camera2Enumerator(ctx)
         let deviceNames = enumerator.deviceNames
@@ -1390,19 +1609,21 @@ public final class AndroidRTCClient: @unchecked Sendable {
         guard let cameraName = selectedName else {
             throw RTCClientErrors.peerConnectionError("No camera available")
         }
-        
+
         // Initialize capturer
         let events = createCameraEventsHandler()
         let capturer = org.webrtc.Camera2Capturer(ctx, cameraName, events)
-        
-        let downstream = videoSource.platformSource.getCapturerObserver()
+
+        let downstream = existingVideoSource.platformSource.getCapturerObserver()
         let proxy = CapturerObserverProxy(downstream: downstream, normalizeToUpright: true)
+        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Initializing camera capturer")
         capturer.initialize(helper, ctx, proxy)
-        
+
         guard let supportedFormats = enumerator.getSupportedFormats(cameraName) else {
             throw RTCClientErrors.peerConnectionError("No supported formats for camera: \(cameraName)")
         }
-        
+
+        formats.removeAll()
         for fmt in supportedFormats {
             formats.insert(Format(
                 isLandscape: fmt.width > fmt.height ? true : false,
@@ -1412,15 +1633,29 @@ public final class AndroidRTCClient: @unchecked Sendable {
         
         let available = Set(formats.map { ($0.width, $0.height) })
         let candidates = formats.filter { available.contains(($0.height, $0.width)) }
-        
+
         if let largestLandscape = candidates.filter({ $0.isLandscape }).max(by: { $0.width * $0.height < $1.width * $1.height }) {
+            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting camera capture: " + largestLandscape.width + "x" + largestLandscape.height + "@" + fps + "fps")
             capturer.startCapture(Int32(largestLandscape.width), Int32(largestLandscape.height), Int32(fps))
         } else if let largestPortrait = candidates.max(by: { $0.width * $0.height < $1.width * $1.height }) {
+            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting camera capture: " + largestPortrait.width + "x" + largestPortrait.height + "@" + fps + "fps")
             capturer.startCapture(Int32(largestPortrait.width), Int32(largestPortrait.height), Int32(fps))
         } else {
             throw RTCClientErrors.peerConnectionError("No suitable video format found")
         }
-        
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else {
+            throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
+        }
+
+        if videoCapturer != nil {
+            helper.dispose()
+            return
+        }
+
+        surfaceTextureHelper = helper
         videoCapturer = capturer
     }
     
@@ -1604,36 +1839,46 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///
     /// - Parameter id: An identifier used for stream/track labeling.
     public func prepareAudioSendRecv(id: String) async throws {
-        lock.lock()
-        defer { lock.unlock() }
+        // Only use the lock to read/update local state. Do not hold it while calling WebRTC APIs
+        // like `addTrack`/`addTransceiver`, because those can synchronously re-enter our observer
+        // callbacks and deadlock on this same lock.
+        let platformPeerConnection: org.webrtc.PeerConnection
+        let audioTrackToAdd: RTCAudioTrack?
         
+        lock.lock()
         guard !isClosed else {
+            lock.unlock()
             throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
         }
         
-        guard let peerConnection = peerConnection?.platformPeerConnection else {
+        guard let pc = self.peerConnection?.platformPeerConnection else {
+            lock.unlock()
             throw RTCClientErrors.peerConnectionError("PeerConnection not yet established")
         }
         
         if audioSource == nil {
             _ = createAudioSource(createConstraints())
         }
-        if localAudioTrack == nil, let audioSource {
+        if self.localAudioTrack == nil, let audioSource {
             _ = createAudioTrack(id: id, audioSource)
         }
         
+        platformPeerConnection = pc
+        audioTrackToAdd = self.localAudioTrack
+        lock.unlock()
+        
         // Add a transceiver if there isn't already one for audio
-        let transceivers = peerConnection.getTransceivers()
+        let transceivers = platformPeerConnection.getTransceivers()
         let hasAudio = transceivers.firstOrNull { t in t.mediaType == org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO } != nil
         if !hasAudio {
             let initOpts = org.webrtc.RtpTransceiver.RtpTransceiverInit(org.webrtc.RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
-            peerConnection.addTransceiver(org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO, initOpts)
+            platformPeerConnection.addTransceiver(org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO, initOpts)
         }
         
-        if let track = localAudioTrack {
+        if let track = audioTrackToAdd {
             var ids = [String]()
             ids.append("stream_\(id)")
-            _ = peerConnection.addTrack(track.platformTrack, ids.toList())
+            _ = platformPeerConnection.addTrack(track.platformTrack, ids.toList())
         }
     }
     
@@ -1873,11 +2118,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         eglBase?.release()
         factory?.dispose()
         
-        // Clean up E2EE resources
+        // Clean up E2EE resources (sender cryptors are unique; receiver cryptors are in ByParticipantId map, singular refs point into that map so do not dispose again)
         videoSenderCryptor?.dispose()
         audioSenderCryptor?.dispose()
-        videoReceiverCryptor?.dispose()
-        audioReceiverCryptor?.dispose()
 
         for (_, cryptor) in videoReceiverCryptorsByParticipantId {
             cryptor.dispose()
@@ -1890,6 +2133,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
         keyProvider = nil
         keyProviderIsSharedKeyMode = nil
+        keyProviderReady = false
         pendingPerParticipantKeys.removeAll()
         
         // Clear all references

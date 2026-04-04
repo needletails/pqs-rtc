@@ -19,32 +19,79 @@
 import AppKit
 import NeedleTailLogger
 
-@MainActor
+/// Uses a top-left origin so `frame`/`bounds` match NSEvent translation and iOS-style edge math.
+final class FlippedPreviewOverlayView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 /// Root AppKit view that hosts the macOS in-call UI.
 ///
 /// `ControllerView` owns the scrollable video layout (`VideoCallScrollView`) and lightweight
 /// overlay labels (callee/status). It also provides helper methods for switching between
 /// voice-style and video-style layouts.
+@MainActor
 class ControllerView: NSView {
     
+    private let pipLayoutLog = NeedleTailLogger("[ControllerView-PiP]")
+    
     let scrollView = VideoCallScrollView()
+    let localPreviewOverlay = FlippedPreviewOverlayView()
+    private weak var currentPreviewView: NTMTKView?
+    private var previewOverlayConstraints: [NSLayoutConstraint] = []
+    private var previewTopConstraint: NSLayoutConstraint?
+    private var previewTrailingConstraint: NSLayoutConstraint?
+    private var previewWidthConstraint: NSLayoutConstraint?
+    private var previewHeightConstraint: NSLayoutConstraint?
+    
+    /// Hosts caller name + status above the scroll view so labels are not clipped by the collection view.
+    private let callInfoChrome: NSVisualEffectView = {
+        let v = NSVisualEffectView()
+        v.wantsLayer = true
+        v.material = .hudWindow
+        v.blendingMode = .withinWindow
+        v.state = .active
+        v.layer?.cornerRadius = 18
+        v.layer?.cornerCurve = .continuous
+        v.layer?.masksToBounds = true
+        v.layer?.borderWidth = 1
+        v.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        v.layer?.shadowColor = NSColor.black.cgColor
+        v.layer?.shadowOpacity = 0.22
+        v.layer?.shadowRadius = 20
+        v.layer?.shadowOffset = .init(width: 0, height: -4)
+        v.layer?.zPosition = 900
+        return v
+    }()
     var voiceImageData: Data?
     var calleeProfileImageView: NSImageView?
     
     let calleeLabel: NSTextField = {
         let txt = NSTextField.newLabel()
         txt.textColor = Constants.OFF_WHITE_COLOR
-        txt.backgroundColor = NSColor(red: 30/255, green: 30/255, blue: 30/255, alpha: 1)
-        txt.font = .systemFont(ofSize: 12, weight: .light)
+        txt.backgroundColor = .clear
+        txt.drawsBackground = false
+        txt.font = .systemFont(ofSize: 14, weight: .semibold)
+        txt.alignment = .center
+        txt.lineBreakMode = .byTruncatingTail
+        txt.maximumNumberOfLines = 2
+        txt.cell?.wraps = true
+        txt.cell?.isScrollable = false
+        txt.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return txt
     }()
     
     let statusLabel: NSTextField = {
         let txt = NSTextField.newLabel()
-        txt.textColor = Constants.OFF_WHITE_COLOR
-        txt.backgroundColor = NSColor(red: 30/255, green: 30/255, blue: 30/255, alpha: 1)
-        txt.font = .systemFont(ofSize: 12, weight: .light)
-        txt.sizeToFit()
+        txt.textColor = NSColor.white.withAlphaComponent(0.78)
+        txt.backgroundColor = .clear
+        txt.drawsBackground = false
+        txt.font = .systemFont(ofSize: 12, weight: .medium)
+        txt.alignment = .center
+        txt.lineBreakMode = .byTruncatingTail
+        txt.maximumNumberOfLines = 2
+        txt.cell?.wraps = true
+        txt.cell?.isScrollable = false
+        txt.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return txt
     }()
     
@@ -107,9 +154,23 @@ class ControllerView: NSView {
         
     }
     
+    override func layout() {
+        super.layout()
+        bringLocalPreviewOverlayToFront()
+    }
+    
+    /// Keeps the PiP overlay above the scroll view, collection churn, and any full-screen
+    /// hosting views (e.g. SwiftUI call controls) added after `videoViewBase()`.
+    func bringLocalPreviewOverlayToFront() {
+        guard localPreviewOverlay.superview === self else { return }
+        addSubview(localPreviewOverlay, positioned: .above, relativeTo: nil)
+    }
+    
     /// Removes subviews and clears layout constraints owned by this view.
     func tearDownView() {
         scrollView.removeFromSuperview()
+        localPreviewOverlay.removeFromSuperview()
+        callInfoChrome.removeFromSuperview()
         calleeProfileImageView?.removeFromSuperview()
         statusLabel.removeFromSuperview()
         calleeLabel.removeFromSuperview()
@@ -117,9 +178,11 @@ class ControllerView: NSView {
         calleeProfileImageView = nil
         deactivateConstraints(for: statusLabel)
         deactivateConstraints(for: calleeLabel)
+        deactivateConstraints(for: callInfoChrome)
         if let calleeProfileImageView {
             deactivateConstraints(for: calleeProfileImageView)
         }
+        deactivateConstraints(for: localPreviewOverlay)
         deactivateConstraints(for: scrollView)
         deactivateConstraints(for: self)
         self.layoutSubtreeIfNeeded()
@@ -133,38 +196,76 @@ class ControllerView: NSView {
             leading: leadingAnchor,
             bottom: bottomAnchor,
             trailing: trailingAnchor)
+        
+        localPreviewOverlay.wantsLayer = true
+        localPreviewOverlay.layer?.backgroundColor = NSColor.clear.cgColor
+        localPreviewOverlay.layer?.zPosition = 1000
+        addSubview(localPreviewOverlay, positioned: .above, relativeTo: scrollView)
+        localPreviewOverlay.anchors(
+            top: topAnchor,
+            leading: leadingAnchor,
+            bottom: bottomAnchor,
+            trailing: trailingAnchor)
         setupVideoView()
     }
     
     private func setupVideoView() {
-        addVideoSubviews()
-        setupVideoConstraints()
+        installCallInfoChrome()
     }
     
-    private func addVideoSubviews() {
-        guard let documentView = scrollView.documentView else { return }
-        documentView.addSubview(statusLabel)
-        documentView.addSubview(calleeLabel)
+    func setCallInfoChromeHidden(_ hidden: Bool) {
+        callInfoChrome.isHidden = hidden
+        calleeLabel.isHidden = hidden
+        statusLabel.isHidden = hidden
     }
     
-    private func setupVideoConstraints() {
-        guard let documentView = scrollView.documentView else { return }
-        // Use your custom anchors method for layout
-        let statusLabelSize = statusLabel.sizeThatFits(.init(width: .greatestFiniteMagnitude, height: statusLabel.frame.size.height))
-        statusLabel.anchors(
-            top: documentView.topAnchor,
-            centerX: documentView.centerXAnchor,
-            paddingTop: 20,
-            width: statusLabelSize.width,
-            height: statusLabelSize.height)
-
+    /// Pins name + status in a top-center card on the root view (not inside the collection document view).
+    private func installCallInfoChrome() {
+        calleeLabel.removeFromSuperview()
+        statusLabel.removeFromSuperview()
+        callInfoChrome.removeFromSuperview()
+        
+        addSubview(callInfoChrome, positioned: .above, relativeTo: scrollView)
+        if #available(macOS 11.0, *) {
+            callInfoChrome.anchors(
+                top: safeAreaLayoutGuide.topAnchor,
+                centerX: centerXAnchor,
+                paddingTop: 8,
+                leadingAtLeast: leadingAnchor,
+                paddingLeadingMin: 16,
+                trailingAtMost: trailingAnchor,
+                paddingTrailingMax: 16,
+                lessThanEqualToWidth: 260)
+        } else {
+            callInfoChrome.anchors(
+                top: topAnchor,
+                centerX: centerXAnchor,
+                paddingTop: 16,
+                leadingAtLeast: leadingAnchor,
+                paddingLeadingMin: 16,
+                trailingAtMost: trailingAnchor,
+                paddingTrailingMax: 16,
+                lessThanEqualToWidth: 260)
+        }
+        
+        callInfoChrome.addSubview(calleeLabel)
+        callInfoChrome.addSubview(statusLabel)
         calleeLabel.anchors(
-            leading: documentView.leadingAnchor,
-            bottom: documentView.bottomAnchor,
-            paddingLeading: 30,
-            paddingBottom: 30,
-            width: 150,
-            height: 40)
+            top: callInfoChrome.topAnchor,
+            leading: callInfoChrome.leadingAnchor,
+            trailing: callInfoChrome.trailingAnchor,
+            paddingTop: 10,
+            paddingLeading: 12,
+            paddingTrailing: 12)
+        statusLabel.anchors(
+            top: calleeLabel.bottomAnchor,
+            leading: callInfoChrome.leadingAnchor,
+            bottom: callInfoChrome.bottomAnchor,
+            trailing: callInfoChrome.trailingAnchor,
+            paddingTop: 4,
+            paddingLeading: 12,
+            paddingBottom: 10,
+            paddingTrailing: 12)
     }
     
     /// High-level call UI layout mode.
@@ -222,11 +323,31 @@ class ControllerView: NSView {
     }
     
     /// Adds the local video preview tile once the call is connected.
-    func addConnectedLocalVideoView(view: NTMTKView) async {
-        guard let documentView = scrollView.documentView else { return }
-        documentView.addSubview(view)
+    func addConnectedLocalVideoView(view: NTMTKView) {
+        bringLocalPreviewOverlayToFront()
+        if let superview = view.superview, superview !== localPreviewOverlay {
+            deactivateConstraintsReferencing(view, in: superview)
+            view.removeFromSuperview()
+        }
+        // Re-add without removing first: keeps Auto Layout constraints intact. Removing here used to
+        // deactivate top/trailing to the overlay while stale handles remained in `previewOverlayConstraints`.
+        localPreviewOverlay.addSubview(view, positioned: .above, relativeTo: nil)
+        localPreviewOverlay.isHidden = false
+        localPreviewOverlay.alphaValue = 1
+        // Clear AppKit default translating masks so PiP width/height constraints are not broken by
+        // implicit “stick to superview” sizing (symptom: huge view hugging the trailing edge).
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.autoresizingMask = []
+        view.wantsLayer = true
+        view.layer?.zPosition = 1001
+        view.isHidden = false
+        view.alphaValue = 1
+        pipLayoutLog.log(
+            level: .info,
+            message: "addConnectedLocalVideoView context=\(view.contextName) tam=\(view.translatesAutoresizingMaskIntoConstraints) mask=\(view.autoresizingMask.rawValue) overlayBounds=\(String(describing: localPreviewOverlay.bounds.size))"
+        )
         updateLocalVideoSize(isConnected: true, view: view)
-        self.layoutSubtreeIfNeeded()
+        schedulePiPLayoutCommit()
     }
     
     deinit {
@@ -234,36 +355,266 @@ class ControllerView: NSView {
     }
     
     /// Updates the local video tile size and layout mode.
-    func updateLocalVideoSize(isConnected: Bool, view: NTMTKView) {
-        let size: CGSize = .init(width: 300, height: 168)
-        Task { @MainActor [weak self] in
-            guard let self = self else { return }
-            await updateVideoConstraints(size: size, isConnected: isConnected, view: view)
-        }
+    func updateLocalVideoSize(isConnected: Bool, view: NTMTKView, minimize: Bool = false, animated: Bool = true) {
+        let size = previewSize(minimized: minimize)
+        updateVideoConstraints(size: size, isConnected: isConnected, view: view, animated: animated)
     }
     
     /// Applies layout constraints to the provided video view for the current call state.
-    func updateVideoConstraints(size: CGSize, isConnected: Bool, view: NTMTKView) async {
-        guard let documentView = scrollView.documentView else { return }
-        if isConnected {
-            view.anchors(
-                bottom: documentView.bottomAnchor,
-                trailing: documentView.trailingAnchor,
-                paddingBottom: 80,
-                paddingTrailing: 20,
-                width: size.width - 5,
-                height: size.height - 5
+    func updateVideoConstraints(size: CGSize, isConnected: Bool, view: NTMTKView, animated: Bool = true) {
+        let targetW = max(1, size.width)
+        let targetH = max(1, size.height)
+        pipLayoutLog.log(
+            level: .info,
+            message: "updateVideoConstraints enter context=\(view.contextName) isConnected=\(isConnected) targetSize=\(targetW)x\(targetH) superview=\(String(describing: type(of: view.superview))) tam=\(view.translatesAutoresizingMaskIntoConstraints) mask=\(view.autoresizingMask.rawValue) overlay=\(view.superview === localPreviewOverlay) currentPreviewSame=\(currentPreviewView === view)"
+        )
+        
+        if isConnected,
+           currentPreviewView === view,
+           view.superview === localPreviewOverlay,
+           let top = previewTopConstraint,
+           let trailing = previewTrailingConstraint,
+           let widthC = previewWidthConstraint,
+           let heightC = previewHeightConstraint,
+           top.isActive, trailing.isActive, widthC.isActive, heightC.isActive {
+            let w = targetW
+            let h = targetH
+            pipLayoutLog.log(
+                level: .info,
+                message: "updateVideoConstraints fastPath before top=\(top.constant) trail=\(trailing.constant) w=\(widthC.constant) h=\(heightC.constant) active=[\(top.isActive),\(trailing.isActive),\(widthC.isActive),\(heightC.isActive)]"
             )
-            
+            if widthC.constant != w { widthC.constant = w }
+            if heightC.constant != h { heightC.constant = h }
+            if animated, window != nil {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.18
+                    context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    self.localPreviewOverlay.layoutSubtreeIfNeeded()
+                    self.layoutSubtreeIfNeeded()
+                }
+            } else {
+                schedulePiPLayoutCommit()
+            }
+            logPiPLayoutSnapshot(phase: "fastPathAfter", view: view)
+            return
+        }
+        
+        if isConnected {
+            var skipReasons: [String] = []
+            if currentPreviewView !== view { skipReasons.append("currentPreviewMismatch(current=\(String(describing: currentPreviewView?.contextName)) view=\(view.contextName))") }
+            if view.superview !== localPreviewOverlay { skipReasons.append("superviewNotOverlay") }
+            if previewTopConstraint == nil { skipReasons.append("nilTop") }
+            if previewTrailingConstraint == nil { skipReasons.append("nilTrailing") }
+            if previewWidthConstraint == nil { skipReasons.append("nilWidth") }
+            if previewHeightConstraint == nil { skipReasons.append("nilHeight") }
+            if let t = previewTopConstraint, !t.isActive { skipReasons.append("topInactive") }
+            if let t = previewTrailingConstraint, !t.isActive { skipReasons.append("trailingInactive") }
+            if let t = previewWidthConstraint, !t.isActive { skipReasons.append("widthInactive") }
+            if let t = previewHeightConstraint, !t.isActive { skipReasons.append("heightInactive") }
+            pipLayoutLog.log(level: .info, message: "updateVideoConstraints fullLayoutPath reasons=\(skipReasons.joined(separator: "; ")) storedCount=\(previewOverlayConstraints.count) storedAllActive=\(previewOverlayConstraints.allSatisfy(\.isActive))")
+        }
+        
+        if let superview = view.superview {
+            let beforeOverlay = localPreviewOverlay.constraints.filter {
+                ($0.firstItem as AnyObject?) === view || ($0.secondItem as AnyObject?) === view
+            }.count
+            deactivateConstraintsReferencing(view, in: superview)
+            let afterOverlay = localPreviewOverlay.constraints.filter {
+                ($0.firstItem as AnyObject?) === view || ($0.secondItem as AnyObject?) === view
+            }.count
+            pipLayoutLog.log(level: .info, message: "updateVideoConstraints stripped superview constraints involving view: before=\(beforeOverlay) after=\(afterOverlay) super=\(String(describing: type(of: superview)))")
+        }
+        let ownedBefore = view.constraints.filter(\.isActive).count
+        deactivateConstraints(for: view)
+        let ownedAfter = view.constraints.filter(\.isActive).count
+        pipLayoutLog.log(level: .info, message: "updateVideoConstraints view.ownedConstraints active: \(ownedBefore) -> \(ownedAfter)")
+        if isConnected {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            let previewConstraintsValid = !previewOverlayConstraints.isEmpty
+                && previewOverlayConstraints.allSatisfy(\.isActive)
+            if currentPreviewView !== view || view.superview !== localPreviewOverlay || !previewConstraintsValid {
+                NSLayoutConstraint.deactivate(previewOverlayConstraints)
+                previewOverlayConstraints = []
+                previewTopConstraint = nil
+                previewTrailingConstraint = nil
+                previewWidthConstraint = nil
+                previewHeightConstraint = nil
+                currentPreviewView = view
+                pipLayoutLog.log(level: .info, message: "updateVideoConstraints reset stored PiP constraints validBeforeReset=\(previewConstraintsValid) inOverlay=\(view.superview === localPreviewOverlay)")
+            }
+            if previewOverlayConstraints.isEmpty {
+                let top = view.topAnchor.constraint(equalTo: localPreviewOverlay.topAnchor, constant: 16)
+                let trailing = view.trailingAnchor.constraint(equalTo: localPreviewOverlay.trailingAnchor, constant: -16)
+                let width = view.widthAnchor.constraint(equalToConstant: targetW)
+                let height = view.heightAnchor.constraint(equalToConstant: targetH)
+                width.priority = .required
+                height.priority = .required
+                previewTopConstraint = top
+                previewTrailingConstraint = trailing
+                previewWidthConstraint = width
+                previewHeightConstraint = height
+                previewOverlayConstraints = [top, trailing, width, height]
+                NSLayoutConstraint.activate(previewOverlayConstraints)
+                view.invalidateIntrinsicContentSize()
+                pipLayoutLog.log(
+                    level: .info,
+                    message: "updateVideoConstraints activated PiP top=\(top.constant) trail=\(trailing.constant) w=\(width.constant) h=\(height.constant) priW=\(width.priority.rawValue) priH=\(height.priority.rawValue)"
+                )
+            } else {
+                previewWidthConstraint?.constant = targetW
+                previewHeightConstraint?.constant = targetH
+                pipLayoutLog.log(
+                    level: .info,
+                    message: "updateVideoConstraints updated existing PiP w=\(previewWidthConstraint?.constant ?? -1) h=\(previewHeightConstraint?.constant ?? -1)"
+                )
+            }
             view.layer?.cornerRadius = 10
+            view.layer?.cornerCurve = .continuous
+            // The PiP frame is already correct in the logs; keep the host clipped so the embedded
+            // preview layer cannot visually spill outside and look "huge".
             view.layer?.masksToBounds = true
+            view.layer?.shadowOpacity = 0
         } else {
+            pipLayoutLog.log(level: .info, message: "updateVideoConstraints disconnected → pin to documentView fill")
+            NSLayoutConstraint.deactivate(previewOverlayConstraints)
+            guard let documentView = scrollView.documentView else { return }
             view.anchors(
                 top: documentView.topAnchor,
                 leading: documentView.leadingAnchor,
                 bottom: documentView.bottomAnchor,
-                trailing: documentView.trailingAnchor
-            )
+                trailing: documentView.trailingAnchor)
+            
+            view.layer?.cornerRadius = 0
+            view.layer?.shadowOpacity = 0
+        }
+        
+        if animated, window != nil {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.18
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                self.localPreviewOverlay.layoutSubtreeIfNeeded()
+                self.layoutSubtreeIfNeeded()
+            }
+        } else {
+            schedulePiPLayoutCommit()
+        }
+        if isConnected, view.superview === localPreviewOverlay {
+            logPiPLayoutSnapshot(phase: "fullPathEnd", view: view)
+        }
+    }
+    
+    /// Commits overlay/root layout on the next main run loop tick to avoid calling
+    /// `layoutSubtreeIfNeeded` while AppKit is already in `-layout` (recursion warning).
+    private func schedulePiPLayoutCommit() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.localPreviewOverlay.layoutSubtreeIfNeeded()
+            self.layoutSubtreeIfNeeded()
+        }
+    }
+    
+    /// Debug snapshot after PiP constraint passes (filter logs with `[ControllerView+PiP]`).
+    private func logPiPLayoutSnapshot(phase: String, view: NTMTKView) {
+        let hz = view.constraintsAffectingLayout(for: .horizontal).count
+        let vt = view.constraintsAffectingLayout(for: .vertical).count
+        let amb = view.hasAmbiguousLayout
+        let intrinsic = view.intrinsicContentSize
+        let captureFrame = view.captureView?.frame.size ?? .zero
+        let captureBounds = view.captureView?.bounds.size ?? .zero
+        let captureSuperview = view.captureView?.superview.map { String(describing: type(of: $0)) } ?? "nil"
+        let previewLayerFrame: CGSize
+        let previewLayerGravity: String
+        if let previewCaptureView = view.captureView as? PreviewCaptureView {
+            previewLayerFrame = previewCaptureView.previewLayer.frame.size
+            previewLayerGravity = String(describing: previewCaptureView.previewLayer.videoGravity)
+        } else {
+            previewLayerFrame = .zero
+            previewLayerGravity = "n/a"
+        }
+        pipLayoutLog.log(
+            level: .info,
+            message: "\(phase) frame=\(view.frame.size) bounds=\(view.bounds.size) overlay=\(localPreviewOverlay.bounds.size) captureFrame=\(captureFrame) captureBounds=\(captureBounds) captureSuperview=\(captureSuperview) previewLayerFrame=\(previewLayerFrame) previewGravity=\(previewLayerGravity) ambiguous=\(amb) intrinsic=\(intrinsic.width)x\(intrinsic.height) affectingLayout H=\(hz) V=\(vt) top=\(previewTopConstraint?.constant ?? .nan) trail=\(previewTrailingConstraint?.constant ?? .nan) wC=\(previewWidthConstraint?.constant ?? .nan) hC=\(previewHeightConstraint?.constant ?? .nan) wActive=\(previewWidthConstraint?.isActive ?? false) hActive=\(previewHeightConstraint?.isActive ?? false)"
+        )
+    }
+    
+    func moveLocalPreview(by translation: CGPoint, view: NTMTKView) {
+        guard currentPreviewView === view,
+              let top = previewTopConstraint,
+              let trailing = previewTrailingConstraint
+        else { return }
+        let overlayBounds = localPreviewOverlay.bounds
+        guard overlayBounds.width > 0, overlayBounds.height > 0 else { return }
+        
+        let currentFrame = view.frame
+        let proposedMinX = currentFrame.minX + translation.x
+        let proposedMinY = currentFrame.minY + translation.y
+        let maxMinX = max(16, overlayBounds.width - currentFrame.width - 16)
+        let maxMinY = max(16, overlayBounds.height - currentFrame.height - 16)
+        let clampedMinX = min(max(16, proposedMinX), maxMinX)
+        let clampedMinY = min(max(16, proposedMinY), maxMinY)
+        // trailing: view.trailing == overlay.trailing + constant → constant must be *negative* to sit inside.
+        let insetFromRight = overlayBounds.width - clampedMinX - currentFrame.width
+        top.constant = clampedMinY
+        trailing.constant = -max(16, insetFromRight)
+        schedulePiPLayoutCommit()
+    }
+    
+    func snapLocalPreviewToNearestCorner(view: NTMTKView, animated: Bool = true) {
+        guard currentPreviewView === view,
+              let top = previewTopConstraint,
+              let trailing = previewTrailingConstraint
+        else { return }
+        let overlayBounds = localPreviewOverlay.bounds
+        guard overlayBounds.width > 0, overlayBounds.height > 0 else { return }
+        
+        let frame = view.frame
+        let leftX: CGFloat = 16
+        let rightX = max(16, overlayBounds.width - frame.width - 16)
+        let topY: CGFloat = 16
+        let bottomY = max(16, overlayBounds.height - frame.height - 16)
+        let currentCenter = CGPoint(x: frame.midX, y: frame.midY)
+        let cornerOrigins: [(CGFloat, CGFloat)] = [
+            (leftX, topY), (rightX, topY),
+            (leftX, bottomY), (rightX, bottomY)
+        ]
+        let bestOrigin = cornerOrigins.min { a, b in
+            let ca = CGPoint(x: a.0 + frame.width / 2, y: a.1 + frame.height / 2)
+            let cb = CGPoint(x: b.0 + frame.width / 2, y: b.1 + frame.height / 2)
+            return hypot(ca.x - currentCenter.x, ca.y - currentCenter.y) < hypot(cb.x - currentCenter.x, cb.y - currentCenter.y)
+        } ?? (leftX, topY)
+        let insetFromRight = overlayBounds.width - bestOrigin.0 - frame.width
+        top.constant = bestOrigin.1
+        trailing.constant = -max(16, insetFromRight)
+        
+        if animated, window != nil {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.18
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                self.localPreviewOverlay.layoutSubtreeIfNeeded()
+                self.layoutSubtreeIfNeeded()
+            }
+        } else {
+            schedulePiPLayoutCommit()
+        }
+    }
+    
+    private func previewSize(minimized: Bool) -> CGSize {
+        // Use an explicit FaceTime-style PiP size so the local preview stays compact
+        // and does not grow with the call window.
+        if minimized {
+            return CGSize(width: 112, height: 63)
+        } else {
+            return CGSize(width: 160, height: 90)
+        }
+    }
+    
+    private func deactivateConstraintsReferencing(_ view: NSView, in container: NSView) {
+        let constraints = container.constraints.filter {
+            ($0.firstItem as AnyObject?) === view || ($0.secondItem as AnyObject?) === view
+        }
+        for constraint in constraints {
+            constraint.isActive = false
+            container.removeConstraint(constraint)
         }
     }
 }

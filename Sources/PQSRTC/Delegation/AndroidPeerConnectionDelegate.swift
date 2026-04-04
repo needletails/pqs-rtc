@@ -91,6 +91,73 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
         }
     }
     
+    // Direct Swift-to-Swift event entry points.
+    // Use these from `AndroidRTCClient` to avoid routing `ClientPCEvent` through the
+    // Android bridge, which can fatal while decoding enum cases on callback threads.
+    /* SKIP @bridge */ public func handleIceCandidateEvent(_ candidate: RTCIceCandidate) {
+        handleIceCandidate(candidate)
+    }
+    
+    /* SKIP @bridge */ public func handleRemoteVideoTrackEvent(_ track: RTCVideoTrack) {
+        handleRemoteVideoTrack(track)
+    }
+    
+    /* SKIP @bridge */ public func handleRemoteAudioTrackEvent(_ track: RTCAudioTrack) {
+        handleRemoteAudioTrack(track)
+    }
+    
+    /* SKIP @bridge */ public func handleSignalingStateChangeEvent(_ stateDesc: String) {
+        handleSignalingStateChange(stateDesc)
+    }
+    
+    /* SKIP @bridge */ public func handleIceConnectionStateChangeEvent(_ stateDesc: String) {
+        handleIceConnectionStateChange(stateDesc)
+    }
+    
+    /* SKIP @bridge */ public func handleStandardizedIceConnectionStateChangeEvent(_ stateDesc: String) {
+        handleStandardizedIceConnectionStateChange(stateDesc)
+    }
+    
+    /* SKIP @bridge */ public func handlePeerConnectionStateChangeEvent(_ stateDesc: String) {
+        handlePeerConnectionStateChange(stateDesc)
+    }
+    
+    /* SKIP @bridge */ public func handleIceConnectionReceivingChangeEvent(_ receiving: Bool) {
+        handleIceConnectionReceivingChange(receiving)
+    }
+    
+    /* SKIP @bridge */ public func handleIceGatheringStateChangeEvent(_ stateDesc: String) {
+        handleIceGatheringStateChange(stateDesc)
+    }
+    
+    /* SKIP @bridge */ public func handleIceCandidatesRemovedEvent(_ count: Int) {
+        handleIceCandidatesRemoved(count)
+    }
+    
+    /* SKIP @bridge */ public func handleAddStreamEvent(_ streamId: String) {
+        handleAddStream(streamId)
+    }
+    
+    /* SKIP @bridge */ public func handleRemoveStreamEvent(_ streamId: String) {
+        handleRemoveStream(streamId)
+    }
+    
+    /* SKIP @bridge */ public func handleDataChannelEvent(_ label: String) {
+        handleDataChannel(label)
+    }
+    
+    /* SKIP @bridge */ public func handleShouldNegotiateEvent() {
+        handleShouldNegotiate()
+    }
+    
+    /* SKIP @bridge */ public func handleAddTrackEvent(_ trackKind: String) {
+        handleAddTrack(trackKind)
+    }
+    
+    /* SKIP @bridge */ public func handleRemoveTrackEvent(_ trackKind: String) {
+        handleRemoveTrack(trackKind)
+    }
+    
     // MARK: - Event Handlers
     
     private func handleIceCandidate(_ candidate: RTCIceCandidate) {

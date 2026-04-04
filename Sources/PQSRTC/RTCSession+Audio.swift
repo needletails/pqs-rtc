@@ -58,24 +58,24 @@ extension RTCSession {
     ///   - connectionId: The connection ID to modify
     /// - Throws: AudioError if connection not found
     func setAudioTrack(isEnabled: Bool, connectionId: String) async throws {
-        logger.log(level: .info, message: "Setting audio track enabled: \(isEnabled) for connection: \(connectionId)")
-        
-        guard !connectionId.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty else {
+        let normalizedId = connectionId.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).normalizedConnectionId
+        logger.log(level: .info, message: "Setting audio track enabled: \(isEnabled) for connection: \(normalizedId)")
+        guard !normalizedId.isEmpty else {
             logger.log(level: .error, message: "Connection ID cannot be empty")
             throw AudioError.connectionNotFound("Empty connection ID")
         }
         
         let manager = connectionManager as RTCConnectionManager
-        guard let connection: RTCConnection = await manager.findConnection(with: connectionId) else {
-            logger.log(level: .error, message: "Connection not found for audio track modification: \(connectionId)")
-            throw AudioError.connectionNotFound(connectionId)
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
+            logger.log(level: .error, message: "Connection not found for audio track modification: \(normalizedId)")
+            throw AudioError.connectionNotFound(normalizedId)
         }
 #if !os(Android)
         await setTrackEnabled(WebRTC.RTCAudioTrack.self, isEnabled: isEnabled, with: connection)
 #elseif os(Android)
         self.rtcClient.setAudioEnabled(isEnabled)
 #endif
-        logger.log(level: .info, message: "Successfully set audio track enabled: \(isEnabled) for connection: \(connectionId)")
+        logger.log(level: .info, message: "Successfully set audio track enabled: \(isEnabled) for connection: \(normalizedId)")
     }
     
 
@@ -225,30 +225,24 @@ extension RTCSession {
         if isAudioActivated {
             return
         }
-        
-        do {
-            audioSession.lockForConfiguration()
-            defer {
-                audioSession.unlockForConfiguration()
-            }
-            
-            // Double-check after acquiring lock
-            if isAudioActivated {
-                return
-            }
-            
-            isAudioActivated = true
-            audioSession.audioSessionDidActivate(session)
-            try audioSession.setCategory(.playAndRecord)
-            try audioSession.setMode(.videoChat)
-            setAudio(true)
-            
-            logger.log(level: .info, message: "Successfully activated audio session")
-            
-        } catch {
-            logger.log(level: .error, message: "Error activating AVAudioSession: \(error)")
-            throw AudioError.audioSessionActivationFailed("Failed to activate session: \(error.localizedDescription)")
+
+        audioSession.lockForConfiguration()
+        defer {
+            audioSession.unlockForConfiguration()
         }
+
+        if isAudioActivated {
+            return
+        }
+
+        isAudioActivated = true
+        audioSession.audioSessionDidActivate(session)
+        // Do not call `setCategory` / `setMode` here: on iOS, `CallManager` applies `.voiceChat` vs
+        // `.videoChat` via `setAudioMode` immediately before activation. Forcing `.videoChat` here
+        // breaks voice-only calls (wrong output routing and audio processing profile).
+        setAudio(true)
+
+        logger.log(level: .info, message: "Successfully activated audio session (preserving category/mode)")
     }
     
     /// Deactivates the audio session with proper error handling

@@ -59,7 +59,9 @@ public struct CollectionViewSections {
         #if os(iOS)
         return createFullScreenLayout()
         #elseif os(macOS)
-        return createAspectRatioLayout(aspectRatio: Self.defaultAspectRatio)
+        // Keep the remote tile pinned to the full collection bounds while the window is resized.
+        // Renderer-level videoGravity/scale handles letterboxing; layout should not collapse.
+        return createFullScreenLayout()
         #endif
     }
     
@@ -71,10 +73,17 @@ public struct CollectionViewSections {
     public func fullScreenItem(aspectRatio: CGFloat) -> NSCollectionLayoutSection {
         guard aspectRatio > 0 else {
             assertionFailure("Aspect ratio must be greater than 0")
+#if os(iOS)
+            return createFullScreenLayout()
+#elseif os(macOS)
             return createAspectRatioLayout(aspectRatio: Self.defaultAspectRatio)
+#endif
         }
-        
+#if os(iOS)
+        return createFullScreenLayout()
+#elseif os(macOS)
         return createAspectRatioLayout(aspectRatio: aspectRatio)
+#endif
     }
     
     /// Creates a conference view layout section for multiple video participants.
@@ -131,6 +140,7 @@ public struct CollectionViewSections {
     }
     #endif
     
+    #if os(macOS)
     private func createAspectRatioLayout(aspectRatio: CGFloat) -> NSCollectionLayoutSection {
         let itemSize = NSCollectionLayoutSize(
             widthDimension: .fractionalWidth(1.0),
@@ -149,6 +159,23 @@ public struct CollectionViewSections {
         
         return NSCollectionLayoutSection(group: group)
     }
+    
+    private func createFullScreenLayout() -> NSCollectionLayoutSection {
+        let itemSize = NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1.0),
+            heightDimension: .fractionalHeight(1.0)
+        )
+        let item = NSCollectionLayoutItem(layoutSize: itemSize)
+        let group = NSCollectionLayoutGroup.horizontal(
+            layoutSize: NSCollectionLayoutSize(
+                widthDimension: .fractionalWidth(1.0),
+                heightDimension: .fractionalHeight(1.0)
+            ),
+            subitems: [item]
+        )
+        return NSCollectionLayoutSection(group: group)
+    }
+    #endif
     
     private func createConferenceLayout(
         itemCount: Int,

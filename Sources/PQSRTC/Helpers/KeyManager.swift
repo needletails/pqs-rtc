@@ -50,10 +50,10 @@ public actor KeyManager: SessionIdentityDelegate {
     public func updateSessionIdentity(_ identity: DoubleRatchetKit.SessionIdentity) async throws {
         // Find the connection identity by searching through all connection identities
         // since they're keyed by connectionId, not session identity UUID
-        var foundConnectionId: String?
+//        var foundConnectionId: String?
         for (connectionId, var connIdentity) in connectionIdentities {
             if connIdentity.sessionIdentity.id == identity.id {
-                foundConnectionId = connectionId
+//                foundConnectionId = connectionId
                 connIdentity.sessionIdentity = identity
                 connectionIdentities[connectionId] = connIdentity
                 logger.log(level: .debug, message: "Updated session identity: \(identity.id) for connectionId: \(connectionId)")
@@ -69,8 +69,13 @@ public actor KeyManager: SessionIdentityDelegate {
             logger.log(level: .debug, message: "Updated session identity: \(identity.id)")
             return
         }
-        
-        logger.log(level: .error, message: "Missing connection identity for updated session identity in CallKeyStore: \(identity.id)")
+
+        // Ratchet can emit a late identity update after `removeConnectionIdentity` / `clearAll` during
+        // hangup; persisting it would be meaningless, so treat as expected teardown noise (not an error).
+        logger.log(
+            level: .debug,
+            message: "Skipping session identity update (no cached connection): \(identity.id)"
+        )
     }
     
     public func fetchOneTimePrivateKey(_ id: UUID?) async throws -> DoubleRatchetKit.CurvePrivateKey? {

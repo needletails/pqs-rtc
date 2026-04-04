@@ -32,18 +32,18 @@ extension RTCSession {
     //MARK: Public
     
     public func handleHandshakeCompleted(_ call: Call) async throws {
-        let copiedSender = call.sender
+//        let copiedSender = call.sender
         let call = try resolveProperRecipient(call: call)
-        let recipient = copiedSender
+//        let recipient = copiedSender
         
         try await startSendingCandidates(call: call)
         if !handshakeComplete {
             setHandshakeComplete(true)
             
-            let connectionIdentity = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
-            guard let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey)  else {
-                throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
-            }
+//            let connectionIdentity = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+//            guard let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey)  else {
+//                throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
+//            }
             
             let plaintext = try BinaryEncoder().encode(call)
             let writeTask = WriteTask(
@@ -66,16 +66,15 @@ extension RTCSession {
     ) async throws -> Call {
         let call = try resolveProperRecipient(call: call)
         
-        let sdpNegotiationMetadata = try PQSRTC.SDPNegotiationMetadata(
-            offerSecretName: call.sender.secretName,
-            offerDeviceId: call.sender.deviceId,
-            answerDeviceId: answerDeviceId)
-        
+//        let sdpNegotiationMetadata = try PQSRTC.SDPNegotiationMetadata(
+//            offerSecretName: call.sender.secretName,
+//            offerDeviceId: call.sender.deviceId,
+//            answerDeviceId: answerDeviceId)
+//        
         let modified = await modifySDP(
             sdp: sdp.sdp,
             hasVideo: call.supportsVideo,
-            stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
-        )
+            stripSsrcLines: call.sharedCommunicationId.isGroupCall)
         
 #if os(Android)
         try await rtcClient.setRemoteDescription(RTCSessionDescription(
@@ -92,9 +91,9 @@ extension RTCSession {
         
         let processedCall = try await createAnswer(call: call)
         
-        guard let remoteProps = call.signalingIdentityProps else {
-            throw RTCErrors.invalidConfiguration("Remote Props are nil")
-        }
+//        guard let remoteProps = call.signalingIdentityProps else {
+//            throw RTCErrors.invalidConfiguration("Remote Props are nil")
+//        }
         
         // Encrypt answer and send (roomId normalized; "#" reattached at transport).
         let plaintext = try BinaryEncoder().encode(processedCall)
@@ -124,8 +123,7 @@ extension RTCSession {
         let modified = await modifySDP(
             sdp: sdp.sdp,
             hasVideo: call.supportsVideo,
-            stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
-        )
+            stripSsrcLines: call.sharedCommunicationId.isGroupCall)
 #if os(Android)
         try await rtcClient.setRemoteDescription(RTCSessionDescription(
             typeDescription: "OFFER",
@@ -147,8 +145,7 @@ extension RTCSession {
         let modified = await modifySDP(
             sdp: sdp.sdp,
             hasVideo: call.supportsVideo,
-            stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
-        )
+            stripSsrcLines: call.sharedCommunicationId.isGroupCall)
         
 #if os(Android)
         try await rtcClient.setRemoteDescription(RTCSessionDescription(
@@ -163,6 +160,8 @@ extension RTCSession {
             connection.call = call
             await connectionManager.updateConnection(id: call.sharedCommunicationId, with: connection)
         }
+        updateFallbackLatestCall(call)
+        armRelayFallbackTimerIfNeeded(for: call)
         
         if !handshakeComplete {
             guard var recipient = call.recipients.first else {
@@ -183,11 +182,11 @@ extension RTCSession {
                 recipient = copiedSender
             }
             
-            let connectionIdentity = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
-            guard let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey) else {
-                throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
-            }
-            
+//            let connectionIdentity = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+//            guard let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey) else {
+//                throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
+//            }
+//            
             let plaintext = try BinaryEncoder().encode(call)
             let writeTask = WriteTask(
                 data: plaintext,
@@ -220,6 +219,7 @@ extension RTCSession {
             iceDeque.removeAll()
         }
         readyForCandidates = true
+        updateFallbackLatestCall(call)
     }
     
     //MARK: Internal
@@ -259,18 +259,14 @@ extension RTCSession {
             // Generate SDP offer using the new SDPHandler
             var description: RTCSessionDescription = try await generateSDPOffer(for: connection, hasAudio: true, hasVideo: hasVideo)
             
-            // SKIP INSERT: android.util.Log.d("RTCClient", "Android: generateSDPOffer completed")
-            // SKIP INSERT: android.util.Log.d("RTCClient", "Android Offer SDP:\n" + description.sdp)
-            
             // Modify SDP for specific requirements
             let modified = await modifySDP(
                 sdp: description.sdp,
                 hasVideo: hasVideo,
-                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
-            )
+                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+            
             description = RTCSessionDescription(typeDescription: description.typeDescription, sdp: modified)
             
-            // SKIP INSERT: android.util.Log.d("RTCClient", "Android Modified Offer SDP:\n" + description.sdp)
             logger.log(level: .info, message: "Android Modified Offer SDP:\n\(description.sdp)")
             
             logger.log(level: .info, message: "Generated SDP offer for call: \(call.sharedCommunicationId)")
@@ -284,8 +280,8 @@ extension RTCSession {
             let modified = await modifySDP(
                 sdp: description.sdp,
                 hasVideo: hasVideo,
-                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
-            )
+                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+            
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             
             logger.log(level: .info, message: "Apple Platform Modified Offer SDP:\n\(description.sdp)")
@@ -304,17 +300,17 @@ extension RTCSession {
             
         } catch let error as SDPHandlerError {
             logger.log(level: .error, message: "SDP offer creation failed: \(error.localizedDescription)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
+            await callState.transition(to: .failed(inferredCallDirection(for: call), call, error.localizedDescription))
             await finishEndConnection(currentCall: call)
             throw error
         } catch let error as RTCErrors {
             logger.log(level: .error, message: "RTC error during offer creation: \(error.localizedDescription)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
+            await callState.transition(to: .failed(inferredCallDirection(for: call), call, error.localizedDescription))
             await finishEndConnection(currentCall: call)
             throw error
         } catch {
             logger.log(level: .error, message: "Unexpected error during offer creation: \(error)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
+            await callState.transition(to: .failed(inferredCallDirection(for: call), call, error.localizedDescription))
             await finishEndConnection(currentCall: call)
             throw RTCErrors.mediaError("Offer creation failed: \(error.localizedDescription)")
         }
@@ -357,24 +353,18 @@ extension RTCSession {
                 throw RTCErrors.connectionNotFound
             }
             
-            
             var sdp: SessionDescription
 #if os(Android)
             // Generate SDP answer using the new SDPHandler
             var description: RTCSessionDescription = try await generateSDPAnswer(for: connection, hasAudio: true, hasVideo: call.supportsVideo)
             
-            // SKIP INSERT: android.util.Log.d("RTCClient", "Android: generateSDPAnswer completed")
-            // SKIP INSERT: android.util.Log.d("RTCClient", "Android Answer SDP:\n" + description.sdp)
-            
             // Modify SDP for specific requirements
             let modified = await modifySDP(
                 sdp: description.sdp,
                 hasVideo: call.supportsVideo,
-                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
-            )
+                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
             description = RTCSessionDescription(typeDescription: description.typeDescription, sdp: modified)
             
-            // SKIP INSERT: android.util.Log.d("RTCClient", "Android Modified Answer SDP:\n" + description.sdp)
             logger.log(level: .info, message: "Android Modified Answer SDP:\n\(description.sdp)")
             
             logger.log(level: .info, message: "Generated SDP answer for call: \(call.sharedCommunicationId)")
@@ -388,8 +378,8 @@ extension RTCSession {
             let modified = await modifySDP(
                 sdp: description.sdp,
                 hasVideo: call.supportsVideo,
-                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
-            )
+                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+            
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             
             logger.log(level: .info, message: "Apple Platform Modified Answer SDP:\n\(description.sdp)")
@@ -441,45 +431,35 @@ extension RTCSession {
         handleNotificationsStream()
         
         do {
-            // Find or create connection
-            var currentConnection: RTCConnection
-            if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
-                currentConnection = connection
-                logger.log(level: .info, message: "Found connection for call: \(call.sharedCommunicationId)")
-            } else {
-                logger.log(level: .info, message: "Creating new connection for call: \(call.sharedCommunicationId)")
-                // The peer connection now requires crypto identities. Build them using the existing
-                // session helper, then fetch the created connection.
-                try await createCryptoPeerConnection(with: call)
-                guard let created = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
-                    throw RTCErrors.connectionNotFound
-                }
-                currentConnection = created
+            
+            guard let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
+                throw RTCErrors.invalidConfiguration("Connection must be created before setting remote SDP.")
             }
+            
+            logger.log(level: .debug, message: "Found connection for call: \(call.sharedCommunicationId)")
             
             // Modify SDP for specific requirements
             var modifiedSdp = sdp
             let modified = await modifySDP(
                 sdp: sdp.sdp,
                 hasVideo: call.supportsVideo,
-                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
-            )
+                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
             modifiedSdp = RTCSessionDescription(typeDescription: sdp.typeDescription, sdp: modified)
             
             // Set remote SDP using the new SDPHandler
-            try await setRemoteSDP(modifiedSdp, for: currentConnection)
+            try await setRemoteSDP(modifiedSdp, for: connection)
             
             pcState = PeerConnectionState.setRemote
+            pcStateByConnectionId[call.sharedCommunicationId] = .setRemote
             logger.log(level: .info, message: "Successfully set remote SDP for call: \(call.sharedCommunicationId)")
             
             // Process any queued incoming candidates that arrived before setRemote
             do {
                 let consumer = inboundCandidateConsumer(for: call.sharedCommunicationId)
-                try await processAllQueuedCandidates(connection: currentConnection, consumer: consumer)
+                try await processAllQueuedCandidates(connection: connection, consumer: consumer)
             } catch {
                 logger.log(level: .warning, message: "Error processing queued candidates: \(error.localizedDescription)")
             }
-            
             
         } catch let error as SDPHandlerError {
             logger.log(level: .error, message: "Failed to set remote SDP: \(error.localizedDescription)")
@@ -523,8 +503,7 @@ extension RTCSession {
             let modified = await modifySDP(
                 sdp: sdp.sdp,
                 hasVideo: call.supportsVideo,
-                stripSsrcLines: call.sharedCommunicationId.hasPrefix("#")
-            )
+                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
             modifiedSdp = WebRTC.RTCSessionDescription(type: sdp.type, sdp: modified)
             
             // Set remote SDP using the new SDPHandler
@@ -669,7 +648,7 @@ extension RTCSession {
             throw RTCErrors.invalidConfiguration("Session Participant not set")
         }
         if call.sender.secretName == sessionParticipant.secretName {
-            call.sender.deviceId = sessionParticipant.deviceId ?? ""
+            call.sender.deviceId = sessionParticipant.deviceId
         } else {
             let copiedSender = call.sender
             guard let recipient = call.recipients.first else {

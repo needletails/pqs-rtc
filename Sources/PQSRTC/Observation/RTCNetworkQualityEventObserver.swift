@@ -38,17 +38,13 @@ public final class RTCNetworkQualityEventObserver {
     }
 
     // `deinit` is nonisolated; cancellation is thread-safe.
-    nonisolated(unsafe) private var task: Task<Void, Never>?
+    private var task: Task<Void, Never>?
 
     // MARK: - Observation-backed stream (NeedleTailKit-style)
     public private(set) var latestStream: AsyncStream<RTCNetworkQualityUpdate>?
     private var latestContinuation: AsyncStream<RTCNetworkQualityUpdate>.Continuation?
 
     public init() {}
-
-    deinit {
-        task?.cancel()
-    }
 
     /// Starts (or restarts) observing `session` network quality events.
     public func start(session: RTCSession) {

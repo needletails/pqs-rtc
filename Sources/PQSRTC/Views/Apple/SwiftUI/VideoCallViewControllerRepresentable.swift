@@ -23,6 +23,40 @@ import SwiftUI
 #if os(iOS)
 import UIKit
 
+/// Forwards mute/end actions to the hosted ``VideoCallViewController``.
+///
+/// Host apps should keep one instance in `@State` and pass it into ``VideoCallViewControllerRepresentable``
+/// instead of relying on `Binding<CallActionDelegate?>` to hold the controller: assigning a
+/// `UIViewController` into that binding is not reliably persisted across SwiftUI updates in some stacks
+/// (e.g. SkipFuseUI), which leaves overlay controls with a `nil` delegate.
+@MainActor
+public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendable {
+    public weak var viewController: VideoCallViewController?
+
+    public init() {}
+
+    public func endCall() async {
+        await viewController?.endCall()
+    }
+
+    public func muteAudio() async {
+        await viewController?.muteAudio()
+    }
+
+    public func muteVideo() async {
+        await viewController?.muteVideo()
+    }
+
+    public func showPictureInPicture(_ show: Bool) async {
+        await viewController?.showPictureInPicture(show)
+    }
+
+    /// Audio-only calls: route playback to speaker or receiver/Bluetooth (matches system Phone behavior).
+    public func setSpeakerOutputEnabled(_ enabled: Bool) {
+        viewController?.setSpeakerOutputEnabled(enabled)
+    }
+}
+
 @MainActor
 /// SwiftUI wrapper around the platform `VideoCallViewController` (iOS).
 ///
@@ -33,12 +67,17 @@ import UIKit
 public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentable {
     
     private let session: RTCSession
+    /// When set, the representable assigns the live controller to this bridge; overlay code can call mute/end on the bridge without depending on `delegate` binding writes.
+    private let actionBridge: VideoCallActionBridge?
     @Binding var delegate: CallActionDelegate?
     @Binding var errorMessage: String
     @Binding var endedCall: Bool
     @Binding var width: CGFloat
     @Binding var height: CGFloat
     @Binding var callState: CallStateMachine.State
+    /// Mirrors ``VideoCallViewController`` mute flags into SwiftUI overlay controls (`CallActionDelegate` → concrete VC casts are unreliable).
+    @Binding var isVideoMuted: Bool
+    @Binding var isAudioMuted: Bool
     private let controlsView: AnyView?
 
     /// Creates a representable that hosts a `VideoCallViewController`.
@@ -51,52 +90,72 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
     ///   - width: Receives view width updates (primarily used by macOS; kept for API parity).
     ///   - height: Receives view height updates (primarily used by macOS; kept for API parity).
     ///   - callState: Receives call state updates.
+    ///   - isVideoMuted: Updated when the controller toggles camera mute.
+    ///   - isAudioMuted: Updated when the controller toggles mic mute.
+    ///   - actionBridge: Optional stable object that receives the controller reference (see ``VideoCallActionBridge``).
     ///   - controlsView: Optional SwiftUI controls view embedded into the controller.
     public init(
         session: RTCSession,
+        actionBridge: VideoCallActionBridge? = nil,
         delegate: Binding<CallActionDelegate?>,
         errorMessage: Binding<String>,
         endedCall: Binding<Bool>,
         width: Binding<CGFloat>,
         height: Binding<CGFloat>,
         callState: Binding<CallStateMachine.State>,
+        isVideoMuted: Binding<Bool>,
+        isAudioMuted: Binding<Bool>,
         controlsView: AnyView? = nil
     ) {
         self.session = session
+        self.actionBridge = actionBridge
         self._delegate = delegate
         self._errorMessage = errorMessage
         self._endedCall = endedCall
         self._width = width
         self._height = height
         self._callState = callState
+        self._isVideoMuted = isVideoMuted
+        self._isAudioMuted = isAudioMuted
         self.controlsView = controlsView
     }
     
     public init<Controls: View>(
         session: RTCSession,
+        actionBridge: VideoCallActionBridge? = nil,
         delegate: Binding<CallActionDelegate?>,
         errorMessage: Binding<String>,
         endedCall: Binding<Bool>,
         width: Binding<CGFloat>,
         height: Binding<CGFloat>,
         callState: Binding<CallStateMachine.State>,
+        isVideoMuted: Binding<Bool>,
+        isAudioMuted: Binding<Bool>,
         @ViewBuilder controlsView: () -> Controls
     ) {
         self.init(
             session: session,
+            actionBridge: actionBridge,
             delegate: delegate,
             errorMessage: errorMessage,
             endedCall: endedCall,
             width: width,
             height: height,
             callState: callState,
+            isVideoMuted: isVideoMuted,
+            isAudioMuted: isAudioMuted,
             controlsView: AnyView(controlsView())
         )
     }
     
     public func makeUIViewController(context: Context) -> VideoCallViewController {
         let vc = VideoCallViewController(session: session)
-        delegate = vc
+        if let actionBridge {
+            actionBridge.viewController = vc
+            delegate = actionBridge
+        } else {
+            delegate = vc
+        }
         vc.videoCallDelegate = context.coordinator
         
         if let controlsView {
@@ -109,7 +168,18 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         return vc
     }
 
-    public func updateUIViewController(_ uiViewController: VideoCallViewController, context: Context) {}
+    public func updateUIViewController(_ uiViewController: VideoCallViewController, context: Context) {
+        // Coordinator is created once; without refreshing `parent`, its `@Binding` copies stay stale and
+        // writes (e.g. `localMuteDisplayDidChange`) never reach the current `CallView` `@State`.
+        context.coordinator.parent = self
+        if let actionBridge {
+            actionBridge.viewController = uiViewController
+            delegate = actionBridge
+        } else {
+            delegate = uiViewController
+        }
+        uiViewController.videoCallDelegate = context.coordinator
+    }
 
     public func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -133,11 +203,44 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         public func endedCall(_ didEnd: Bool) async {
             self.parent.endedCall = didEnd
         }
+
+        public func localMuteDisplayDidChange(videoMuted: Bool, audioMuted: Bool) async {
+            self.parent.isVideoMuted = videoMuted
+            self.parent.isAudioMuted = audioMuted
+        }
     }
 }
 
 #elseif os(macOS)
 import AppKit
+
+/// Forwards mute/end actions to the hosted ``VideoCallViewController`` (macOS).
+@MainActor
+public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendable {
+    public weak var viewController: VideoCallViewController?
+
+    public init() {}
+
+    public func endCall() async {
+        await viewController?.endCall()
+    }
+
+    public func muteAudio() async {
+        await viewController?.muteAudio()
+    }
+
+    public func muteVideo() async {
+        await viewController?.muteVideo()
+    }
+
+    public func showPictureInPicture(_ show: Bool) async {
+        await viewController?.showPictureInPicture(show)
+    }
+
+    public func setSpeakerOutputEnabled(_ enabled: Bool) {
+        viewController?.setSpeakerOutputEnabled(enabled)
+    }
+}
 
 @MainActor
 /// SwiftUI wrapper around the platform `VideoCallViewController` (macOS).
@@ -149,12 +252,15 @@ import AppKit
 public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentable {
 
     private let session: RTCSession
+    private let actionBridge: VideoCallActionBridge?
     @Binding var delegate: CallActionDelegate?
     @Binding var errorMessage: String
     @Binding var endedCall: Bool
     @Binding var width: CGFloat
     @Binding var height: CGFloat
     @Binding var callState: CallStateMachine.State
+    @Binding var isVideoMuted: Bool
+    @Binding var isAudioMuted: Bool
     private let controlsView: AnyView?
 
     /// Creates a representable that hosts a `VideoCallViewController`.
@@ -167,51 +273,72 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
     ///   - width: Receives view width updates.
     ///   - height: Receives view height updates.
     ///   - callState: Receives call state updates.
+    ///   - isVideoMuted: Updated when the controller toggles camera mute.
+    ///   - isAudioMuted: Updated when the controller toggles mic mute.
+    ///   - actionBridge: Optional stable object that receives the controller reference (see ``VideoCallActionBridge``).
     ///   - controlsView: Optional SwiftUI controls view embedded into the controller.
     public init(
         session: RTCSession,
+        actionBridge: VideoCallActionBridge? = nil,
         delegate: Binding<CallActionDelegate?>,
         errorMessage: Binding<String>,
         endedCall: Binding<Bool>,
         width: Binding<CGFloat>,
         height: Binding<CGFloat>,
         callState: Binding<CallStateMachine.State>,
+        isVideoMuted: Binding<Bool>,
+        isAudioMuted: Binding<Bool>,
         controlsView: AnyView? = nil
     ) {
         self.session = session
+        self.actionBridge = actionBridge
         self._delegate = delegate
         self._errorMessage = errorMessage
         self._endedCall = endedCall
         self._width = width
         self._height = height
         self._callState = callState
+        self._isVideoMuted = isVideoMuted
+        self._isAudioMuted = isAudioMuted
         self.controlsView = controlsView
     }
     
     public init<Controls: View>(
         session: RTCSession,
+        actionBridge: VideoCallActionBridge? = nil,
         delegate: Binding<CallActionDelegate?>,
         errorMessage: Binding<String>,
         endedCall: Binding<Bool>,
         width: Binding<CGFloat>,
         height: Binding<CGFloat>,
         callState: Binding<CallStateMachine.State>,
+        isVideoMuted: Binding<Bool>,
+        isAudioMuted: Binding<Bool>,
         @ViewBuilder controlsView: () -> Controls
     ) {
         self.init(
             session: session,
+            actionBridge: actionBridge,
             delegate: delegate,
             errorMessage: errorMessage,
             endedCall: endedCall,
             width: width,
             height: height,
             callState: callState,
+            isVideoMuted: isVideoMuted,
+            isAudioMuted: isAudioMuted,
             controlsView: AnyView(controlsView())
         )
     }
     public func makeNSViewController(context: Context) -> VideoCallViewController {
         let vc = VideoCallViewController(session: session)
-        delegate = vc
+        if let actionBridge {
+            actionBridge.viewController = vc
+            delegate = actionBridge
+        } else {
+            delegate = vc
+        }
+        vc.usesEmbeddedControls = true
         vc.videoCallDelegate = context.coordinator
         
         if let controlsView {
@@ -224,7 +351,16 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         return vc
     }
 
-    public func updateNSViewController(_ nsViewController: VideoCallViewController, context: Context) {}
+    public func updateNSViewController(_ nsViewController: VideoCallViewController, context: Context) {
+        context.coordinator.parent = self
+        if let actionBridge {
+            actionBridge.viewController = nsViewController
+            delegate = actionBridge
+        } else {
+            delegate = nsViewController
+        }
+        nsViewController.videoCallDelegate = context.coordinator
+    }
 
     public func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -240,18 +376,33 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         }
         
         public func passErrorMessage(_ message: String) async {
-            self.parent.errorMessage = message
+            DispatchQueue.main.async {
+                self.parent.errorMessage = message
+            }
         }
         public func deliverCallState(_ state: CallStateMachine.State) async {
-            self.parent.callState = state
+            DispatchQueue.main.async {
+                self.parent.callState = state
+            }
         }
         public func endedCall(_ didEnd: Bool) async {
-            self.parent.endedCall = didEnd
+            DispatchQueue.main.async {
+                self.parent.endedCall = didEnd
+            }
         }
         /// Receives size updates from the underlying AppKit controller.
         public func passSize(_ size: NSSize) async {
-            self.parent.width = size.width
-            self.parent.height = size.height
+            DispatchQueue.main.async {
+                self.parent.width = size.width
+                self.parent.height = size.height
+            }
+        }
+
+        public func localMuteDisplayDidChange(videoMuted: Bool, audioMuted: Bool) async {
+            DispatchQueue.main.async {
+                self.parent.isVideoMuted = videoMuted
+                self.parent.isAudioMuted = audioMuted
+            }
         }
     }
 }

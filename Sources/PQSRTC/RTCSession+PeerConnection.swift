@@ -100,6 +100,7 @@ extension RTCSession {
         sender: String,
         recipient: String,
         localIdentity: ConnectionLocalIdentity,
+        policyOverride: RTCIceTransportSelection? = nil,
         willFinishNegotiation: Bool = false
     ) async throws -> RTCConnection {
         logger.log(level: .info, message: "Creating peer connection with id: \(call.sharedCommunicationId), hasVideo: \(call.supportsVideo)")
@@ -111,6 +112,13 @@ extension RTCSession {
         let localKeys = localIdentity.localKeys
         let symmetricKey = localIdentity.symmetricKey
         let sessionIdentity = localIdentity.sessionIdentity
+        let selectedIcePolicy = policyOverride ?? iceTransportSelection(for: call.sharedCommunicationId)
+        registerFallbackStateIfNeeded(
+            call: call,
+            sender: sender,
+            recipient: recipient,
+            localIdentity: localIdentity,
+            policyOverride: selectedIcePolicy)
         
         var connection: RTCConnection?
 #if os(Android)
@@ -134,7 +142,8 @@ extension RTCSession {
             let peerConnection = try self.rtcClient.initializeFactory(
                 iceServers: self.iceServers,
                 username: self.username,
-                password: self.password
+                password: self.password,
+                iceTransportPolicy: selectedIcePolicy
             )
             logger.log(level: .info, message: "Successfully initialized factory for connection: \(call.sharedCommunicationId)")
             
@@ -163,7 +172,7 @@ extension RTCSession {
                 username: self.username,
                 credential: self.password)
         ]
-        
+        config.iceTransportPolicy = selectedIcePolicy == .relay ? .relay : .all
         config.iceServers = iceServers
         // Unified plan is more superior than planB
         config.sdpSemantics = .unifiedPlan
@@ -226,6 +235,27 @@ extension RTCSession {
         // Start notification handling if not already running
         handleNotificationsStream()
         
+        #if os(Android)
+        // Android-specific ordering: attach local media before emitting the ciphertext handshake.
+        //
+        // On Android, the app can receive the peer's `call_cipher` quickly enough that
+        // `finishCryptoSessionCreation(...)` starts building the offer while this method is still
+        // preparing the local PeerConnection. If we send ciphertext first, the offer path can race
+        // ahead with audio-only state and never publish the video sender.
+        connection = try await self.addAudioToStream(with: connection)
+        if call.supportsVideo {
+            connection = try await self.addVideoToStream(with: connection)
+        }
+        
+        if !willFinishNegotiation {
+            // Once media is attached, perform the 1:1 ciphertext handshake so signaling can proceed.
+            // FrameCryptor (media frame encryption) is independently gated by `enableEncryption`.
+            try await setMessageKey(connection: connection, call: call)
+            if let foundConnection = await connectionManager.findConnection(with: connection.id) {
+                connection = foundConnection
+            }
+        }
+        #else
         if !willFinishNegotiation {
             // Always perform the 1:1 ciphertext handshake so signaling can proceed.
             // FrameCryptor (media frame encryption) is independently gated by `enableEncryption`.
@@ -239,6 +269,7 @@ extension RTCSession {
         if call.supportsVideo {
             connection = try await self.addVideoToStream(with: connection)
         }
+        #endif
         
         // Update connection in manager with any changes from adding tracks
         await connectionManager.updateConnection(id: connection.id, with: connection)
@@ -250,9 +281,9 @@ extension RTCSession {
             await setVideoTrack(isEnabled: pendingVideoEnabled, connectionId: normalizedId)
         }
         
-        logger.log(level: .info, message: "Successfully created peer connection with id: \(call.sharedCommunicationId)")
+        logger.log(level: .info, message: "Successfully created peer connection with id: \(call.sharedCommunicationId) policy=\(selectedIcePolicy.rawValue)")
         
-        await setConnectingIfReady(call: call, callDirection: .inbound(call.supportsVideo ? .video : .voice))
+        await setConnectingIfReady(call: call, callDirection: inferredCallDirection(for: call))
         return connection
     }
     
@@ -320,6 +351,9 @@ extension RTCSession {
         // Clear any session-level pending buffers/caches.
         iceDeque.removeAll()
         pendingRemoteVideoRenderersByConnectionId.removeAll()
+#if os(Android)
+        pendingLocalVideoRenderersByConnectionId.removeAll()
+#endif
 
 #if canImport(WebRTC)
         // Stop outbound RTP stats loops (diagnostic only).
@@ -361,23 +395,28 @@ extension RTCSession {
         
         do {
 #if !os(Android)
-            // Create audio track
+            var updated = connection
             let audioTrack = try self.createAudioTrack(with: connection)
-            
+            updated.localAudioTrack = audioTrack
+
             // Add audio track to peer connection and capture the returned sender
             // IMPORTANT (SFU + E2EE):
             // The streamId is used by remote receivers to identify the track owner in Unified Plan.
             // Using `connection.id` (room id) collapses all participants into the same stream id.
             // Use the local participant id instead so receivers can map streamIds -> sender.
-            let id = sdpSafeStreamId(for: connection.localParticipantId)
-            let maybeAudioSender = connection.peerConnection.add(audioTrack, streamIds: [id])
-            
+            let streamId = sdpSafeStreamId(for: connection.localParticipantId)
+            let maybeAudioSender = updated.peerConnection.add(audioTrack, streamIds: [streamId])
+
+            let manager = connectionManager as RTCConnectionManager
+            var persistedViaCryptor = false
             // CRITICAL: Create sender FrameCryptor using the returned sender
             // This ensures frames are encrypted from the start, without relying on async sender discovery
-            if let audioSender = maybeAudioSender, connection.audioSenderCryptor == nil {
+            if let audioSender = maybeAudioSender, updated.audioSenderCryptor == nil {
                 do {
                     if enableEncryption {
-                        try await self.createEncryptedFrame(connection: connection, kind: .audioSender(audioSender))
+                        // Pass `updated` so `localAudioTrack` is stored with the same write as the cryptor.
+                        try await self.createEncryptedFrame(connection: updated, kind: .audioSender(audioSender))
+                        persistedViaCryptor = true
                     }
                 } catch {
                     logger.log(level: .warning, message: "⚠️ Failed to create audio sender FrameCryptor immediately - will retry in addedStream: \(error)")
@@ -385,15 +424,28 @@ extension RTCSession {
             } else if maybeAudioSender == nil {
                 logger.log(level: .warning, message: "⚠️ Failed to obtain audio sender from peerConnection.add - will rely on addedStream fallback")
             }
+            if !persistedViaCryptor {
+                await manager.updateConnection(id: updated.id, with: updated)
+            }
+            logger.log(level: .info, message: "Successfully added audio to stream for connection: \(connection.id)")
+            if let latest = await manager.findConnection(with: updated.id) {
+                return latest
+            }
+            return updated
 #elseif os(Android)
             // Create audio track
             let audioTrack = try await self.createAudioTrack(with: connection)
             // Use NeedleTailRTC's prepareAudioSendRecv method to handle audio track addition
             try await self.rtcClient.prepareAudioSendRecv(id: connection.id)
-#endif
-            
+            // Mirror Apple: attach sender FrameCryptors as soon as track is added (E2EE).
+            if enableEncryption && rtcClient.isFrameKeyProviderReady() {
+                rtcClient.createSenderEncryptedFrame(participant: connection.localParticipantId, connectionId: connection.id)
+            } else if enableEncryption {
+                logger.log(level: .debug, message: "Skipping early audio sender cryptor attach until Android key provider is ready")
+            }
             logger.log(level: .info, message: "Successfully added audio to stream for connection: \(connection.id)")
             return connection
+#endif
             
         } catch let error as AudioError {
             logger.log(level: .error, message: "Failed to add audio to stream: \(error.localizedDescription)")
@@ -448,6 +500,17 @@ extension RTCSession {
 #else
             // Android: Let prepareVideoSendRecv handle complete setup (track creation + peer connection)
             updatedConnection.localVideoTrack = try self.rtcClient.prepareVideoSendRecv(id: connection.id)
+            if let localVideoTrack = updatedConnection.localVideoTrack,
+               let pendingPreview = pendingLocalVideoRenderersByConnectionId.removeValue(forKey: connection.id.normalizedConnectionId) {
+                logger.log(level: .info, message: "Attaching buffered local preview renderer now that local video track is available")
+                pendingPreview.attach(localVideoTrack)
+            }
+            // Mirror Apple: attach sender FrameCryptors as soon as track is added (E2EE).
+            if enableEncryption && rtcClient.isFrameKeyProviderReady() {
+                rtcClient.createSenderEncryptedFrame(participant: connection.localParticipantId, connectionId: connection.id)
+            } else if enableEncryption {
+                logger.log(level: .debug, message: "Skipping early video sender cryptor attach until Android key provider is ready")
+            }
 #endif
             
             // Update connection in manager
@@ -571,6 +634,7 @@ extension RTCSession {
     public func finishEndConnection(currentCall: Call?, force: Bool) async {
         let callKey = currentCall.map { teardownKey(for: $0) }
         let connectionIdKey = currentCall?.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines)
+        clearFallbackState(connectionId: connectionIdKey)
 
         if !force {
             if let connectionIdKey, !connectionIdKey.isEmpty {
@@ -610,6 +674,9 @@ extension RTCSession {
 
         if let connectionId {
             pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
+#if os(Android)
+            pendingLocalVideoRenderersByConnectionId.removeValue(forKey: connectionId)
+#endif
         }
         
         // Clean up video and crypto resources before closing connection
@@ -649,6 +716,7 @@ extension RTCSession {
             // Clear video track references
             connection.localVideoTrack = nil
             connection.remoteVideoTrack = nil
+            connection.localAudioTrack = nil
             
             await connectionManager.updateConnection(id: connectionId, with: connection)
             logger.log(level: .debug, message: "Cleaned up video and crypto resources for connection: \(connectionId)")
@@ -707,6 +775,9 @@ extension RTCSession {
 
             // Clear any buffered renderer requests since they are scoped to old connections.
             pendingRemoteVideoRenderersByConnectionId.removeAll()
+#if os(Android)
+            pendingLocalVideoRenderersByConnectionId.removeAll()
+#endif
 
             if !remainingConnections.isEmpty {
                 logger.log(level: .debug, message: "Closed \(remainingConnections.count) peer connection(s) (no call provided)")

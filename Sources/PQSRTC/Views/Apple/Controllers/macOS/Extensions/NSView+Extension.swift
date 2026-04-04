@@ -85,7 +85,12 @@ extension NSView {
         width: CGFloat = 0,
         height: CGFloat = 0,
         minWidth: CGFloat = 0,
-        minHeight: CGFloat = 0) {
+        minHeight: CGFloat = 0,
+        leadingAtLeast: NSLayoutXAxisAnchor? = nil,
+        paddingLeadingMin: CGFloat = 0,
+        trailingAtMost: NSLayoutXAxisAnchor? = nil,
+        paddingTrailingMax: CGFloat = 0,
+        lessThanEqualToWidth: CGFloat = 0) {
         
         translatesAutoresizingMaskIntoConstraints = false
         
@@ -107,6 +112,12 @@ extension NSView {
         if let centerY = centerY {
             self.centerYAnchor.constraint(equalTo: centerY).isActive = true
         }
+        if let anchor = leadingAtLeast {
+            leadingAnchor.constraint(greaterThanOrEqualTo: anchor, constant: paddingLeadingMin).isActive = true
+        }
+        if let anchor = trailingAtMost {
+            trailingAnchor.constraint(lessThanOrEqualTo: anchor, constant: -paddingTrailingMax).isActive = true
+        }
         
         // Set default width and height
         if width > 0 {
@@ -122,6 +133,9 @@ extension NSView {
         }
         if minHeight > 0 {
             heightAnchor.constraint(greaterThanOrEqualToConstant: minHeight).isActive = true
+        }
+        if lessThanEqualToWidth > 0 {
+            widthAnchor.constraint(lessThanOrEqualToConstant: lessThanEqualToWidth).isActive = true
         }
     }
 

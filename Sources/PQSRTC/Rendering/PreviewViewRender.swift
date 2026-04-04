@@ -77,7 +77,13 @@ actor PreviewViewRender: RendererDelegate {
         bounds: CGRect,
         logger: NeedleTailLogger = NeedleTailLogger("[PreviewViewRender]")
     ) async {
+        // `PreviewCaptureView` sets `.resizeAspect` on macOS for a FaceTime-like PiP; keep that.
+        // `.resizeAspectFill` here was overriding it and made the local preview look zoomed / oversized.
+#if os(macOS)
+        layer.videoGravity = .resizeAspect
+#else
         layer.videoGravity = .resizeAspectFill
+#endif
         
         self.layer = layer
         self.ciContext = ciContext
@@ -135,8 +141,8 @@ actor PreviewViewRender: RendererDelegate {
     }
     
     func initializeCaptureStream() async throws {
-        try await startCaptureSession()
         try await createCaptureSession()
+        try await startCaptureSession()
         try await startStream(ciContext: ciContext)
     }
     
@@ -222,6 +228,7 @@ actor PreviewViewRender: RendererDelegate {
     private func createCaptureSession() async throws {
         guard let session = layer.session else { return }
         session.beginConfiguration()
+        defer { session.commitConfiguration() }
         
         var captureDevice: AVCaptureDevice?
         _ = defaultDevices.devices.map { dev in
@@ -235,36 +242,85 @@ actor PreviewViewRender: RendererDelegate {
         guard let captureDevice = captureDevice else { return }
         
         let input = try AVCaptureDeviceInput(device: captureDevice)
-        session.removeInput(input)
-        if session.canAddInput(input) {
-            session.addInput(input)
-            //Local Capture setup
-            let output = AVCaptureVideoDataOutput()
-            output.alwaysDiscardsLateVideoFrames = true
-            output.setSampleBufferDelegate(captureOutputWrapper, queue: DispatchQueue(label: "preview-capture-queue"))
-            for connection in output.connections {
+        guard session.canAddInput(input) else {
+            logger.log(level: .error, message: "Unable to add capture input to AVCaptureSession")
+            return
+        }
+        session.addInput(input)
+        
+        // Local capture setup
+        let output = AVCaptureVideoDataOutput()
+        output.alwaysDiscardsLateVideoFrames = true
+        output.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        ]
+        output.setSampleBufferDelegate(captureOutputWrapper, queue: DispatchQueue(label: "preview-capture-queue"))
+        guard session.canAddOutput(output) else {
+            logger.log(level: .error, message: "Unable to add capture output to AVCaptureSession")
+            return
+        }
+        session.addOutput(output)
+        
+        let mirrorLocalVideo = Self.resolvedLocalVideoMirroredUserDefaults()
+        for connection in output.connections {
+            applyManualVideoMirroring(mirrorLocalVideo, to: connection)
 #if os(iOS)
-                if connection.isVideoRotationAngleSupported(VideoRotation.portrait.angle) {
-                    connection.videoRotationAngle = VideoRotation.portrait.angle
-                }
-#elseif os(macOS)
-                if connection.isVideoRotationAngleSupported(VideoRotation.landscapeLeft.angle) {
-                    connection.videoRotationAngle = VideoRotation.landscapeLeft.angle
-                }
-#endif
+            if connection.isVideoRotationAngleSupported(VideoRotation.portrait.angle) {
+                connection.videoRotationAngle = VideoRotation.portrait.angle
             }
-            session.addOutput(output)
-#if os(iOS)
-            if #available(iOS 16.0, *) {
-                if session.isMultitaskingCameraAccessSupported {
-                    // Enable using the camera in multitasking modes.
-                    session.isMultitaskingCameraAccessEnabled = true
-                }
+#elseif os(macOS)
+            // macOS camera capture already arrives in the expected desktop orientation for WebRTC.
+            // Forcing a landscape rotation here flips the outbound media for the remote peer.
+            if connection.isVideoRotationAngleSupported(0) {
+                connection.videoRotationAngle = 0
             }
 #endif
         }
-        session.commitConfiguration()
+#if os(iOS)
+        if #available(iOS 16.0, *) {
+            if session.isMultitaskingCameraAccessSupported {
+                // Enable using the camera in multitasking modes.
+                session.isMultitaskingCameraAccessEnabled = true
+            }
+        }
+#endif
         self.logger.log(level: .debug, message: "Created the Capture Session")
+        applyLocalVideoMirroringToPreviewLayerConnection(mirrorLocalVideo)
+    }
+
+    /// Reads ``PQSRTCCallUIPreferences/localVideoMirroredUserDefaultsKey``; missing key defaults to `true`.
+    nonisolated private static func resolvedLocalVideoMirroredUserDefaults() -> Bool {
+        let key = PQSRTCCallUIPreferences.localVideoMirroredUserDefaultsKey
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }
+
+    private func applyLocalVideoMirroringToPreviewLayerConnection(_ mirrored: Bool) {
+        guard let connection = layer.connection else { return }
+        applyManualVideoMirroring(mirrored, to: connection)
+    }
+
+    /// macOS (`AVCaptureConnection_Tundra`) throws if `isVideoMirrored` is set while `automaticallyAdjustsVideoMirroring` is true.
+    private func applyManualVideoMirroring(_ mirrored: Bool, to connection: AVCaptureConnection) {
+        guard connection.isVideoMirroringSupported else { return }
+        connection.automaticallyAdjustsVideoMirroring = false
+        connection.isVideoMirrored = mirrored
+    }
+
+    /// Re-applies mirroring for the capture session’s video output connections and the on-screen preview layer.
+    func applyLocalVideoMirroringFromUserDefaults() {
+        let mirrored = Self.resolvedLocalVideoMirroredUserDefaults()
+        guard let session = layer.session else {
+            applyLocalVideoMirroringToPreviewLayerConnection(mirrored)
+            return
+        }
+        for output in session.outputs {
+            guard let videoOutput = output as? AVCaptureVideoDataOutput else { continue }
+            for connection in videoOutput.connections {
+                applyManualVideoMirroring(mirrored, to: connection)
+            }
+        }
+        applyLocalVideoMirroringToPreviewLayerConnection(mirrored)
     }
     
     private var rtcVideoCaptureWrapper: RTCVideoCaptureWrapper?
@@ -284,6 +340,7 @@ actor PreviewViewRender: RendererDelegate {
     nonisolated(unsafe) private var injectedFrameCount: UInt64 = 0
     nonisolated(unsafe) private var didLogFirstInjection: Bool = false
     nonisolated(unsafe) private var lastInjectionUptimeNs: UInt64 = 0
+    private var didLogFirstLocalMetalScale = false
     
     enum DeviceOrientationState: Sendable {
         case wasLandscapeLeft, wasLandscapeRight, none
@@ -391,6 +448,17 @@ actor PreviewViewRender: RendererDelegate {
             }
     }
 #endif
+
+    /// Matches `SampleBufferViewRenderer`: AppKit-backed views can report zero width/height until layout;
+    /// Metal needs a positive destination size.
+    private func resolveRenderableBounds() async -> CGSize {
+        let hostBounds = await bounds.size
+        if hostBounds.width > 0, hostBounds.height > 0 {
+            return hostBounds
+        }
+        return CGSize(width: 640, height: 480)
+    }
+
     private func handleOutputStream(_ packet: CaptureOutputWrapper.CaptureOutputPacket?, ciContext: CIContext) async throws {
         if let packet = packet {
             var rtcRotation: RTCVideoRotation = ._0
@@ -399,7 +467,6 @@ actor PreviewViewRender: RendererDelegate {
                 rtcRotation = rotation
             }
 #endif
-            guard await bounds.size != .zero else { return }
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(packet.sampleBuffer) else { return }
             guard let session = self.layer.session else { return }
 
@@ -439,19 +506,33 @@ actor PreviewViewRender: RendererDelegate {
 
             if shouldRenderOnMetal {
 #if os(iOS)
-                scaleMode = await determineScale
+                // Match the historical preview-layer behavior (`resizeAspectFill`) so the local tile
+                // does not get letterboxed or stretched when using the Metal preview path.
+                scaleMode = .aspectFill
+#elseif os(macOS)
+                scaleMode = .aspectFitHorizontal
 #endif
+                let renderBounds = await resolveRenderableBounds()
                 let aspectRatio = await metalProcessor.getAspectRatio(
                     width: CGFloat(pixelBuffer.width),
                     height: CGFloat(pixelBuffer.height))
                 let scaleInfo = await metalProcessor.createSize(
                     for: scaleMode,
                     originalSize: .init(width: pixelBuffer.width, height: pixelBuffer.height),
-                    desiredSize: bounds.size,
+                    desiredSize: renderBounds,
                     aspectRatio: aspectRatio)
+                if didLogFirstLocalMetalScale == false {
+                    didLogFirstLocalMetalScale = true
+                    let srcFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+                    let srcPlanes = CVPixelBufferGetPlaneCount(pixelBuffer)
+                    logger.log(
+                        level: .info,
+                        message: "Local preview Metal conversion srcFormat=\(srcFormat) planes=\(srcPlanes) srcSize=\(pixelBuffer.width)x\(pixelBuffer.height) renderBounds=\(renderBounds) scaleMode=\(scaleMode) scaleX=\(scaleInfo.scaleX) scaleY=\(scaleInfo.scaleY)"
+                    )
+                }
                 let info = try await metalProcessor.createMetalImage(
                     fromPixelBuffer: pixelBuffer,
-                    parentBounds: bounds.size,
+                    parentBounds: renderBounds,
                     scaleInfo: scaleInfo,
                     aspectRatio: aspectRatio)
                 try await delegate?.passTexture(texture: info.texture)

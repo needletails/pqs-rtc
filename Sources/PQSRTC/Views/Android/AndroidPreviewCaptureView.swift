@@ -60,6 +60,12 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
     /// The Android WebRTC client that owns EGL and renderer lifecycle.
     private let client: AndroidRTCClient
     
+    /// Pending local track to attach when the surface becomes ready.
+    private var pendingTrack: RTCVideoTrack?
+    
+    /// Flag to track if the surface-ready callback has been set up.
+    private var surfaceCallbackSetup = false
+    
     // MARK: - Initialization
     /// Creates a preview capture view bound to an `AndroidRTCClient`.
     ///
@@ -68,7 +74,7 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
         self.client = client
         // SKIP INSERT: this@AndroidPreviewCaptureView._surfaceViewRenderer = CustomSurfaceViewRenderer(ProcessInfo.processInfo.androidContext)
         // SKIP INSERT: (this@AndroidPreviewCaptureView._surfaceViewRenderer as CustomSurfaceViewRenderer).setNormalizeToUpright(false)
-        // SKIP INSERT: (this@AndroidPreviewCaptureView._surfaceViewRenderer as CustomSurfaceViewRenderer).setExtraRotation(90)
+        // SKIP INSERT: (this@AndroidPreviewCaptureView._surfaceViewRenderer as CustomSurfaceViewRenderer).setExtraRotation(0)
         // SKIP INSERT: this@AndroidPreviewCaptureView._surfaceViewRenderer.setId(android.view.View.generateViewId())
         // SKIP INSERT: android.util.Log.d("ANDROIDPREVIEWCAPTUREVIEW", "INITIALIZED APCV")
     }
@@ -80,19 +86,80 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
     
     /// Releases renderer resources safely, handling cases where the OpenGL context may be destroyed.
     public func release() {
+        pendingTrack = nil
         // SKIP INSERT: try {
         // SKIP INSERT:     _surfaceViewRenderer.release()
         // SKIP INSERT: } catch (e: java.lang.Exception) {
         // SKIP INSERT:     android.util.Log.w("AndroidPreviewCaptureView", "Error releasing renderer (context may be destroyed): ${e.message}")
         // SKIP INSERT: }
     }
+    
+    /// Returns `true` if the underlying surface is ready for rendering.
+    private func isSurfaceReady() -> Bool {
+        // SKIP INSERT: try {
+        // SKIP INSERT:     val holder = _surfaceViewRenderer.holder
+        // SKIP INSERT:     val surface = holder?.surface
+        // SKIP INSERT:     val hasSize = _surfaceViewRenderer.width > 0 && _surfaceViewRenderer.height > 0
+        // SKIP INSERT:     return surface != null && surface.isValid && hasSize
+        // SKIP INSERT: } catch (e: Exception) {
+        // SKIP INSERT:     return false
+        // SKIP INSERT: }
+        return false
+    }
+    
+    /// Sets up a surface holder callback to detect when the surface becomes ready.
+    private func setupSurfaceCallback() {
+        // SKIP INSERT: if (surfaceCallbackSetup) return
+        // SKIP INSERT: surfaceCallbackSetup = true
+        // SKIP INSERT: try {
+        // SKIP INSERT:     val holder = _surfaceViewRenderer.holder
+        // SKIP INSERT:     holder?.addCallback(object : android.view.SurfaceHolder.Callback {
+        // SKIP INSERT:         override fun surfaceCreated(holder: android.view.SurfaceHolder) {
+        // SKIP INSERT:             android.util.Log.d("AndroidPreviewCaptureView", "Surface created")
+        // SKIP INSERT:             attachPendingTrackIfReady()
+        // SKIP INSERT:         }
+        // SKIP INSERT:
+        // SKIP INSERT:         override fun surfaceChanged(holder: android.view.SurfaceHolder, format: Int, width: Int, height: Int) {
+        // SKIP INSERT:             android.util.Log.d("AndroidPreviewCaptureView", "Surface changed: ${width}x${height}")
+        // SKIP INSERT:             attachPendingTrackIfReady()
+        // SKIP INSERT:         }
+        // SKIP INSERT:
+        // SKIP INSERT:         override fun surfaceDestroyed(holder: android.view.SurfaceHolder) {
+        // SKIP INSERT:             android.util.Log.d("AndroidPreviewCaptureView", "Surface destroyed")
+        // SKIP INSERT:         }
+        // SKIP INSERT:     })
+        // SKIP INSERT: } catch (e: Exception) {
+        // SKIP INSERT:     android.util.Log.w("AndroidPreviewCaptureView", "Failed to setup surface callback: ${e.message}")
+        // SKIP INSERT: }
+    }
+    
+    /// Attaches the pending track if the surface is ready.
+    private func attachPendingTrackIfReady() {
+        // SKIP INSERT: val track = pendingTrack ?: return
+        // SKIP INSERT: if (isSurfaceReady()) {
+        // SKIP INSERT:     try {
+        // SKIP INSERT:         track.platformTrack.addSink(_surfaceViewRenderer)
+        // SKIP INSERT:         android.util.Log.d("AndroidPreviewCaptureView", "Attached pending track after surface ready")
+        // SKIP INSERT:         pendingTrack = null
+        // SKIP INSERT:     } catch (e: java.lang.IllegalStateException) {
+        // SKIP INSERT:         android.util.Log.w("AndroidPreviewCaptureView", "Failed to attach pending track: ${e.message}")
+        // SKIP INSERT:     }
+        // SKIP INSERT: }
+    }
 
     /// Attaches a local video track to this preview renderer.
     public func attach(_ track: RTCVideoTrack) {
-        // SKIP INSERT: try {
-        // SKIP INSERT:     track.platformTrack.addSink(_surfaceViewRenderer)
-        // SKIP INSERT: } catch (e: java.lang.IllegalStateException) {
-        // SKIP INSERT:     android.util.Log.w("AndroidPreviewCaptureView", "Attempted to attach disposed track: ${e.message}")
+        // SKIP INSERT: setupSurfaceCallback()
+        // SKIP INSERT: if (isSurfaceReady()) {
+        // SKIP INSERT:     try {
+        // SKIP INSERT:         track.platformTrack.addSink(_surfaceViewRenderer)
+        // SKIP INSERT:         android.util.Log.d("AndroidPreviewCaptureView", "Attached track immediately - surface ready")
+        // SKIP INSERT:     } catch (e: java.lang.IllegalStateException) {
+        // SKIP INSERT:         android.util.Log.w("AndroidPreviewCaptureView", "Attempted to attach disposed track: ${e.message}")
+        // SKIP INSERT:     }
+        // SKIP INSERT: } else {
+        // SKIP INSERT:     pendingTrack = track
+        // SKIP INSERT:     android.util.Log.d("AndroidPreviewCaptureView", "Surface not ready, queued track for later attachment")
         // SKIP INSERT: }
     }
 
@@ -102,6 +169,9 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
         // SKIP INSERT:     track.platformTrack.removeSink(_surfaceViewRenderer)
         // SKIP INSERT: } catch (e: java.lang.IllegalStateException) {
         // SKIP INSERT:     // Ignore if already detached or disposed
+        // SKIP INSERT: }
+        // SKIP INSERT: if (pendingTrack?.platformTrack == track.platformTrack) {
+        // SKIP INSERT:     pendingTrack = null
         // SKIP INSERT: }
     }
 }

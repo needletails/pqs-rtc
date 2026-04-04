@@ -27,13 +27,13 @@ final class VideoCallScrollView: NSScrollView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         self.setupScrollView()
-        self.documentView = VideoCallCollectionView()
+        self.installDocumentView()
     }
     
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         self.setupScrollView()
-        self.documentView = VideoCallCollectionView()
+        self.installDocumentView()
     }
     
     /// Applies common appearance/scroll settings for the call UI.
@@ -41,8 +41,24 @@ final class VideoCallScrollView: NSScrollView {
         self.wantsLayer = true
         self.layer?.backgroundColor = Constants.DARK_CHARCOAL_COLOR
         self.drawsBackground = false
-        self.verticalScroller?.isEnabled = false
-        self.horizontalScroller?.isEnabled = false
+        self.hasVerticalScroller = false
+        self.hasHorizontalScroller = false
+        self.autohidesScrollers = true
+    }
+    
+    private func installDocumentView() {
+        let collectionView = VideoCallCollectionView(frame: contentView.bounds)
+        collectionView.autoresizingMask = [.width, .height]
+        collectionView.translatesAutoresizingMaskIntoConstraints = true
+        documentView = collectionView
+    }
+    
+    override func layout() {
+        super.layout()
+        guard let documentView else { return }
+        if documentView.frame.size != contentView.bounds.size {
+            documentView.frame = contentView.bounds
+        }
     }
 }
 #endif

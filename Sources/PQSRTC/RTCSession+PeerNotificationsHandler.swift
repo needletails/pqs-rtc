@@ -19,6 +19,7 @@
 import WebRTC
 #endif
 import BinaryCodable
+import Foundation
 
 extension RTCSession {
 
@@ -127,7 +128,14 @@ extension RTCSession {
                 if stateChanged.description == "stable" {}
             case .addedStream(_, _):
                 self.logger.log(level: .info, message: "peerConnection did add stream")
-#if canImport(WebRTC)
+#if os(Android)
+                // Mirror Apple: attach sender FrameCryptors when stream is added (fallback if not already created in addAudioToStream/addVideoToStream).
+                if enableEncryption && rtcClient.isFrameKeyProviderReady() {
+                    rtcClient.createSenderEncryptedFrame(participant: connection.localParticipantId, connectionId: connection.id)
+                } else if enableEncryption {
+                    self.logger.log(level: .debug, message: "Skipping addedStream sender cryptor attach until Android key provider is ready")
+                }
+#elseif canImport(WebRTC)
                 
                 for sender in connection.peerConnection.senders {
                     let params = sender.parameters
@@ -239,8 +247,9 @@ extension RTCSession {
                         updated.remoteVideoTrack = videoTrack
                         await connectionManager.updateConnection(id: updated.id, with: updated)
                         
-                        if let pendingRenderer = pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: updated.id) {
-                            logger.log(level: .info, message: "Attaching buffered remote renderer now that remote video track is available (trackId=\(trackId))")
+                        if let pendingRenderer = pendingRemoteVideoRenderersByConnectionId[updated.id] {
+                            logger.log(level: .info, message: "Rebinding remote renderer now that remote video track is available (trackId=\(trackId))")
+                            connection.remoteVideoTrack?.remove(pendingRenderer)
                             videoTrack.add(pendingRenderer)
                         }
                         
@@ -360,6 +369,7 @@ extension RTCSession {
                 self.logger.log(level: .info, message: "peerConnection new connection state: \(newState.description)")
                 if newState.state == .connected, let callDirection = await self.callState.callDirection {
                     let id: String? = connectionId
+                    cancelRelayFallbackTimer(connectionId: connection.id)
                     
                     await self.callState.transition(
                         to: .connected(
@@ -369,6 +379,8 @@ extension RTCSession {
 #if canImport(WebRTC)
                     // Start periodic stats logging so we can prove whether RTP is actually leaving the client.
                     await startOutboundRtpStatsLoggingIfEnabled(connectionId: connection.id)
+                    // Always run outbound video flow probe (caller/callee correlation; not diagnostics-gated).
+                    startOutboundVideoFlowProbe(connectionId: connection.id)
                     // Start adaptive video send control only for SFU group calls that use video.
                     if connection.call.supportsVideo {
                         await startAdaptiveVideoSendIfNeeded(connectionId: connection.id)
@@ -383,6 +395,7 @@ extension RTCSession {
                 if newState.state == .closed {
 #if canImport(WebRTC)
                     stopOutboundRtpStatsLogging(connectionId: connection.id)
+                    stopOutboundVideoFlowProbe(connectionId: connection.id)
                     stopAdaptiveVideoSend(connectionId: connection.id)
 #endif
 #if os(Android)
@@ -431,42 +444,45 @@ extension RTCSession {
                 }
                 self.logger.log(level: .info, message: "peerConnection did change ice state \(newState.description)")
                 
+                if newState.state == .failed {
+                    if await retryWithRelayIfNeeded(call: connection.call, reason: "ice_failed") {
+                        continue
+                    }
+                }
+
+                if newState.state == .disconnected, shouldDeferDisconnectFailure(for: connection.call) {
+                    self.logger.log(level: .warning, message: "Deferring disconnect failure while outbound relay fallback remains available for \(connection.id)")
+                    continue
+                }
+
                 if newState.state == .failed || newState.state == .disconnected || newState.state == .closed {
 #if canImport(WebRTC)
                     stopOutboundRtpStatsLogging(connectionId: connection.id)
+                    stopOutboundVideoFlowProbe(connectionId: connection.id)
 #endif
                     iceDeque.removeAll()
                     if let id = connectionId as String? {
-
-                            if let callDirection = await self.callState.callDirection {
-                                let errorMessage = newState.state == .failed ? "PeerConnection Failed" :
-                                (newState.state == .disconnected ? "PeerConnection Disconnected" : "PeerConnection Closed")
-                                await callState.transition(to: .failed(callDirection, connection.call, errorMessage))
-                                await finishEndConnection(currentCall: connection.call)
-                            }
-                        
-                        var errorMessage = ""
-                        
-                        if newState.state == .failed {
-                            errorMessage = "PeerConnection Failed"
-                        } else if newState.state == .disconnected {
-                            errorMessage = "PeerConnection Disconnected"
-                        } else if newState.state == .closed {
-                            errorMessage = "PeerConnection Closed"
-                        }
-                        
-                        // Determine call direction
-                        let callDirection: CallStateMachine.CallDirection
-                        if let existingDirection = await self.callState.callDirection {
-                            callDirection = existingDirection
-                        } else {
-                            // Fallback: determine from call type
-                            callDirection = .inbound(connection.call.supportsVideo ? .video : .voice)
-                        }
-                        
-                        await callState.transition(to: .failed(callDirection, connection.call, errorMessage))
-                        await finishEndConnection(currentCall: connection.call)
+                        cancelRelayFallbackTimer(connectionId: id)
                     }
+
+                    let errorMessage: String
+                    if newState.state == .failed {
+                        errorMessage = "PeerConnection Failed"
+                    } else if newState.state == .disconnected {
+                        errorMessage = "PeerConnection Disconnected"
+                    } else {
+                        errorMessage = "PeerConnection Closed"
+                    }
+
+                    let callDirection: CallStateMachine.CallDirection
+                    if let existingDirection = await self.callState.callDirection {
+                        callDirection = existingDirection
+                    } else {
+                        callDirection = .inbound(connection.call.supportsVideo ? .video : .voice)
+                    }
+
+                    await callState.transition(to: .failed(callDirection, connection.call, errorMessage))
+                    await finishEndConnection(currentCall: connection.call)
                 }
                 
             case .removedIceCandidates(_, _):
