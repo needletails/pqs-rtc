@@ -33,26 +33,32 @@ extension RTCSession {
 #if os(Android)
     /// Render local video to Android view (equivalent to iOS RTCVideoRenderWrapper)
     func renderLocalVideo(to view: AndroidPreviewCaptureView, connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Rendering local video for connection: \(connectionId)")
         let manager = connectionManager as RTCConnectionManager
-        guard let videoTrack: RTCVideoTrack = await manager.findConnection(with: connectionId)?.localVideoTrack else { return }
+        pendingLocalVideoRenderersByConnectionId[normalizedId] = view
+        guard let videoTrack: RTCVideoTrack = await manager.findConnection(with: normalizedId)?.localVideoTrack else {
+            logger.log(level: .info, message: "Local video track not ready yet; buffered preview renderer for connection: \(normalizedId)")
+            return
+        }
         logger.log(level: .info, message: "Attaching Local Track to View - Track: \(videoTrack)")
         view.attach(videoTrack)
+        pendingLocalVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
     }
     
     /// Render remote video to Android view (equivalent to iOS RTCVideoRenderWrapper)
     func renderRemoteVideo(to view: AndroidSampleCaptureView, connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Rendering remote video for connection: \(connectionId)")
         let manager = connectionManager as RTCConnectionManager
         let client: AndroidRTCClient = self.rtcClient
-        guard var connection: RTCConnection = await manager.findConnection(with: connectionId) else {
-            logger.log(level: .error, message: "No connection found for ID: \(connectionId)")
+        pendingRemoteVideoRenderersByConnectionId[normalizedId] = view
+
+        guard var connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
+            logger.log(level: .error, message: "No connection found for ID: \(connectionId) (normalized=\(normalizedId))")
             return
         }
-        
-        // Buffer the renderer request in case the remote track arrives after the UI calls this.
-        pendingRemoteVideoRenderersByConnectionId[connectionId] = view
-        
+
         logger.log(level: .info, message: "Attempting to get remote video track from peer connection")
         connection.remoteVideoTrack = client.getRemoteVideoTrack(peerConnection: connection.peerConnection)
         
@@ -60,30 +66,33 @@ extension RTCSession {
             logger.log(level: .info, message: "✅ Found remote video track, attaching renderer")
             logger.log(level: .info, message: "📹 Video track - trackId: \(videoTrack.trackId)")
             view.attach(videoTrack)
-            pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
+            pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
         } else {
             logger.log(level: .warning, message: "⚠️ Remote video track is nil - will attach renderer when track becomes available")
             logger.log(level: .info, message: "Remote renderer buffered; will attach when receiver/track is added")
             // Don't fatal error, just log and return - renderer is buffered
         }
         
-        await manager.updateConnection(id: connectionId, with: connection)
+        await manager.updateConnection(id: normalizedId, with: connection)
     }
     
     /// Remove remote video renderer
     func removeRemote(view: AndroidSampleCaptureView, connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Removing remote video renderer for connection: \(connectionId)")
-        pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
+        pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
         let manager = connectionManager as RTCConnectionManager
-        guard let remoteTrack: RTCVideoTrack = await manager.findConnection(with: connectionId)?.remoteVideoTrack else { return }
+        guard let remoteTrack: RTCVideoTrack = await manager.findConnection(with: normalizedId)?.remoteVideoTrack else { return }
         view.detach(remoteTrack)
     }
     
     /// Remove local video renderer
     func removeLocal(view: AndroidPreviewCaptureView, connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Removing local video renderer for connection: \(connectionId)")
+        pendingLocalVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
         let manager = connectionManager as RTCConnectionManager
-        guard let localVideoTrack: RTCVideoTrack = await manager.findConnection(with: connectionId)?.localVideoTrack else { return }
+        guard let localVideoTrack: RTCVideoTrack = await manager.findConnection(with: normalizedId)?.localVideoTrack else { return }
         view.detach(localVideoTrack)
     }
 #else
@@ -96,10 +105,14 @@ extension RTCSession {
     }
     func renderRemoteVideo(to renderer: RTCVideoRenderWrapper, with connectionId: String) async {
         let normalizedId = connectionId.normalizedConnectionId
-        logger.log(level: .info, message: "Rendering remote video for connection: \(connectionId)")
+        if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled {
+            logger.log(level: .trace, message: "Rendering remote video for connection: \(connectionId)")
+        }
         let manager = connectionManager as RTCConnectionManager
 
-        // Buffer the renderer request in case the remote track arrives after the UI calls this.
+        // Keep the renderer request registered even after an optimistic attach.
+        // SFU/Unified Plan flows can surface a placeholder receiver track before the
+        // actual inbound receiver is finalized; `didAddReceiver` must be able to rebind.
         pendingRemoteVideoRenderersByConnectionId[normalizedId] = renderer
 
         guard var connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
@@ -113,26 +126,33 @@ extension RTCSession {
         }
         
         if let videoTrack = connection.remoteVideoTrack {
-            logger.log(level: .info, message: "✅ Found remote video track, attaching renderer")
-            logger.log(level: .info, message: "📹 Video track details - trackId: \(videoTrack.trackId), enabled: \(videoTrack.isEnabled), readyState: \(videoTrack.readyState.rawValue)")
+            if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled {
+                logger.log(level: .trace, message: "Found remote video track, attaching renderer")
+                logger.log(level: .trace, message: "Video track details - trackId: \(videoTrack.trackId), enabled: \(videoTrack.isEnabled), readyState: \(videoTrack.readyState.rawValue)")
+            }
             
             // Check if the receiver has a track and if it's the same as the video track
             if let videoReceiver = connection.peerConnection.transceivers.first(where: { $0.mediaType == .video })?.receiver {
-                logger.log(level: .info, message: "�� Receiver track: \(videoReceiver.track != nil ? "exists" : "nil"), trackId: \(videoReceiver.track?.trackId ?? "nil")")
-                logger.log(level: .info, message: "🔍 Video track matches receiver track: \(videoReceiver.track == videoTrack)")
-                
+                if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled {
+                    logger.log(level: .trace, message: "Receiver track: \(videoReceiver.track != nil ? "exists" : "nil"), trackId: \(videoReceiver.track?.trackId ?? "nil")")
+                    logger.log(level: .trace, message: "Video track matches receiver track: \(videoReceiver.track == videoTrack)")
+                    logger.log(level: .trace, message: "PeerConnection media summary: transceivers=\(connection.peerConnection.transceivers.count) receivers=\(connection.peerConnection.receivers.count) senders=\(connection.peerConnection.senders.count)")
+                }
+
                 // Check if FrameCryptor is attached to this receiver (only relevant when frame encryption is enabled).
                 if enableEncryption {
                     if let frameCryptor = connection.videoFrameCryptor {
-                        logger.log(level: .info, message: "🔍 FrameCryptor exists and is attached to receiver")
-                        logger.log(level: .info, message: "🔍 FrameCryptor enabled: \(frameCryptor.enabled)")
+                        if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled {
+                            logger.log(level: .trace, message: "FrameCryptor exists and is attached to receiver")
+                            logger.log(level: .trace, message: "FrameCryptor enabled: \(frameCryptor.enabled)")
+                        }
                     } else {
-                        logger.log(level: .warning, message: "⚠️ FrameCryptor is nil (enableEncryption=true) - frames won't be decrypted!")
+                        logger.log(level: .warning, message: "FrameCryptor is nil (enableEncryption=true) - frames won't be decrypted!")
                     }
                 }
             }
+            connection.remoteVideoTrack?.remove(renderer)
             videoTrack.add(renderer)
-            pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
 
             // One-shot stats snapshot shortly after attaching the renderer.
             // This tells us definitively whether:
@@ -144,21 +164,72 @@ extension RTCSession {
                 connectionId: normalizedId,
                 delayNanoseconds: 2_000_000_000,
                 reason: "afterAttachRemoteRenderer")
+            startInboundVideoFlowProbe(connectionId: normalizedId)
             #endif
         } else {
-            logger.log(level: .warning, message: "⚠️ Remote video track is nil - transceivers: \(connection.peerConnection.transceivers.count)")
-            logger.log(level: .info, message: "Remote renderer buffered; will attach when receiver/track is added")
-            // Log transceiver details for debugging
-            for (index, transceiver) in connection.peerConnection.transceivers.enumerated() {
-                logger.log(level: .info, message: "Transceiver \(index): mediaType=\(transceiver.mediaType), receiver.track=\(String(describing: transceiver.receiver.track))")
+            logger.log(level: .warning, message: "Remote video track is nil - transceivers: \(connection.peerConnection.transceivers.count)")
+            if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled {
+                logger.log(level: .trace, message: "Remote renderer buffered; will attach when receiver/track is added")
+                for (index, transceiver) in connection.peerConnection.transceivers.enumerated() {
+                    logger.log(level: .trace, message: "Transceiver \(index): mediaType=\(transceiver.mediaType), receiver.track=\(String(describing: transceiver.receiver.track))")
+                }
             }
         }
         await manager.updateConnection(id: normalizedId, with: connection)
     }
+
+    /// Whether inbound remote video should be treated as live for UI (camera-off overlay).
+    ///
+    /// On the receive side, `RTCVideoTrack.isEnabled` is mostly a **local** output toggle and often
+    /// stays `true` when the sender stops camera capture. This WebRTC Swift module does not expose
+    /// `isMuted` on `RTCVideoTrack`, so call sites should also use frame timing (e.g.
+    /// `SampleBufferViewRenderer.ageMillisecondsSinceLastVideoFrameCallback()`) to detect a frozen
+    /// picture when the peer turns video off.
+    ///
+    /// Returns `true` when there is no receiver track yet (still connecting).
+    func inboundRemoteVideoTrackAppearsEnabled(connectionId: String) async -> Bool {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard let track = await connectionManager.findConnection(with: normalizedId)?.remoteVideoTrack else {
+            return true
+        }
+        return track.isEnabled
+    }
+
+    /// Adds another sink for the remote video track without touching ``pendingRemoteVideoRenderersByConnectionId``
+    /// (used for Picture in Picture so the in-call renderer stays the canonical pending target).
+    func addAuxiliaryRemoteVideoRenderer(_ renderer: RTCVideoRenderWrapper, connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        logger.log(level: .info, message: "Adding auxiliary remote video renderer (e.g. PiP) for connection: \(connectionId)")
+        let manager = connectionManager as RTCConnectionManager
+        guard var connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
+            logger.log(level: .warning, message: "addAuxiliaryRemoteVideoRenderer: connection not found for \(connectionId)")
+            return
+        }
+        if connection.remoteVideoTrack == nil {
+            connection.remoteVideoTrack = connection.peerConnection.transceivers.first { $0.mediaType == .video }?.receiver.track as? WebRTC.RTCVideoTrack
+        }
+        guard let videoTrack = connection.remoteVideoTrack else {
+            logger.log(level: .warning, message: "addAuxiliaryRemoteVideoRenderer: remote video track nil")
+            return
+        }
+        videoTrack.add(renderer)
+        await manager.updateConnection(id: normalizedId, with: connection)
+    }
+
+    /// Removes an auxiliary sink added via ``addAuxiliaryRemoteVideoRenderer`` only (does not clear pending renderer state).
+    func removeAuxiliaryRemoteVideoRenderer(_ renderer: RTCVideoRenderWrapper, connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        logger.log(level: .info, message: "Removing auxiliary remote video renderer for connection: \(connectionId)")
+        let manager = connectionManager as RTCConnectionManager
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
+        connection.remoteVideoTrack?.remove(renderer)
+    }
+
     func removeRemote(renderer: RTCVideoRenderWrapper, connectionId: String) async {
         let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Removing remote video renderer for connection: \(connectionId)")
         pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
+        stopInboundVideoFlowProbe(connectionId: normalizedId)
         let manager = connectionManager as RTCConnectionManager
         guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
         connection.remoteVideoTrack?.remove(renderer)
@@ -220,6 +291,60 @@ extension RTCSession {
         throw RTCErrors.mediaError("Unsupported platform for local video track creation")
 #endif
     }
+
+#if canImport(WebRTC)
+    /// Rebuilds the local video sender pipeline by creating a fresh `RTCVideoSource` + `RTCVideoTrack`
+    /// and re-binding the existing capture wrapper delegate to the new source.
+    ///
+    /// This is used as an escalated recovery when outbound video counters remain flat even though
+    /// audio and transport are healthy.
+    func restartLocalVideoSenderPipeline(connectionId: String) async -> Bool {
+        let normalizedId = connectionId.normalizedConnectionId
+        let manager = connectionManager as RTCConnectionManager
+        guard var connection = await manager.findConnection(with: normalizedId) else {
+            logger.log(level: .warning, message: "restartLocalVideoSenderPipeline: connection not found for id=\(normalizedId)")
+            return false
+        }
+        guard connection.call.supportsVideo else { return false }
+
+        let newVideoSource = RTCSession.factory.videoSource()
+        let newTrackId = "video_\(connection.localParticipantId)_\(connection.id)_recovery_\(UUID().uuidString)"
+        let newVideoTrack = RTCSession.factory.videoTrack(with: newVideoSource, trackId: newTrackId)
+
+        if let wrapper = connection.rtcVideoCaptureWrapper {
+            wrapper.updateCaptureDelegate(newVideoSource)
+        } else {
+            connection.rtcVideoCaptureWrapper = RTCVideoCaptureWrapper(delegate: newVideoSource)
+            if let wrapper = connection.rtcVideoCaptureWrapper {
+                // Wake controllers that may still be waiting for a wrapper after a late reconnect.
+                resumeVideoCaptureWrapperWaiters(connectionId: normalizedId, wrapper: wrapper)
+            }
+        }
+
+        var touchedAnyVideoSender = false
+        for sender in connection.peerConnection.senders where sender.track?.kind == kRTCMediaStreamTrackKindVideo {
+            sender.track = newVideoTrack
+            var params = sender.parameters
+            if !params.encodings.isEmpty {
+                for encoding in params.encodings {
+                    encoding.isActive = true
+                }
+                sender.parameters = params
+            }
+            touchedAnyVideoSender = true
+        }
+
+        if !touchedAnyVideoSender {
+            logger.log(level: .warning, message: "restartLocalVideoSenderPipeline: no video sender found for connection id=\(normalizedId)")
+            return false
+        }
+
+        connection.localVideoTrack = newVideoTrack
+        await manager.updateConnection(id: normalizedId, with: connection)
+        logger.log(level: .warning, message: "Rebuilt local video sender pipeline for connection id=\(normalizedId)")
+        return true
+    }
+#endif
     
     func setVideoTrack(isEnabled: Bool, connectionId: String) async {
         let normalizedId = connectionId.normalizedConnectionId
@@ -259,9 +384,68 @@ extension RTCSession {
     
 #if !os(Android)
     func setTrackEnabled<T: RTCMediaStreamTrack>(_ type: T.Type, isEnabled: Bool, with connection: RTCConnection) async {
-        connection.peerConnection.transceivers
-            .compactMap { $0.sender.track as? T }
-            .forEach { $0.isEnabled = isEnabled }
+        // Prefer `senders` — some stacks attach local tracks there before transceiver.sender.track is wired.
+        var applied = Set<ObjectIdentifier>()
+#if canImport(WebRTC)
+        var audioEncoderMuteApplied = false
+#endif
+        for sender in connection.peerConnection.senders {
+            guard let track = sender.track as? T else { continue }
+            track.isEnabled = isEnabled
+            applied.insert(ObjectIdentifier(track))
+        }
+        for transceiver in connection.peerConnection.transceivers {
+            guard let track = transceiver.sender.track as? T else { continue }
+            let id = ObjectIdentifier(track)
+            guard !applied.contains(id) else { continue }
+            track.isEnabled = isEnabled
+            applied.insert(id)
+        }
+#if canImport(WebRTC)
+        // Cached local track can diverge from `sender.track` reference in some negotiation paths; always sync it for video.
+        if T.self == WebRTC.RTCVideoTrack.self, let local = connection.localVideoTrack {
+            if let track = local as? T {
+                let oid = ObjectIdentifier(track)
+                if !applied.contains(oid) {
+                    track.isEnabled = isEnabled
+                    applied.insert(oid)
+                }
+            }
+        }
+        // Audio: keep cached mic track in sync, and drive RTP sender encodings — some WebRTC builds keep uplink active when only `track.isEnabled` is toggled.
+        if T.self == WebRTC.RTCAudioTrack.self {
+            if let local = connection.localAudioTrack, let track = local as? T {
+                let oid = ObjectIdentifier(track)
+                if !applied.contains(oid) {
+                    track.isEnabled = isEnabled
+                    applied.insert(oid)
+                }
+            }
+            for sender in connection.peerConnection.senders {
+                guard sender.track?.kind == kRTCMediaStreamTrackKindAudio else { continue }
+                var params = sender.parameters
+                if !params.encodings.isEmpty {
+                    for encoding in params.encodings {
+                        encoding.isActive = isEnabled
+                    }
+                    sender.parameters = params
+                    audioEncoderMuteApplied = true
+                }
+            }
+        }
+#endif
+        var shouldWarnNoTrackTouches = applied.isEmpty
+#if canImport(WebRTC)
+        if T.self == WebRTC.RTCAudioTrack.self, audioEncoderMuteApplied {
+            shouldWarnNoTrackTouches = false
+        }
+#endif
+        if shouldWarnNoTrackTouches {
+            logger.log(
+                level: .warning,
+                message: "setTrackEnabled(\(String(describing: T.self))): no tracks updated for connection id=\(connection.id); senders=\(connection.peerConnection.senders.count) transceivers=\(connection.peerConnection.transceivers.count) localVideoTrack=\(connection.localVideoTrack != nil) localAudioTrack=\(connection.localAudioTrack != nil)"
+            )
+        }
     }
 #endif
 }

@@ -28,6 +28,17 @@ import Foundation
 extension RTCVideoFrame: @retroactive @unchecked Sendable {}
 extension CMSampleBuffer: @retroactive @unchecked Sendable {}
 
+@MainActor
+final class SampleBufferDisplayLayerBox {
+    let layer: AVSampleBufferDisplayLayer
+
+    init(layer: AVSampleBufferDisplayLayer) {
+        self.layer = layer
+    }
+}
+
+extension SampleBufferDisplayLayerBox: @unchecked Sendable {}
+
 // MARK: - Error Types
 /// Errors produced by `SampleBufferViewRenderer`.
 ///
@@ -64,6 +75,11 @@ public enum SampleBufferViewRendererError: Error, Sendable {
 // MARK: - Main Renderer Class
 /// Converts inbound WebRTC frames into either Metal textures or displayable sample buffers.
 ///
+/// Frames from ``RTCVideoRenderWrapper`` are **deep-copied to I420** on the WebRTC callback thread before
+/// this actor sees them, so plane pointers remain valid for async Metal / sample-buffer work (see
+/// `RTCVideoRenderWrapper.makeRenderSafeFrameCopy`). Verbose I420 / first-frame traces use `.trace` and
+/// `PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled` (`PQSRTC_REMOTE_VIDEO_TRACE_LOGGING=1` in Release).
+///
 /// The renderer consumes `RTCVideoFrame` instances via `RTCVideoRenderWrapper` and:
 /// - When Metal rendering is enabled, produces a texture and passes it to `BufferToMetalDelegate`.
 /// - When Metal rendering is paused, converts frames into `CMSampleBuffer` and enqueues them
@@ -78,7 +94,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     private let metalProcessor = MetalProcessor()
     private let logger: NeedleTailLogger
     let rtcVideoRenderWrapper: RTCVideoRenderWrapper
-    private let layer: AVSampleBufferDisplayLayer
+    private let layerBox: SampleBufferDisplayLayerBox
     private let ciContext: CIContext
     @MainActor var bounds: CGRect
     private weak var delegate: BufferToMetalDelegate?
@@ -108,21 +124,34 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     // Used to answer: "are we still receiving frames?" vs "are we receiving but failing to render?"
     nonisolated(unsafe) private var lastFrameCallbackUptimeNs: UInt64 = 0
     nonisolated(unsafe) private var lastEnqueueUptimeNs: UInt64 = 0
+    /// Last time a frame successfully reached the display path (Metal `passTexture` or sample-buffer enqueue).
+    nonisolated(unsafe) private var lastSuccessfulRemoteVideoOutputUptimeNs: UInt64 = 0
     nonisolated(unsafe) private var receivedFrameCount: UInt64 = 0
     nonisolated(unsafe) private var enqueuedFrameCount: UInt64 = 0
     
-    // MARK: - Always-on first-frame diagnostics
+    // MARK: - First-frame / wire-format diagnostics (trace, gated)
     //
-    // These are intentionally always enabled (not behind criticalBugLoggingEnabled) because
-    // they answer the primary question during bring-up:
-    // "are we receiving any remote frames at all?"
+    // Emitted at `.trace` only when `PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled` is true
+    // (DEBUG by default; Release requires `PQSRTC_REMOTE_VIDEO_TRACE_LOGGING=1`). Answers bring-up
+    // questions like “any remote callbacks?” and “what I420 strides hit Metal?”.
     nonisolated(unsafe) private var didLogFirstFrameCallback: Bool = false
     private var didLogFirstEnqueue: Bool = false
+    private var didLogFirstIncomingPixelFormat = false
+    private var didLogFirstIncomingI420Format = false
+    private var i420WireLogCount = 0
+    private var lastI420WireSignature: String?
+    private var i420DetailedLogCount = 0
+    private var didLogFirstRemoteMetalScale = false
+    private var didLogIOSRemoteI420MetalPath = false
     private var telemetryTask: Task<Void, Never>?
+    /// Always-on 2s cadence: distinguish “no frames from WebRTC” vs “frames arrive but nothing is displayed”.
+    private var remoteVideoHealthWatchdogTask: Task<Void, Never>?
+    private var didLogRemoteNeverOutputWarning = false
     
     private struct TelemetrySnapshot: Sendable {
         let cbAgeMs: Int64
         let enqAgeMs: Int64
+        let outputAgeMs: Int64
         let received: UInt64
         let enqueued: UInt64
         let dropped: Int
@@ -134,16 +163,20 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     nonisolated(unsafe) private var pauseMetalRendering = false
     nonisolated(unsafe) private var streamContinuation: AsyncStream<RTCVideoFrame?>.Continuation?
     nonisolated(unsafe) private var isShutdown = false
+    /// Set by the call UI after `renderRemoteVideo` — enables “should be receiving but isn’t” checks.
+    nonisolated(unsafe) private var remoteVideoInboundExpected: Bool = false
+    nonisolated(unsafe) private var remoteVideoExpectedSinceUptimeNs: UInt64 = 0
+    nonisolated(unsafe) private var lastLogRemoteExpectedNoCallbacksUptimeNs: UInt64 = 0
 
     
     // MARK: - Initialization
     init(
-        layer: AVSampleBufferDisplayLayer,
+        layerBox: SampleBufferDisplayLayerBox,
         ciContext: CIContext,
         bounds: CGRect,
         logger: NeedleTailLogger = NeedleTailLogger("[SampleBufferViewRenderer]")
     ) {
-        self.layer = layer
+        self.layerBox = layerBox
         self.ciContext = ciContext
         self.bounds = bounds
         self.logger = logger
@@ -164,12 +197,36 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         logger.log(level: .debug, message: "Delegate set to NTMTKView")
     }
     
+    /// Mirrors the hosting ``NTMTKView`` bounds into the renderer.
+    ///
+    /// On macOS, AppKit often resizes `NSView` via `setFrameSize` / `layout`, which does **not**
+    /// reliably trigger Swift `frame.didSet`. If these bounds stay `.zero`, ``handleCVPixelBufferFrame``
+    /// skips Metal output (`boundsNotValid` path) and the call UI stays blank despite decoded frames.
+    func applyHostViewBounds(_ rect: CGRect) async {
+        await MainActor.run {
+            bounds = rect
+        }
+    }
+    
     /// Enables or disables Metal rendering.
     ///
     /// When Metal rendering is paused, frames are routed to the sample-buffer pipeline.
     nonisolated func passPause(_ bool: Bool) {
         pauseMetalRendering = bool
         logger.log(level: .debug, message: "Metal rendering paused: \(bool)")
+    }
+
+    /// Call when the session has attached a live remote video track to this renderer (`renderRemoteVideo` / auxiliary sink).
+    /// The health watchdog then warns if no frame callbacks arrive within a short grace period.
+    func setRemoteVideoInboundExpected(_ expected: Bool) {
+        remoteVideoInboundExpected = expected
+        if expected {
+            remoteVideoExpectedSinceUptimeNs = DispatchTime.now().uptimeNanoseconds
+            lastLogRemoteExpectedNoCallbacksUptimeNs = 0
+        } else {
+            remoteVideoExpectedSinceUptimeNs = 0
+            lastLogRemoteExpectedNoCallbacksUptimeNs = 0
+        }
     }
     
     /// Starts consuming frames from the `RTCVideoRenderWrapper` output.
@@ -178,6 +235,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             logger.log(level: .warning, message: "Cannot start stream - renderer is shutdown")
             return
         }
+        didLogRemoteNeverOutputWarning = false
         
         if let existingTask = streamTask, !existingTask.isCancelled {
             logger.log(level: .info, message: "Cancelling existing stream task")
@@ -207,12 +265,13 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                     if snap.cbAgeMs > 1500 || (snap.cbAgeMs >= 0 && snap.enqAgeMs > 1500) {
                         await self.logger.log(
                             level: .warning,
-                            message: "Render telemetry: lastFrameCallbackMsAgo=\(snap.cbAgeMs) lastEnqueueMsAgo=\(snap.enqAgeMs) received=\(snap.received) enqueued=\(snap.enqueued) dropped=\(snap.dropped) pauseMetal=\(snap.pauseMetal) layerStatus=\(snap.layerStatusRaw)"
+                            message: "Render telemetry: lastFrameCallbackMsAgo=\(snap.cbAgeMs) lastEnqueueMsAgo=\(snap.enqAgeMs) lastOutputMsAgo=\(snap.outputAgeMs) received=\(snap.received) enqueued=\(snap.enqueued) dropped=\(snap.dropped) pauseMetal=\(snap.pauseMetal) layerStatus=\(snap.layerStatusRaw)"
                         )
-                    } else if snap.received > 0, snap.received % 600 == 0 {
+                    } else if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled,
+                              snap.received > 0, snap.received % 600 == 0 {
                         // Roughly every ~20s at 30fps.
                         await self.logger.log(
-                            level: .debug,
+                            level: .trace,
                             message: "Render telemetry: OK received=\(snap.received) enqueued=\(snap.enqueued) dropped=\(snap.dropped)"
                         )
                     }
@@ -221,6 +280,17 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         } else {
             telemetryTask?.cancel()
             telemetryTask = nil
+        }
+
+        remoteVideoHealthWatchdogTask?.cancel()
+        remoteVideoHealthWatchdogTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if Task.isCancelled { return }
+                if self.isShutdown { return }
+                await self.logRemoteVideoHealthIfNeeded()
+            }
         }
         
         streamTask = Task(priority: .high) { [weak self] in
@@ -279,8 +349,16 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         droppedSampleFrames = 0
         lastFrameCallbackUptimeNs = 0
         lastEnqueueUptimeNs = 0
+        lastSuccessfulRemoteVideoOutputUptimeNs = 0
         receivedFrameCount = 0
         enqueuedFrameCount = 0
+        
+        remoteVideoHealthWatchdogTask?.cancel()
+        remoteVideoHealthWatchdogTask = nil
+        didLogRemoteNeverOutputWarning = false
+        remoteVideoInboundExpected = false
+        remoteVideoExpectedSinceUptimeNs = 0
+        lastLogRemoteExpectedNoCallbacksUptimeNs = 0
         
         logger.log(level: .info, message: "Shutdown completed")
     }
@@ -302,11 +380,11 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 self.receivedFrameCount &+= 1
                 
                 // First-frame callback signal (runs on WebRTC callback thread).
-                if self.didLogFirstFrameCallback == false {
+                if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, self.didLogFirstFrameCallback == false {
                     self.didLogFirstFrameCallback = true
                     Task { [weak self] in
                         guard let self else { return }
-                        await self.logger.log(level: .info, message: "✅ First remote video frame received by renderer callback")
+                        await self.logger.log(level: .trace, message: "First remote video frame received by renderer callback")
                     }
                 }
                 
@@ -330,7 +408,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             }
             
             do {
-                try await self.handleFrame(frame, ciContext: self.ciContext, layer: self.layer)
+                try await self.handleFrame(frame, ciContext: self.ciContext)
             } catch {
                 logger.log(level: .error, message: "Frame handling failed: \(error)")
                 // Continue processing other frames instead of breaking the stream
@@ -354,16 +432,84 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         
         let cbAgeMs = ageMsSince(lastCb)
         let enqAgeMs = ageMsSince(lastEnq)
-        let statusRaw = await MainActor.run { layer.status.rawValue }
+        let lastOut = lastSuccessfulRemoteVideoOutputUptimeNs
+        let outputAgeMs = ageMsSince(lastOut)
+        let statusRaw = await MainActor.run { layerBox.layer.status.rawValue }
         return TelemetrySnapshot(
             cbAgeMs: cbAgeMs,
             enqAgeMs: enqAgeMs,
+            outputAgeMs: outputAgeMs,
             received: receivedFrameCount,
             enqueued: enqueuedFrameCount,
             dropped: droppedSampleFrames,
             pauseMetal: pauseMetalRendering,
             layerStatusRaw: statusRaw
         )
+    }
+
+    /// Periodic remote-video health: WebRTC vs renderer output vs (when on sample-buffer path) enqueue.
+    private func logRemoteVideoHealthIfNeeded() async {
+        let snap = await makeTelemetrySnapshot()
+        let now = DispatchTime.now().uptimeNanoseconds
+        let expectHint = remoteVideoInboundExpected ? " inboundExpected=true" : ""
+
+        if remoteVideoInboundExpected, snap.received == 0 {
+            let since = remoteVideoExpectedSinceUptimeNs
+            if since > 0, now >= since {
+                let elapsedMs = Int64((now - since) / 1_000_000)
+                if elapsedMs > 5_000, now &- lastLogRemoteExpectedNoCallbacksUptimeNs >= 8_000_000_000 {
+                    lastLogRemoteExpectedNoCallbacksUptimeNs = now
+                    await logger.log(
+                        level: .warning,
+                        message: "Remote video health: INBOUND EXPECTED (track attached to this renderer) but ZERO WebRTC frame callbacks after \(elapsedMs)ms — check remote camera, transceiver direction, mute, packet loss, or decoder"
+                    )
+                }
+            }
+        }
+
+        guard snap.received > 0 else { return }
+
+        if snap.cbAgeMs > 1_500 {
+            await logger.log(
+                level: .warning,
+                message: "Remote video health: WebRTC frame callbacks STALLED (lastFrameCallbackMsAgo=\(snap.cbAgeMs)) received=\(snap.received) pauseMetal=\(snap.pauseMetal)\(expectHint)"
+            )
+            return
+        }
+
+        guard snap.cbAgeMs >= 0, snap.cbAgeMs < 900 else { return }
+
+        if snap.pauseMetal {
+            if snap.enqAgeMs > 1_500 {
+                await logger.log(
+                    level: .warning,
+                    message: "Remote video health: callbacks OK but SAMPLE-BUFFER enqueue STALLED (lastEnqueueMsAgo=\(snap.enqAgeMs)) received=\(snap.received) enqueued=\(snap.enqueued) dropped=\(snap.dropped) layerStatus=\(snap.layerStatusRaw)\(expectHint)"
+                )
+            }
+        } else {
+            if snap.outputAgeMs > 1_500 {
+                await logger.log(
+                    level: .warning,
+                    message: "Remote video health: callbacks OK but RENDERER OUTPUT STALLED — no successful Metal passTexture / display path (lastOutputMsAgo=\(snap.outputAgeMs)) received=\(snap.received) pauseMetal=\(snap.pauseMetal)\(expectHint)"
+                )
+            } else if snap.received > 45, snap.outputAgeMs < 0, didLogRemoteNeverOutputWarning == false {
+                didLogRemoteNeverOutputWarning = true
+                await logger.log(
+                    level: .warning,
+                    message: "Remote video health: many frames received (\(snap.received)) but NEVER recorded a successful display output (check Metal errors / delegate)"
+                )
+            }
+        }
+    }
+
+    /// Compatibility helper for call UI code that treats stale inbound frame callbacks as "camera off".
+    ///
+    /// Returns:
+    /// - `-1` when no frame callback has been observed yet
+    /// - elapsed milliseconds since the last renderer callback otherwise
+    func ageMillisecondsSinceLastVideoFrameCallback() async -> Int64 {
+        let snap = await makeTelemetrySnapshot()
+        return snap.cbAgeMs
     }
     
 
@@ -381,7 +527,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
 #endif
     }
     
-    private func handleFrame(_ frame: RTCVideoFrame?, ciContext: CIContext, layer: AVSampleBufferDisplayLayer) async throws {
+    private func handleFrame(_ frame: RTCVideoFrame?, ciContext: CIContext) async throws {
         guard let frame = frame else {
             logger.log(level: .debug, message: "Received nil frame, skipping")
             return
@@ -392,18 +538,19 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         
         // Handle RTCCVPixelBuffer frames
         if let cvBuffer = buffer as? RTCCVPixelBuffer {
-            try await handleCVPixelBufferFrame(cvBuffer, frame: frame, layer: layer)
-        }
-        // Handle RTCI420Buffer frames
-        else if let i420Buffer = buffer as? RTCI420Buffer {
+            if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled {
+                logger.log(level: .trace, message: "CVBuffer TO PROCESS \(cvBuffer)")
+            }
+            try await handleCVPixelBufferFrame(cvBuffer, frame: frame)
+        } else if let i420Buffer = buffer as? RTCI420Buffer {
+            logI420WireDetailsIfNeeded(i420Buffer, frame: frame, context: "handleFrame dispatch")
             try await handleI420BufferFrame(i420Buffer, frame: frame)
-        }
-        else {
+        } else {
             logger.log(level: .warning, message: "Unsupported buffer type: \(type(of: buffer))")
         }
     }
     
-    private func handleCVPixelBufferFrame(_ buffer: RTCCVPixelBuffer, frame: RTCVideoFrame, layer: AVSampleBufferDisplayLayer) async throws {
+    private func handleCVPixelBufferFrame(_ buffer: RTCCVPixelBuffer, frame: RTCVideoFrame) async throws {
         let pixelBuffer = buffer.pixelBuffer
         
         // Validate pixel buffer dimensions
@@ -413,32 +560,47 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             logger.log(level: .warning, message: "Invalid pixel buffer dimensions: \(width)x\(height)")
             throw SampleBufferViewRendererError.invalidPixelBuffer
         }
-        
-        // Check bounds
-        guard await bounds.size != .zero else {
-            logger.log(level: .debug, message: "Bounds are zero, skipping frame")
-            return
+        if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogFirstIncomingPixelFormat == false {
+            didLogFirstIncomingPixelFormat = true
+            let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+            let planes = CVPixelBufferGetPlaneCount(pixelBuffer)
+            logger.log(level: .trace, message: "First remote CVPixelBuffer format=\(format) planes=\(planes) size=\(width)x\(height) pauseMetal=\(pauseMetalRendering)")
         }
         
         if !pauseMetalRendering {
             // Process for Metal rendering
             try await processFrameForMetal(pixelBuffer: pixelBuffer)
         } else {
-            // Process for sample buffer display
-            try await processFrameForSampleBuffer(buffer: buffer, frame: frame)
+            // For sample-buffer path (PiP / non-Metal), prefer native NV12 when already provided by
+            // WebRTC to avoid unnecessary color conversion churn. Fall back to explicit I420->NV12
+            // conversion for other formats.
+            let normalizedBuffer = try makeSampleDisplayPixelBuffer(from: frame.buffer, fallback: pixelBuffer)
+            let time = normalizedPresentationTime(for: frame)
+            try await processPixelBufferForSampleBuffer(pixelBuffer: normalizedBuffer, time: time)
         }
     }
     
     private func handleI420BufferFrame(_ buffer: RTCI420Buffer, frame: RTCVideoFrame) async throws {
-        // Check bounds
-        guard await bounds.size != .zero else {
-            logger.log(level: .debug, message: "Bounds are zero, skipping I420 frame")
-            return
+        if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogFirstIncomingI420Format == false {
+            didLogFirstIncomingI420Format = true
+            logger.log(level: .trace, message: "First remote I420 frame received (detailed wire log emitted separately)")
         }
-        
         if !pauseMetalRendering {
+            #if os(iOS)
+            // Render iOS remote frames from source I420 planes directly for Metal.
+            // This avoids an extra I420->NV12 interleave step and preserves source strides.
+            if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogIOSRemoteI420MetalPath == false {
+                didLogIOSRemoteI420MetalPath = true
+                logger.log(
+                    level: .trace,
+                    message: "Remote iOS direct I420->Metal path active src=\(buffer.width)x\(buffer.height) strides=\(buffer.strideY)/\(buffer.strideU)/\(buffer.strideV)"
+                )
+            }
+            try await processI420FrameForMetal(buffer: buffer)
+            #else
             // Metal path supports I420 directly.
             try await processI420FrameForMetal(buffer: buffer)
+            #endif
             return
         }
         
@@ -449,7 +611,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     }
 
     // MARK: - Pixel buffer conversion (I420 -> NV12)
-    private func makeNV12PixelBuffer(fromI420 buffer: RTCI420Buffer) throws -> CVPixelBuffer {
+    private func makeNV12PixelBuffer(fromI420 buffer: any RTCI420BufferProtocol) throws -> CVPixelBuffer {
         let width = Int(buffer.width)
         let height = Int(buffer.height)
         
@@ -493,7 +655,9 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             memcpy(dst, src, width)
         }
         
-        // Interleave U/V into NV12 UV plane.
+        // Interleave chroma into bi-planar UV memory.
+        //
+        // Keep standard NV12 UV order for sample-buffer / PiP path.
         let chromaWidth = (width + 1) / 2
         let chromaHeight = (height + 1) / 2
         let uSrcStride = Int(buffer.strideU)
@@ -504,7 +668,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             let vSrc = buffer.dataV.advanced(by: row * vSrcStride)
             let uvDst = uvDestBase.advanced(by: row * uvDestStride)
             
-            // Each chroma sample becomes 2 bytes: U then V.
+            // Write U then V (NV12).
             let uv = uvDst.assumingMemoryBound(to: UInt8.self)
             for col in 0..<chromaWidth {
                 uv[col * 2] = uSrc[col]
@@ -517,6 +681,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     
     private func processFrameForMetal(pixelBuffer: CVPixelBuffer) async throws {
         do {
+            let renderBounds = await resolveRenderableBounds()
             let aspectRatio = await metalProcessor.getAspectRatio(
                 width: CGFloat(pixelBuffer.width), 
                 height: CGFloat(pixelBuffer.height)
@@ -524,7 +689,9 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             
             let scaleMode: ScaleMode
 #if os(iOS)
-            scaleMode = await determineScale
+            // Restore historical iOS call-tile behavior: fill the available bounds.
+            // This matches prior UX where remote video fully occupied the phone viewport.
+            scaleMode = .aspectFill
 #elseif os(macOS)
             scaleMode = .aspectFitHorizontal
 #endif
@@ -532,13 +699,13 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             let scaleInfo = await metalProcessor.createSize(
                 for: scaleMode,
                 originalSize: .init(width: pixelBuffer.width, height: pixelBuffer.height),
-                desiredSize: bounds.size,
+                desiredSize: renderBounds,
                 aspectRatio: aspectRatio
             )
             
             let info = try await metalProcessor.createMetalImage(
                 fromPixelBuffer: pixelBuffer,
-                parentBounds: bounds.size,
+                parentBounds: renderBounds,
                 scaleInfo: scaleInfo,
                 aspectRatio: aspectRatio
             )
@@ -549,16 +716,54 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             }
             
             try await delegate.passTexture(texture: info.texture)
+            lastSuccessfulRemoteVideoOutputUptimeNs = DispatchTime.now().uptimeNanoseconds
             
         } catch {
-            logger.log(level: .error, message: "Metal processing failed: \(error)")
+            let w = CVPixelBufferGetWidth(pixelBuffer)
+            let h = CVPixelBufferGetHeight(pixelBuffer)
+            let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
+            logger.log(
+                level: .error,
+                message: "Metal processing failed: \(w)x\(h) format=\(fmt) pauseMetalRendering=\(pauseMetalRendering) error=\(error)"
+            )
             throw SampleBufferViewRendererError.metalProcessingFailed(error.localizedDescription)
         }
+    }
+
+    /// Returns a non-zero render target size for Metal conversion.
+    ///
+    /// Some host views (especially AppKit-backed collection/grid cells) can initialize this renderer
+    /// before layout has established a non-zero frame. In that case we fall back to the layer's
+    /// current bounds, and finally to a conservative default.
+    private func resolveRenderableBounds() async -> CGSize {
+        let hostBounds = await bounds.size
+        if hostBounds.width > 0, hostBounds.height > 0 {
+            return hostBounds
+        }
+        let layerBounds = await MainActor.run { self.layerBox.layer.bounds.size }
+        if layerBounds.width > 0, layerBounds.height > 0 {
+            return layerBounds
+        }
+        return .init(width: 640, height: 480)
     }
 
     private func processFrameForSampleBuffer(buffer: RTCCVPixelBuffer, frame: RTCVideoFrame) async throws {
         let time = normalizedPresentationTime(for: frame)
         try await processPixelBufferForSampleBuffer(pixelBuffer: buffer.pixelBuffer, time: time)
+    }
+    
+    private func makeSampleDisplayPixelBuffer(from buffer: RTCVideoFrameBuffer, fallback: CVPixelBuffer) throws -> CVPixelBuffer {
+        let format = CVPixelBufferGetPixelFormatType(fallback)
+        if isNV12PixelFormat(format), CVPixelBufferGetWidth(fallback) > 0, CVPixelBufferGetHeight(fallback) > 0 {
+            return fallback
+        }
+        let converted = buffer.toI420()
+        return try makeNV12PixelBuffer(fromI420: converted)
+    }
+    
+    private func isNV12PixelFormat(_ format: OSType) -> Bool {
+        format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
     }
     
     /// Produces a small, monotonic presentation timestamp for AVSampleBufferDisplayLayer.
@@ -651,11 +856,11 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
 
         // Decide whether we need to flush to resume decoding (failed state, requiresFlush, or long stall).
         let recoveryReason = await MainActor.run { () -> String? in
-            if layer.status == .failed { return "layerFailed" }
+            if layerBox.layer.status == .failed { return "layerFailed" }
             if didStallLongEnoughToRebase { return "stallGap" }
             // Some Fig failures set requiresFlushToResumeDecoding without flipping `status` to `.failed`.
             if #available(iOS 11.0, macOS 10.13, *) {
-                if layer.requiresFlushToResumeDecoding { return "requiresFlushToResumeDecoding" }
+                if layerBox.layer.requiresFlushToResumeDecoding { return "requiresFlushToResumeDecoding" }
             }
             return nil
         }
@@ -664,7 +869,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             await recoverSampleBufferLayerIfNeeded(reason: reason, nowUptimeNs: nowUptimeNs)
         }
         
-        let ready = await MainActor.run { layer.isReadyForMoreMediaData }
+        let ready = await MainActor.run { layerBox.layer.isReadyForMoreMediaData }
         guard ready else {
             droppedSampleFrames += 1
             consecutiveNotReadyDrops += 1
@@ -682,14 +887,16 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             return
         }
         
-        await MainActor.run { layer.enqueue(sampleBuffer) }
-        lastEnqueueUptimeNs = DispatchTime.now().uptimeNanoseconds
+        await MainActor.run { layerBox.layer.enqueue(sampleBuffer) }
+        let outNow = DispatchTime.now().uptimeNanoseconds
+        lastEnqueueUptimeNs = outNow
+        lastSuccessfulRemoteVideoOutputUptimeNs = outNow
         enqueuedFrameCount &+= 1
         consecutiveNotReadyDrops = 0
         
-        if didLogFirstEnqueue == false {
+        if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogFirstEnqueue == false {
             didLogFirstEnqueue = true
-            logger.log(level: .info, message: "✅ First remote video frame enqueued to AVSampleBufferDisplayLayer")
+            logger.log(level: .trace, message: "First remote video frame enqueued to AVSampleBufferDisplayLayer")
         }
     }
 
@@ -712,8 +919,8 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
 
         await MainActor.run {
             // Stronger than `flush()`; clears the last displayed image as well.
-            layer.flushAndRemoveImage()
-            layer.flush()
+            layerBox.layer.flushAndRemoveImage()
+            layerBox.layer.flush()
         }
 
         logger.log(level: .info, message: "Recovered AVSampleBufferDisplayLayer to resume rendering (reason=\(reason))")
@@ -721,21 +928,35 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     
     private func processI420FrameForMetal(buffer: RTCI420Buffer) async throws {
         do {
+            let renderBounds = await resolveRenderableBounds()
             let aspectRatio = await metalProcessor.getAspectRatio(
-                width: CGFloat(buffer.width), 
+                width: CGFloat(buffer.width),
                 height: CGFloat(buffer.height)
             )
-            let scaleMode = await determineScale  
+            let scaleMode: ScaleMode
+#if os(iOS)
+            // Keep iOS remote behavior consistent with main call tile UX: fill viewport.
+            scaleMode = .aspectFill
+#else
+            scaleMode = .aspectFitHorizontal
+#endif
             let scaleInfo = await metalProcessor.createSize(
                 for: scaleMode,
                 originalSize: .init(width: CGFloat(buffer.width), height: CGFloat(buffer.height)),
-                desiredSize: bounds.size,
+                desiredSize: renderBounds,
                 aspectRatio: aspectRatio
             )
+            if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogFirstRemoteMetalScale == false {
+                didLogFirstRemoteMetalScale = true
+                logger.log(
+                    level: .trace,
+                    message: "Remote I420 Metal conversion srcSize=\(buffer.width)x\(buffer.height) renderBounds=\(renderBounds) scaleMode=\(scaleMode) scaleX=\(scaleInfo.scaleX) scaleY=\(scaleInfo.scaleY)"
+                )
+            }
 
             let info = try await metalProcessor.createMetalImage(
                 fromI420Buffer: buffer,
-                parentBounds: bounds.size,
+                parentBounds: renderBounds,
                 scaleInfo: scaleInfo,
                 aspectRatio: aspectRatio
             )
@@ -746,11 +967,149 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             }
             
             try await delegate.passTexture(texture: info.texture)
+            lastSuccessfulRemoteVideoOutputUptimeNs = DispatchTime.now().uptimeNanoseconds
             
         } catch {
             logger.log(level: .error, message: "I420 Metal processing failed: \(error)")
             throw SampleBufferViewRendererError.metalProcessingFailed(error.localizedDescription)
         }
+    }
+
+    private func logI420WireDetailsIfNeeded(_ buffer: RTCI420Buffer, frame: RTCVideoFrame, context: String) {
+        guard PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled else { return }
+        let signature = "\(buffer.width)x\(buffer.height)|\(buffer.strideY)|\(buffer.strideU)|\(buffer.strideV)|\(rotationLabel(frame.rotation))"
+        let shouldLogBecauseChanged = lastI420WireSignature != signature
+        let shouldLogBecauseFirstFew = i420WireLogCount < 12
+        guard shouldLogBecauseChanged || shouldLogBecauseFirstFew else { return }
+
+        i420WireLogCount += 1
+        lastI420WireSignature = signature
+        let includeRowDiagnostics = i420DetailedLogCount < 8 || shouldLogBecauseChanged
+        if includeRowDiagnostics {
+            i420DetailedLogCount += 1
+        }
+        let message = describeI420Wire(
+            buffer,
+            frame: frame,
+            context: context,
+            includeRowDiagnostics: includeRowDiagnostics
+        )
+        logger.log(level: .trace, message: "\(message)")
+    }
+
+    private func describeI420Wire(
+        _ buffer: RTCI420Buffer,
+        frame: RTCVideoFrame,
+        context: String,
+        includeRowDiagnostics: Bool
+    ) -> String {
+        let width = Int(buffer.width)
+        let height = Int(buffer.height)
+        let chromaWidth = (width + 1) / 2
+        let chromaHeight = (height + 1) / 2
+
+        let strideY = Int(buffer.strideY)
+        let strideU = Int(buffer.strideU)
+        let strideV = Int(buffer.strideV)
+        let yPadding = strideY - width
+        let uPadding = strideU - chromaWidth
+        let vPadding = strideV - chromaWidth
+
+        let yAddr = hexAddress(buffer.dataY)
+        let uAddr = hexAddress(buffer.dataU)
+        let vAddr = hexAddress(buffer.dataV)
+
+        let yPreview = previewBytes(buffer.dataY, count: min(16, max(strideY, 0)))
+        let uPreview = previewBytes(buffer.dataU, count: min(16, max(strideU, 0)))
+        let vPreview = previewBytes(buffer.dataV, count: min(16, max(strideV, 0)))
+
+        let yStats = planeStats(buffer.dataY, sampleCount: min(max(strideY, 0), 64))
+        let uStats = planeStats(buffer.dataU, sampleCount: min(max(strideU, 0), 64))
+        let vStats = planeStats(buffer.dataV, sampleCount: min(max(strideV, 0), 64))
+
+        let strideCheck = "strideExpected(y/u/v)=\(width)/\(chromaWidth)/\(chromaWidth) " +
+            "strideExtra(y/u/v)=\(max(0, yPadding))/\(max(0, uPadding))/\(max(0, vPadding))"
+        let yRowSummary = includeRowDiagnostics
+            ? " yRows=\(samplePlaneRows(ptr: buffer.dataY, stride: strideY, rowCount: height, logicalWidth: width))"
+            : ""
+        let uRowSummary = includeRowDiagnostics
+            ? " uRows=\(samplePlaneRows(ptr: buffer.dataU, stride: strideU, rowCount: chromaHeight, logicalWidth: chromaWidth))"
+            : ""
+        let vRowSummary = includeRowDiagnostics
+            ? " vRows=\(samplePlaneRows(ptr: buffer.dataV, stride: strideV, rowCount: chromaHeight, logicalWidth: chromaWidth))"
+            : ""
+
+        return "[Wire I420 \(context)] rotation=\(rotationLabel(frame.rotation)) tsNs=\(frame.timeStampNs) " +
+            "size=\(width)x\(height) chroma=\(chromaWidth)x\(chromaHeight) " +
+            "strides(y/u/v)=\(strideY)/\(strideU)/\(strideV) padding(y/u/v)=\(yPadding)/\(uPadding)/\(vPadding) " +
+            "\(strideCheck) " +
+            "planes(y/u/v)=\(yAddr)/\(uAddr)/\(vAddr) " +
+            "y[0..]=\(yPreview) u[0..]=\(uPreview) v[0..]=\(vPreview) " +
+            "statsY(min/max/avg)=\(yStats.min)/\(yStats.max)/\(yStats.avg) " +
+            "statsU(min/max/avg)=\(uStats.min)/\(uStats.max)/\(uStats.avg) " +
+            "statsV(min/max/avg)=\(vStats.min)/\(vStats.max)/\(vStats.avg)" +
+            "\(yRowSummary)\(uRowSummary)\(vRowSummary)"
+    }
+
+    private func rotationLabel(_ rotation: RTCVideoRotation) -> String {
+        switch rotation {
+        case ._0: return "0"
+        case ._90: return "90"
+        case ._180: return "180"
+        case ._270: return "270"
+        @unknown default: return "unknown"
+        }
+    }
+
+    private func hexAddress(_ ptr: UnsafePointer<UInt8>) -> String {
+        let raw = UInt(bitPattern: UnsafeRawPointer(ptr))
+        return "0x" + String(raw, radix: 16)
+    }
+
+    private func previewBytes(_ ptr: UnsafePointer<UInt8>, count: Int) -> String {
+        guard count > 0 else { return "[]" }
+        var bytes: [String] = []
+        bytes.reserveCapacity(count)
+        for i in 0..<count {
+            let b = ptr[i]
+            let hex = String(format: "%02x", b)
+            bytes.append(hex)
+        }
+        return "[" + bytes.joined(separator: " ") + "]"
+    }
+
+    private func planeStats(_ ptr: UnsafePointer<UInt8>, sampleCount: Int) -> (min: Int, max: Int, avg: Int) {
+        guard sampleCount > 0 else { return (0, 0, 0) }
+        var lo = Int.max
+        var hi = Int.min
+        var sum = 0
+        for i in 0..<sampleCount {
+            let v = Int(ptr[i])
+            lo = min(lo, v)
+            hi = max(hi, v)
+            sum += v
+        }
+        return (lo, hi, sum / sampleCount)
+    }
+
+    private func samplePlaneRows(
+        ptr: UnsafePointer<UInt8>,
+        stride: Int,
+        rowCount: Int,
+        logicalWidth: Int
+    ) -> String {
+        guard stride > 0, rowCount > 0, logicalWidth > 0 else { return "none" }
+        let sampledRows = [0, rowCount / 2, max(0, rowCount - 1)]
+        var parts: [String] = []
+        parts.reserveCapacity(sampledRows.count)
+        for row in sampledRows {
+            let rowPtr = ptr.advanced(by: row * stride)
+            let previewCount = min(8, logicalWidth)
+            let preview = previewBytes(rowPtr, count: previewCount)
+            let rowStats = planeStats(rowPtr, sampleCount: min(logicalWidth, 64))
+            parts.append("r\(row):\(preview) s=\(rowStats.min)/\(rowStats.max)/\(rowStats.avg)")
+        }
+        return parts.joined(separator: " | ")
     }
 }
 #endif
