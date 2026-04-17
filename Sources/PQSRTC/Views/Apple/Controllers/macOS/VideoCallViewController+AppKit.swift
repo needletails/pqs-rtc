@@ -76,6 +76,7 @@ public final class VideoCallViewController: NSViewController {
     private let previewPanSuppressionDistanceThreshold: CGFloat = 6
     /// `NSObjectProtocol` is not `Sendable`; token is only used from main; `deinit` must remove it without isolation.
     nonisolated(unsafe) private var localVideoMirrorObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var preferredVideoCaptureDeviceObserver: NSObjectProtocol?
     /// Observe real host-window closes; SwiftUI/AppKit hosting can trigger view disappearance without a real close.
     nonisolated(unsafe) private var windowWillCloseObserver: NSObjectProtocol?
     /// Full-frame hit target above `PreviewCaptureView` / Metal so PiP pan/click aren’t swallowed by subviews.
@@ -84,6 +85,10 @@ public final class VideoCallViewController: NSViewController {
     /// Strong so SwiftUI `Coordinator` survives for mute/state callbacks; cleared in ``tearDownCall()``.
     public var videoCallDelegate: VideoCallDelegate?
     private let logger = NeedleTailLogger("[VideoCallViewController]")
+    /// Task observing remote screen track events from the session.
+    private var screenTrackStreamTask: Task<Void, Never>?
+    /// Whether a remote screen-share tile is currently visible in the collection view.
+    private var hasActiveRemoteScreenShare = false
     /// If `true`, the host app provides its own controls overlay via ``setControlsView(_:)``.
     public var usesEmbeddedControls = false
     /// For SwiftUI call chrome: re-sync toggle state after ``muteVideo()`` / ``muteAudio()`` (avoids optimistic UI drift).
@@ -105,6 +110,9 @@ public final class VideoCallViewController: NSViewController {
     deinit {
         if let localVideoMirrorObserver {
             NotificationCenter.default.removeObserver(localVideoMirrorObserver)
+        }
+        if let preferredVideoCaptureDeviceObserver {
+            NotificationCenter.default.removeObserver(preferredVideoCaptureDeviceObserver)
         }
         if let windowWillCloseObserver {
             NotificationCenter.default.removeObserver(windowWillCloseObserver)
@@ -142,6 +150,15 @@ public final class VideoCallViewController: NSViewController {
         ) { [weak self] _ in
             guard let self else { return }
             Task { await self.applyLocalVideoMirroringFromUserDefaults() }
+        }
+
+        preferredVideoCaptureDeviceObserver = NotificationCenter.default.addObserver(
+            forName: PQSRTCCallUIPreferences.preferredVideoCaptureDeviceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { await self.applyPreferredVideoCaptureDeviceFromUserDefaults() }
         }
         
         stateStreamTask = Task { @MainActor [weak self] in
@@ -295,11 +312,47 @@ public final class VideoCallViewController: NSViewController {
     public override func viewDidAppear() {
         super.viewDidAppear()
         installWindowCloseObserverIfNeeded()
+        startRemoteScreenTrackObservation()
+    }
+
+    private func startRemoteScreenTrackObservation() {
+        screenTrackStreamTask?.cancel()
+        screenTrackStreamTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let stream = await self.session.remoteScreenTrackStream()
+            for await event in stream {
+                guard !Task.isCancelled else { return }
+                if event.isActive {
+                    await self.createScreenView(connectionId: event.connectionId, participantId: event.participantId)
+                } else {
+                    await self.tearDownScreenView(participantId: event.participantId)
+                }
+            }
+        }
     }
     
+    /// Logged when root view bounds change (SwiftUI ↔ AppKit sizing).
+    private var lastLayoutProbeBounds: CGSize = .zero
+    /// Throttles `[VideoCallLayoutProbe] compositionalSection` (provider runs often during live resize).
+    private var lastCompositionalLayoutProbeSignature: String = ""
+    private static let isLayoutProbeEnabled: Bool = {
+        #if DEBUG
+        true
+        #else
+        ProcessInfo.processInfo.environment["PQSRTC_LAYOUT_PROBE"] == "1"
+        #endif
+    }()
+    /// When `effectiveContentSize` is briefly zero during live resize, fractional layout items collapse; reuse last good size.
+    private var lastStableCompositionalContentSize: CGSize = CGSize(width: 335, height: 475)
+
     public override func viewDidLayout() {
         super.viewDidLayout()
         guard let controllerView = self.view as? ControllerView else { return }
+        let b = controllerView.bounds.size
+        if b != lastLayoutProbeBounds {
+            lastLayoutProbeBounds = b
+            logLayoutProbe("viewDidLayout controllerBounds=\(Int(b.width))x\(Int(b.height)) scrollFrame=\(Int(controllerView.scrollView.frame.size.width))x\(Int(controllerView.scrollView.frame.size.height))")
+        }
         // Do not call `collectionViewLayout?.invalidateLayout()` here: it schedules another layout
         // pass and this method runs again, causing constant churn (and can starve remote video).
         // `VideoCallCollectionView` already invalidates when its bounds size changes.
@@ -353,7 +406,8 @@ public final class VideoCallViewController: NSViewController {
     private func applyVoiceCallWindowLayout() async {
         let controllerView = self.view as! ControllerView
         await videoCallDelegate?.passSize(.init(width: 450, height: 100))
-        controllerView.anchors(width: 450, height: 100)
+        logLayoutProbe("applyVoiceCallWindowLayout passSize=450x100 replaceRootSizing=450x100")
+        controllerView.replaceCallRootSizingForVoiceCall(width: 450, height: 100)
     }
     
     /// Resizes the host window and pins the call root view for video (same as pre-refactor `.connecting` video).
@@ -364,13 +418,8 @@ public final class VideoCallViewController: NSViewController {
     private func applyVideoCallWindowLayout() async {
         let controllerView = self.view as! ControllerView
         await videoCallDelegate?.passSize(.init(width: 335, height: 475))
-        controllerView.anchors(
-            top: self.view.topAnchor,
-            leading: self.view.leadingAnchor,
-            bottom: self.view.bottomAnchor,
-            trailing: self.view.trailingAnchor,
-            minWidth: 335,
-            minHeight: 475)
+        logLayoutProbe("applyVideoCallWindowLayout passSize=335x475 replaceRootSizing=min335x475 note=noDuplicateSelfEdgePins scrollViewAlreadyFillsBounds")
+        controllerView.replaceCallRootSizingForVideoCall(minWidth: 335, minHeight: 475)
         upgradedToVideo = true
     }
     
@@ -578,6 +627,12 @@ public final class VideoCallViewController: NSViewController {
         return ageMs < Self.remoteVideoStaleFrameThresholdMs
     }
     
+    private func applyMainRemoteTileInboundExpectation(connectionId: String) async {
+        let expect = await session.shouldExpectRemoteVideoCallbacksFromOtherParticipants(connectionId: connectionId)
+        guard let remoteRenderer = videoViews.views.first(where: { $0.videoView.contextName == "sample" })?.videoView.renderer as? SampleBufferViewRenderer else { return }
+        await remoteRenderer.setRemoteVideoInboundExpected(expect)
+    }
+
     private func startRemoteVideoTrackPolling() {
         stopRemoteVideoTrackPolling()
         guard let raw = currentCall?.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return }
@@ -585,12 +640,18 @@ public final class VideoCallViewController: NSViewController {
         remoteVideoTrackPollTask = Task { @MainActor [weak self] in
             guard let self else { return }
             var last: Bool?
+            var lastInboundExpect: Bool?
             while !Task.isCancelled {
                 guard self.isRunning else { break }
                 let appearsActive = await self.remotePartyVideoAppearsActive(connectionId: connectionId)
                 if last != appearsActive {
                     last = appearsActive
                     self.updateRemoteCameraOffChrome(isRemoteVideoActive: appearsActive)
+                }
+                let expectInbound = await self.session.shouldExpectRemoteVideoCallbacksFromOtherParticipants(connectionId: connectionId)
+                if lastInboundExpect != expectInbound {
+                    lastInboundExpect = expectInbound
+                    await self.applyMainRemoteTileInboundExpectation(connectionId: connectionId)
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
@@ -670,6 +731,12 @@ public final class VideoCallViewController: NSViewController {
                 logger.log(level: .error, message: "Error Invoking End \(error)")
             }
         }
+        screenTrackStreamTask?.cancel()
+        screenTrackStreamTask = nil
+        for model in videoViews.views where model.isScreenShare {
+            await tearDownScreenView(participantId: model.participantId)
+        }
+        hasActiveRemoteScreenShare = false
         await tearDownPreviewView()
         await tearDownSampleView()
         let videoView = self.view as! ControllerView
@@ -736,6 +803,12 @@ public final class VideoCallViewController: NSViewController {
               let renderer = localView.renderer as? PreviewViewRender else { return }
         await renderer.applyLocalVideoMirroringFromUserDefaults()
     }
+
+    private func applyPreferredVideoCaptureDeviceFromUserDefaults() async {
+        guard let localView = detachedPreviewView ?? videoViews.views.first(where: { $0.videoView.contextName == "preview" })?.videoView,
+              let renderer = localView.renderer as? PreviewViewRender else { return }
+        await renderer.applyPreferredVideoCaptureDeviceFromUserDefaults()
+    }
     
     /// Creates and starts the remote sample (receive) Metal view.
     ///
@@ -746,7 +819,7 @@ public final class VideoCallViewController: NSViewController {
             scheduleConfigureLocalPreviewIfNeeded()
             if let remoteRenderer = videoViews.views.first(where: { $0.videoView.contextName == "sample" })?.videoView.renderer as? SampleBufferViewRenderer,
                let connectionId = currentCall?.sharedCommunicationId {
-                await remoteRenderer.setRemoteVideoInboundExpected(true)
+                await applyMainRemoteTileInboundExpectation(connectionId: connectionId)
                 startRemoteRendererRecoveryIfNeeded(renderer: remoteRenderer, connectionId: connectionId)
             }
             startRemoteVideoTrackPolling()
@@ -789,7 +862,7 @@ public final class VideoCallViewController: NSViewController {
             to: remoteRenderer.rtcVideoRenderWrapper,
             with: connectionId)
         await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
-        await remoteRenderer.setRemoteVideoInboundExpected(true)
+        await applyMainRemoteTileInboundExpectation(connectionId: connectionId)
         startRemoteRendererRecoveryIfNeeded(renderer: remoteRenderer, connectionId: connectionId)
         startRemoteVideoTrackPolling()
         scheduleConfigureLocalPreviewIfNeeded()
@@ -820,6 +893,99 @@ public final class VideoCallViewController: NSViewController {
         await self.session.setVideoTrack(isEnabled: false, connectionId: connectionId)
         await session.removeRemote(renderer: remoteVideoRenderer.rtcVideoRenderWrapper, connectionId: connectionId)
         remoteVideoView.shutdownMetalStream()
+    }
+
+    /// Creates and renders a remote screen-share tile, promoting it to the dominant position.
+    func createScreenView(connectionId: String, participantId: String) async {
+        let contextName = "screen_\(participantId)"
+        if videoViews.views.contains(where: { $0.videoView.contextName == contextName }) {
+            return
+        }
+
+        let screenView: NTMTKView
+        do {
+            screenView = try NTMTKView(type: .sample, contextName: contextName)
+        } catch {
+            logger.log(level: .error, message: "Failed to create screen share view: \(error)")
+            return
+        }
+
+        let model = VideoViewModel(videoView: screenView, participantId: participantId, connectionId: connectionId)
+        videoViews.views.insert(model, at: 0)
+        hasActiveRemoteScreenShare = true
+        await performQuery(removePreview: previewDetachedToOverlay)
+        await waitForMountedVideoView(screenView)
+
+        await screenView.startRendering()
+        screenView.shouldRenderOnMetal = true
+        guard let screenRenderer = screenView.renderer as? SampleBufferViewRenderer else {
+            videoViews.views.removeAll(where: { $0.videoView.contextName == contextName })
+            hasActiveRemoteScreenShare = videoViews.views.contains(where: { $0.isScreenShare })
+            await performQuery(removePreview: previewDetachedToOverlay)
+            logger.log(level: .error, message: "Screen share renderer unavailable, removing orphan tile for participant=\(participantId)")
+            return
+        }
+        await session.renderRemoteScreenVideo(
+            to: screenRenderer.rtcVideoRenderWrapper,
+            connectionId: connectionId,
+            participantId: participantId)
+        await screenRenderer.setRemoteVideoInboundExpected(true)
+        addPresenterBadge(to: screenView)
+
+        await videoCallDelegate?.remoteScreenShareDidChange(participantId: participantId, isSharing: true)
+        logger.log(level: .info, message: "Remote screen share view created for participant=\(participantId)")
+    }
+
+    /// Removes a remote screen-share tile and returns to normal layout.
+    func tearDownScreenView(participantId: String) async {
+        let contextName = "screen_\(participantId)"
+        guard let model = videoViews.views.first(where: { $0.videoView.contextName == contextName }) else { return }
+        let screenView = model.videoView
+        if let screenRenderer = screenView.renderer as? SampleBufferViewRenderer {
+            await screenRenderer.setRemoteVideoInboundExpected(false)
+            await screenRenderer.shutdown()
+
+            let connectionId = model.connectionId.isEmpty ? currentCall?.sharedCommunicationId : model.connectionId
+            if let connectionId {
+                await session.removeRemoteScreenVideoRenderer(
+                    screenRenderer.rtcVideoRenderWrapper,
+                    connectionId: connectionId,
+                    participantId: participantId)
+            }
+        }
+        screenView.shutdownMetalStream()
+        videoViews.removeView(model)
+        hasActiveRemoteScreenShare = videoViews.views.contains(where: { $0.isScreenShare })
+        await performQuery(removePreview: previewDetachedToOverlay)
+
+        await videoCallDelegate?.remoteScreenShareDidChange(participantId: participantId, isSharing: false)
+        logger.log(level: .info, message: "Remote screen share view removed for participant=\(participantId)")
+    }
+
+    /// Adds a "Presenting" badge to a screen-share tile (idempotent).
+    private func addPresenterBadge(to view: NTMTKView) {
+        let badgeId = NSUserInterfaceItemIdentifier("presenterBadge")
+        if view.subviews.contains(where: { $0.identifier == badgeId }) { return }
+
+        let badge = NSView()
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.85).cgColor
+        badge.layer?.cornerRadius = 6
+        badge.identifier = NSUserInterfaceItemIdentifier("presenterBadge")
+
+        let label = NSTextField(labelWithString: "Presenting")
+        label.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .white
+        badge.addSubview(label)
+
+        let icon = NSImageView(image: NSImage(systemSymbolName: "rectangle.inset.filled.and.person.filled", accessibilityDescription: "Presenting")!)
+        icon.contentTintColor = .white
+        badge.addSubview(icon)
+
+        view.addSubview(badge)
+        badge.anchors(top: view.topAnchor, leading: view.leadingAnchor, paddingTop: 8, paddingLeading: 8)
+        icon.anchors(leading: badge.leadingAnchor, centerY: badge.centerYAnchor, paddingLeading: 6, width: 14, height: 14)
+        label.anchors(top: badge.topAnchor, leading: icon.trailingAnchor, bottom: badge.bottomAnchor, trailing: badge.trailingAnchor, paddingTop: 4, paddingLeading: 4, paddingBottom: 4, paddingTrailing: 8)
     }
 
     private func stopRemoteRendererRecovery() {
@@ -885,7 +1051,7 @@ public final class VideoCallViewController: NSViewController {
                 await renderer.startStream()
                 await self.session.renderRemoteVideo(to: renderer.rtcVideoRenderWrapper, with: connectionId)
                 await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
-                await renderer.setRemoteVideoInboundExpected(true)
+                await self.applyMainRemoteTileInboundExpectation(connectionId: connectionId)
             }
         }
     }
@@ -1045,6 +1211,7 @@ extension VideoCallViewController {
                 for subview in item.view.subviews where subview !== model.videoView {
                     subview.removeFromSuperview()
                 }
+                let didReparentVideoView = model.videoView.superview !== item.view
                 if model.videoView.superview !== item.view {
                     model.videoView.removeFromSuperview()
                     item.view.addSubview(model.videoView)
@@ -1055,6 +1222,12 @@ extension VideoCallViewController {
                     bottom: item.view.bottomAnchor,
                     trailing: item.view.trailingAnchor)
                 model.videoView.layoutSubtreeIfNeeded()
+                if model.isScreenShare {
+                    self.addPresenterBadge(to: model.videoView)
+                }
+                if didReparentVideoView || item.view.bounds.width < 1 || item.view.bounds.height < 1 {
+                    self.logLayoutProbe("cellConfigure index=\(indexPath.item) context=\(model.videoView.contextName) itemBounds=\(Int(item.view.bounds.width))x\(Int(item.view.bounds.height)) videoBounds=\(Int(model.videoView.bounds.width))x\(Int(model.videoView.bounds.height)) reparented=\(didReparentVideoView) previewDetached=\(self.previewDetachedToOverlay)")
+                }
                 self.loadedPreviewItem = true
                 return item
             }
@@ -1064,12 +1237,34 @@ extension VideoCallViewController {
     /// Creates the compositional layout used for the call video grid.
     fileprivate func createLayout(itemCount: Int? = nil) -> NSCollectionViewLayout {
         let layout = NSCollectionViewCompositionalLayout { [weak self]
-            (_: Int, _: NSCollectionLayoutEnvironment) -> NSCollectionLayoutSection in
+            (_: Int, layoutEnvironment: NSCollectionLayoutEnvironment) -> NSCollectionLayoutSection in
             guard let self else {
                 return CollectionViewSections().fullScreenItem()
             }
+            let rawEffective = layoutEnvironment.container.effectiveContentSize
             let controllerView = self.view as? ControllerView
             let collectionView = controllerView?.scrollView.documentView as? NSCollectionView
+            var effective = rawEffective
+            if effective.width < 1 || effective.height < 1 {
+                if let cv = collectionView {
+                    let bb = cv.bounds.size
+                    if bb.width >= 1, bb.height >= 1 {
+                        effective = bb
+                    } else {
+                        let fs = cv.frame.size
+                        if fs.width >= 1, fs.height >= 1 {
+                            effective = fs
+                        } else {
+                            effective = self.lastStableCompositionalContentSize
+                        }
+                    }
+                } else {
+                    effective = self.lastStableCompositionalContentSize
+                }
+            }
+            if effective.width >= 1, effective.height >= 1 {
+                self.lastStableCompositionalContentSize = effective
+            }
             let liveCount: Int = {
                 guard let collectionView else { return 0 }
                 guard collectionView.numberOfSections > 0 else { return 0 }
@@ -1079,12 +1274,27 @@ extension VideoCallViewController {
             // Prefer live `NSCollectionView` counts when non-zero: the diffable snapshot can briefly
             // read `0` during apply/resize while cells are still mounted (remote tile looked “removed”).
             let resolvedItemCount = itemCount ?? (liveCount > 0 ? liveCount : snapshotCount)
-            if resolvedItemCount > 1 {
-                return self.sections.conferenceViewSection(itemCount: resolvedItemCount)
+            let sectionKind = resolvedItemCount > 1 ? "conference" : "fullscreen"
+            let compSig = "\(Int(effective.width))x\(Int(effective.height))|\(liveCount)|\(snapshotCount)|\(resolvedItemCount)|\(sectionKind)"
+            if compSig != self.lastCompositionalLayoutProbeSignature {
+                self.lastCompositionalLayoutProbeSignature = compSig
+                self.logLayoutProbe("compositionalSection effectiveContent=\(Int(effective.width))x\(Int(effective.height)) liveCount=\(liveCount) snapshotCount=\(snapshotCount) resolved=\(resolvedItemCount) section=\(sectionKind)")
             }
-            return self.sections.fullScreenItem()
+            if self.hasActiveRemoteScreenShare, resolvedItemCount > 1 {
+                let cameraTileCount = resolvedItemCount - 1
+                return self.sections.screenShareDominantSection(cameraTileCount: cameraTileCount, groupAbsoluteExtent: effective)
+            }
+            if resolvedItemCount > 1 {
+                return self.sections.conferenceViewSection(itemCount: resolvedItemCount, groupAbsoluteExtent: effective)
+            }
+            return self.sections.fullScreenItem(groupAbsoluteExtent: effective)
         }
         return layout
+    }
+
+    private func logLayoutProbe(_ message: String) {
+        guard Self.isLayoutProbeEnabled else { return }
+        logger.log(level: .debug, message: "[VideoCallLayoutProbe] \(message)")
     }
 
     private func installWindowCloseObserverIfNeeded() {
@@ -1161,6 +1371,27 @@ extension VideoCallViewController: CallActionDelegate {
     
     public func showPictureInPicture(_ show: Bool) async {
         // No-op on macOS; not implemented
+    }
+
+    /// Starts screen sharing with the given target.
+    public func startScreenShare(target: ScreenShareTarget) async {
+        guard let connectionId = await resolvedMuteConnectionId() else {
+            logger.log(level: .warning, message: "startScreenShare: no active connection")
+            return
+        }
+        do {
+            try await session.addScreenTrackToStream(target: target, connectionId: connectionId)
+            await videoCallDelegate?.screenShareDidChange(isSharing: true)
+        } catch {
+            logger.log(level: .error, message: "startScreenShare failed: \(error)")
+        }
+    }
+
+    /// Stops the active screen share.
+    public func stopScreenShare() async {
+        guard let connectionId = await resolvedMuteConnectionId() else { return }
+        await session.removeScreenTrackFromStream(connectionId: connectionId)
+        await videoCallDelegate?.screenShareDidChange(isSharing: false)
     }
 }
 #endif

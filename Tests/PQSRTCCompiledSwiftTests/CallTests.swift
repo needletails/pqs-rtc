@@ -42,9 +42,9 @@ struct CallTests {
             _ = try Call(sharedCommunicationId: " ", sender: sender, recipients: [recipient])
         }
 
-        #expect(throws: Error.self) {
-            _ = try Call(sharedCommunicationId: "comm", sender: sender, recipients: [])
-        }
+        // Empty recipients is allowed (conference calls join before participants are known).
+        let emptyRecipientsCall = try Call(sharedCommunicationId: "comm", sender: sender, recipients: [])
+        #expect(emptyRecipientsCall.recipients.isEmpty)
     }
 
     @Test
@@ -70,5 +70,15 @@ struct CallTests {
         #expect(call.unanswered == true)
         #expect(call.endedAt != nil)
         #expect(call.duration != nil)
+    }
+
+    @Test
+    func groupCallConnectionIdDetection() {
+        #expect("#room".isGroupCall)
+        #expect("#conf-7dd14337-c20e-436e-9220-40ea234cafa6".isGroupCall)
+        #expect("conf-7dd14337-c20e-436e-9220-40ea234cafa6".isGroupCall)
+        #expect("conf-7dd14337-c20e-436e-9220-40ea234cafa6".normalizedConnectionId.isGroupCall)
+        #expect(!"7dd14337-c20e-436e-9220-40ea234cafa6".isGroupCall)
+        #expect(!"alice".isGroupCall)
     }
 }

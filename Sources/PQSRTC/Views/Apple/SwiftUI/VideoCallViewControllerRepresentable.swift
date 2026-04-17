@@ -51,6 +51,14 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
         await viewController?.showPictureInPicture(show)
     }
 
+    public func startScreenShare(target: ScreenShareTarget) async {
+        await viewController?.startScreenShare(target: target)
+    }
+
+    public func stopScreenShare() async {
+        await viewController?.stopScreenShare()
+    }
+
     /// Audio-only calls: route playback to speaker or receiver/Bluetooth (matches system Phone behavior).
     public func setSpeakerOutputEnabled(_ enabled: Bool) {
         viewController?.setSpeakerOutputEnabled(enabled)
@@ -78,6 +86,10 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
     /// Mirrors ``VideoCallViewController`` mute flags into SwiftUI overlay controls (`CallActionDelegate` → concrete VC casts are unreliable).
     @Binding var isVideoMuted: Bool
     @Binding var isAudioMuted: Bool
+    /// Mirrors local screen sharing state from the hosted controller.
+    @Binding var isScreenSharing: Bool
+    /// `true` when any remote participant is actively screen-sharing.
+    @Binding var hasActiveRemoteScreenShare: Bool
     private let controlsView: AnyView?
 
     /// Creates a representable that hosts a `VideoCallViewController`.
@@ -92,6 +104,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
     ///   - callState: Receives call state updates.
     ///   - isVideoMuted: Updated when the controller toggles camera mute.
     ///   - isAudioMuted: Updated when the controller toggles mic mute.
+    ///   - isScreenSharing: Updated when the controller starts/stops local screen sharing.
+    ///   - hasActiveRemoteScreenShare: Updated when a remote participant starts/stops screen sharing.
     ///   - actionBridge: Optional stable object that receives the controller reference (see ``VideoCallActionBridge``).
     ///   - controlsView: Optional SwiftUI controls view embedded into the controller.
     public init(
@@ -105,6 +119,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         callState: Binding<CallStateMachine.State>,
         isVideoMuted: Binding<Bool>,
         isAudioMuted: Binding<Bool>,
+        isScreenSharing: Binding<Bool> = .constant(false),
+        hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
         controlsView: AnyView? = nil
     ) {
         self.session = session
@@ -117,6 +133,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         self._callState = callState
         self._isVideoMuted = isVideoMuted
         self._isAudioMuted = isAudioMuted
+        self._isScreenSharing = isScreenSharing
+        self._hasActiveRemoteScreenShare = hasActiveRemoteScreenShare
         self.controlsView = controlsView
     }
     
@@ -131,6 +149,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         callState: Binding<CallStateMachine.State>,
         isVideoMuted: Binding<Bool>,
         isAudioMuted: Binding<Bool>,
+        isScreenSharing: Binding<Bool> = .constant(false),
+        hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
         @ViewBuilder controlsView: () -> Controls
     ) {
         self.init(
@@ -144,6 +164,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
             callState: callState,
             isVideoMuted: isVideoMuted,
             isAudioMuted: isAudioMuted,
+            isScreenSharing: isScreenSharing,
+            hasActiveRemoteScreenShare: hasActiveRemoteScreenShare,
             controlsView: AnyView(controlsView())
         )
     }
@@ -195,24 +217,45 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         }
         
         public func passErrorMessage(_ message: String) async {
-            self.parent.errorMessage = message
+            DispatchQueue.main.async {
+                self.parent.errorMessage = message
+            }
         }
         public func deliverCallState(_ state: CallStateMachine.State) async {
-            self.parent.callState = state
+            DispatchQueue.main.async {
+                self.parent.callState = state
+            }
         }
         public func endedCall(_ didEnd: Bool) async {
-            self.parent.endedCall = didEnd
+            DispatchQueue.main.async {
+                self.parent.endedCall = didEnd
+            }
         }
 
         public func localMuteDisplayDidChange(videoMuted: Bool, audioMuted: Bool) async {
-            self.parent.isVideoMuted = videoMuted
-            self.parent.isAudioMuted = audioMuted
+            DispatchQueue.main.async {
+                self.parent.isVideoMuted = videoMuted
+                self.parent.isAudioMuted = audioMuted
+            }
+        }
+
+        public func screenShareDidChange(isSharing: Bool) async {
+            DispatchQueue.main.async {
+                self.parent.isScreenSharing = isSharing
+            }
+        }
+
+        public func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async {
+            DispatchQueue.main.async {
+                self.parent.hasActiveRemoteScreenShare = isSharing
+            }
         }
     }
 }
 
 #elseif os(macOS)
 import AppKit
+import NeedleTailLogger
 
 /// Forwards mute/end actions to the hosted ``VideoCallViewController`` (macOS).
 @MainActor
@@ -235,6 +278,14 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
 
     public func showPictureInPicture(_ show: Bool) async {
         await viewController?.showPictureInPicture(show)
+    }
+
+    public func startScreenShare(target: ScreenShareTarget) async {
+        await viewController?.startScreenShare(target: target)
+    }
+
+    public func stopScreenShare() async {
+        await viewController?.stopScreenShare()
     }
 
     public func setSpeakerOutputEnabled(_ enabled: Bool) {
@@ -261,6 +312,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
     @Binding var callState: CallStateMachine.State
     @Binding var isVideoMuted: Bool
     @Binding var isAudioMuted: Bool
+    @Binding var isScreenSharing: Bool
+    @Binding var hasActiveRemoteScreenShare: Bool
     private let controlsView: AnyView?
 
     /// Creates a representable that hosts a `VideoCallViewController`.
@@ -275,6 +328,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
     ///   - callState: Receives call state updates.
     ///   - isVideoMuted: Updated when the controller toggles camera mute.
     ///   - isAudioMuted: Updated when the controller toggles mic mute.
+    ///   - isScreenSharing: Updated when the controller starts/stops local screen sharing.
+    ///   - hasActiveRemoteScreenShare: Updated when a remote participant starts/stops screen sharing.
     ///   - actionBridge: Optional stable object that receives the controller reference (see ``VideoCallActionBridge``).
     ///   - controlsView: Optional SwiftUI controls view embedded into the controller.
     public init(
@@ -288,6 +343,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         callState: Binding<CallStateMachine.State>,
         isVideoMuted: Binding<Bool>,
         isAudioMuted: Binding<Bool>,
+        isScreenSharing: Binding<Bool> = .constant(false),
+        hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
         controlsView: AnyView? = nil
     ) {
         self.session = session
@@ -300,6 +357,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         self._callState = callState
         self._isVideoMuted = isVideoMuted
         self._isAudioMuted = isAudioMuted
+        self._isScreenSharing = isScreenSharing
+        self._hasActiveRemoteScreenShare = hasActiveRemoteScreenShare
         self.controlsView = controlsView
     }
     
@@ -314,6 +373,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         callState: Binding<CallStateMachine.State>,
         isVideoMuted: Binding<Bool>,
         isAudioMuted: Binding<Bool>,
+        isScreenSharing: Binding<Bool> = .constant(false),
+        hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
         @ViewBuilder controlsView: () -> Controls
     ) {
         self.init(
@@ -327,6 +388,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
             callState: callState,
             isVideoMuted: isVideoMuted,
             isAudioMuted: isAudioMuted,
+            isScreenSharing: isScreenSharing,
+            hasActiveRemoteScreenShare: hasActiveRemoteScreenShare,
             controlsView: AnyView(controlsView())
         )
     }
@@ -369,6 +432,17 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
     @MainActor
     /// Receives callbacks from `VideoCallViewController` and updates SwiftUI bindings.
     public final class Coordinator: NSObject, VideoCallDelegate {
+        private static let layoutProbeLog = NeedleTailLogger("[VideoCallLayoutProbe][Representable]")
+        private static let isLayoutProbeEnabled: Bool = {
+            #if DEBUG
+            true
+            #else
+            ProcessInfo.processInfo.environment["PQSRTC_LAYOUT_PROBE"] == "1"
+            #endif
+        }()
+        /// Throttles identical `passSize` lines (SDK sends fixed minima, not live window size).
+        private var lastPassSizeSignature: String = ""
+
         var parent: VideoCallViewControllerRepresentable
         
         init(_ parent: VideoCallViewControllerRepresentable) {
@@ -392,6 +466,23 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         }
         /// Receives size updates from the underlying AppKit controller.
         public func passSize(_ size: NSSize) async {
+            let w = Int(size.width)
+            let h = Int(size.height)
+            let sig = "\(w)x\(h)"
+            if sig != lastPassSizeSignature {
+                lastPassSizeSignature = sig
+                guard Self.isLayoutProbeEnabled else {
+                    DispatchQueue.main.async {
+                        self.parent.width = size.width
+                        self.parent.height = size.height
+                    }
+                    return
+                }
+                Self.layoutProbeLog.log(
+                    level: .debug,
+                    message: "[VideoCallLayoutProbe] passSize binding update -> \(w)x\(h) note=hostVoIPUsesThisForMinFrameNotLiveWindowSizeUnlessSDKContractChanges"
+                )
+            }
             DispatchQueue.main.async {
                 self.parent.width = size.width
                 self.parent.height = size.height
@@ -402,6 +493,18 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
             DispatchQueue.main.async {
                 self.parent.isVideoMuted = videoMuted
                 self.parent.isAudioMuted = audioMuted
+            }
+        }
+
+        public func screenShareDidChange(isSharing: Bool) async {
+            DispatchQueue.main.async {
+                self.parent.isScreenSharing = isSharing
+            }
+        }
+
+        public func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async {
+            DispatchQueue.main.async {
+                self.parent.hasActiveRemoteScreenShare = isSharing
             }
         }
     }

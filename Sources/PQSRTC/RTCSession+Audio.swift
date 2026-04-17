@@ -67,6 +67,13 @@ extension RTCSession {
         
         let manager = connectionManager as RTCConnectionManager
         guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
+            // Group/conference: PC is created after SFU registration — buffer like video so
+            // mute/unmute applies once `createPeerConnection` finishes.
+            if isGroupCall {
+                pendingAudioEnabledByConnectionId[normalizedId] = isEnabled
+                logger.log(level: .info, message: "Audio track state requested before connection exists; buffering isEnabled=\(isEnabled) for connectionId=\(normalizedId)")
+                return
+            }
             logger.log(level: .error, message: "Connection not found for audio track modification: \(normalizedId)")
             throw AudioError.connectionNotFound(normalizedId)
         }

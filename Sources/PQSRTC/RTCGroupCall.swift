@@ -111,6 +111,11 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
         (self.eventsStream, self.eventsContinuation) = AsyncStream.makeStream(of: Event.self)
     }
 
+    /// Replaces the stored ``Call`` after outbound media negotiation (e.g. SDP offer metadata).
+    func applyUpdatedCallForNegotiation(_ call: Call) {
+        self.call = call
+    }
+
     deinit {
         eventsContinuation.finish()
     }
@@ -132,10 +137,11 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
         Array(participantsById.values)
     }
 
-    /// Joins the group call.
+    /// Joins the group call facade (roster / event stream state).
     ///
-    /// This creates the SFU PeerConnection and triggers an outbound SDP offer via
-    /// ``RTCTransportEvents/sendOffer(call:)``.
+    /// The SFU ``RTCPeerConnection`` and initial offer are created only after the server
+    /// acknowledges registration (see ``RTCSession/beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId:)``),
+    /// once `pcKeyManager` has the SFU signaling identity.
     public func join() async throws {
         guard state == .idle else { return }
         state = .joining

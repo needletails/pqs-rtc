@@ -164,40 +164,47 @@ extension RTCSession {
         armRelayFallbackTimerIfNeeded(for: call)
         
         if !handshakeComplete {
-            guard var recipient = call.recipients.first else {
-                throw RTCErrors.invalidConfiguration("Received handshakeComplete without a recipient in call")
+            let normComm = call.sharedCommunicationId.normalizedConnectionId
+            let isSfuGroupRoom = isGroupCall
+                || groupCalls[normComm] != nil
+                || groupCalls[call.sharedCommunicationId] != nil
+
+            if isSfuGroupRoom {
+                // Conference / SFU group calls often carry an empty `recipients` list; there is no
+                // 1:1 ratchet peer to target for cipher handshake fanout.
+                setHandshakeComplete(true)
+                try await startSendingCandidates(call: call)
+            } else {
+                guard var recipient = call.recipients.first else {
+                    throw RTCErrors.invalidConfiguration("Received handshakeComplete without a recipient in call")
+                }
+
+                var call = call
+
+                guard let sessionParticipant else {
+                    throw RTCErrors.invalidConfiguration("Received a call without a session participant")
+                }
+                if recipient.secretName == sessionParticipant.secretName {
+                    recipient.deviceId = sessionParticipant.deviceId
+
+                    let copiedSender = call.sender
+                    call.recipients = [copiedSender]
+                    call.sender = recipient
+                    recipient = copiedSender
+                }
+
+                let plaintext = try BinaryEncoder().encode(call)
+                let writeTask = WriteTask(
+                    data: plaintext,
+                    roomId: call.sharedCommunicationId.normalizedConnectionId,
+                    flag: .handshakeComplete,
+                    call: call)
+                let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
+                try await taskProcessor.feedTask(task: encryptableTask)
+                setHandshakeComplete(true)
+
+                try await startSendingCandidates(call: call)
             }
-            
-            var call = call
-            
-            guard let sessionParticipant else {
-                throw RTCErrors.invalidConfiguration("Received a call without a session participant")
-            }
-            if recipient.secretName == sessionParticipant.secretName {
-                recipient.deviceId = sessionParticipant.deviceId
-                
-                let copiedSender = call.sender
-                call.recipients = [copiedSender]
-                call.sender = recipient
-                recipient = copiedSender
-            }
-            
-//            let connectionIdentity = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
-//            guard let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey) else {
-//                throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
-//            }
-//            
-            let plaintext = try BinaryEncoder().encode(call)
-            let writeTask = WriteTask(
-                data: plaintext,
-                roomId: call.sharedCommunicationId.normalizedConnectionId,
-                flag: .handshakeComplete,
-                call: call)
-            let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
-            try await taskProcessor.feedTask(task: encryptableTask)
-            setHandshakeComplete(true)
-            
-            try await startSendingCandidates(call: call)
         }
     }
     
@@ -211,14 +218,15 @@ extension RTCSession {
     }
     
     public func startSendingCandidates(call: Call) async throws {
+        let connKey = call.sharedCommunicationId.normalizedConnectionId
         guard await connectionManager.findConnection(with: call.sharedCommunicationId) != nil else { return }
-        if !iceDeque.isEmpty {
-            for item in iceDeque {
+        if let buffered = iceDequeByConnectionId[connKey], !buffered.isEmpty {
+            for item in buffered {
                 try await sendEncryptedSfuCandidateFromDeque(item, call: call)
             }
-            iceDeque.removeAll()
+            iceDequeByConnectionId[connKey] = nil
         }
-        readyForCandidates = true
+        readyForCandidatesByConnectionId[connKey] = true
         updateFallbackLatestCall(call)
     }
     
@@ -335,7 +343,8 @@ extension RTCSession {
         try await loop.run(200, sleep: Duration.milliseconds(50)) { [weak self] in
             guard let self else { return false }
             var canRun = true
-            let state = await self.pcStateByConnectionId[call.sharedCommunicationId] ?? .none
+            let stateKey = call.sharedCommunicationId.normalizedConnectionId
+            let state = await self.pcStateByConnectionId[stateKey] ?? .none
             if state == .setRemote {
                 canRun = false
             }
@@ -449,13 +458,14 @@ extension RTCSession {
             // Set remote SDP using the new SDPHandler
             try await setRemoteSDP(modifiedSdp, for: connection)
             
+            let stateKey = call.sharedCommunicationId.normalizedConnectionId
             pcState = PeerConnectionState.setRemote
-            pcStateByConnectionId[call.sharedCommunicationId] = .setRemote
+            pcStateByConnectionId[stateKey] = .setRemote
             logger.log(level: .info, message: "Successfully set remote SDP for call: \(call.sharedCommunicationId)")
             
             // Process any queued incoming candidates that arrived before setRemote
             do {
-                let consumer = inboundCandidateConsumer(for: call.sharedCommunicationId)
+                let consumer = inboundCandidateConsumer(for: stateKey)
                 try await processAllQueuedCandidates(connection: connection, consumer: consumer)
             } catch {
                 logger.log(level: .warning, message: "Error processing queued candidates: \(error.localizedDescription)")
@@ -496,6 +506,16 @@ extension RTCSession {
                 throw RTCErrors.invalidConfiguration("Connection must be created before setting remote SDP.")
             }
             
+            // Guard against stale answers from duplicate offer/answer cycles.
+            // When audio and video tracks are added in quick succession,
+            // peerConnectionShouldNegotiate can fire twice, producing two offers.
+            // The first answer moves signaling back to stable; the second answer
+            // would crash WebRTC if we tried to apply it.
+            if sdp.type == .answer && connection.peerConnection.signalingState == .stable {
+                logger.log(level: .warning, message: "Dropping stale SDP answer for \(call.sharedCommunicationId): signaling state is already stable")
+                return
+            }
+            
             logger.log(level: .debug, message: "Found connection for call: \(call.sharedCommunicationId)")
             
             // Modify SDP for specific requirements
@@ -509,13 +529,14 @@ extension RTCSession {
             // Set remote SDP using the new SDPHandler
             try await setRemoteSDP(modifiedSdp, for: connection)
             
+            let stateKey = call.sharedCommunicationId.normalizedConnectionId
             pcState = PeerConnectionState.setRemote
-            pcStateByConnectionId[call.sharedCommunicationId] = .setRemote
+            pcStateByConnectionId[stateKey] = .setRemote
             logger.log(level: .info, message: "Successfully set remote SDP for call: \(call.sharedCommunicationId)")
             
             // Process any queued incoming candidates that arrived before setRemote
             do {
-                let consumer = inboundCandidateConsumer(for: call.sharedCommunicationId)
+                let consumer = inboundCandidateConsumer(for: stateKey)
                 try await processAllQueuedCandidates(connection: connection, consumer: consumer)
             } catch {
                 logger.log(level: .warning, message: "Error processing queued candidates: \(error.localizedDescription)")
@@ -545,13 +566,14 @@ extension RTCSession {
         call: Call
     ) async throws {
         logger.log(level: .info, message: "Received ICE candidate with id: \(candidate.id) for call: \(call.sharedCommunicationId)")
-        let consumer = inboundCandidateConsumer(for: call.sharedCommunicationId)
+        let stateKey = call.sharedCommunicationId.normalizedConnectionId
+        let consumer = inboundCandidateConsumer(for: stateKey)
         await consumer.feedConsumer(candidate)
         guard let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
             logger.log(level: .warning, message: "No connection found for candidate with id: \(candidate.id), call: \(call.sharedCommunicationId)")
             return
         }
-        let state = pcStateByConnectionId[call.sharedCommunicationId] ?? pcState
+        let state = pcStateByConnectionId[stateKey] ?? pcState
         logger.log(level: .info, message: "Current pcState: \(state), checking if ready to process candidates")
         if state == PeerConnectionState.setRemote {
             logger.log(level: .info, message: "Processing candidates for call: \(call.sharedCommunicationId)")

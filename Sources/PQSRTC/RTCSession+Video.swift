@@ -46,7 +46,7 @@ extension RTCSession {
         pendingLocalVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
     }
     
-    /// Render remote video to Android view (equivalent to iOS RTCVideoRenderWrapper)
+    /// Render remote video to Android view for 1:1 calls.
     func renderRemoteVideo(to view: AndroidSampleCaptureView, connectionId: String) async {
         let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Rendering remote video for connection: \(connectionId)")
@@ -59,31 +59,60 @@ extension RTCSession {
             return
         }
 
-        logger.log(level: .info, message: "Attempting to get remote video track from peer connection")
         connection.remoteVideoTrack = client.getRemoteVideoTrack(peerConnection: connection.peerConnection)
         
         if let videoTrack = connection.remoteVideoTrack {
-            logger.log(level: .info, message: "✅ Found remote video track, attaching renderer")
-            logger.log(level: .info, message: "📹 Video track - trackId: \(videoTrack.trackId)")
+            logger.log(level: .info, message: "Found remote video track, attaching renderer - trackId: \(videoTrack.trackId)")
             view.attach(videoTrack)
             pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
         } else {
-            logger.log(level: .warning, message: "⚠️ Remote video track is nil - will attach renderer when track becomes available")
             logger.log(level: .info, message: "Remote renderer buffered; will attach when receiver/track is added")
-            // Don't fatal error, just log and return - renderer is buffered
         }
         
         await manager.updateConnection(id: normalizedId, with: connection)
     }
+
+    /// Render a specific participant's video to an Android view (for group/conference calls).
+    func renderRemoteVideoForParticipant(to view: AndroidSampleCaptureView, connectionId: String, participantId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        logger.log(level: .info, message: "Rendering remote video for participant=\(participantId) connection=\(connectionId)")
+        let manager = connectionManager as RTCConnectionManager
+
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
+            logger.log(level: .error, message: "No connection found for participant render: \(connectionId)")
+            return
+        }
+
+        guard let videoTrack = connection.remoteVideoTracksByParticipantId[participantId] else {
+            logger.log(level: .info, message: "Track not yet available for participant=\(participantId), will attach on arrival")
+            return
+        }
+
+        view.attach(videoTrack)
+        logger.log(level: .info, message: "Attached renderer to participant=\(participantId) trackId=\(videoTrack.trackId)")
+    }
     
-    /// Remove remote video renderer
+    /// Remove remote video renderer.
     func removeRemote(view: AndroidSampleCaptureView, connectionId: String) async {
         let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Removing remote video renderer for connection: \(connectionId)")
         pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
         let manager = connectionManager as RTCConnectionManager
-        guard let remoteTrack: RTCVideoTrack = await manager.findConnection(with: normalizedId)?.remoteVideoTrack else { return }
-        view.detach(remoteTrack)
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
+        if let remoteTrack = connection.remoteVideoTrack {
+            view.detach(remoteTrack)
+        }
+    }
+
+    /// Remove remote video renderer for a specific participant.
+    func removeRemoteForParticipant(view: AndroidSampleCaptureView, connectionId: String, participantId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        logger.log(level: .info, message: "Removing remote renderer for participant=\(participantId) connection=\(connectionId)")
+        let manager = connectionManager as RTCConnectionManager
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
+        if let track = connection.remoteVideoTracksByParticipantId[participantId] {
+            view.detach(track)
+        }
     }
     
     /// Remove local video renderer
@@ -94,6 +123,47 @@ extension RTCSession {
         let manager = connectionManager as RTCConnectionManager
         guard let localVideoTrack: RTCVideoTrack = await manager.findConnection(with: normalizedId)?.localVideoTrack else { return }
         view.detach(localVideoTrack)
+    }
+
+    /// Render a remote screen share track to an Android view.
+    func renderRemoteScreenVideo(to view: AndroidSampleCaptureView, connectionId: String, participantId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        logger.log(level: .info, message: "Rendering remote screen video for connection=\(connectionId) participant=\(participantId)")
+        let manager = connectionManager as RTCConnectionManager
+
+        guard var connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
+            logger.log(level: .error, message: "renderRemoteScreenVideo: connection not found for \(connectionId)")
+            return
+        }
+
+        // Prefer per-participant lookup, fall back to legacy single track
+        var screenTrack = connection.remoteScreenTracksByParticipantId[participantId]
+        if screenTrack == nil {
+            screenTrack = connection.remoteScreenTrack
+                ?? rtcClient.getRemoteScreenVideoTrack(peerConnection: connection.peerConnection)
+            if let screenTrack {
+                connection.remoteScreenTrack = screenTrack
+                await manager.updateConnection(id: normalizedId, with: connection)
+            }
+        }
+
+        if let screenTrack {
+            view.attach(screenTrack)
+            logger.log(level: .info, message: "Remote screen renderer attached for participant=\(participantId)")
+        } else {
+            logger.log(level: .warning, message: "renderRemoteScreenVideo: screen track not available yet for participant=\(participantId)")
+        }
+    }
+
+    /// Removes a renderer previously bound via `renderRemoteScreenVideo`.
+    func removeRemoteScreenVideoRenderer(_ view: AndroidSampleCaptureView, connectionId: String, participantId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        let manager = connectionManager as RTCConnectionManager
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
+        let screenTrack = connection.remoteScreenTracksByParticipantId[participantId] ?? connection.remoteScreenTrack
+        if let screenTrack {
+            view.detach(screenTrack)
+        }
     }
 #else
     func renderLocalVideo(to renderer: RTCVideoRenderWrapper, connectionId: String) async {
@@ -223,6 +293,37 @@ extension RTCSession {
         let manager = connectionManager as RTCConnectionManager
         guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
         connection.remoteVideoTrack?.remove(renderer)
+    }
+
+    /// Binds a renderer to a remote participant's screen-share track.
+    ///
+    /// This mirrors ``renderRemoteVideo(to:with:)`` but targets the screen track stored in
+    /// ``RTCConnection/remoteScreenTracksByParticipantId`` instead of the camera track.
+    func renderRemoteScreenVideo(to renderer: RTCVideoRenderWrapper, connectionId: String, participantId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        logger.log(level: .info, message: "Rendering remote screen video for connection=\(connectionId) participant=\(participantId)")
+        let manager = connectionManager as RTCConnectionManager
+
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
+            logger.log(level: .error, message: "renderRemoteScreenVideo: connection not found for \(connectionId)")
+            return
+        }
+
+        guard let screenTrack = connection.remoteScreenTracksByParticipantId[participantId] else {
+            logger.log(level: .warning, message: "renderRemoteScreenVideo: screen track not found for participant=\(participantId)")
+            return
+        }
+
+        screenTrack.add(renderer)
+        logger.log(level: .info, message: "Remote screen renderer attached for participant=\(participantId) trackId=\(screenTrack.trackId)")
+    }
+
+    /// Removes a renderer previously bound via ``renderRemoteScreenVideo(to:connectionId:participantId:)``.
+    func removeRemoteScreenVideoRenderer(_ renderer: RTCVideoRenderWrapper, connectionId: String, participantId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        let manager = connectionManager as RTCConnectionManager
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
+        connection.remoteScreenTracksByParticipantId[participantId]?.remove(renderer)
     }
 
     func removeRemote(renderer: RTCVideoRenderWrapper, connectionId: String) async {
@@ -380,6 +481,34 @@ extension RTCSession {
             }
         }
 #endif
+    }
+
+    /// For SFU conferences: whether the main remote tile’s health watchdog should expect inbound frames.
+    ///
+    /// Uses **mapped remote camera tracks** (`remoteVideoTracksByParticipantId`), not roster membership:
+    /// roster can list audio-only peers or signaling-only entries while the main video tile still has
+    /// nothing to decode.
+    ///
+    /// Non-group calls always return `true`.
+    public func shouldExpectRemoteVideoCallbacksFromOtherParticipants(connectionId: String) async -> Bool {
+        guard let connection = await connectionManager.findConnection(with: connectionId) else {
+            return true
+        }
+        if !connection.id.isGroupCall {
+            return true
+        }
+        let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return connectionHasRemoteVideoFromNonLocalParticipant(connection, localNorm: local)
+    }
+
+    private func connectionHasRemoteVideoFromNonLocalParticipant(_ connection: RTCConnection, localNorm: String) -> Bool {
+        for (participantKey, _) in connection.remoteVideoTracksByParticipantId {
+            let p = participantKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !p.isEmpty, p != localNorm {
+                return true
+            }
+        }
+        return false
     }
     
 #if !os(Android)

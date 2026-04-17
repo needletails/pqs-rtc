@@ -30,7 +30,6 @@ extension RTCSession {
                 break
             case CallStateMachine.State.connecting(_, _):
                 break
-                //                await delegate.updateMetadata(for: currentCall, callState: state)
             case CallStateMachine.State.connected(let callDirection, _):
 #if os(macOS)
                 await stopRingtone()
@@ -63,12 +62,8 @@ extension RTCSession {
                     break
                 }
 #endif
-                //                await delegate.updateMetadata(for: currentCall, callState: state)
             case CallStateMachine.State.held(_, _):
                 break
-                //                await delegate.updateMetadata(for: currentCall, callState: state)
-                //Need to feed id
-                //                await delegate.sendHoldCallMessage(to: currentCall)
             case CallStateMachine.State.ended(_, _):
 #if os(macOS)
                 await stopRingtone()
@@ -77,10 +72,6 @@ extension RTCSession {
                 // Disable audio when the call has fully ended
                 setAudio(false)
 #endif
-                //                Task { [weak self] in
-                //                    guard let self else { return }
-                //                    await delegate.updateMetadata(for: currentCall, callState: state)
-                //                }
             case CallStateMachine.State.failed(let callDirection, let currentCall, let error):
 #if os(macOS)
                 await stopRingtone()
@@ -95,7 +86,6 @@ extension RTCSession {
                 } else {
                     logger.log(level: .warning, message: "RTCTransportEvents delegate not set; cannot send didEnd for call \(currentCall.sharedCommunicationId)")
                 }
-                //                await delegate.updateMetadata(for: currentCall, callState: CallStateMachine.State.ended(endState, currentCall))
                 await finishEndConnection(currentCall: currentCall)
             case CallStateMachine.State.callAnsweredAuxDevice(let currentCall):
 #if os(macOS)
@@ -104,7 +94,6 @@ extension RTCSession {
 #if os(iOS)
                 setAudio(false)
 #endif
-                //                await delegate.updateMetadata(for: currentCall, callState: state)
                 await finishEndConnection(currentCall: currentCall)
             }
         }

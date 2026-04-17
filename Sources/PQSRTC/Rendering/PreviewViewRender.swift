@@ -29,14 +29,6 @@ actor PreviewViewRender: RendererDelegate {
     let metalProcessor = MetalProcessor()
     private let captureOutputWrapper = CaptureOutputWrapper()
     let layer: AVCaptureVideoPreviewLayer
-    private let defaultDevices = AVCaptureDevice.DiscoverySession(
-        deviceTypes: [
-            .microphone,
-            .builtInWideAngleCamera
-        ],
-        mediaType: .video,
-        position: .front
-    )
     private let ciContext: CIContext
     var streamTask: Task<Void, Error>?
     
@@ -230,16 +222,7 @@ actor PreviewViewRender: RendererDelegate {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         
-        var captureDevice: AVCaptureDevice?
-        _ = defaultDevices.devices.map { dev in
-            if dev.hasMediaType(.video) {
-                captureDevice = dev
-            } else {
-                // Handle error case
-            }
-        }
-        
-        guard let captureDevice = captureDevice else { return }
+        guard let captureDevice = Self.resolvePreferredVideoCaptureDevice() else { return }
         
         let input = try AVCaptureDeviceInput(device: captureDevice)
         guard session.canAddInput(input) else {
@@ -293,6 +276,73 @@ actor PreviewViewRender: RendererDelegate {
         let key = PQSRTCCallUIPreferences.localVideoMirroredUserDefaultsKey
         if UserDefaults.standard.object(forKey: key) == nil { return true }
         return UserDefaults.standard.bool(forKey: key)
+    }
+
+    nonisolated private static func resolvedPreferredVideoCaptureDeviceUID() -> String? {
+        let key = PQSRTCCallUIPreferences.preferredVideoCaptureDeviceUIDKey
+        guard let raw = UserDefaults.standard.string(forKey: key)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else { return nil }
+        return raw
+    }
+
+    /// Picks the camera for capture: explicit UID from ``PQSRTCCallUIPreferences/preferredVideoCaptureDeviceUIDKey`` if valid, otherwise the first discovered device.
+    nonisolated static func resolvePreferredVideoCaptureDevice() -> AVCaptureDevice? {
+        if let uid = resolvedPreferredVideoCaptureDeviceUID(),
+           let device = AVCaptureDevice(uniqueID: uid),
+           device.hasMediaType(.video) {
+            return device
+        }
+        let devices = PQSRTCCallUIPreferences.availableVideoCaptureDevices()
+#if os(iOS)
+        return devices.first(where: { $0.position == .front }) ?? devices.first
+#else
+        return devices.first
+#endif
+    }
+
+    /// Hot-swaps the active video input to match ``PQSRTCCallUIPreferences/preferredVideoCaptureDeviceUIDKey`` (no-op if the session is not running yet).
+    func applyPreferredVideoCaptureDeviceFromUserDefaults() async {
+        guard let session = layer.session, session.isRunning else { return }
+        let mirrorLocalVideo = Self.resolvedLocalVideoMirroredUserDefaults()
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+        for input in session.inputs {
+            if let deviceInput = input as? AVCaptureDeviceInput, deviceInput.device.hasMediaType(.video) {
+                session.removeInput(deviceInput)
+            }
+        }
+        guard let captureDevice = Self.resolvePreferredVideoCaptureDevice() else {
+            logger.log(level: .error, message: "No video capture device available for preferred device swap")
+            return
+        }
+        do {
+            let newInput = try AVCaptureDeviceInput(device: captureDevice)
+            guard session.canAddInput(newInput) else {
+                logger.log(level: .error, message: "Cannot add preferred video device input")
+                return
+            }
+            session.addInput(newInput)
+        } catch {
+            logger.log(level: .error, message: "Failed to add preferred video device: \(error.localizedDescription)")
+            return
+        }
+        for output in session.outputs {
+            guard let videoOutput = output as? AVCaptureVideoDataOutput else { continue }
+            for connection in videoOutput.connections {
+                applyManualVideoMirroring(mirrorLocalVideo, to: connection)
+#if os(iOS)
+                if connection.isVideoRotationAngleSupported(VideoRotation.portrait.angle) {
+                    connection.videoRotationAngle = VideoRotation.portrait.angle
+                }
+#elseif os(macOS)
+                if connection.isVideoRotationAngleSupported(0) {
+                    connection.videoRotationAngle = 0
+                }
+#endif
+            }
+        }
+        applyLocalVideoMirroringToPreviewLayerConnection(mirrorLocalVideo)
     }
 
     private func applyLocalVideoMirroringToPreviewLayerConnection(_ mirrored: Bool) {

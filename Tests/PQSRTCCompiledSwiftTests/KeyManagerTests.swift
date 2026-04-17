@@ -54,4 +54,30 @@ struct KeyManagerTests {
         #expect(fetched != nil)
         #expect(fetched?.id == id)
     }
+
+    @Test
+    func clearAllEmptiesCaches() async throws {
+        let keyManager = KeyManager()
+        _ = try await keyManager.generateSenderIdentity(connectionId: "conn-clear", secretName: "alice")
+        let props = try await keyManager.fetchCallKeyBundle()
+        let unwrapped = await props.sessionIdentity.props(symmetricKey: props.symmetricKey)
+        #expect(unwrapped != nil)
+        if let unwrapped {
+            _ = try await keyManager.createRecipientIdentity(connectionId: "peer-clear", props: unwrapped)
+        }
+        await keyManager.storeCiphertext(connectionId: "pending-clear", ciphertext: Data([0x07]))
+        #expect(await keyManager.sessionIdentityCount() > 0)
+
+        await keyManager.clearAll()
+
+        #expect(await keyManager.sessionIdentityCount() == 0)
+        #expect(await keyManager.fetchCiphertext(connectionId: "pending-clear") == nil)
+        var bundleFetchFailed = false
+        do {
+            _ = try await keyManager.fetchCallKeyBundle()
+        } catch {
+            bundleFetchFailed = true
+        }
+        #expect(bundleFetchFailed)
+    }
 }

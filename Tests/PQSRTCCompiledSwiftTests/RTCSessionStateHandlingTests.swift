@@ -83,4 +83,143 @@ struct RTCSessionStateHandlingTests {
         )
         #expect(endState == .failed)
     }
+
+    // MARK: - appStateStream accessor
+
+    @Test("appStateStream returns nil before createStateStream")
+    func appStateStreamNilBeforeCreate() async throws {
+        let events = TestTransportEvents()
+        let session = await RTCSession(
+            iceServers: [],
+            username: "u",
+            password: "p",
+            delegate: events
+        )
+        defer { Task { await session.shutdown(with: nil) } }
+
+        let stream = await session.appStateStream()
+        #expect(stream == nil)
+    }
+
+    @Test("appStateStream returns stream after createStateStream")
+    func appStateStreamExistsAfterCreate() async throws {
+        let events = TestTransportEvents()
+        let session = await RTCSession(
+            iceServers: [],
+            username: "u",
+            password: "p",
+            delegate: events
+        )
+        defer { Task { await session.shutdown(with: nil) } }
+
+        let call = try makeCall(sharedId: "c1")
+        try await session.createStateStream(with: call)
+
+        let stream = await session.appStateStream()
+        #expect(stream != nil)
+    }
+
+    // MARK: - ICE disconnect grace period
+
+    @Test("armDisconnectGraceTimer does not fail the call immediately")
+    func disconnectGraceTimerDoesNotImmediatelyFail() async throws {
+        let events = TestTransportEvents()
+        let session = await RTCSession(
+            iceServers: [],
+            username: "u",
+            password: "p",
+            iceDisconnectGracePeriodMs: 500,
+            delegate: events
+        )
+        defer { Task { await session.shutdown(with: nil) } }
+
+        let call = try makeCall(sharedId: "grace-1")
+        try await session.createStateStream(with: call)
+        await session.callState.transition(to: .connecting(.outbound(.voice), call))
+        await session.callState.transition(to: .connected(.outbound(.voice), call))
+
+        await session.armDisconnectGraceTimer(call: call, connectionId: call.sharedCommunicationId)
+
+        let state = await session.callState.currentState
+        #expect(state?.description.contains("Connected") == true)
+        let endCalls = await events.didEndCalls
+        #expect(endCalls.isEmpty)
+    }
+
+    @Test("disconnectGraceTimer fires after grace period expires")
+    func disconnectGraceTimerFiresAfterExpiry() async throws {
+        let events = TestTransportEvents()
+        let session = await RTCSession(
+            iceServers: [],
+            username: "u",
+            password: "p",
+            iceDisconnectGracePeriodMs: 100,
+            delegate: events
+        )
+        defer { Task { await session.shutdown(with: nil) } }
+
+        let call = try makeCall(sharedId: "grace-2")
+        try await session.createStateStream(with: call)
+        await session.callState.transition(to: .connecting(.outbound(.voice), call))
+        await session.callState.transition(to: .connected(.outbound(.voice), call))
+
+        await session.armDisconnectGraceTimer(call: call, connectionId: call.sharedCommunicationId)
+
+        try await Task.sleep(nanoseconds: 250_000_000)
+
+        let state = await session.callState.currentState
+        #expect(state?.description.contains("Failed") == true)
+    }
+
+    @Test("cancelDisconnectGraceTask prevents the timer from firing")
+    func cancelDisconnectGraceTaskPreventsFailure() async throws {
+        let events = TestTransportEvents()
+        let session = await RTCSession(
+            iceServers: [],
+            username: "u",
+            password: "p",
+            iceDisconnectGracePeriodMs: 100,
+            delegate: events
+        )
+        defer { Task { await session.shutdown(with: nil) } }
+
+        let call = try makeCall(sharedId: "grace-3")
+        try await session.createStateStream(with: call)
+        await session.callState.transition(to: .connecting(.outbound(.voice), call))
+        await session.callState.transition(to: .connected(.outbound(.voice), call))
+
+        await session.armDisconnectGraceTimer(call: call, connectionId: call.sharedCommunicationId)
+        await session.cancelDisconnectGraceTask()
+
+        try await Task.sleep(nanoseconds: 250_000_000)
+
+        let state = await session.callState.currentState
+        #expect(state?.description.contains("Connected") == true)
+        let endCalls = await events.didEndCalls
+        #expect(endCalls.isEmpty)
+    }
+
+    // MARK: - Per-connection candidate scoping
+
+    @Test("per-connection candidate dictionaries are independent")
+    func perConnectionCandidateDictionariesAreIndependent() async throws {
+        let events = TestTransportEvents()
+        let session = await RTCSession(
+            iceServers: [],
+            username: "u",
+            password: "p",
+            delegate: events
+        )
+        defer { Task { await session.shutdown(with: nil) } }
+
+        let readyA = await session.readyForCandidatesByConnectionId["conn-a"]
+        let readyB = await session.readyForCandidatesByConnectionId["conn-b"]
+        #expect(readyA == nil)
+        #expect(readyB == nil)
+
+        let dequeA = await session.iceDequeByConnectionId["conn-a"]
+        let dequeB = await session.iceDequeByConnectionId["conn-b"]
+        #expect(dequeA == nil)
+        #expect(dequeB == nil)
+    }
 }

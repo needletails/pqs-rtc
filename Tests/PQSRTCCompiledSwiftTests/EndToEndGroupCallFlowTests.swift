@@ -99,8 +99,9 @@ struct EndToEndGroupCallFlowTests {
         var call = try Call(sharedCommunicationId: sfuRecipientId, sender: local, recipients: [bob, carol], supportsVideo: false)
         call.signalingIdentityProps = sfuProps
 
-        try await step("createSFUIdentity/startGroupCall(encrypt offer)") {
+        try await step("createSFUIdentity + beginGroupCallMedia (encrypt offer)") {
             try await session.createSFUIdentity(sfuRecipientId: sfuRecipientId, call: call)
+            try await session.beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId: sfuRecipientId)
         }
 
         let gotOffer = await waitUntil { await transport.sfuMessages.contains(where: { $0.packet.flag == .offer }) }

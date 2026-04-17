@@ -19,6 +19,11 @@ extension RTCSession {
         groupCalls[sfuIdentity.normalizedConnectionId]
     }
 
+    /// Public accessor for the ``RTCGroupCall`` associated with a conference/group room.
+    public func groupCallForRoom(_ roomId: String) -> RTCGroupCall? {
+        groupCall(forSfuIdentity: roomId)
+    }
+
     /// Creates the room and room keys this is the entry point for group calls.
     /// Store and find by normalized ID (no "#"); transport layer reattaches "#" for IRC.
     public func groupCallNegotiation(
@@ -126,6 +131,64 @@ extension RTCSession {
                 props: props)
         }
     }
+
+    /// After SFU `.registration` completes (``createSFUIdentity``), creates the SFU peer connection
+    /// and sends the initial encrypted offer when a local ``RTCGroupCall`` exists.
+    ///
+    /// No-op if there is no registered group for `sfuRecipientId`, or if a connection already exists
+    /// (idempotent for duplicate registrations).
+    public func beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId: String) async throws {
+        let normalizedLookup = sfuRecipientId.normalizedConnectionId
+        guard let group = groupCall(forSfuIdentity: normalizedLookup) else {
+            logger.log(
+                level: .warning,
+                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: no RTCGroupCall for sfuRecipientId=\(sfuRecipientId) normalized=\(normalizedLookup) (registration reply may not have arrived, or room id does not match groupCallNegotiation)")
+            return
+        }
+
+        var mediaCall = await group.currentCall
+        guard await !hasConnection(id: mediaCall.sharedCommunicationId) else {
+            logger.log(
+                level: .debug,
+                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: connection already exists for \(mediaCall.sharedCommunicationId)")
+            return
+        }
+
+        logger.log(
+            level: .info,
+            message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: creating SFU PeerConnection and offer for room=\(normalizedLookup)")
+
+        let frameLocalIdentity: ConnectionLocalIdentity
+        if let existingIdentity = try? await keyManager.fetchCallKeyBundle() {
+            frameLocalIdentity = existingIdentity
+        } else {
+            frameLocalIdentity = try await keyManager.generateSenderIdentity(
+                connectionId: mediaCall.sharedCommunicationId,
+                secretName: mediaCall.sender.secretName)
+        }
+
+        if mediaCall.frameIdentityProps == nil {
+            guard let frameProps = await frameLocalIdentity.sessionIdentity.props(symmetricKey: frameLocalIdentity.symmetricKey) else {
+                throw EncryptionErrors.missingProps
+            }
+            mediaCall.frameIdentityProps = frameProps
+        }
+
+        let recipientRoute = normalizedLookup
+        let bootstrapKey = mediaCall.sharedCommunicationId.normalizedConnectionId
+        pendingInitialSfuGroupOfferConnectionIds.insert(bootstrapKey)
+        defer { pendingInitialSfuGroupOfferConnectionIds.remove(bootstrapKey) }
+
+        _ = try await createPeerConnection(
+            with: mediaCall,
+            sender: mediaCall.sender.secretName,
+            recipient: recipientRoute,
+            localIdentity: frameLocalIdentity,
+            willFinishNegotiation: true)
+
+        let updatedCall = try await sendGroupCallOffer(mediaCall)
+        await group.applyUpdatedCallForNegotiation(updatedCall)
+    }
     
     /// Starts a group call by creating a single PeerConnection intended to connect to an SFU.
     ///
@@ -155,7 +218,7 @@ extension RTCSession {
         try await taskProcessor.feedTask(task: encryptableTask)
         
         // Enable ICE trickle for SFU calls.
-        // Without this, candidates remain buffered (readyForCandidates stays false) and ICE can stall in `checking`.
+        // Without this, candidates remain buffered and ICE can stall in `checking`.
         do {
             try await startSendingCandidates(call: call)
         } catch {

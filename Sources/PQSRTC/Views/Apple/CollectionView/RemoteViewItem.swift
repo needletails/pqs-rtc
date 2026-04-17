@@ -78,13 +78,7 @@ public final class RemoteViewItemCell: UICollectionViewCell {
     func setVideoView(_ view: UIView) {
         contentView.subviews.forEach { $0.removeFromSuperview() }
         contentView.addSubview(view)
-        view.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            view.topAnchor.constraint(equalTo: contentView.topAnchor),
-            view.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            view.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            view.trailingAnchor.constraint(equalTo: contentView.trailingAnchor)
-        ])
+        view.anchors(top: contentView.topAnchor, leading: contentView.leadingAnchor, bottom: contentView.bottomAnchor, trailing: contentView.trailingAnchor)
     }
 }
 #endif
@@ -193,6 +187,15 @@ public struct VideoViewModel: Hashable, Identifiable {
     
     /// The video view component associated with this model
     public let videoView: NTMTKView
+
+    /// `true` when this tile renders a screen-share track rather than a camera feed.
+    public let isScreenShare: Bool
+
+    /// The remote participant who owns this screen-share track (empty for camera tiles).
+    public let participantId: String
+
+    /// The peer connection this screen tile was bound to (empty for camera tiles).
+    public let connectionId: String
     
     // MARK: - Initialization
     
@@ -202,6 +205,9 @@ public struct VideoViewModel: Hashable, Identifiable {
     public init(videoView: NTMTKView) {
         self.id = UUID()
         self.videoView = videoView
+        self.isScreenShare = false
+        self.participantId = ""
+        self.connectionId = ""
     }
     
     /// Creates a new video view model with a specific identifier and video view.
@@ -212,6 +218,18 @@ public struct VideoViewModel: Hashable, Identifiable {
     public init(id: UUID, videoView: NTMTKView) {
         self.id = id
         self.videoView = videoView
+        self.isScreenShare = false
+        self.participantId = ""
+        self.connectionId = ""
+    }
+
+    /// Creates a screen-share video view model.
+    public init(videoView: NTMTKView, participantId: String, connectionId: String) {
+        self.id = UUID()
+        self.videoView = videoView
+        self.isScreenShare = true
+        self.participantId = participantId
+        self.connectionId = connectionId
     }
     
     // MARK: - Hashable Conformance

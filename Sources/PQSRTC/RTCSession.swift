@@ -43,6 +43,7 @@ import NeedleTailAsyncSequence
 /// ```
 ///
 /// For SFU group calls, prefer ``RTCSession/createGroupCall(call:sfuRecipientId:)``.
+/* SKIP @bridge */
 public actor RTCSession {
     
     // MARK: - Type aliases & executors
@@ -252,8 +253,8 @@ public actor RTCSession {
     /// Whether the peer connection/ICE machinery has been started for the current call.
     var notRunning = true
     
-    /// Whether the session is ready to send/receive ICE candidates.
-    var readyForCandidates = false
+    /// Per-connection flag indicating whether ICE candidates can be sent immediately.
+    var readyForCandidatesByConnectionId: [String: Bool] = [:]
     
     /// Monotonic identifier used when creating local tracks/transceivers.
     var lastId = 0
@@ -261,8 +262,9 @@ public actor RTCSession {
     /// Monotonic identifier used when creating ICE candidates.
     var iceId = 0
     
-    /// Local buffer for ICE candidates when ordering needs to be preserved.
-    var iceDeque = Deque<IceCandidate>()
+    /// Per-connection buffer for ICE candidates generated before the connection is
+    /// ready to send them.
+    var iceDequeByConnectionId: [String: Deque<IceCandidate>] = [:]
     
     /// The connection id considered "active" for the current call.
     ///
@@ -298,6 +300,20 @@ public actor RTCSession {
 
     /// Per-connection outbound retry state for `.all` -> `.relay` fallback.
     var connectionFallbackStateByConnectionId: [String: RTCConnectionFallbackState] = [:]
+    /// Connection ids currently being recycled for relay fallback.
+    ///
+    /// During `.all` -> `.relay` retry we intentionally close the old peer connection.
+    /// Late ICE callbacks from that stale peer can otherwise race and incorrectly fail
+    /// the call while the replacement peer is still being created.
+    var relayFallbackRetryingConnectionIds: Set<String> = []
+
+    /// Grace period (milliseconds) before treating an ICE `disconnected` event as fatal
+    /// on an already-connected call. Allows transient network interruptions (e.g. WiFi ↔
+    /// cellular handoff) to recover without tearing down the call.
+    let iceDisconnectGracePeriodMs: UInt64
+
+    /// Pending task that will fail the call after the disconnect grace period expires.
+    var disconnectGraceTask: Task<Void, Never>?
     
     /// Task that mirrors high-level RTC state into `callState`.
     var stateTask: Task<Void, Error>?
@@ -378,6 +394,20 @@ public actor RTCSession {
     private var finishingConnectionIds: Set<String> = []
     private var recentlyEndedConnectionIds: [String] = []
     private var endedConnectionIds: Set<String> = []
+
+    /// Connection IDs that currently have an offer being created.
+    /// Prevents concurrent `createOffer` calls on the same peer connection,
+    /// which would produce mismatched m-line ordering and crash WebRTC.
+    var offerInFlightConnectionIds: Set<String> = []
+
+    /// Normalized connection ids for which the first SFU group offer is not sent yet.
+    ///
+    /// WebRTC emits `negotiationNeeded` as soon as the first sender is attached; the peer-notifications
+    /// handler would call ``sendGroupCallOffer`` while ``createPeerConnection`` is still attaching
+    /// video, racing the intentional offer and causing "m-lines order" errors on the second
+    /// `setLocalDescription`. Suppress auto-offers until ``beginGroupCallMediaAfterSfuRegistrationIfNeeded``
+    /// finishes the initial ``sendGroupCallOffer``.
+    var pendingInitialSfuGroupOfferConnectionIds: Set<String> = []
     
 #if canImport(WebRTC)
     /// Delegate that surfaces frame-cryptor events for debugging and monitoring.
@@ -419,6 +449,193 @@ public actor RTCSession {
     /// `RTCConnection` has been registered (e.g. inbound CallKit answer timing). We buffer
     /// the desired state and apply it once the peer connection is created.
     var pendingVideoEnabledByConnectionId: [String: Bool] = [:]
+
+    /// Pending local audio enabled state when the UI toggles mic before the peer connection exists
+    /// (common for SFU / conference while registration and cipher setup are in flight).
+    var pendingAudioEnabledByConnectionId: [String: Bool] = [:]
+
+    // MARK: - Screen capture source storage (platform-specific)
+#if os(macOS)
+    var _macScreenCaptureSourceStorage: MacScreenCaptureSource?
+#endif
+#if os(iOS) && !os(Android)
+    var _iOSScreenCaptureSourceStorage: iOSScreenCaptureSource?
+#endif
+#if os(Android)
+    nonisolated internal let androidMediaProjectionPermission = AndroidMediaProjectionPermissionBox()
+
+    /// Stores the MediaProjection permission result for use by `addScreenTrackToStream`.
+    /// Must be called before `startScreenShare(target: .androidScreen)`.
+    ///
+    /// `nonisolated` keeps Skip’s generated JNI adapter from awaiting into the actor for this
+    /// Android-only permission handoff (Swift 6 `Sendable` / `Task` diagnostics).
+    /* SKIP @bridge */ public nonisolated func setAndroidMediaProjectionResult(resultCode: Int, data: Any) {
+        androidMediaProjectionPermission.store(resultCode: resultCode, intent: data)
+    }
+#endif
+
+    // MARK: - Remote screen track notifications
+
+    private var remoteScreenTrackContinuations: [UUID: AsyncStream<RemoteScreenTrackEvent>.Continuation] = [:]
+
+    /// Returns an async stream that yields events whenever a remote participant starts or stops
+    /// sharing their screen. View controllers subscribe to this stream to create/destroy screen
+    /// rendering tiles dynamically.
+    public func remoteScreenTrackStream() -> AsyncStream<RemoteScreenTrackEvent> {
+        let id = UUID()
+        return AsyncStream { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            Task { await self.storeRemoteScreenTrackContinuation(id, continuation: continuation) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                Task { await self.removeRemoteScreenTrackContinuation(id) }
+            }
+        }
+    }
+
+    private func storeRemoteScreenTrackContinuation(_ id: UUID, continuation: AsyncStream<RemoteScreenTrackEvent>.Continuation) {
+        remoteScreenTrackContinuations[id] = continuation
+    }
+
+    private func removeRemoteScreenTrackContinuation(_ id: UUID) {
+        remoteScreenTrackContinuations.removeValue(forKey: id)
+    }
+
+    func notifyRemoteScreenTrackChanged(_ event: RemoteScreenTrackEvent) {
+        for (_, continuation) in remoteScreenTrackContinuations {
+            continuation.yield(event)
+        }
+    }
+
+    func finishAllRemoteScreenTrackStreams() {
+        for (_, continuation) in remoteScreenTrackContinuations {
+            continuation.finish()
+        }
+        remoteScreenTrackContinuations.removeAll()
+    }
+
+    // MARK: - Remote participant track notifications
+
+    private var remoteParticipantTrackContinuations: [UUID: AsyncStream<RemoteParticipantTrackEvent>.Continuation] = [:]
+
+    /// Returns an async stream that yields events whenever a remote participant's camera
+    /// video track is added or removed. The Android controller subscribes to assign
+    /// renderers to participants dynamically.
+    public func remoteParticipantTrackStream() -> AsyncStream<RemoteParticipantTrackEvent> {
+        let id = UUID()
+        return AsyncStream { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            Task { await self.storeRemoteParticipantTrackContinuation(id, continuation: continuation) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                Task { await self.removeRemoteParticipantTrackContinuation(id) }
+            }
+        }
+    }
+
+    private func storeRemoteParticipantTrackContinuation(_ id: UUID, continuation: AsyncStream<RemoteParticipantTrackEvent>.Continuation) {
+        remoteParticipantTrackContinuations[id] = continuation
+    }
+
+    private func removeRemoteParticipantTrackContinuation(_ id: UUID) {
+        remoteParticipantTrackContinuations.removeValue(forKey: id)
+    }
+
+    func notifyRemoteParticipantTrackChanged(_ event: RemoteParticipantTrackEvent) {
+        for (_, continuation) in remoteParticipantTrackContinuations {
+            continuation.yield(event)
+        }
+    }
+
+    func finishAllRemoteParticipantTrackStreams() {
+        for (_, continuation) in remoteParticipantTrackContinuations {
+            continuation.finish()
+        }
+        remoteParticipantTrackContinuations.removeAll()
+    }
+
+    // MARK: - Conference Permissions
+
+    public private(set) var conferencePermissions = ConferencePermissions()
+    private var conferencePermissionContinuations: [UUID: AsyncStream<ConferencePermissions>.Continuation] = [:]
+
+    /// Returns an async stream that yields whenever conference permissions change.
+    public func conferencePermissionStream() -> AsyncStream<ConferencePermissions> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            continuation.onTermination = { [weak self] _ in
+                Task { [weak self] in
+                    await self?.removeConferencePermissionContinuation(id)
+                }
+            }
+            Task { [weak self] in
+                await self?.storeConferencePermissionContinuation(id, continuation: continuation)
+                if let current = await self?.conferencePermissions {
+                    continuation.yield(current)
+                }
+            }
+        }
+    }
+
+    private func storeConferencePermissionContinuation(_ id: UUID, continuation: AsyncStream<ConferencePermissions>.Continuation) {
+        conferencePermissionContinuations[id] = continuation
+    }
+
+    private func removeConferencePermissionContinuation(_ id: UUID) {
+        conferencePermissionContinuations.removeValue(forKey: id)
+    }
+
+    /// Called by the app layer when a `ConferencePermissionEvent` is received from NeedleTailKit.
+    /// Translates the string-based role map into typed `ConferenceRole` values.
+    ///
+    /// Username matching is case-insensitive because the server keys roles by IRC nick
+    /// while the client uses `secretName`, and casing can differ across transports.
+    public func updateConferenceRoles(localUsername: String, participantRoles: [String: String]) {
+        var typedRoles: [String: ConferenceRole] = [:]
+        for (username, roleString) in participantRoles {
+            typedRoles[username] = ConferenceRole(rawValue: roleString) ?? .viewer
+        }
+        let lowercasedLocal = localUsername.lowercased()
+        let localRole = typedRoles.first(where: { $0.key.lowercased() == lowercasedLocal })?.value
+            ?? typedRoles[localUsername]
+            ?? .viewer
+        conferencePermissions = ConferencePermissions(localRole: localRole, participantRoles: typedRoles)
+        notifyConferencePermissionsChanged()
+    }
+
+    /// Resets conference permissions back to default (viewer) state.
+    public func resetConferencePermissions() {
+        conferencePermissions = ConferencePermissions()
+        notifyConferencePermissionsChanged()
+        for (_, continuation) in conferencePermissionContinuations {
+            continuation.finish()
+        }
+        conferencePermissionContinuations.removeAll()
+    }
+
+    private func notifyConferencePermissionsChanged() {
+        for (_, continuation) in conferencePermissionContinuations {
+            continuation.yield(conferencePermissions)
+        }
+    }
+
+#if canImport(WebRTC)
+    /// Context for deferring `setReceivingMessageKey` until RTP receivers exist (Apple WebRTC).
+    struct PendingAppleDeferredReceiveFrameKeyContext: Sendable {
+        let remoteTrackOwnerParticipantId: String?
+    }
+
+    /// Apple WebRTC: when `receiveCiphertext` runs before any RTP receiver exists, we defer
+    /// ``RTCSession/setReceivingMessageKey`` until `didAddReceiver` / `startedReceiving`.
+    /// Key: ``String/normalizedConnectionId`` for the connection.
+    var pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId: [String: PendingAppleDeferredReceiveFrameKeyContext] = [:]
+#endif
 
     // MARK: - Frame key provisioning diagnostics (DEBUG-only consumers)
     //
@@ -605,21 +822,44 @@ public actor RTCSession {
         return "id:\(call.id.uuidString)|comm:\(call.sharedCommunicationId)"
     }
 
+    /// Normalized id for teardown idempotency and ``RTCConnectionManager`` lookup (`#` stripped + lowercased).
+    func teardownConnectionIdKey(_ connectionId: String) -> String {
+        connectionId
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            .normalizedConnectionId
+            .lowercased()
+    }
+
+    private func removeFromAuxiliaryTeardownSets(connectionId raw: String) {
+        let trimmed = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        let variants = Set(
+            [
+                trimmed,
+                trimmed.normalizedConnectionId,
+                teardownConnectionIdKey(raw)
+            ].filter { !$0.isEmpty })
+        for v in variants {
+            offerInFlightConnectionIds.remove(v)
+            pendingInitialSfuGroupOfferConnectionIds.remove(v)
+        }
+    }
+
     func beginEnding(connectionId: String) -> Bool {
-        let trimmed = connectionId.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        if endedConnectionIds.contains(trimmed) { return false }
-        if finishingConnectionIds.contains(trimmed) { return false }
-        finishingConnectionIds.insert(trimmed)
+        let key = teardownConnectionIdKey(connectionId)
+        guard !key.isEmpty else { return false }
+        if endedConnectionIds.contains(key) { return false }
+        if finishingConnectionIds.contains(key) { return false }
+        finishingConnectionIds.insert(key)
         return true
     }
 
     func endEnding(connectionId: String) {
-        let trimmed = connectionId.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        finishingConnectionIds.remove(trimmed)
-        endedConnectionIds.insert(trimmed)
-        recentlyEndedConnectionIds.append(trimmed)
+        let key = teardownConnectionIdKey(connectionId)
+        guard !key.isEmpty else { return }
+        finishingConnectionIds.remove(key)
+        removeFromAuxiliaryTeardownSets(connectionId: connectionId)
+        endedConnectionIds.insert(key)
+        recentlyEndedConnectionIds.append(key)
         // Prevent unbounded growth in long-lived sessions.
         let maxRemembered = 32
         if recentlyEndedConnectionIds.count > maxRemembered {
@@ -646,6 +886,11 @@ public actor RTCSession {
     func resetTeardownIdempotency(forConnectionId connectionId: String) {
         let rawTrimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedId = rawTrimmed.normalizedConnectionId
+        let canonical = teardownConnectionIdKey(connectionId)
+
+        finishingConnectionIds.remove(canonical)
+        endedConnectionIds.remove(canonical)
+        recentlyEndedConnectionIds.removeAll { $0 == canonical }
 
         finishingConnectionIds.remove(rawTrimmed)
         endedConnectionIds.remove(rawTrimmed)
@@ -654,6 +899,8 @@ public actor RTCSession {
         finishingConnectionIds.remove(normalizedId)
         endedConnectionIds.remove(normalizedId)
         recentlyEndedConnectionIds.removeAll { $0 == normalizedId }
+
+        removeFromAuxiliaryTeardownSets(connectionId: connectionId)
     }
 
     func beginEnding(callKey: String) -> Bool {
@@ -683,11 +930,12 @@ public actor RTCSession {
     // MARK: - Internal connection & candidate helpers
     
     func inboundCandidateConsumer(for connectionId: String) -> NeedleTailAsyncConsumer<IceCandidate> {
-        if let existing = inboundCandidateConsumers[connectionId] {
+        let key = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        if let existing = inboundCandidateConsumers[key] {
             return existing
         }
         let created = NeedleTailAsyncConsumer<IceCandidate>()
-        inboundCandidateConsumers[connectionId] = created
+        inboundCandidateConsumers[key] = created
         return created
     }
 
@@ -730,6 +978,7 @@ public actor RTCSession {
         username: String,
         password: String,
         iceTransportPolicyStrategy: RTCIceTransportPolicyStrategy = .allThenRelay(timeoutMilliseconds: 4_000),
+        iceDisconnectGracePeriodMs: UInt64 = 8_000,
         logger: NeedleTailLogger = NeedleTailLogger("[RTCSession]"),
         ratchetSalt: Data = "PQSRTCFrameEncryptionSalt".data(using: .utf8)!,
         frameEncryptionKeyMode: RTCFrameEncryptionKeyMode = .shared,
@@ -743,6 +992,7 @@ public actor RTCSession {
         self.username = username
         self.password = password
         self.iceTransportPolicyStrategy = iceTransportPolicyStrategy
+        self.iceDisconnectGracePeriodMs = iceDisconnectGracePeriodMs
         self.logger = logger
         self.ratchetSalt = ratchetSalt
         self.frameEncryptionKeyMode = frameEncryptionKeyMode
@@ -877,7 +1127,7 @@ public enum EncryptionErrors: Error, Sendable {
 
 
 /// Errors that can occur during RTC operations.
-public enum RTCErrors: Error, Sendable {
+public enum RTCErrors: Error, LocalizedError, Sendable {
     /// The session attempted to reconnect but failed.
     case reconnectionFailed
     /// A socket or equivalent underlying transport could not be created.
@@ -900,6 +1150,8 @@ public enum RTCErrors: Error, Sendable {
     case mediaError(String)
     
     case missingGroupCall
+    /// An operation was denied due to insufficient conference permissions.
+    case permissionDenied(String)
     /// Human-readable description suitable for logging/UX.
     public var errorDescription: String? {
         switch self {
@@ -925,6 +1177,8 @@ public enum RTCErrors: Error, Sendable {
             return "Media error: \(message)"
         case .missingGroupCall:
             return "No group call available"
+        case .permissionDenied(let message):
+            return "Permission denied: \(message)"
         }
     }
 }

@@ -35,6 +35,12 @@ public protocol CallActionDelegate: AnyObject, Sendable {
     ///
     /// The default implementation is a no-op.
     func showPictureInPicture(_ show: Bool) async
+
+    /// Starts screen sharing with the given target.
+    func startScreenShare(target: ScreenShareTarget) async
+
+    /// Stops the active screen share.
+    func stopScreenShare() async
 }
 
 // Provide default no-op implementations for platform-specific actions
@@ -47,6 +53,9 @@ public extension CallActionDelegate {
 
     /// Default no-op PiP implementation.
     func showPictureInPicture(_ show: Bool) async {}
+
+    func startScreenShare(target: ScreenShareTarget) async {}
+    func stopScreenShare() async {}
 }
 
 /// Internal receiver for picture-in-picture events.
@@ -72,6 +81,18 @@ public protocol VideoCallDelegate: AnyObject, Sendable {
     ///
     /// Default implementation is a no-op for hosts that do not mirror mute into `@State`.
     func localMuteDisplayDidChange(videoMuted: Bool, audioMuted: Bool) async
+
+    /// Called when the local screen sharing state changes.
+    func screenShareDidChange(isSharing: Bool) async
+
+    /// Called when a remote participant starts or stops sharing their screen.
+    func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async
+
+    /// Called when conference permissions change (roles updated by server).
+    func conferencePermissionsDidChange(_ permissions: ConferencePermissions) async
+
+    /// Called when a permission request is received from another participant (host/cohost sees this).
+    func permissionRequestReceived(from participant: String, action: ConferencePermissionAction) async
 #if os(macOS)
     /// Provides the updated view size (macOS only).
     func passSize(_ size: NSSize) async
@@ -80,4 +101,8 @@ public protocol VideoCallDelegate: AnyObject, Sendable {
 
 public extension VideoCallDelegate {
     func localMuteDisplayDidChange(videoMuted: Bool, audioMuted: Bool) async {}
+    func screenShareDidChange(isSharing: Bool) async {}
+    func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async {}
+    func conferencePermissionsDidChange(_ permissions: ConferencePermissions) async {}
+    func permissionRequestReceived(from participant: String, action: ConferencePermissionAction) async {}
 }

@@ -70,6 +70,25 @@ actor TaskProcessor {
         jobs.removeAll(where: { $0.id == id })
     }
 
+    func removeJobs(forConnectionId connectionId: String) async {
+        let normalized = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !normalized.isEmpty else { return }
+
+        let beforeCached = jobs.count
+        jobs.removeAll { job in
+            job.referencesConnectionId(normalized)
+        }
+        let removedCached = beforeCached - jobs.count
+        let removedQueued = await jobConsumer.removeQueuedJobs(forConnectionId: normalized)
+
+        if removedCached > 0 || removedQueued > 0 {
+            logger.log(
+                level: .debug,
+                message: "Dropped stale task-processor jobs for connectionId=\(normalized) cached=\(removedCached) queued=\(removedQueued)"
+            )
+        }
+    }
+
     // MARK: - Public API
 
     public func feedTask(task: EncryptableTask) async throws {
@@ -125,14 +144,23 @@ actor TaskProcessor {
                 throw error
             }
         }.value
+
+        if !jobs.isEmpty {
+            try await startProcessingIfNeeded()
+        }
     }
     // MARK: - Core loop
+
+    private static let maxPausedRetries = 8
+    private static let pausedRetryIntervalNs: UInt64 = 250_000_000 // 250ms
 
     private func processingLoop() async throws {
 
         if await jobConsumer.deque.isEmpty {
             try await loadFromCache()
         }
+
+        var consecutivePauses = 0
 
         func startLoop() async throws {
 
@@ -150,10 +178,22 @@ actor TaskProcessor {
                     do {
                         
                         let outcome = try await process(job)
-                        
+
                         if outcome == .paused {
-                            await jobConsumer.gracefulShutdown()
-                            return
+                            consecutivePauses += 1
+                            if consecutivePauses > Self.maxPausedRetries {
+                                logger.log(level: .warning, message: "Paused job exceeded \(Self.maxPausedRetries) retries, dropping: \(job.id)")
+                                removeJob(id: job.id)
+                                consecutivePauses = 0
+                            } else {
+                                await jobConsumer.gracefulShutdown()
+                                try? await Task.sleep(nanoseconds: Self.pausedRetryIntervalNs)
+                                if Task.isCancelled { return }
+                                try await loadFromCache()
+                                break
+                            }
+                        } else {
+                            consecutivePauses = 0
                         }
                         if await jobConsumer.deque.isEmpty {
                             await jobConsumer.gracefulShutdown()
@@ -193,6 +233,22 @@ actor TaskProcessor {
             // Don't remove the job - keep it in cache to retry when identity is created
             logger.log(level: .debug, message: "Job paused - identity not yet created, will retry: \(job.id)")
             return .paused
+        } catch let error as RTCErrors {
+            switch error {
+            case .invalidConfiguration(let message):
+                let lower = message.lowercased()
+                if lower.contains("missing connection identity") || lower.contains("missing local connection identity") {
+                    // This is expected when late jobs from a previous call race teardown.
+                    removeJob(id: job.id)
+                    logger.log(level: .debug, message: "Dropping stale job with missing identity: \(job.id) (\(message))")
+                    return .deleted
+                }
+            default:
+                break
+            }
+            removeJob(id: job.id)
+            logger.log(level: .error, message: "Job error: \(error)")
+            return .failed
         } catch let error as RatchetError {
             // Ratchet state is out of sync - this can happen if messages arrive out of order
             // or if recipient initialization happened with the wrong header
@@ -311,6 +367,21 @@ actor TaskProcessor {
     }
 }
 
+private extension Job {
+    func referencesConnectionId(_ normalizedConnectionId: String) -> Bool {
+        switch task {
+        case .writeMessage(let outboundTask):
+            let room = outboundTask.roomId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+            let callId = outboundTask.call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+            return room == normalizedConnectionId || callId == normalizedConnectionId
+        case .streamMessage(let inboundTask):
+            let packetRoom = inboundTask.packet.sfuIdentity.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+            let callId = inboundTask.call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+            return packetRoom == normalizedConnectionId || callId == normalizedConnectionId
+        }
+    }
+}
+
 
 /// An enumeration representing the type of task, which can be either an inbound or outbound message.
 ///
@@ -405,6 +476,14 @@ extension NeedleTailAsyncConsumer {
     func gracefulShutdown() async {
         // Clear the deque to stop processing
         deque.removeAll()
+    }
+
+    func removeQueuedJobs(forConnectionId connectionId: String) async -> Int where T == Job {
+        let before = deque.count
+        deque.removeAll { taskJob in
+            taskJob.item.referencesConnectionId(connectionId)
+        }
+        return before - deque.count
     }
 }
 

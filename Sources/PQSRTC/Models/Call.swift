@@ -117,6 +117,13 @@ public struct StartCallMetadata: Codable, Sendable, Equatable {
     /// A unique identifier for the communication session.
     /// Used to track and manage the call throughout its lifecycle.
     public let communicationId: String
+
+    /// Optional canonical wire id for channel-scoped group calls.
+    /// Falls back to `communicationId` when not provided by older clients.
+    public let channelWireId: String?
+
+    /// Optional user-facing channel title for UI only (never transport identity).
+    public let channelDisplayName: String?
     
     /// A boolean indicating whether video is supported for the call.
     /// Determines if the call will be audio-only or include video capabilities.
@@ -139,6 +146,8 @@ public struct StartCallMetadata: Codable, Sendable, Equatable {
         answerParticipant: Call.Participant? = nil,
         sharedMessageId: String? = nil,
         communicationId: String,
+        channelWireId: String? = nil,
+        channelDisplayName: String? = nil,
         supportsVideo: Bool
     ) throws {
         // Validate input parameters for production safety
@@ -150,6 +159,10 @@ public struct StartCallMetadata: Codable, Sendable, Equatable {
         self.answerParticipant = answerParticipant
         self.sharedMessageId = sharedMessageId?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.communicationId = communicationId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedChannelWireId = channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedDisplayName = channelDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.channelWireId = (trimmedChannelWireId?.isEmpty == false) ? trimmedChannelWireId : nil
+        self.channelDisplayName = (trimmedDisplayName?.isEmpty == false) ? trimmedDisplayName : nil
         self.supportsVideo = supportsVideo
     }
 }
@@ -309,6 +322,13 @@ public struct Call: Sendable, Codable, Equatable {
     /// A unique identifier for the shared communication session.
     /// Used to group related calls and manage the overall communication session.
     public var sharedCommunicationId: String
+
+    /// Optional canonical wire id for channel-scoped group calls.
+    /// Falls back to `sharedCommunicationId` for older payloads.
+    public var channelWireId: String?
+
+    /// Optional user-facing channel title for UI only.
+    public var channelDisplayName: String?
     
     /// The participant who initiated the call.
     /// Contains the caller's identification and device information.
@@ -359,6 +379,9 @@ public struct Call: Sendable, Codable, Equatable {
     /// Additional metadata associated with the call.
     /// Stored as a Foundation Data
     public var metadata: Data?
+
+    /// Password for ephemeral conference rooms (client-side only, not persisted over wire).
+    public var conferencePassword: String?
     
     /// Initializes a new instance of `Call`.
     ///
@@ -386,6 +409,8 @@ public struct Call: Sendable, Codable, Equatable {
         id: UUID = UUID(),
         sharedMessageId: String? = nil,
         sharedCommunicationId: String,
+        channelWireId: String? = nil,
+        channelDisplayName: String? = nil,
         sender: Participant,
         recipients: [Participant],
         createdAt: Date = Date(),
@@ -400,17 +425,17 @@ public struct Call: Sendable, Codable, Equatable {
         signalingIdentityProps: SessionIdentity.UnwrappedProps? = nil,
         metadata: Data? = nil
     ) throws {
-        // Validate input parameters for production safety
         guard !sharedCommunicationId.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty else {
             throw CallError.invalidMetadata("sharedCommunicationId cannot be empty")
-        }
-        guard !recipients.isEmpty else {
-            throw CallError.invalidMetadata("recipients cannot be empty")
         }
         
         self.id = id
         self.sharedMessageId = sharedMessageId?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         self.sharedCommunicationId = sharedCommunicationId.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        let trimmedChannelWireId = channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedDisplayName = channelDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.channelWireId = (trimmedChannelWireId?.isEmpty == false) ? trimmedChannelWireId : nil
+        self.channelDisplayName = (trimmedDisplayName?.isEmpty == false) ? trimmedDisplayName : nil
         self.sender = sender
         self.recipients = recipients
         self.createdAt = createdAt
@@ -450,6 +475,8 @@ public struct Call: Sendable, Codable, Equatable {
         self.id = UUID()
         self.sharedMessageId = nil
         self.sharedCommunicationId = trimmed
+        self.channelWireId = trimmed.ensureIRCChannel
+        self.channelDisplayName = nil
         self.sender = sender
         self.recipients = recipients
         self.createdAt = Date()
@@ -509,6 +536,24 @@ public struct Call: Sendable, Codable, Equatable {
         case unanswered = "unanswered"
         case rejected = "rejected"
         case failed = "failed"
+    }
+
+    /// Canonical channel wire identity when this call is channel-scoped.
+    ///
+    /// Returns `nil` for ephemeral 1:1 SFU relay rooms (`#<uuid>`) regardless of
+    /// whether `channelWireId` was set explicitly (e.g. by `init(groupSharedCommunicationId:)`).
+    public var resolvedChannelWireId: String? {
+        let candidate: String
+        if let explicit = channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
+            candidate = explicit.ensureIRCChannel
+        } else {
+            let comm = sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard comm.isGroupCall else { return nil }
+            candidate = comm.ensureIRCChannel
+        }
+        let stem = candidate.hasPrefix("#") ? String(candidate.dropFirst()) : candidate
+        if UUID(uuidString: stem) != nil { return nil }
+        return candidate
     }
 }
 

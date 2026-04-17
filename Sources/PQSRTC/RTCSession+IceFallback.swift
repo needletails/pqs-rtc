@@ -29,9 +29,12 @@ extension RTCSession {
         recipient: String,
         localIdentity: ConnectionLocalIdentity,
         policyOverride: RTCIceTransportSelection?
-    ) {
+    ) async {
         let connectionId = normalizedFallbackConnectionId(for: call.sharedCommunicationId)
-        let direction = inferredCallDirection(for: call)
+        // Prefer explicit call-state direction when available.
+        // `Call` shape can be rewritten during inbound crypto/signaling normalization
+        // and may temporarily look outbound even while call-state is inbound.
+        let direction = await callState.callDirection ?? inferredCallDirection(for: call)
         let policy = policyOverride ?? connectionFallbackStateByConnectionId[connectionId]?.currentPolicy ?? initialIceTransportSelection()
 
         if var existing = connectionFallbackStateByConnectionId[connectionId] {
@@ -114,7 +117,13 @@ extension RTCSession {
 
         existing.timeoutTask?.cancel()
         existing.timeoutTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: timeoutMs * 1_000_000)
+            do {
+                try await Task.sleep(nanoseconds: timeoutMs * 1_000_000)
+            } catch {
+                // Timer was canceled (for example after ICE connected); never run fallback.
+                return
+            }
+            guard !Task.isCancelled else { return }
             guard let self else { return }
             _ = await self.retryWithRelayIfNeeded(call: call, reason: "ice_timeout")
         }
@@ -146,11 +155,27 @@ extension RTCSession {
             return false
         }
 
+        // A stale timer can race after ICE already connected but before call-state propagation.
+        // If the live peer is already connected, suppress relay retry.
+#if canImport(WebRTC) && !os(Android)
+        if let liveConnection = await connectionManager.findConnection(with: connectionId) {
+            let iceState = liveConnection.peerConnection.iceConnectionState
+            let pcState = liveConnection.peerConnection.connectionState
+            if iceState == .connected || iceState == .completed || pcState == .connected {
+                cancelRelayFallbackTimer(connectionId: connectionId)
+                logger.log(level: .info, message: "Skipping relay fallback for connection=\(connectionId) because peer is already connected (ice=\(iceState.rawValue) pc=\(pcState.rawValue))")
+                return false
+            }
+        }
+#endif
+
         existing.hasRetriedToRelay = true
         existing.currentPolicy = .relay
         existing.timeoutTask?.cancel()
         existing.timeoutTask = nil
         connectionFallbackStateByConnectionId[connectionId] = existing
+        relayFallbackRetryingConnectionIds.insert(connectionId)
+        defer { relayFallbackRetryingConnectionIds.remove(connectionId) }
 
         logger.log(level: .warning, message: "Retrying connection=\(connectionId) with relay-only ICE after \(reason)")
 
@@ -168,6 +193,10 @@ extension RTCSession {
             connectionFallbackStateByConnectionId[connectionId] = existing
             return true
         } catch {
+            if error is CancellationError {
+                logger.log(level: .warning, message: "Relay fallback retry canceled for connection=\(connectionId); preserving existing call state")
+                return false
+            }
             logger.log(level: .error, message: "Relay fallback retry failed for connection=\(connectionId): \(error)")
             if let direction = await callState.callDirection {
                 await callState.transition(to: .failed(direction, existing.latestCall, "Relay fallback failed: \(error.localizedDescription)"))
@@ -206,8 +235,8 @@ extension RTCSession {
     private func discardPeerConnectionAttemptForRetry(call: Call) async {
         let connectionId = normalizedFallbackConnectionId(for: call.sharedCommunicationId)
         cancelRelayFallbackTimer(connectionId: connectionId)
-        readyForCandidates = false
-        iceDeque.removeAll()
+        readyForCandidatesByConnectionId[connectionId] = nil
+        iceDequeByConnectionId[connectionId] = nil
         pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
 #if os(Android)
         pendingLocalVideoRenderersByConnectionId.removeValue(forKey: connectionId)
@@ -228,13 +257,35 @@ extension RTCSession {
             connection.videoSenderCryptor?.enabled = false
             connection.audioFrameCryptor?.enabled = false
             connection.audioSenderCryptor?.enabled = false
+            connection.screenSenderCryptor?.enabled = false
             connection.videoFrameCryptor?.delegate = nil
             connection.videoSenderCryptor?.delegate = nil
             connection.audioFrameCryptor?.delegate = nil
             connection.audioSenderCryptor?.delegate = nil
+            connection.screenSenderCryptor?.delegate = nil
+            for (_, cryptor) in connection.screenReceiverCryptorsByParticipantId {
+                cryptor.enabled = false
+                cryptor.delegate = nil
+            }
+            for participantId in connection.remoteScreenTracksByParticipantId.keys {
+                notifyRemoteScreenTrackChanged(
+                    RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
+                )
+            }
+            connection.remoteScreenTracksByParticipantId.removeAll()
 #endif
 #if os(Android)
             stopAdaptiveVideoSend(connectionId: connectionId)
+            for participantId in connection.remoteVideoTracksByParticipantId.keys {
+                notifyRemoteParticipantTrackChanged(
+                    RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
+                )
+            }
+            for participantId in connection.remoteScreenTracksByParticipantId.keys {
+                notifyRemoteScreenTrackChanged(
+                    RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
+                )
+            }
             rtcClient.close()
 #else
             connection.peerConnection.delegate = nil
@@ -242,5 +293,48 @@ extension RTCSession {
 #endif
             await connectionManager.removeConnection(with: connectionId)
         }
+    }
+
+    // MARK: - ICE Disconnect Grace Period
+
+    func armDisconnectGraceTimer(for connection: RTCConnection) {
+        armDisconnectGraceTimer(call: connection.call, connectionId: connection.id)
+    }
+
+    func armDisconnectGraceTimer(call: Call, connectionId: String) {
+        cancelDisconnectGraceTask()
+        let gracePeriodNs = iceDisconnectGracePeriodMs * 1_000_000
+
+        disconnectGraceTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: gracePeriodNs)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+
+            let currentState = await self.callState.currentState
+            guard case .connected = currentState else { return }
+
+            self.logger.log(level: .warning, message: "ICE disconnect grace period expired for \(connectionId), failing call")
+
+            let callDirection: CallStateMachine.CallDirection
+            if let existingDirection = await self.callState.callDirection {
+                callDirection = existingDirection
+            } else {
+                callDirection = .inbound(call.supportsVideo ? .video : .voice)
+            }
+
+            await self.callState.transition(to: .failed(callDirection, call, "PeerConnection Disconnected"))
+            await self.finishEndConnection(currentCall: call)
+        }
+
+        logger.log(level: .info, message: "Armed ICE disconnect grace timer for \(connectionId) (\(iceDisconnectGracePeriodMs)ms)")
+    }
+
+    func cancelDisconnectGraceTask() {
+        disconnectGraceTask?.cancel()
+        disconnectGraceTask = nil
     }
 }

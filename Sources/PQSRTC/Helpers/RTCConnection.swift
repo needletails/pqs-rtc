@@ -97,11 +97,20 @@ import FoundationEssentials
 #if os(Android)
     public let peerConnection: RTCPeerConnection
     public var localVideoTrack: RTCVideoTrack?
+    public var localScreenTrack: RTCVideoTrack?
     public var remoteVideoTrack: RTCVideoTrack?
+    public var remoteScreenTrack: RTCVideoTrack?
+
+    /// Group-call support (SFU / conference): multiple remote participants on a single PeerConnection.
+    public var remoteVideoTracksByParticipantId: [String: RTCVideoTrack] = [:]
+    /// Screen share tracks received from remote participants, keyed by participant ID.
+    public var remoteScreenTracksByParticipantId: [String: RTCVideoTrack] = [:]
 #elseif canImport(WebRTC)
     public let peerConnection: WebRTC.RTCPeerConnection
     internal var rtcVideoCaptureWrapper: RTCVideoCaptureWrapper?
+    internal var screenCaptureWrapper: RTCVideoCaptureWrapper?
     public var localVideoTrack: WebRTC.RTCVideoTrack?
+    public var localScreenTrack: WebRTC.RTCVideoTrack?
     /// Local mic publish track (Apple). Stored so mute can target the same object WebRTC captures from when `RTCRtpSender.track` is nil or swapped during negotiation.
     public var localAudioTrack: WebRTC.RTCAudioTrack?
     public var remoteVideoTrack: WebRTC.RTCVideoTrack?
@@ -112,8 +121,12 @@ import FoundationEssentials
     /// The SDK maps `participantId` → track/cryptor as tracks arrive via Unified Plan receiver events.
     public var remoteVideoTracksByParticipantId: [String: WebRTC.RTCVideoTrack] = [:]
     public var remoteAudioTracksByParticipantId: [String: WebRTC.RTCAudioTrack] = [:]
+    /// Screen share tracks received from remote participants, keyed by participant ID.
+    public var remoteScreenTracksByParticipantId: [String: WebRTC.RTCVideoTrack] = [:]
     var videoReceiverCryptorsByParticipantId: [String: RTCFrameCryptor] = [:]
     var audioReceiverCryptorsByParticipantId: [String: RTCFrameCryptor] = [:]
+    var screenSenderCryptor: RTCFrameCryptor?
+    var screenReceiverCryptorsByParticipantId: [String: RTCFrameCryptor] = [:]
 #endif
     
 #if os(Android)
@@ -194,8 +207,9 @@ actor RTCConnectionManager {
 
     /// Group / SFU connections keep `Call.sharedCommunicationId` as stored `RTCConnection.id`, often with a `#` prefix.
     /// Many APIs (mute, render helpers) pass ``String/normalizedConnectionId`` without `#`. Match both forms.
+    /// Case-insensitive: conference room IDs can arrive in varying case from different code paths.
     private func normalizedLookupKey(_ id: String) -> String {
-        id.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        id.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId.lowercased()
     }
 
     private func indexOfConnection(matchingLookupId lookupId: String) -> Int? {

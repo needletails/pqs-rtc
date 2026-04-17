@@ -21,6 +21,9 @@ import QuartzCore
 import WebRTC
 import NeedleTailLogger
 import NeedleTailMediaKit
+#if os(macOS)
+@preconcurrency import AppKit
+#endif
 
 protocol BufferToMetalDelegate: AnyObject, Sendable {
     /// Supplies a decoded video frame as an `MTLTexture` to be rendered.
@@ -38,6 +41,13 @@ protocol BufferToMetalDelegate: AnyObject, Sendable {
 /// - `.preview` for local camera preview
 /// - `.sample` for remote/received video
 public final class NTMTKView: MTKView, BufferToMetalDelegate {
+    private static let isMetalDiagnosticLoggingEnabled: Bool = {
+        #if DEBUG
+        true
+        #else
+        ProcessInfo.processInfo.environment["PQSRTC_METAL_DIAGNOSTICS"] == "1"
+        #endif
+    }()
     
     /// Declares the logical role of an `NTMTKView` in the call UI.
     public enum ViewType: Sendable {
@@ -631,11 +641,12 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     /// Logs at most once per `intervalNs` (resize storms otherwise bury Console).
     @MainActor
     private func logMetalDiagnostic(_ message: String, intervalNs: UInt64 = 300_000_000) {
+        guard Self.isMetalDiagnosticLoggingEnabled else { return }
         let now = DispatchTime.now().uptimeNanoseconds
         guard now &- lastMetalDiagnosticLogUptimeNs >= intervalNs else { return }
         lastMetalDiagnosticLogUptimeNs = now
         logger.log(
-            level: .warning,
+            level: .debug,
             message: "[NTMTKView context=\(contextName) type=\(type)] \(message)"
         )
     }
@@ -647,13 +658,38 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         lastDrawableSizeDiagnosticLogUptimeNs = now
 #if os(macOS)
         let contentsScaleForLog = layer?.contentsScale ?? 1
+        let liveResize = (window as? NSWindow)?.inLiveResize == true
 #else
         let contentsScaleForLog = layer.contentsScale
+        let liveResize = false
 #endif
         logger.log(
             level: .info,
-            message: "[NTMTKView context=\(contextName) type=\(type)] drawableSize=\(newPixelSize) boundsPoints=\(bounds.size) contentsScale=\(contentsScaleForLog)"
+            message: "[NTMTKView context=\(contextName) type=\(type)] drawableSize=\(newPixelSize) boundsPoints=\(bounds.size) contentsScale=\(contentsScaleForLog) inLiveResize=\(liveResize)"
         )
+    }
+
+    /// Compact layout snapshot for Metal diagnostics (resize / coalescing / drawable starvation).
+    @MainActor
+    private func metalLayoutDebugSuffix() -> String {
+#if os(macOS)
+        let live = (window as? NSWindow)?.inLiveResize == true
+        let wsz = window?.frame.size ?? .zero
+        let sup = superview?.bounds.size ?? .zero
+        return " inLiveResize=\(live) windowFrame=\(wsz) frame=\(frame.size) superBounds=\(sup) hidden=\(isHidden) alpha=\(alphaValue)"
+#else
+        let wsz = window?.bounds.size ?? .zero
+        let sup = superview?.bounds.size ?? .zero
+        return " windowBounds=\(wsz) frame=\(frame.size) superBounds=\(sup) hidden=\(isHidden) alpha=\(alpha)"
+#endif
+    }
+
+    @MainActor
+    private func metalInFlightAgeMs() -> Int64 {
+        guard metalDrawInFlightSinceUptimeNs > 0 else { return -1 }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now >= metalDrawInFlightSinceUptimeNs else { return -1 }
+        return Int64((now - metalDrawInFlightSinceUptimeNs) / 1_000_000)
     }
     
     @MainActor
@@ -787,7 +823,17 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         
         var pointSize = bounds.size
         let finite = pointSize.width.isFinite && pointSize.height.isFinite
-        if finite, pointSize.width > 0, pointSize.height > 0 {
+        // During live window resize, AppKit can briefly report `.zero` bounds while `frame` still
+        // carries the visible size; using only `lastNonZeroBoundsSize` then pins the drawable to a
+        // stale small rect (remote/preview tiles stay letterboxed).
+        if (!finite || pointSize.width <= 0 || pointSize.height <= 0) {
+            let fs = frame.size
+            if fs.width.isFinite, fs.height.isFinite, fs.width > 0, fs.height > 0 {
+                pointSize = fs
+            }
+        }
+        let finiteAfterFrame = pointSize.width.isFinite && pointSize.height.isFinite
+        if finiteAfterFrame, pointSize.width > 0, pointSize.height > 0 {
             lastNonZeroBoundsSize = pointSize
         } else if lastNonZeroBoundsSize.width > 0, lastNonZeroBoundsSize.height > 0 {
             logMetalDiagnostic(
@@ -822,7 +868,7 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
                 if inFlightMs > 1_500, now &- lastInFlightRecoveryUptimeNs >= 1_200_000_000 {
                     lastInFlightRecoveryUptimeNs = now
                     logMetalDiagnostic(
-                        "Recovering stuck inFlight draw after \(inFlightMs)ms; forcing draw reservation reset (bounds=\(bounds.size), drawableSize=\(drawableSize))",
+                        "Recovering stuck inFlight draw after \(inFlightMs)ms; forcing draw reservation reset (bounds=\(bounds.size), drawableSize=\(drawableSize))\(metalLayoutDebugSuffix())",
                         intervalNs: 300_000_000
                     )
                     metalDrawInFlight = false
@@ -831,8 +877,13 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
             }
         }
         guard metalDrawInFlight == false else {
+            let priorPending = metalDrawPending
             metalDrawPending = true
-            logMetalDiagnostic("Metal draw coalesced (inFlight); will present after current GPU work completes", intervalNs: 400_000_000)
+            let age = metalInFlightAgeMs()
+            logMetalDiagnostic(
+                "Metal draw coalesced (inFlight ~\(age)ms); will present after GPU completes. priorPending=\(priorPending) bounds=\(bounds.size) drawableSize=\(drawableSize) lastNonZeroBounds=\(lastNonZeroBoundsSize)\(metalLayoutDebugSuffix())",
+                intervalNs: 400_000_000
+            )
             return
         }
         // Reserve before `currentDrawableSize()` / `drawableSize` — they can trigger layout → nested

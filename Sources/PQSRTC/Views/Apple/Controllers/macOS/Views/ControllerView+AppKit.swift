@@ -36,6 +36,8 @@ class ControllerView: NSView {
     
     let scrollView = VideoCallScrollView()
     let localPreviewOverlay = FlippedPreviewOverlayView()
+    /// Voice/video window sizing applied to the call root; must be replaced—not stacked—on each transition.
+    private var callRootSizingConstraints: [NSLayoutConstraint] = []
     private weak var currentPreviewView: NTMTKView?
     private var previewOverlayConstraints: [NSLayoutConstraint] = []
     private var previewTopConstraint: NSLayoutConstraint?
@@ -166,8 +168,40 @@ class ControllerView: NSView {
         addSubview(localPreviewOverlay, positioned: .above, relativeTo: nil)
     }
     
+    /// Replaces fixed width/height used for the compact voice-call chrome (stacks constraints if repeated).
+    func replaceCallRootSizingForVoiceCall(width: CGFloat, height: CGFloat) {
+        NSLayoutConstraint.deactivate(callRootSizingConstraints)
+        callRootSizingConstraints.removeAll()
+        translatesAutoresizingMaskIntoConstraints = false
+        let w = widthAnchor.constraint(equalToConstant: width)
+        let h = heightAnchor.constraint(equalToConstant: height)
+        w.priority = .required
+        h.priority = .required
+        NSLayoutConstraint.activate([w, h])
+        callRootSizingConstraints = [w, h]
+    }
+    
+    /// Replaces minimum size hints for video calls (matches ``VideoCallViewController`` `passSize` defaults).
+    func replaceCallRootSizingForVideoCall(minWidth: CGFloat, minHeight: CGFloat) {
+        NSLayoutConstraint.deactivate(callRootSizingConstraints)
+        callRootSizingConstraints.removeAll()
+        translatesAutoresizingMaskIntoConstraints = false
+        let w = widthAnchor.constraint(greaterThanOrEqualToConstant: minWidth)
+        let h = heightAnchor.constraint(greaterThanOrEqualToConstant: minHeight)
+        w.priority = .required
+        h.priority = .required
+        NSLayoutConstraint.activate([w, h])
+        callRootSizingConstraints = [w, h]
+    }
+    
+    func clearCallRootSizingConstraints() {
+        NSLayoutConstraint.deactivate(callRootSizingConstraints)
+        callRootSizingConstraints.removeAll()
+    }
+    
     /// Removes subviews and clears layout constraints owned by this view.
     func tearDownView() {
+        clearCallRootSizingConstraints()
         scrollView.removeFromSuperview()
         localPreviewOverlay.removeFromSuperview()
         callInfoChrome.removeFromSuperview()

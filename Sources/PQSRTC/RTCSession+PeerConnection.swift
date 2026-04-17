@@ -113,7 +113,7 @@ extension RTCSession {
         let symmetricKey = localIdentity.symmetricKey
         let sessionIdentity = localIdentity.sessionIdentity
         let selectedIcePolicy = policyOverride ?? iceTransportSelection(for: call.sharedCommunicationId)
-        registerFallbackStateIfNeeded(
+        await registerFallbackStateIfNeeded(
             call: call,
             sender: sender,
             recipient: recipient,
@@ -280,6 +280,14 @@ extension RTCSession {
             ?? pendingVideoEnabledByConnectionId.removeValue(forKey: connection.id) {
             await setVideoTrack(isEnabled: pendingVideoEnabled, connectionId: normalizedId)
         }
+        if let pendingAudioEnabled = pendingAudioEnabledByConnectionId.removeValue(forKey: normalizedId)
+            ?? pendingAudioEnabledByConnectionId.removeValue(forKey: connection.id) {
+            do {
+                try await setAudioTrack(isEnabled: pendingAudioEnabled, connectionId: normalizedId)
+            } catch {
+                logger.log(level: .warning, message: "Failed to apply buffered audio enabled=\(pendingAudioEnabled) for \(normalizedId): \(error)")
+            }
+        }
         
         logger.log(level: .info, message: "Successfully created peer connection with id: \(call.sharedCommunicationId) policy=\(selectedIcePolicy.rawValue)")
         
@@ -348,9 +356,22 @@ extension RTCSession {
         }
     #endif
 
+        // Stop any active screen capture source.
+        if let source = screenCaptureSourceForCurrentPlatform {
+            await stopPlatformScreenCapture(source)
+        }
+
+        // Finish all remote track stream continuations so observers exit cleanly.
+        finishAllRemoteScreenTrackStreams()
+        finishAllRemoteParticipantTrackStreams()
+
         // Clear any session-level pending buffers/caches.
-        iceDeque.removeAll()
+        iceDequeByConnectionId.removeAll()
+        readyForCandidatesByConnectionId.removeAll()
         pendingRemoteVideoRenderersByConnectionId.removeAll()
+#if canImport(WebRTC)
+        pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId.removeAll()
+#endif
 #if os(Android)
         pendingLocalVideoRenderersByConnectionId.removeAll()
 #endif
@@ -586,6 +607,12 @@ extension RTCSession {
         handleStateStream()
     }
     
+    /// Returns the dedicated app-layer state stream for database persistence
+    /// and CallKit synchronization. Returns `nil` if streams have not been created yet.
+    public func appStateStream() async -> AsyncStream<CallStateMachine.State>? {
+        await callState.appLayerStream
+    }
+    
     private func handleStateStream() {
         if stateTask?.isCancelled == false { stateTask?.cancel() }
         stateTask = Task { [weak self] in
@@ -635,6 +662,7 @@ extension RTCSession {
         let callKey = currentCall.map { teardownKey(for: $0) }
         let connectionIdKey = currentCall?.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines)
         clearFallbackState(connectionId: connectionIdKey)
+        cancelDisconnectGraceTask()
 
         if !force {
             if let connectionIdKey, !connectionIdKey.isEmpty {
@@ -673,6 +701,7 @@ extension RTCSession {
         let connectionId = currentCall?.sharedCommunicationId.normalizedConnectionId
 
         if let connectionId {
+            await taskProcessor.removeJobs(forConnectionId: connectionId)
             pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
 #if os(Android)
             pendingLocalVideoRenderersByConnectionId.removeValue(forKey: connectionId)
@@ -713,6 +742,27 @@ extension RTCSession {
             connection.audioFrameCryptor = nil
             connection.audioSenderCryptor = nil
             
+            // Clean up screen share resources
+            connection.screenSenderCryptor?.enabled = false
+            connection.screenSenderCryptor?.delegate = nil
+            connection.screenSenderCryptor = nil
+            for (_, cryptor) in connection.screenReceiverCryptorsByParticipantId {
+                cryptor.enabled = false
+                cryptor.delegate = nil
+            }
+            connection.screenReceiverCryptorsByParticipantId.removeAll()
+            if connection.localScreenTrack != nil, let captureSource = screenCaptureSourceForCurrentPlatform {
+                await stopPlatformScreenCapture(captureSource)
+            }
+            connection.localScreenTrack = nil
+            connection.screenCaptureWrapper = nil
+            for participantId in connection.remoteScreenTracksByParticipantId.keys {
+                notifyRemoteScreenTrackChanged(
+                    RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
+                )
+            }
+            connection.remoteScreenTracksByParticipantId.removeAll()
+            
             // Clear video track references
             connection.localVideoTrack = nil
             connection.remoteVideoTrack = nil
@@ -725,6 +775,36 @@ extension RTCSession {
             stopAdaptiveVideoSend(connectionId: connectionId)
             // Android cleanup is handled in rtcClient.close(), but ensure video is disabled
             await setVideoTrack(isEnabled: false, connectionId: connectionId)
+
+            // Stop local screen capture
+            rtcClient.stopScreenCapture()
+            connection.localScreenTrack = nil
+
+            // Emit removal events for any active remote screen shares (per-participant and legacy single)
+            for participantId in connection.remoteScreenTracksByParticipantId.keys {
+                notifyRemoteScreenTrackChanged(
+                    RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
+                )
+            }
+            connection.remoteScreenTracksByParticipantId.removeAll()
+            if connection.remoteScreenTrack != nil {
+                let resolvedParticipant = connection.remoteParticipantId.isEmpty ? connection.id : connection.remoteParticipantId
+                notifyRemoteScreenTrackChanged(
+                    RemoteScreenTrackEvent(connectionId: connection.id, participantId: resolvedParticipant, isActive: false)
+                )
+                connection.remoteScreenTrack = nil
+            }
+
+            // Emit removal events for per-participant video tracks
+            for participantId in connection.remoteVideoTracksByParticipantId.keys {
+                notifyRemoteParticipantTrackChanged(
+                    RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
+                )
+            }
+            connection.remoteVideoTracksByParticipantId.removeAll()
+            connection.remoteVideoTrack = nil
+
+            await connectionManager.updateConnection(id: connectionId, with: connection)
 #endif
         }
 
@@ -798,10 +878,10 @@ extension RTCSession {
         // Reset connection state
         pcState = PeerConnectionState.none
         pcStateByConnectionId.removeAll()
-        readyForCandidates = false
+        readyForCandidatesByConnectionId.removeAll()
 
         // Clear any queued outbound candidates.
-        iceDeque.removeAll()
+        iceDequeByConnectionId.removeAll()
         
         // Clean up candidate buffers
         for (_, consumer) in inboundCandidateConsumers {
@@ -811,6 +891,7 @@ extension RTCSession {
         
         // Clear any buffered media toggles.
         pendingVideoEnabledByConnectionId.removeAll()
+        pendingAudioEnabledByConnectionId.removeAll()
         
         // Reset counters and flags
         notRunning = true

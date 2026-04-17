@@ -40,7 +40,7 @@ public actor KeyManager: SessionIdentityDelegate {
     private let logger: NeedleTailLogger
     
     private let crypto = NeedleTailCrypto()
-    
+
     public init(logger: NeedleTailLogger = NeedleTailLogger("[CallKeyStore]")) {
         self.logger = logger
     }
@@ -120,7 +120,7 @@ public actor KeyManager: SessionIdentityDelegate {
         connectionIdentities.removeAll()
         pendingCiphertext.removeAll()
         oneTimeKeys.removeAll()
-        logger.log(level: .info, message: "Cleared all cached data: \(String(describing: sessionIdentityCount)) session identities")
+        logger.log(level: .info, message: "Cleared all cached data: \(sessionIdentityCount()) session identities")
     }
     
     /// Returns the number of cached session identities.
@@ -232,16 +232,14 @@ public actor KeyManager: SessionIdentityDelegate {
         
         // Create session identity.
         //
-        // IMPORTANT: Group/SFU calls often use channel-style ids like "#<uuid>".
-        // The SFU server strips a leading '#' before UUID parsing; do the same here so both sides
-        // derive the same session id for ratchet compatibility.
-        let normalizedConnectionId: String = {
-            let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("#") { return String(trimmed.dropFirst()) }
-            return trimmed
-        }()
+        // IMPORTANT: Group/SFU calls may use channel-style ids (`#<uuid>`) or
+        // conference ids (`conf-<uuid>`). Normalize those wrappers so both sides
+        // derive the same stable UUID session id for ratchet compatibility.
+        let normalizedConnectionId = connectionId
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .normalizedUUIDConnectionId
         guard let sessionId = UUID(uuidString: normalizedConnectionId) else {
-            throw RTCErrors.invalidConfiguration("Invalid connectionId (expected UUID or #UUID): \(connectionId)")
+            throw RTCErrors.invalidConfiguration("Invalid connectionId (expected UUID, #UUID, conf-UUID, or #conf-UUID): \(connectionId)")
         }
         let sessionIdentity: SessionIdentity
         
@@ -286,14 +284,12 @@ public actor KeyManager: SessionIdentityDelegate {
         props: SessionIdentity.UnwrappedProps
     ) async throws -> ConnectionSessionIdentity {
         
-        // Match sender identity derivation: strip leading '#' before UUID parsing.
-        let normalizedConnectionId: String = {
-            let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("#") { return String(trimmed.dropFirst()) }
-            return trimmed
-        }()
+        // Match sender identity derivation for all supported wrappers.
+        let normalizedConnectionId = connectionId
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .normalizedUUIDConnectionId
         guard let sessionId = UUID(uuidString: normalizedConnectionId) else {
-            throw RTCErrors.invalidConfiguration("Invalid connectionId (expected UUID or #UUID): \(connectionId)")
+            throw RTCErrors.invalidConfiguration("Invalid connectionId (expected UUID, #UUID, conf-UUID, or #conf-UUID): \(connectionId)")
         }
         var identity = ConnectionSessionIdentity(
             connectionId: connectionId,

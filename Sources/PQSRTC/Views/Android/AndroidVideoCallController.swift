@@ -23,11 +23,9 @@ import NeedleTailLogger
 /// This actor listens to the session's call state stream and:
 /// - Notifies a `VideoCallDelegate` about state changes and errors.
 /// - Attaches/detaches local and remote video renderers.
+/// - Dynamically assigns per-participant tracks to views for group/conference calls.
 /// - Exposes user actions (end call, mute audio/video) via `CallActionDelegate`.
-///
-/// Threading: As an actor, it serializes call-related operations and UI wiring.
 public actor AndroidVideoCallController: CallActionDelegate {
-    /// Delegate that receives state updates and UI-facing events.
     public weak var videoCallDelegate: VideoCallDelegate?
     
     private unowned let session: RTCSession
@@ -50,39 +48,47 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var remoteViews: [AndroidSampleCaptureView] = []
     
     private var stateStreamTask: Task<Void, Never>?
-    
-    /// Creates a controller bound to a specific `RTCSession`.
-    ///
-    /// - Parameter session: The session that owns call state and media operations.
+    private var screenTrackStreamTask: Task<Void, Never>?
+    private var participantTrackStreamTask: Task<Void, Never>?
+    private var screenView: AndroidSampleCaptureView?
+    private(set) var hasActiveRemoteScreenShare = false
+    private var activeRemoteScreenShareParticipantId: String?
+
+    /// Tracks which participant is currently rendered by which view.
+    private var participantViewAssignments: [String: AndroidSampleCaptureView] = [:]
+    /// Pool of views not yet assigned to any participant.
+    private var unassignedViews: [AndroidSampleCaptureView] = []
+    /// Whether this is a group/conference call (multiple remote participants).
+    private var isGroupCall: Bool {
+        currentCall?.sharedCommunicationId.isGroupCall ?? false
+    }
+
     public init(session: RTCSession) {
         self.session = session
     }
     
     /// Sets the remote capture views that should render inbound video.
-    ///
-    /// The controller will render to all provided views when connected in a video call.
     public func setRemoteViews(remotes: [AndroidSampleCaptureView]) async {
         self.remoteViews = remotes
         self.remoteView = remotes.first
-        logger.log(level: .debug, message: "SET REMOTE VIEWS \(remotes)")
+        self.unassignedViews = remotes
+        self.participantViewAssignments.removeAll()
+        logger.log(level: .debug, message: "SET REMOTE VIEWS count=\(remotes.count)")
         await syncWithCurrentState(reason: "setRemoteViews")
     }
     
     /// Sets the local preview capture view used for outbound video.
     public func setLocalView(local: AndroidPreviewCaptureView) async {
         self.localView = local
-        logger.log(level: .debug, message: "SET LOCAL VIEW \(local)")
+        logger.log(level: .debug, message: "SET LOCAL VIEW")
         await syncWithCurrentState(reason: "setLocalView")
     }
     
-    /// Sets (or clears) the delegate that receives UI-facing call events.
     public func setVideoCallDelegate(_ conformer: VideoCallDelegate?) async {
         self.videoCallDelegate = conformer
     }
     
-    /// Starts consuming the session's call state stream.
-    ///
-    /// If already started, this method is a no-op.
+    /// Starts consuming the session's call state and participant track streams.
     public func start() async {
         guard stateStreamTask == nil else {
             logger.log(level: .warning, message: "AndroidVideoCallController.start() called while already running; ignoring")
@@ -91,26 +97,24 @@ public actor AndroidVideoCallController: CallActionDelegate {
         }
         isRunning = true
         logger.log(level: .info, message: "AndroidVideoCallController starting")
+        startRemoteScreenTrackObservation()
+        startParticipantTrackObservation()
         stateStreamTask = Task { [weak self] in
             guard let self else { return }
 
-            // Mirror the Apple controllers: the host app may present the Android call UI
-            // before `RTCSession.createStateStream(with:)` has run.
             var stateStream: AsyncStream<CallStateMachine.State>?
             while !Task.isCancelled {
                 if let stream = await self.session.callState._currentCallStream.last {
                     stateStream = stream
                     break
                 }
-                try? await Task.sleep(nanoseconds: 25_000_000) // 25ms
+                try? await Task.sleep(nanoseconds: 25_000_000)
             }
             guard let stateStream else {
                 logger.log(level: .error, message: "No call state stream available; cannot observe call state")
                 return
             }
 
-            // AsyncStream does not replay prior values. If we subscribed after the state machine
-            // advanced, bootstrap from the current state so Android matches Apple behavior.
             let bootstrapState = await self._currentCallState
             if let current = await self.session.callState.currentState,
                current != bootstrapState {
@@ -167,8 +171,6 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 case .voice:
                     break
                 case .video:
-                    // Match Apple: if Android attaches late and misses `.connecting`,
-                    // still ensure the preview exists before rendering the remote tile.
                     await self.createPreviewView()
                     await self.createSampleView()
                 }
@@ -202,10 +204,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
     }
     
     // MARK: - Actions
-    /// Ends the active call, notifies the transport (if available), and tears down session resources.
-    ///
-    /// This performs the full shutdown path (`RTCSession.shutdown(with:)`) to ensure peer connections,
-    /// crypto state, and key material are cleared.
+
     public func endCall() async {
         guard let call = self.currentCall else {
             await tearDownCall()
@@ -213,15 +212,11 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return
         }
         
-        // Notify transport that the user ended the call
         if let transport = try? await session.requireTransport() {
             try? await transport.didEnd(call: call, endState: CallStateMachine.EndState.userInitiated)
         }
         
-        // Fully tear down the RTC session (peer connections, crypto, keys, etc.)
         await session.shutdown(with: call)
-        
-        // Finally clean up local UI/stream state
         await tearDownCall()
         await videoCallDelegate?.endedCall(true)
     }
@@ -232,19 +227,157 @@ public actor AndroidVideoCallController: CallActionDelegate {
         do {
             try await self.session.setAudioTrack(isEnabled: !shouldMute, connectionId: callId)
             isMutingAudio = shouldMute
-        } catch {
-            // swallow in release; delegate already receives failures
-        }
+        } catch {}
     }
     
-    /// Toggles the local video track enabled state for the active call.
     public func muteVideo() async {
         isMutingVideo.toggle()
         guard let callId = self.currentCall?.sharedCommunicationId else { return }
         await self.session.setVideoTrack(isEnabled: !self.isMutingVideo, connectionId: callId)
     }
     
+    // MARK: - Screen Share Actions
+
+    public func startScreenShare(target: ScreenShareTarget) async {
+        guard let connectionId = currentCall?.sharedCommunicationId else { return }
+        do {
+            try await session.addScreenTrackToStream(target: target, connectionId: connectionId)
+            await videoCallDelegate?.screenShareDidChange(isSharing: true)
+        } catch {
+            logger.log(level: .error, message: "Failed to start screen share: \(error)")
+        }
+    }
+
+    public func stopScreenShare() async {
+        guard let connectionId = currentCall?.sharedCommunicationId else { return }
+        await session.removeScreenTrackFromStream(connectionId: connectionId)
+        await videoCallDelegate?.screenShareDidChange(isSharing: false)
+    }
+
+    // MARK: - Remote Screen Track Observation
+
+    private func startRemoteScreenTrackObservation() {
+        guard screenTrackStreamTask == nil else { return }
+        screenTrackStreamTask = Task { [weak self] in
+            guard let self else { return }
+            let stream = await session.remoteScreenTrackStream()
+            for await event in stream {
+                guard !Task.isCancelled else { break }
+                await self.handleRemoteScreenTrackEvent(event)
+            }
+        }
+    }
+
+    private func stopRemoteScreenTrackObservation() {
+        screenTrackStreamTask?.cancel()
+        screenTrackStreamTask = nil
+    }
+
+    private func handleRemoteScreenTrackEvent(_ event: RemoteScreenTrackEvent) async {
+        if event.isActive {
+            logger.log(level: .info, message: "Remote screen share started from participant=\(event.participantId)")
+            if let view = screenView,
+               let previousParticipantId = activeRemoteScreenShareParticipantId,
+               previousParticipantId != event.participantId {
+                await session.removeRemoteScreenVideoRenderer(
+                    view,
+                    connectionId: event.connectionId,
+                    participantId: previousParticipantId
+                )
+            }
+            activeRemoteScreenShareParticipantId = event.participantId
+            hasActiveRemoteScreenShare = true
+            if let view = screenView {
+                await session.renderRemoteScreenVideo(
+                    to: view,
+                    connectionId: event.connectionId,
+                    participantId: event.participantId
+                )
+            }
+            await videoCallDelegate?.remoteScreenShareDidChange(participantId: event.participantId, isSharing: true)
+        } else {
+            logger.log(level: .info, message: "Remote screen share ended from participant=\(event.participantId)")
+            let endedActiveShare = activeRemoteScreenShareParticipantId == nil
+                || activeRemoteScreenShareParticipantId == event.participantId
+            guard endedActiveShare else {
+                logger.log(
+                    level: .debug,
+                    message: "Ignoring remote screen-share removal for inactive participant=\(event.participantId); activeParticipant=\(activeRemoteScreenShareParticipantId ?? "nil")"
+                )
+                return
+            }
+            if let view = screenView {
+                await session.removeRemoteScreenVideoRenderer(view, connectionId: event.connectionId, participantId: event.participantId)
+                screenView = nil
+            }
+            activeRemoteScreenShareParticipantId = nil
+            hasActiveRemoteScreenShare = false
+            await videoCallDelegate?.remoteScreenShareDidChange(participantId: event.participantId, isSharing: false)
+        }
+    }
+
+    // MARK: - Remote Participant Track Observation (Group Calls)
+
+    private func startParticipantTrackObservation() {
+        guard participantTrackStreamTask == nil else { return }
+        participantTrackStreamTask = Task { [weak self] in
+            guard let self else { return }
+            let stream = await session.remoteParticipantTrackStream()
+            for await event in stream {
+                guard !Task.isCancelled else { break }
+                await self.handleParticipantTrackEvent(event)
+            }
+        }
+    }
+
+    private func stopParticipantTrackObservation() {
+        participantTrackStreamTask?.cancel()
+        participantTrackStreamTask = nil
+    }
+
+    private func handleParticipantTrackEvent(_ event: RemoteParticipantTrackEvent) async {
+        guard event.kind == "video" else { return }
+        let connectionId = currentCall?.sharedCommunicationId ?? event.connectionId
+
+        if event.isActive {
+            logger.log(level: .info, message: "Participant track added: participant=\(event.participantId)")
+            guard participantViewAssignments[event.participantId] == nil else {
+                logger.log(level: .debug, message: "Participant \(event.participantId) already has a view assignment")
+                return
+            }
+            guard !unassignedViews.isEmpty else {
+                logger.log(level: .warning, message: "No unassigned views for new participant=\(event.participantId)")
+                return
+            }
+            let view = unassignedViews.removeFirst()
+            participantViewAssignments[event.participantId] = view
+            await session.renderRemoteVideoForParticipant(to: view, connectionId: connectionId, participantId: event.participantId)
+            logger.log(level: .info, message: "Assigned view to participant=\(event.participantId), remaining unassigned=\(unassignedViews.count)")
+        } else {
+            logger.log(level: .info, message: "Participant track removed: participant=\(event.participantId)")
+            if let view = participantViewAssignments.removeValue(forKey: event.participantId) {
+                await session.removeRemoteForParticipant(view: view, connectionId: connectionId, participantId: event.participantId)
+                unassignedViews.append(view)
+                // A previously unassigned participant track may already exist in the connection map.
+                // Re-scan and attach immediately when a slot frees up.
+                await assignExistingParticipantTracks(connectionId: connectionId)
+            }
+        }
+    }
+
+    /// Sets the view used to render a remote screen share and attaches it to the active screen track.
+    public func setScreenView(_ view: AndroidSampleCaptureView) async {
+        screenView = view
+        guard let connectionId = currentCall?.sharedCommunicationId else { return }
+        await session.renderRemoteScreenVideo(
+            to: view,
+            connectionId: connectionId,
+            participantId: activeRemoteScreenShareParticipantId ?? connectionId
+        )
+    }
+
     // MARK: - View Management
+
     private func createPreviewView(shouldQuery: Bool = true) async {
         guard let connectionId = currentCall?.sharedCommunicationId else {
             logger.log(level: .debug, message: "createPreviewView skipped: missing currentCall")
@@ -265,19 +398,39 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return
         }
         logger.log(level: .info, message: "AndroidVideoCallController creating sample view for connection: \(connectionId)")
-        logger.log(level: .debug, message: "CREATE SAMPLE VIEW \(remoteViews)")
-        if !remoteViews.isEmpty {
-            for view in remoteViews {
-                await session.renderRemoteVideo(to: view, connectionId: connectionId)
-            }
-        } else if let remoteView {
-            await session.renderRemoteVideo(to: remoteView, connectionId: connectionId)
+
+        if isGroupCall {
+            // For group calls, the participant track stream handles dynamic assignment.
+            // Try to assign any already-arrived tracks to views now.
+            await assignExistingParticipantTracks(connectionId: connectionId)
         } else {
-            logger.log(level: .debug, message: "Missing remote views for rendering sample")
+            // 1:1 call: use the single-track path.
+            if let remoteView {
+                await session.renderRemoteVideo(to: remoteView, connectionId: connectionId)
+            } else if !remoteViews.isEmpty {
+                await session.renderRemoteVideo(to: remoteViews[0], connectionId: connectionId)
+            } else {
+                logger.log(level: .debug, message: "Missing remote views for rendering sample")
+            }
         }
         await session.setVideoTrack(isEnabled: true, connectionId: connectionId)
     }
-    
+
+    /// Assigns views to participants whose tracks arrived before the UI was ready.
+    private func assignExistingParticipantTracks(connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard let connection = await session.connectionManager.findConnection(with: normalizedId) else { return }
+
+        for (participantId, _) in connection.remoteVideoTracksByParticipantId {
+            guard participantViewAssignments[participantId] == nil else { continue }
+            guard !unassignedViews.isEmpty else { break }
+            let view = unassignedViews.removeFirst()
+            participantViewAssignments[participantId] = view
+            await session.renderRemoteVideoForParticipant(to: view, connectionId: connectionId, participantId: participantId)
+            logger.log(level: .info, message: "Late-assigned view to participant=\(participantId)")
+        }
+    }
+
     private func tearDownPreviewView() async {
         guard let connectionId = currentCall?.sharedCommunicationId, let localView else { return }
         await session.removeLocal(view: localView, connectionId: connectionId)
@@ -285,28 +438,42 @@ public actor AndroidVideoCallController: CallActionDelegate {
     
     private func tearDownSampleView() async {
         guard let connectionId = currentCall?.sharedCommunicationId else { return }
-        if !remoteViews.isEmpty {
-            for view in remoteViews {
-                await session.removeRemote(view: view, connectionId: connectionId)
+
+        if isGroupCall {
+            for (participantId, view) in participantViewAssignments {
+                await session.removeRemoteForParticipant(view: view, connectionId: connectionId, participantId: participantId)
             }
-        } else if let remoteView {
-            await session.removeRemote(view: remoteView, connectionId: connectionId)
+            participantViewAssignments.removeAll()
+            unassignedViews.removeAll()
+        } else {
+            if let remoteView {
+                await session.removeRemote(view: remoteView, connectionId: connectionId)
+            } else if !remoteViews.isEmpty {
+                await session.removeRemote(view: remoteViews[0], connectionId: connectionId)
+            }
         }
     }
 
     // MARK: - Teardown
+
     private func tearDownCall() async {
         guard isRunning else { return }
-        // Prevent concurrent teardown from running more than once
         isRunning = false
 
-        // Guarantee the underlying RTCSession is returned to a pre-call baseline
-        // even when teardown is triggered by remote end/failure (not user-initiated endCall()).
-        if let call = self.currentCall {
-            await session.shutdown(with: call)
-        }
         await tearDownPreviewView()
         await tearDownSampleView()
+        stopRemoteScreenTrackObservation()
+        stopParticipantTrackObservation()
+        if let view = screenView, let connectionId = currentCall?.sharedCommunicationId {
+            await session.removeRemoteScreenVideoRenderer(
+                view,
+                connectionId: connectionId,
+                participantId: activeRemoteScreenShareParticipantId ?? connectionId
+            )
+        }
+        screenView = nil
+        activeRemoteScreenShareParticipantId = nil
+        hasActiveRemoteScreenShare = false
         stateStreamTask?.cancel()
         stateStreamTask = nil
         currentCall = nil

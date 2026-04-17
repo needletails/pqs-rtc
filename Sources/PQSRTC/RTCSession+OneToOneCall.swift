@@ -71,7 +71,7 @@ extension RTCSession {
     /// - Parameter call: The incoming call with SDP offer in metadata
     public func answerCall(_ call: Call) async throws {
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).
-        activeConnectionId = call.sharedCommunicationId
+        activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
         if isGroupCall {
             shouldOffer = true
         }
@@ -145,12 +145,31 @@ extension RTCSession {
 }
 
 extension String {
+    /// Channel-backed group rooms use a `#` prefix. SFU conference rooms often use `conf-<uuid>` (with or
+    /// without `#`) as the peer-connection id — treat those as group for E2EE sender deferral, SSRC stripping,
+    /// and related paths that key off ``String/isGroupCall``.
     public var isGroupCall: Bool {
-        self.first == "#"
+        if self.first == "#" { return true }
+        return normalizedConnectionId.hasPrefix("conf-")
     }
     
     public var normalizedConnectionId: String {
         self.hasPrefix("#") ? String(self.dropFirst()) : self
+    }
+
+    /// Normalizes identifiers that should map to a UUID-shaped connection/session id.
+    ///
+    /// Accepted forms:
+    /// - `UUID`
+    /// - `#UUID`
+    /// - `conf-UUID`
+    /// - `#conf-UUID`
+    public var normalizedUUIDConnectionId: String {
+        let noChannelPrefix = self.normalizedConnectionId
+        if noChannelPrefix.hasPrefix("conf-") {
+            return String(noChannelPrefix.dropFirst("conf-".count))
+        }
+        return noChannelPrefix
     }
     
     public var ensureIRCChannel: String {

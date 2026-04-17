@@ -492,6 +492,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
     private var localVideoTrack: RTCVideoTrack?
     private var videoCapturer: org.webrtc.Camera2Capturer?
     private var surfaceTextureHelper: org.webrtc.SurfaceTextureHelper?
+
+    // Screen capture fields (coexist alongside camera)
+    private var screenVideoSource: RTCVideoSource?
+    private var screenVideoTrack: RTCVideoTrack?
+    private var screenCapturer: org.webrtc.VideoCapturer?
+    private var screenSurfaceTextureHelper: org.webrtc.SurfaceTextureHelper?
     
     // Track active surface renderers for proper cleanup
     private var activeSurfaceRenderers: Set<org.webrtc.SurfaceViewRenderer> = []
@@ -503,6 +509,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     private var keyProviderReady: Bool = false
     private var videoSenderCryptor: org.webrtc.FrameCryptor?
     private var audioSenderCryptor: org.webrtc.FrameCryptor?
+    private var screenSenderCryptor: org.webrtc.FrameCryptor?
     private var videoReceiverCryptor: org.webrtc.FrameCryptor?
     private var audioReceiverCryptor: org.webrtc.FrameCryptor?
 
@@ -914,7 +921,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: }
         // SKIP INSERT: val pcNonNull = pc!!
         // SKIP INSERT: val senders = pcNonNull.senders
-        // SKIP INSERT: val videoSender = senders.firstOrNull { it.track()?.kind() == "video" }
+        // SKIP INSERT: val videoSender = senders.firstOrNull {
+        // SKIP INSERT:     it.track()?.kind() == "video" && !(it.track()?.id()?.startsWith("screen_") ?: false)
+        // SKIP INSERT: }
         // SKIP INSERT: val audioSender = senders.firstOrNull { it.track()?.kind() == "audio" }
 
         // SKIP INSERT: fun attachObserver(tag: String, cryptor: org.webrtc.FrameCryptor?) {
@@ -978,6 +987,75 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: }
         // SKIP INSERT: if (android.os.Looper.myLooper() == mainLooper) doCreateSenderCryptors()
         // SKIP INSERT: else android.os.Handler(mainLooper).post { doCreateSenderCryptors() }
+    }
+
+    /// Attaches a dedicated FrameCryptor encryptor to the local screen-share RTP sender.
+    ///
+    /// This keeps camera and screen outbound encryption independent when both are published.
+    public func createScreenSenderEncryptedFrame(participant: String, connectionId: String, trackId: String? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !isClosed else {
+            // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Cannot create screen sender encrypted frame: AndroidRTCClient has been closed")
+            return
+        }
+
+        // SKIP INSERT: val mainLooper = android.os.Looper.getMainLooper()
+        // SKIP INSERT: fun doCreateScreenSenderCryptor() {
+        // SKIP INSERT: run {
+        // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
+        // SKIP INSERT: val pc = this@AndroidRTCClient.peerConnection?.platformPeerConnection
+        // SKIP INSERT: val factory = this@AndroidRTCClient.factory
+        // SKIP INSERT: if (keyProvider == null || pc == null || factory == null) {
+        // SKIP INSERT:     android.util.Log.e("AndroidRTCClient", "KeyProvider, PeerConnection, or Factory not initialized")
+        // SKIP INSERT:     return@run
+        // SKIP INSERT: }
+        // SKIP INSERT: val sender = pc.senders.firstOrNull { s ->
+        // SKIP INSERT:     val track = s.track()
+        // SKIP INSERT:     if (track?.kind() != "video") return@firstOrNull false
+        // SKIP INSERT:     if (trackId != null) return@firstOrNull track?.id() == trackId
+        // SKIP INSERT:     (track?.id()?.startsWith("screen_") ?: false)
+        // SKIP INSERT: }
+        // SKIP INSERT: if (sender == null) {
+        // SKIP INSERT:     android.util.Log.w("AndroidRTCClient", "No screen sender found for FrameCryptor attach (trackId=${trackId ?: "<auto>"})")
+        // SKIP INSERT:     return@run
+        // SKIP INSERT: }
+        // SKIP INSERT:
+        // SKIP INSERT: this@AndroidRTCClient.screenSenderCryptor?.dispose()
+        // SKIP INSERT: this@AndroidRTCClient.screenSenderCryptor = null
+        // SKIP INSERT:
+        // SKIP INSERT: val cryptor = org.webrtc.FrameCryptorFactory.createFrameCryptorForRtpSender(
+        // SKIP INSERT:     factory,
+        // SKIP INSERT:     sender,
+        // SKIP INSERT:     participant,
+        // SKIP INSERT:     org.webrtc.FrameCryptorAlgorithm.AES_GCM,
+        // SKIP INSERT:     keyProvider
+        // SKIP INSERT: )
+        // SKIP INSERT:
+        // SKIP INSERT: cryptor?.setObserver(object : org.webrtc.FrameCryptor.Observer {
+        // SKIP INSERT:     override fun onFrameCryptionStateChanged(participantId: String, newState: org.webrtc.FrameCryptor.FrameCryptionState) {
+        // SKIP INSERT:         val stateDescription = when (newState) {
+        // SKIP INSERT:             org.webrtc.FrameCryptor.FrameCryptionState.NEW -> "new"
+        // SKIP INSERT:             org.webrtc.FrameCryptor.FrameCryptionState.OK -> "ok"
+        // SKIP INSERT:             org.webrtc.FrameCryptor.FrameCryptionState.MISSINGKEY -> "missingKey"
+        // SKIP INSERT:             org.webrtc.FrameCryptor.FrameCryptionState.KEYRATCHETED -> "keyRatcheted"
+        // SKIP INSERT:             org.webrtc.FrameCryptor.FrameCryptionState.INTERNALERROR -> "internalError"
+        // SKIP INSERT:             org.webrtc.FrameCryptor.FrameCryptionState.ENCRYPTIONFAILED -> "encryptionFailed"
+        // SKIP INSERT:             org.webrtc.FrameCryptor.FrameCryptionState.DECRYPTIONFAILED -> "decryptionFailed"
+        // SKIP INSERT:             else -> "unknown(${newState.ordinal})"
+        // SKIP INSERT:         }
+        // SKIP INSERT:         val logLevel = if (newState == org.webrtc.FrameCryptor.FrameCryptionState.OK) android.util.Log.INFO else android.util.Log.WARN
+        // SKIP INSERT:         android.util.Log.println(logLevel, "AndroidRTCClient", "[screen-sender] FrameCryptor state for '$participantId': $stateDescription")
+        // SKIP INSERT:     }
+        // SKIP INSERT: })
+        // SKIP INSERT: cryptor?.setEnabled(true)
+        // SKIP INSERT: this@AndroidRTCClient.screenSenderCryptor = cryptor
+        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "✅ Screen sender cryptor attached (trackId=${sender.track()?.id() ?: "unknown"})")
+        // SKIP INSERT: }
+        // SKIP INSERT: }
+        // SKIP INSERT: if (android.os.Looper.myLooper() == mainLooper) doCreateScreenSenderCryptor()
+        // SKIP INSERT: else android.os.Handler(mainLooper).post { doCreateScreenSenderCryptor() }
     }
 
     /// Attaches FrameCryptor decryptors to current RTP receivers (audio/video) on the active PeerConnection.
@@ -1379,6 +1457,214 @@ public final class AndroidRTCClient: @unchecked Sendable {
         fatalError("createVideoTrack should only be called on Android")
     }
     
+    // MARK: - Screen Share
+
+    /// Creates a screen-specific video source (stored separately from the camera source).
+    private func createScreenVideoSource() -> RTCVideoSource {
+        // SKIP INSERT: val fac = factory ?: throw IllegalStateException("Factory not initialized")
+        // SKIP INSERT: val src = RTCVideoSource(fac.createVideoSource(true))
+        // SKIP INSERT: this.screenVideoSource = src
+        // SKIP INSERT: return src
+        fatalError("createScreenVideoSource should only be called on Android")
+    }
+
+    /// Creates a screen video track (stored separately from the camera track).
+    private func createScreenVideoTrack(id: String, _ videoSource: RTCVideoSource) -> RTCVideoTrack {
+        // SKIP INSERT: val fac = factory ?: throw IllegalStateException("Factory not initialized")
+        // SKIP INSERT: val track = RTCVideoTrack(fac.createVideoTrack("screen_${id}", videoSource.platformSource))
+        // SKIP INSERT: this.screenVideoTrack = track
+        // SKIP INSERT: return track
+        fatalError("createScreenVideoTrack should only be called on Android")
+    }
+
+    /// Prepares a second video transceiver for screen sharing, creates the screen track,
+    /// and starts `ScreenCapturerAndroid` with the MediaProjection result.
+    ///
+    /// - Parameters:
+    ///   - id: Participant/stream label used for the `screen_<id>` stream ID prefix.
+    ///   - resultCode: The `Activity.RESULT_OK` code from the MediaProjection permission grant.
+    ///   - data: The `Intent` data from `MediaProjectionManager.createScreenCaptureIntent()`.
+    /// - Returns: The screen video track wrapper.
+    public func prepareScreenShareSendRecv(id: String, resultCode: Int, data: Any) throws -> RTCVideoTrack? {
+        let platformPeerConnection: org.webrtc.PeerConnection
+        let trackToReturn: RTCVideoTrack?
+        let shouldStartCapture: Bool
+        do {
+            lock.lock()
+            guard !isClosed else {
+                lock.unlock()
+                throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
+            }
+            guard let pc = self.peerConnection?.platformPeerConnection else {
+                lock.unlock()
+                throw RTCClientErrors.peerConnectionError("PeerConnection not yet established")
+            }
+
+            if screenVideoSource == nil {
+                _ = createScreenVideoSource()
+            }
+            if screenVideoTrack == nil, let source = screenVideoSource {
+                _ = createScreenVideoTrack(id: id, source)
+            }
+
+            platformPeerConnection = pc
+            trackToReturn = screenVideoTrack
+            shouldStartCapture = (screenCapturer == nil)
+            lock.unlock()
+        }
+
+        // Add a SEND_ONLY video transceiver for the screen track
+        let initOpts = org.webrtc.RtpTransceiver.RtpTransceiverInit(org.webrtc.RtpTransceiver.RtpTransceiverDirection.SEND_ONLY)
+        platformPeerConnection.addTransceiver(org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, initOpts)
+
+        if let track = trackToReturn {
+            var ids = [String]()
+            ids.append("screen_\(id)")
+            _ = platformPeerConnection.addTrack(track.platformTrack, ids.toList())
+        }
+
+        if shouldStartCapture {
+            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Launching async screen capture startup")
+            let capturedResultCode = resultCode
+            let capturedData = data
+            Task.detached { [weak self] in
+                guard let self else { return }
+                do {
+                    try self.startScreenCapture(resultCode: capturedResultCode, data: capturedData)
+                    // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Screen capture started")
+                } catch {
+                    // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Failed to start screen capture: ${error}")
+                }
+            }
+        }
+
+        return trackToReturn
+    }
+
+    /// Starts the Android screen capturer using MediaProjection.
+    private func startScreenCapture(resultCode: Int, data: Any, fps: Int = 15) throws {
+        let existingSource: RTCVideoSource
+        let staleHelper: org.webrtc.SurfaceTextureHelper?
+
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
+        }
+        guard let ctx = ProcessInfo.processInfo.androidContext else {
+            lock.unlock()
+            throw RTCClientErrors.peerConnectionError("Android context not available")
+        }
+        guard let source = screenVideoSource else {
+            lock.unlock()
+            throw RTCClientErrors.peerConnectionError("Screen video source not initialized")
+        }
+        if screenCapturer != nil {
+            lock.unlock()
+            return
+        }
+
+        existingSource = source
+        staleHelper = screenSurfaceTextureHelper
+        screenSurfaceTextureHelper = nil
+        lock.unlock()
+
+        do {
+            try ensureEglBase()
+        } catch {
+            throw RTCClientErrors.peerConnectionError("Failed to ensure EGL base: \(error.localizedDescription)")
+        }
+
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
+        }
+        guard let eglBase = eglBase else {
+            lock.unlock()
+            throw RTCClientErrors.peerConnectionError("EGL base is nil after ensureEglBase")
+        }
+        lock.unlock()
+
+        staleHelper?.dispose()
+
+        let helper = org.webrtc.SurfaceTextureHelper.create("WebRTCScreenCapture", eglBase.eglBaseContext)
+        guard let helper else {
+            throw RTCClientErrors.peerConnectionError("Failed to create SurfaceTextureHelper for screen capture")
+        }
+
+        // SKIP INSERT: val intentData = data as android.content.Intent
+        // SKIP INSERT: val callback = object : android.media.projection.MediaProjection.Callback() {
+        // SKIP INSERT:     override fun onStop() {
+        // SKIP INSERT:         android.util.Log.i("AndroidRTCClient", "MediaProjection stopped")
+        // SKIP INSERT:     }
+        // SKIP INSERT: }
+        // SKIP INSERT: val capturer = org.webrtc.ScreenCapturerAndroid(intentData, callback)
+
+        let downstream = existingSource.platformSource.getCapturerObserver()
+        // Screen frames don't need rotation normalization
+        // SKIP INSERT: val ctx = ProcessInfo.processInfo.androidContext
+        // SKIP INSERT:     ?: throw IllegalStateException("Android context not available")
+        // SKIP INSERT: capturer.initialize(helper, ctx, downstream)
+        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting screen capture at 1920x1080@${fps}fps")
+        // SKIP INSERT: capturer.startCapture(1920, 1080, fps)
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else {
+            helper.dispose()
+            throw RTCClientErrors.peerConnectionError("AndroidRTCClient closed during screen capture startup")
+        }
+        if screenCapturer != nil {
+            helper.dispose()
+            return
+        }
+        screenSurfaceTextureHelper = helper
+        // SKIP INSERT: this.screenCapturer = capturer
+    }
+
+    /// Stops the screen capturer and releases screen-specific resources.
+    public func stopScreenCapture() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // SKIP INSERT: (screenCapturer as? org.webrtc.ScreenCapturerAndroid)?.stopCapture()
+        // SKIP INSERT: (screenCapturer as? org.webrtc.ScreenCapturerAndroid)?.dispose()
+        screenCapturer = nil
+
+        screenSurfaceTextureHelper?.dispose()
+        screenSurfaceTextureHelper = nil
+        screenSenderCryptor?.dispose()
+        screenSenderCryptor = nil
+
+        screenVideoTrack?._isEnabled = false
+    }
+
+    /// Enables or disables the local screen video track.
+    public func setScreenVideoEnabled(_ enabled: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { return }
+        screenVideoTrack?._isEnabled = enabled
+    }
+
+    /// Returns the first remote screen video track by finding a transceiver whose track ID starts with `screen_`.
+    /// For 1:1 calls — group calls should use ``getRemoteScreenVideoTrackById``.
+    public func getRemoteScreenVideoTrack(peerConnection: RTCPeerConnection) -> RTCVideoTrack? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { return nil }
+
+        guard peerConnection.platformPeerConnection != nil else { return nil }
+        // SKIP INSERT: val pc = peerConnection.platformPeerConnection ?: return null
+        // SKIP INSERT: for (t in pc.getTransceivers()) {
+        // SKIP INSERT:     if (t.mediaType != org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) continue
+        // SKIP INSERT:     val track = t.getReceiver()?.track() as? org.webrtc.VideoTrack ?: continue
+        // SKIP INSERT:     if (track.id().startsWith("screen_")) return RTCVideoTrack(track)
+        // SKIP INSERT: }
+        return nil
+    }
+
     /// Enables or disables the local audio track.
     public func setAudioEnabled(_ enabled: Bool) {
         lock.lock()
@@ -1817,20 +2103,56 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Attempts to fetch the first remote video track from the provided peer connection.
     ///
     /// This uses transceivers (Unified Plan) and returns the receiver's track if present.
+    /// For 1:1 calls only — group calls should use ``getRemoteVideoTrackById``.
     public func getRemoteVideoTrack(peerConnection: RTCPeerConnection) -> RTCVideoTrack? {
         lock.lock()
         defer { lock.unlock() }
         
         guard !isClosed else { return nil }
         
-        guard
-            let pc = peerConnection.platformPeerConnection,
-            let transceiver = pc.getTransceivers().firstOrNull({ t in
-                t.mediaType == org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO
-            }),
-            let videoTrack = transceiver.getReceiver()?.track() as? org.webrtc.VideoTrack
-        else { return nil }
-        return RTCVideoTrack(videoTrack)
+        guard peerConnection.platformPeerConnection != nil else { return nil }
+        // SKIP INSERT: val pc = peerConnection.platformPeerConnection ?: return null
+        // SKIP INSERT: for (t in pc.getTransceivers()) {
+        // SKIP INSERT:     if (t.mediaType != org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) continue
+        // SKIP INSERT:     val track = t.getReceiver()?.track() as? org.webrtc.VideoTrack ?: continue
+        // SKIP INSERT:     if (!track.id().startsWith("screen_")) return RTCVideoTrack(track)
+        // SKIP INSERT: }
+        return nil
+    }
+
+    /// Returns the remote video track matching a specific trackId.
+    ///
+    /// For SFU group calls where multiple remote participants each have their own video
+    /// transceiver, this method finds the exact track rather than returning the first one.
+    public func getRemoteVideoTrackById(peerConnection: RTCPeerConnection, trackId: String) -> RTCVideoTrack? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !isClosed else { return nil }
+        guard peerConnection.platformPeerConnection != nil else { return nil }
+        // SKIP INSERT: val pc = peerConnection.platformPeerConnection ?: return null
+        // SKIP INSERT: for (t in pc.getTransceivers()) {
+        // SKIP INSERT:     if (t.mediaType != org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) continue
+        // SKIP INSERT:     val track = t.getReceiver()?.track() as? org.webrtc.VideoTrack ?: continue
+        // SKIP INSERT:     if (track.id() == trackId) return RTCVideoTrack(track)
+        // SKIP INSERT: }
+        return nil
+    }
+
+    /// Returns the remote screen video track matching a specific trackId.
+    public func getRemoteScreenVideoTrackById(peerConnection: RTCPeerConnection, trackId: String) -> RTCVideoTrack? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !isClosed else { return nil }
+        guard peerConnection.platformPeerConnection != nil else { return nil }
+        // SKIP INSERT: val pc = peerConnection.platformPeerConnection ?: return null
+        // SKIP INSERT: for (t in pc.getTransceivers()) {
+        // SKIP INSERT:     if (t.mediaType != org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) continue
+        // SKIP INSERT:     val track = t.getReceiver()?.track() as? org.webrtc.VideoTrack ?: continue
+        // SKIP INSERT:     if (track.id() == trackId && track.id().startsWith("screen_")) return RTCVideoTrack(track)
+        // SKIP INSERT: }
+        return nil
     }
    
     /// Ensures an audio transceiver is present with `SEND_RECV` and attaches a local audio track.
@@ -2075,9 +2397,16 @@ public final class AndroidRTCClient: @unchecked Sendable {
             videoCapturer = nil
         }
         
-        // Dispose surface texture helper
+        // Stop and dispose screen capturer
+        // SKIP INSERT: (screenCapturer as? org.webrtc.ScreenCapturerAndroid)?.stopCapture()
+        // SKIP INSERT: (screenCapturer as? org.webrtc.ScreenCapturerAndroid)?.dispose()
+        screenCapturer = nil
+
+        // Dispose surface texture helpers
         surfaceTextureHelper?.dispose()
         surfaceTextureHelper = nil
+        screenSurfaceTextureHelper?.dispose()
+        screenSurfaceTextureHelper = nil
         
         // Detach video tracks from renderers first, then release renderers
         // This ensures no video frames are being sent to renderers during cleanup
@@ -2090,11 +2419,19 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // Also detach any remote video tracks that might be attached
         // Note: Remote tracks are typically managed by the session, but we ensure cleanup here
         
-        // Release all active surface renderers to stop OpenGL rendering
-        // Use safe release to handle cases where OpenGL context may already be destroyed
-        for renderer in activeSurfaceRenderers {
-            safeReleaseRenderer(renderer)
-        }
+        // Release all active surface renderers to stop OpenGL rendering.
+        // Do not call `safeReleaseRenderer(_:)` here: it also takes `lock`, which would
+        // deadlock because `close()` already holds this same non-recursive lock.
+        // SKIP INSERT: for (renderer in activeSurfaceRenderers) {
+        // SKIP INSERT:     try {
+        // SKIP INSERT:         val egl = eglBase
+        // SKIP INSERT:         if (egl != null && egl.eglBaseContext != null) {
+        // SKIP INSERT:             renderer.release()
+        // SKIP INSERT:         }
+        // SKIP INSERT:     } catch (_: Throwable) {
+        // SKIP INSERT:         // Ignore teardown-time renderer release failures.
+        // SKIP INSERT:     }
+        // SKIP INSERT: }
         activeSurfaceRenderers.removeAll()
         
         // Clear pending observers
@@ -2112,8 +2449,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
         }
         
         localVideoTrack?.dispose()
+        screenVideoTrack?.dispose()
         localAudioTrack?.dispose()
         videoSource?.dispose()
+        screenVideoSource?.dispose()
         audioSource?.dispose()
         eglBase?.release()
         factory?.dispose()
@@ -2121,6 +2460,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // Clean up E2EE resources (sender cryptors are unique; receiver cryptors are in ByParticipantId map, singular refs point into that map so do not dispose again)
         videoSenderCryptor?.dispose()
         audioSenderCryptor?.dispose()
+        screenSenderCryptor?.dispose()
 
         for (_, cryptor) in videoReceiverCryptorsByParticipantId {
             cryptor.dispose()
@@ -2139,13 +2479,16 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // Clear all references
         peerConnection = nil
         localVideoTrack = nil
+        screenVideoTrack = nil
         localAudioTrack = nil
         videoSource = nil
+        screenVideoSource = nil
         audioSource = nil
         eglBase = nil
         factory = nil
         videoSenderCryptor = nil
         audioSenderCryptor = nil
+        screenSenderCryptor = nil
         videoReceiverCryptor = nil
         audioReceiverCryptor = nil
     }

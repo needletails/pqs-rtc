@@ -82,45 +82,103 @@ public struct AndroidLocalVideoCompose: ContentComposer {
 // MARK: - Android Remote Video Compose View
 /// Compose view that hosts a remote video renderer.
 ///
-/// This is the Android equivalent of `SampleCaptureView`.
+/// Accepts a pre-created `AndroidSampleCaptureView` whose track has been (or will be)
+/// assigned externally by the controller. This is the Android equivalent of
+/// `SampleCaptureView` on Apple.
 public struct AndroidRemoteVideoCompose: ContentComposer {
     private let client: AndroidRTCClient
+    private let captureView: AndroidSampleCaptureView
 
-    public init(client: AndroidRTCClient) {
+    public init(client: AndroidRTCClient, captureView: AndroidSampleCaptureView) {
         self.client = client
+        self.captureView = captureView
     }
 
     @Composable
     public func Compose(context: ComposeContext) {
-        let captureView = remember { AndroidCaptureViewFactory.createSampleCaptureView(client: client) }
-        let renderer = remember { captureView.surfaceViewRenderer }
+        let renderer = captureView.surfaceViewRenderer
 
         androidx.compose.runtime.DisposableEffect(renderer) {
             onDispose {
-                // Ensure proper cleanup when the composable leaves scope
                 client.removeRenderer(renderer)
                 // SKIP INSERT: try { renderer.clearImage() } catch (e: Exception) { /* Ignore if context destroyed */ }
                 client.safeReleaseRenderer(renderer)
             }
         }
 
-        Box(modifier = context.modifier) {
+        Box(modifier: context.modifier) {
             androidx.compose.ui.viewinterop.AndroidView(
-                factory = { ctx in
-                    // Initialize renderer on the UI thread
-                    client.initializeSurfaceRenderer(renderer, mirror = false)
+                factory: { ctx in
+                    client.initializeSurfaceRenderer(renderer, mirror: false)
                     renderer
                 },
-                update = { view in
-                    // Optional: respond to Compose state changes if needed
-                }
+                update: { _ in }
             )
         }
     }
 }
 
 
-@MainActor var setRemote = false
+// MARK: - Android Screen Share Compose View
+/// Compose view that renders a remote screen share as a dominant tile with a "Presenting" badge.
+public struct AndroidScreenShareCompose: ContentComposer {
+
+    private let client: AndroidRTCClient
+    private let captureView: AndroidSampleCaptureView
+    private let presenterName: String
+
+    public init(
+        client: AndroidRTCClient,
+        captureView: AndroidSampleCaptureView,
+        presenterName: String = "Presenting"
+    ) {
+        self.client = client
+        self.captureView = captureView
+        self.presenterName = presenterName
+    }
+
+    @Composable
+    public func Compose(context: ComposeContext) {
+        let renderer = captureView.surfaceViewRenderer
+
+        androidx.compose.runtime.DisposableEffect(renderer) {
+            onDispose {
+                client.removeRenderer(renderer)
+                client.safeReleaseRenderer(renderer)
+            }
+        }
+
+        Box(modifier: context.modifier.fillMaxWidth()) {
+            androidx.compose.ui.viewinterop.AndroidView(
+                factory: { ctx in
+                    client.initializeSurfaceRenderer(renderer, mirror: false)
+                    renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                    renderer
+                },
+                modifier: Modifier.fillMaxWidth().aspectRatio(Float(16.0 / 9.0)),
+                update: { _ in }
+            )
+
+            // "Presenting" badge overlay
+            Box(
+                modifier: Modifier
+                    .align(androidx.compose.ui.Alignment.TopStart)
+                    .padding(8.dp)
+                    .background(
+                        color: androidx.compose.ui.graphics.Color(0xCC000000.toInt()),
+                        shape: RoundedCornerShape(6.dp)
+                    )
+                    .padding(horizontal: 8.dp, vertical: 4.dp)
+            ) {
+                androidx.compose.material3.Text(
+                    text: presenterName,
+                    color: androidx.compose.ui.graphics.Color.White,
+                    fontSize: 12.sp
+                )
+            }
+        }
+    }
+}
 
 // MARK: - Android Video Call Compose View (Parent)
 /// Parent compose that renders a collection of remote views.
@@ -131,15 +189,18 @@ public struct AndroidRemoteGridCompose: ContentComposer {
     
     private let client: AndroidRTCClient
     private let remoteCaptureViews: [AndroidSampleCaptureView]
+    private let cleanupOnDispose: Bool
     private let onDispose: () -> Void
     
     public init(
         client: AndroidRTCClient,
         remoteCaptureViews: [AndroidSampleCaptureView],
+        cleanupOnDispose: Bool = true,
         onDispose: @escaping () -> Void
     ) {
         self.client = client
         self.remoteCaptureViews = remoteCaptureViews
+        self.cleanupOnDispose = cleanupOnDispose
         self.onDispose = onDispose
     }
     
@@ -147,31 +208,79 @@ public struct AndroidRemoteGridCompose: ContentComposer {
     public func Compose(context: ComposeContext) {
         androidx.compose.runtime.DisposableEffect(remoteCaptureViews) {
             onDispose {
-                for view in remoteCaptureViews {
-                    client.removeRenderer(view.surfaceViewRenderer)
-                    client.safeReleaseRenderer(view.surfaceViewRenderer)
+                if cleanupOnDispose {
+                    for view in remoteCaptureViews {
+                        client.removeRenderer(view.surfaceViewRenderer)
+                        client.safeReleaseRenderer(view.surfaceViewRenderer)
+                    }
+                    onDispose()
                 }
-                onDispose()
             }
         }
         
         Box(
             modifier: context.modifier.fillMaxSize()
         ) {
-            // Remote grid (simple vertical stack placeholder)
+            let grid = conferenceGridDimensions(for: remoteCaptureViews.count)
+            let rows = chunked(remoteCaptureViews, size: grid.columns)
             Column(modifier: Modifier.fillMaxSize()) {
-                for view in remoteCaptureViews {
-                    androidx.compose.ui.viewinterop.AndroidView(
-                        factory: { ctx in
-                            client.initializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
-                            view.surfaceViewRenderer
-                        },
-                        modifier: Modifier.weight(Float(1.0)).fillMaxWidth(),
-                        update: { _ in }
-                    )
+                for row in rows {
+                    Row(modifier: Modifier.weight(Float(1.0)).fillMaxWidth()) {
+                        for view in row {
+                            androidx.compose.ui.viewinterop.AndroidView(
+                                factory: { _ in
+                                    client.initializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
+                                    view.surfaceViewRenderer
+                                },
+                                modifier: Modifier.weight(Float(1.0)).fillMaxHeight(),
+                                update: { _ in }
+                            )
+                        }
+                        let missingColumns = max(0, grid.columns - row.count)
+                        if missingColumns > 0 {
+                            for _ in 0..<missingColumns {
+                                Spacer(modifier: Modifier.weight(Float(1.0)).fillMaxHeight())
+                            }
+                        }
+                    }
+                }
+                let missingRows = max(0, grid.rows - rows.count)
+                if missingRows > 0 {
+                    for _ in 0..<missingRows {
+                        Spacer(modifier: Modifier.weight(Float(1.0)).fillMaxWidth())
+                    }
                 }
             }
         }
+    }
+
+    private func conferenceGridDimensions(for itemCount: Int) -> (columns: Int, rows: Int) {
+        switch itemCount {
+        case 0:
+            return (1, 1)
+        case 1...2:
+            return (2, 1)
+        case 3...4:
+            return (2, 2)
+        case 5...6:
+            return (3, 2)
+        case 7...9:
+            return (3, 3)
+        default:
+            return (4, 3)
+        }
+    }
+
+    private func chunked<T>(_ source: [T], size: Int) -> [[T]] {
+        guard size > 0 else { return [source] }
+        var result: [[T]] = []
+        var index = 0
+        while index < source.count {
+            let end = min(index + size, source.count)
+            result.append(Array(source[index..<end]))
+            index = end
+        }
+        return result
     }
 }
 #endif
@@ -182,6 +291,8 @@ fileprivate final class AndroidVideoCallCoordinator: VideoCallDelegate {
     private var errorMessage: Binding<String>
     private var endedCall: Binding<Bool>
     private var callState: Binding<CallStateMachine.State>
+    var isScreenSharing: Binding<Bool>?
+    var hasActiveRemoteScreenShare: Binding<Bool>?
 
     init(
         errorMessage: Binding<String>,
@@ -214,6 +325,14 @@ fileprivate final class AndroidVideoCallCoordinator: VideoCallDelegate {
     public func endedCall(_ didEnd: Bool) async {
         endedCall.wrappedValue = didEnd
     }
+
+    public func screenShareDidChange(isSharing: Bool) async {
+        isScreenSharing?.wrappedValue = isSharing
+    }
+
+    public func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async {
+        hasActiveRemoteScreenShare?.wrappedValue = isSharing
+    }
 }
 
 @MainActor
@@ -221,9 +340,13 @@ fileprivate final class AndroidVideoCallResources {
     let controller: AndroidVideoCallController
     let localCaptureView: AndroidPreviewCaptureView
     let remoteCaptureViews: [AndroidSampleCaptureView]
+    /// Lazily created view for rendering a remote screen share.
+    lazy var screenCaptureView: AndroidSampleCaptureView = AndroidCaptureViewFactory.createSampleCaptureView(client: _client)
     var coordinator: AndroidVideoCallCoordinator?
+    private let _client: AndroidRTCClient
 
     init(session: RTCSession, remoteCount: Int) {
+        self._client = session.rtcClient
         self.controller = AndroidVideoCallController(session: session)
         self.localCaptureView = AndroidCaptureViewFactory.createPreviewCaptureView(client: session.rtcClient)
 
@@ -293,14 +416,16 @@ public struct AndroidLocalVideoView: View {
 /// SwiftUI wrapper for remote video rendering.
 public struct AndroidRemoteVideoView: View {
     private let client: AndroidRTCClient
-    
-    public init(client: AndroidRTCClient) {
+    private let captureView: AndroidSampleCaptureView
+
+    public init(client: AndroidRTCClient, captureView: AndroidSampleCaptureView) {
         self.client = client
+        self.captureView = captureView
     }
     
     public var body: some View {
         ComposeView {
-            AndroidRemoteVideoCompose(client: client)
+            AndroidRemoteVideoCompose(client: client, captureView: captureView)
         }
     }
 }
@@ -309,15 +434,18 @@ public struct AndroidRemoteVideoView: View {
 public struct AndroidRemoteGrid: View {
     private let client: AndroidRTCClient
     private let remoteCaptureViews: [AndroidSampleCaptureView]
+    private let cleanupOnDispose: Bool
     private let onDispose: () -> Void
     
     public init(
         client: AndroidRTCClient,
         remoteCaptureViews: [AndroidSampleCaptureView],
+        cleanupOnDispose: Bool = true,
         onDispose: @escaping () -> Void
     ) {
         self.client = client
         self.remoteCaptureViews = remoteCaptureViews
+        self.cleanupOnDispose = cleanupOnDispose
         self.onDispose = onDispose
     }
     
@@ -326,7 +454,35 @@ public struct AndroidRemoteGrid: View {
             AndroidRemoteGridCompose(
                 client: client,
                 remoteCaptureViews: remoteCaptureViews,
+                cleanupOnDispose: cleanupOnDispose,
                 onDispose: onDispose
+            )
+        }
+    }
+}
+
+/// SwiftUI wrapper that renders a remote screen share tile.
+public struct AndroidScreenShareView: View {
+    private let client: AndroidRTCClient
+    private let captureView: AndroidSampleCaptureView
+    private let presenterName: String
+
+    public init(
+        client: AndroidRTCClient,
+        captureView: AndroidSampleCaptureView,
+        presenterName: String = "Presenting"
+    ) {
+        self.client = client
+        self.captureView = captureView
+        self.presenterName = presenterName
+    }
+
+    public var body: some View {
+        ComposeView {
+            AndroidScreenShareCompose(
+                client: client,
+                captureView: captureView,
+                presenterName: presenterName
             )
         }
     }
@@ -341,6 +497,7 @@ public struct AndroidVideoCallView: View {
     private let remoteCount: Int
     private let session: RTCSession
     @State var resourceKey: String
+    @State var currentRemotePage: Int = 0
     @State var localViewSize: CGSize = .zero
     @Binding var delegate: CallActionDelegate?
     @Binding var errorMessage: String
@@ -348,6 +505,8 @@ public struct AndroidVideoCallView: View {
     @Binding var width: CGFloat
     @Binding var height: CGFloat
     @Binding var callState: CallStateMachine.State
+    @Binding var isScreenSharing: Bool
+    @Binding var hasActiveRemoteScreenShare: Bool
     
     public init(
         session: RTCSession,
@@ -357,7 +516,9 @@ public struct AndroidVideoCallView: View {
         endedCall: Binding<Bool>,
         width: Binding<CGFloat>,
         height: Binding<CGFloat>,
-        callState: Binding<CallStateMachine.State>
+        callState: Binding<CallStateMachine.State>,
+        isScreenSharing: Binding<Bool> = .constant(false),
+        hasActiveRemoteScreenShare: Binding<Bool> = .constant(false)
     ) {
         self.session = session
         self.remoteCount = remoteCount
@@ -367,6 +528,8 @@ public struct AndroidVideoCallView: View {
         self._width = width
         self._height = height
         self._callState = callState
+        self._isScreenSharing = isScreenSharing
+        self._hasActiveRemoteScreenShare = hasActiveRemoteScreenShare
         self._resourceKey = State(initialValue: UUID().uuidString)
     }
     
@@ -376,18 +539,60 @@ public struct AndroidVideoCallView: View {
             session: session,
             remoteCount: remoteCount
         )
+        let remotePages = paginateRemotes(resources.remoteCaptureViews, pageSize: 12)
 
         ZStack {
             GeometryReader { geo in
-                AndroidRemoteGrid(
-                    client: session.rtcClient,
-                    remoteCaptureViews: resources.remoteCaptureViews,
-                    onDispose: {
-                        Task { @MainActor in
-                            await resources.controller.stop()
+                VStack(spacing: 0) {
+                    if hasActiveRemoteScreenShare {
+                        AndroidScreenShareView(
+                            client: session.rtcClient,
+                            captureView: resources.screenCaptureView
+                        )
+                        .frame(maxWidth: .infinity)
+                        .frame(height: geo.size.height * 0.55)
+                        .onAppear {
+                            Task { @MainActor in
+                                await resources.controller.setScreenView(resources.screenCaptureView)
+                            }
                         }
                     }
-                )
+
+                    if remotePages.count > 1 {
+                        TabView(selection: $currentRemotePage) {
+                            ForEach(Array(remotePages.enumerated()), id: \.offset) { idx, remotes in
+                                AndroidRemoteGrid(
+                                    client: session.rtcClient,
+                                    remoteCaptureViews: remotes,
+                                    cleanupOnDispose: false,
+                                    onDispose: {}
+                                )
+                                .tag(idx)
+                            }
+                        }
+                        .tabViewStyle(.page(indexDisplayMode: .always))
+                        .overlay(alignment: .top) {
+                            Text("Page \(currentRemotePage + 1)/\(remotePages.count)")
+                                .font(.footnote)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(Color.black.opacity(0.55))
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
+                                .padding(.top, 12)
+                        }
+                    } else {
+                        AndroidRemoteGrid(
+                            client: session.rtcClient,
+                            remoteCaptureViews: resources.remoteCaptureViews,
+                            onDispose: {
+                                Task { @MainActor in
+                                    await resources.controller.stop()
+                                }
+                            }
+                        )
+                    }
+                }
                 
                 AndroidLocalVideoView(
                     client: session.rtcClient,
@@ -412,6 +617,13 @@ public struct AndroidVideoCallView: View {
             }
         }
         .ignoresSafeArea()
+        .onChange(of: remotePages.count) { _, newCount in
+            guard newCount > 0 else {
+                currentRemotePage = 0
+                return
+            }
+            currentRemotePage = min(currentRemotePage, newCount - 1)
+        }
         .onAppear {
             Task { @MainActor in
                 await configureController(resources: resources)
@@ -433,12 +645,16 @@ public struct AndroidVideoCallView: View {
                 endedCall: $endedCall,
                 callState: $callState
             )
+            coordinator.isScreenSharing = $isScreenSharing
+            coordinator.hasActiveRemoteScreenShare = $hasActiveRemoteScreenShare
         } else {
             let coordinator = AndroidVideoCallCoordinator(
                 errorMessage: $errorMessage,
                 endedCall: $endedCall,
                 callState: $callState
             )
+            coordinator.isScreenSharing = $isScreenSharing
+            coordinator.hasActiveRemoteScreenShare = $hasActiveRemoteScreenShare
             resources.coordinator = coordinator
             await resources.controller.setVideoCallDelegate(coordinator)
         }
@@ -483,6 +699,19 @@ public struct AndroidVideoCallView: View {
     
     private func getAspectRatio(width: CGFloat, height: CGFloat) -> CGFloat {
         return max(width, height) / min(width, height)
+    }
+
+    private func paginateRemotes(_ source: [AndroidSampleCaptureView], pageSize: Int) -> [[AndroidSampleCaptureView]] {
+        guard pageSize > 0 else { return [source] }
+        guard !source.isEmpty else { return [[]] }
+        var pages: [[AndroidSampleCaptureView]] = []
+        var index = 0
+        while index < source.count {
+            let end = min(index + pageSize, source.count)
+            pages.append(Array(source[index..<end]))
+            index = end
+        }
+        return pages
     }
     
 }

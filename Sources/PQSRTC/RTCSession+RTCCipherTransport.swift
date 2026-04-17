@@ -23,13 +23,60 @@ import DoubleRatchetKit
 
 extension RTCSession {
     
+    /// Resolves which participant owns inbound media for frame-key provisioning.
+    ///
+    /// In 1:1 SFU rooms, `resolveProperRecipient(call:)` can rewrite `call.sender` to the local
+    /// participant on the answering side. If we then use `call.sender.secretName` as the remote
+    /// track owner, we provision the receive key under the local participant id and the actual
+    /// remote media stays undecryptable on subsequent calls.
+    private func remoteTrackOwnerParticipantId(
+        connection: RTCConnection,
+        call: Call
+    ) -> String? {
+        let isSfuRoom =
+            groupCall(forSfuIdentity: connection.id) != nil ||
+            groupCall(forSfuIdentity: call.sharedCommunicationId) != nil
+        guard isSfuRoom else { return nil }
+
+        let localSessionParticipantId = sessionParticipant?.secretName
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let senderId = call.sender.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let recipientIds = call.recipients
+            .map(\.secretName)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if call.recipients.count <= 1 {
+            let remoteParticipantId = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let localParticipantId = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let roomNorm = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+            let remoteNorm = remoteParticipantId.normalizedConnectionId
+            let isRoomRoutedRemoteId = !roomNorm.isEmpty && remoteNorm.caseInsensitiveCompare(roomNorm) == .orderedSame
+
+            // Group / conference SFU PCs use the **room id** as `recipient` (see `beginGroupCallMediaAfterSfuRegistrationIfNeeded`).
+            // That string is signaling routing, not the owner of inbound RTP `msid`/stream labels — using it here
+            // provisions frame keys under `conf-…` while FrameCryptors resolve `nudge`/`echo`/UUID stream ids → missingKey / no video.
+            if !remoteParticipantId.isEmpty,
+               remoteParticipantId != localParticipantId,
+               !isRoomRoutedRemoteId {
+                return remoteParticipantId
+            }
+
+            if !localSessionParticipantId.isEmpty, senderId == localSessionParticipantId {
+                return recipientIds.first
+            }
+        }
+
+        return senderId.isEmpty ? recipientIds.first : senderId
+    }
+    
     public func createCryptoPeerConnection(with call: Call) async throws {
         logger.log(level: .info, message: "Starting CreateCryptoPeerConnection")
         var call = call
         call.sharedCommunicationId = call.sharedCommunicationId.normalizedConnectionId
         
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).
-        activeConnectionId = call.sharedCommunicationId
+        activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
         
         // Ensure RTC state streams are created so the UI can observe call state for 1-to-1 calls
         guard let recipient = call.recipients.first else {
@@ -131,13 +178,26 @@ extension RTCSession {
         } else {
             resolvedCall = try resolveProperRecipient(call: call)
         }
-        let recipient = call.sender
+        // 1:1 fix: use normalized remote recipient after call-shape resolution.
+        // For multi-recipient/group payloads, preserve previous behavior to avoid
+        // changing established routing semantics.
+        let recipient: Call.Participant
+        if resolvedCall.recipients.count <= 1 {
+            guard let resolvedRecipient = resolvedCall.recipients.first else {
+                throw RTCErrors.invalidConfiguration("Received ciphertext without a resolved recipient in call")
+            }
+            recipient = resolvedRecipient
+        } else {
+            recipient = call.sender
+        }
         
-        // Treat `sharedCommunicationId` as a UUID; SFU room IDs use "#uuid" channel format.
-        let rawId = resolvedCall.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let uuidString = rawId.hasPrefix("#") ? String(rawId.dropFirst()) : rawId
+        // Treat `sharedCommunicationId` as a UUID; accepted wrappers:
+        // `#uuid`, `conf-uuid`, and `#conf-uuid`.
+        let uuidString = resolvedCall.sharedCommunicationId
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .normalizedUUIDConnectionId
         guard let callId = UUID(uuidString: uuidString) else {
-            throw RTCErrors.invalidConfiguration("Call has an invalid UUID as sharedCommunicationId")
+            throw RTCErrors.invalidConfiguration("Call has an invalid UUID as sharedCommunicationId (expected UUID/#UUID/conf-UUID/#conf-UUID)")
         }
         pendingAnswerCallId = callId
         if callAnswerStatesById[callId] == nil {
@@ -151,13 +211,19 @@ extension RTCSession {
         
         logger.log(level: .info, message: "We are going to offer? \(shouldOffer ? "YES" : "NO")")
         if shouldOffer {
-            switch await connectionManager.findConnection(with: resolvedCall.sharedCommunicationId)?.cipherNegotiationState {
+            let connId = resolvedCall.sharedCommunicationId
+            guard !offerInFlightConnectionIds.contains(connId) else {
+                logger.log(
+                    level: .warning,
+                    message: "Offer already in flight for \(connId); skipping duplicate to avoid m-line mismatch"
+                )
+                return resolvedCall
+            }
+            offerInFlightConnectionIds.insert(connId)
+            defer { offerInFlightConnectionIds.remove(connId) }
+            switch await connectionManager.findConnection(with: connId)?.cipherNegotiationState {
             case .complete:
                 var resolvedCall = try await createOffer(call: resolvedCall)
-                
-                //                guard let remoteProps = resolvedCall.signalingIdentityProps else {
-                //                    throw RTCErrors.invalidConfiguration("Remote Props are missing")
-                //                }
                 
                 let keyBundle = try await pcKeyManager.fetchCallKeyBundle()
                 guard let localProps = await keyBundle.sessionIdentity.props(symmetricKey: keyBundle.symmetricKey) else {
@@ -196,7 +262,9 @@ extension RTCSession {
 #if canImport(WebRTC)
     enum TrackKind: Sendable {
         case videoSender(RTCRtpSender), videoReceiver(RTCRtpReceiver), audioSender(RTCRtpSender), audioReceiver(RTCRtpReceiver)
+        case screenSender(RTCRtpSender), screenReceiver(RTCRtpReceiver)
     }
+
 #endif
     
     //MARK: Key Derivation & Cleanup
@@ -312,7 +380,6 @@ extension RTCSession {
                 return
             }
             
-            // Set delegate before enabling
             videoFrameCryptor.delegate = frameCryptorDelegate
             videoFrameCryptor.enabled = true
             connection.videoSenderCryptor = videoFrameCryptor
@@ -374,6 +441,39 @@ extension RTCSession {
             if let participantIdOverride {
                 connection.audioReceiverCryptorsByParticipantId[participantIdOverride] = audioCryptor
             }
+        case .screenSender(let sender):
+            let screenCryptor = RTCFrameCryptor(
+                factory: Self.factory,
+                rtpSender: sender,
+                participantId: connection.localParticipantId,
+                algorithm: .aesGcm,
+                keyProvider: keyProvider)
+
+            guard let screenCryptor else {
+                logger.log(level: .error, message: "Failed to create screen sender FrameCryptor")
+                return
+            }
+
+            screenCryptor.delegate = frameCryptorDelegate
+            screenCryptor.enabled = true
+            connection.screenSenderCryptor = screenCryptor
+        case .screenReceiver(let receiver):
+            let screenCryptor = RTCFrameCryptor(
+                factory: Self.factory,
+                rtpReceiver: receiver,
+                participantId: participantIdOverride ?? connection.remoteParticipantId,
+                algorithm: .aesGcm,
+                keyProvider: keyProvider)
+
+            guard let screenCryptor else {
+                logger.log(level: .error, message: "Failed to create screen receiver FrameCryptor")
+                return
+            }
+
+            screenCryptor.delegate = frameCryptorDelegate
+            screenCryptor.enabled = true
+            let screenReceiverKey = participantIdOverride ?? connection.remoteParticipantId
+            connection.screenReceiverCryptorsByParticipantId[screenReceiverKey] = screenCryptor
         }
         await connectionManager.updateConnection(id: connection.id, with: connection)
     }
@@ -739,22 +839,23 @@ extension RTCSession {
             // Store ciphertext in keyManager for this connection (for ratcheting purposes)
             await keyManager.storeCiphertext(connectionId: connection.id, ciphertext: ciphertext)
             
-            let remoteTrackOwner: String? = {
-                if groupCall(forSfuIdentity: connection.id) != nil { return call.sender.secretName }
-                if groupCall(forSfuIdentity: call.sharedCommunicationId) != nil { return call.sender.secretName }
-                return nil
-            }()
+            let remoteTrackOwner = remoteTrackOwnerParticipantId(connection: connection, call: call)
             
 #if canImport(WebRTC)
             let hasVideoReceiver = connection.peerConnection.receivers.contains { $0.track?.kind == kRTCMediaStreamTrackKindVideo }
             let hasAudioReceiver = connection.peerConnection.receivers.contains { $0.track?.kind == kRTCMediaStreamTrackKindAudio }
-            logger.log(level: .info, message: "\(hasVideoReceiver ? "Has video receiver" : "Missing video receiver") \(hasAudioReceiver ? "Has audio receiver" : "Has audio receiver")")
+            logger.log(level: .info, message: "\(hasVideoReceiver ? "Has video receiver" : "Missing video receiver") \(hasAudioReceiver ? "Has audio receiver" : "Missing audio receiver")")
             
             if hasVideoReceiver || hasAudioReceiver {
+                let norm = connection.id.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+                pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId.removeValue(forKey: norm)
                 logger.log(level: .info, message: "🚀 Receivers available, completing ciphertext handshake")
                 try await setReceivingMessageKey(connection: connection, ciphertext: ciphertext, remoteTrackOwnerParticipantId: remoteTrackOwner)
                 logger.log(level: .info, message: "👌 Handshake complete")
             } else {
+                let norm = connection.id.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+                pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId[norm] = PendingAppleDeferredReceiveFrameKeyContext(
+                    remoteTrackOwnerParticipantId: remoteTrackOwner)
                 logger.log(level: .info, message: "⏳ Receivers not yet available, will set up cryptor when receivers start")
             }
 #else
@@ -803,3 +904,47 @@ extension RTCSession {
         try await taskProcessor.feedTask(task: encryptableTask)
     }
 }
+
+#if canImport(WebRTC)
+extension RTCSession {
+    /// Completes receive-side frame key provisioning when ciphertext arrived before any RTP receiver (Apple).
+    func tryCompleteAppleDeferredReceivingMessageKey(connectionId: String) async {
+        guard enableEncryption else { return }
+        let norm = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !norm.isEmpty else { return }
+        guard pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId[norm] != nil else { return }
+        guard let connection = await connectionManager.findConnection(with: connectionId) else { return }
+        let hasVideoReceiver = connection.peerConnection.receivers.contains { $0.track?.kind == kRTCMediaStreamTrackKindVideo }
+        let hasAudioReceiver = connection.peerConnection.receivers.contains { $0.track?.kind == kRTCMediaStreamTrackKindAudio }
+        guard hasVideoReceiver || hasAudioReceiver else { return }
+        guard let ciphertext = await keyManager.fetchCiphertext(connectionId: connection.id), !ciphertext.isEmpty else { return }
+        guard let ctx = pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId[norm] else { return }
+        do {
+            try await setReceivingMessageKey(
+                connection: connection,
+                ciphertext: ciphertext,
+                remoteTrackOwnerParticipantId: ctx.remoteTrackOwnerParticipantId)
+            pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId.removeValue(forKey: norm)
+            logger.log(level: .info, message: "Completed deferred receiving message key after receivers appeared (connId=\(connection.id))")
+        } catch {
+            logger.log(level: .error, message: "Deferred setReceivingMessageKey failed (will retry on next receiver event): \(error)")
+        }
+    }
+
+    // MARK: - Test hooks (package-internal; used by `PQSRTCCompiledSwiftTests`)
+
+    internal func testing_seedPendingAppleDeferredReceiveFrameKeyForTests(
+        normalizedConnectionId: String,
+        remoteTrackOwnerParticipantId: String? = nil
+    ) {
+        let key = normalizedConnectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !key.isEmpty else { return }
+        pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId[key] = PendingAppleDeferredReceiveFrameKeyContext(
+            remoteTrackOwnerParticipantId: remoteTrackOwnerParticipantId)
+    }
+
+    internal func testing_pendingAppleDeferredReceiveFrameKeyEntryCount() -> Int {
+        pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId.count
+    }
+}
+#endif

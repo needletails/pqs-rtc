@@ -65,6 +65,12 @@ public actor CallStateMachine {
         }
     }
 
+    /// Dedicated stream for the app layer (database persistence, CallKit sync).
+    /// Kept separate from `currentCallStream` so `.first` / `.last` indexing
+    /// used by the SDK and VC consumers is unaffected.
+    public private(set) var appLayerStream: AsyncStream<State>?
+    private var appLayerContinuation: AsyncStream<State>.Continuation?
+
     /// The current call, if one is being handled.
     public private(set) var currentCall: Call?
     
@@ -91,6 +97,9 @@ public actor CallStateMachine {
         }
         streamContinuations.removeAll()
         currentCallStream.removeAll()
+        appLayerContinuation?.finish()
+        appLayerContinuation = nil
+        appLayerStream = nil
         self.logger.log(level: .debug, message: "Reclaimed memory in CallState")
     }
     
@@ -100,16 +109,13 @@ public actor CallStateMachine {
         }
         streamContinuations.removeAll()
         currentCallStream.removeAll()
+        appLayerContinuation?.finish()
+        appLayerContinuation = nil
+        appLayerStream = nil
         logger.log(level: .debug, message: "CallStateMachine cleanup completed")
     }
     
     func createStreams(with call: Call) async {
-        
-        if !currentCallStream.isEmpty {
-            return
-        }
-        
-        // Clean up existing streams first
         await cleanup()
         
         logger.log(level: .info, message: "Creating streams for call: \(call.sharedCommunicationId)")
@@ -129,6 +135,14 @@ public actor CallStateMachine {
                 }
             }
         ])
+        
+        appLayerStream = AsyncStream<State>(bufferingPolicy: .bufferingOldest(8)) { continuation in
+            self.appLayerContinuation = continuation
+            continuation.onTermination = { status in
+                logger.log(level: .debug, message: "App layer state stream terminated with status: \(status)")
+            }
+        }
+        
         await self.transition(to: .ready(call))
     }
     
@@ -357,6 +371,7 @@ public actor CallStateMachine {
         for continuation in streamContinuations {
             continuation.yield(nextState)
         }
+        appLayerContinuation?.yield(nextState)
         
         logger.log(level: .info, message: "State transition completed: \(previousState?.description ?? "nil") -> \(nextState)")
     }
