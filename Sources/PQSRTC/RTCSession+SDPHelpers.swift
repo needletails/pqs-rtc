@@ -103,13 +103,9 @@ extension RTCSession {
         for line in lines {
             var line = line
             
-            // Optional SFU interoperability hardening:
-            // Some SFU-side SDP validators/parsers are overly strict and reject valid SSRC attribute
-            // lines (e.g. `a=ssrc:<ssrc> cname:<cname>`). Those lines are not required for basic
-            // RTP interop (SSRCs are conveyed in RTP headers), but removing them can break
-            // sender/track association in some 1:1 stacks. Therefore:
-            // - For 1:1 P2P calls: keep `a=ssrc:` lines.
-            // - For SFU/group calls (when requested): drop `a=ssrc:` lines but keep `a=ssrc-group:`.
+            // Legacy escape hatch only. SFU renegotiation offers must keep SSRC attributes:
+            // stripping `a=ssrc:` while leaving `a=ssrc-group:FID` creates remote tracks
+            // with no inbound RTP stats on Apple WebRTC.
             if stripSsrcLines {
                 let lower = line.lowercased()
                 if lower.hasPrefix("a=ssrc:") {
@@ -117,12 +113,15 @@ extension RTCSession {
                 }
             }
 
-            // H264 profile-level-id guidance:
-            // - 42e034 => Constrained Baseline, level 5.2 (very high)
-            // - 42e01f => Constrained Baseline, level 3.1 (too low for 1080p; can force severe downscale or stall some pipelines)
+            // H264 profile-level-id guidance (historical 1:1 SFU remote-video outage):
+            // - 42e034 => Constrained Baseline, level 5.2 (very high; some peers/SFU hops reject or behave poorly)
+            // - 42e01f => Constrained Baseline, level 3.1 (too low for 1080p; can force severe downscale or sender stalls)
             //
-            // We cap at level 4.0 which supports 1080p @ ~30fps while avoiding the very-high 5.x levels.
-            // This has proven more stable than forcing 3.1 when the capture source is 1080x1920.
+            // Production symptom: calls reached ICE connected with tracks attached, but remote video could
+            // freeze/black-screen because the sender pipeline stalled under aggressive profile rewriting.
+            //
+            // Fix: cap to level 4.0 (42e028), which is stable for 1080p-ish capture while avoiding both
+            // overly-high 5.x offers and overly-low 3.1 fallback.
             if line.contains("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034") {
                 line = line.replacingOccurrences(
                     of: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034",
@@ -273,6 +272,7 @@ extension RTCSession {
             let description = try await connection.peerConnection.offer(for: constraints)
             
             self.logger.log(level: .info, message: "Apple Platform Offer SDP:\n\(description.sdp)")
+            self.logger.log(level: .info, message: "Apple Platform Offer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
             
             guard validateSDP(description.sdp) else {
                 throw SDPHandlerError.invalidSDPFormat("Generated SDP failed validation")
@@ -309,6 +309,7 @@ extension RTCSession {
             let description = try await connection.peerConnection.answer(for: constraints)
             
             self.logger.log(level: .info, message: "Apple Platform Answer SDP:\n\(description.sdp)")
+            self.logger.log(level: .info, message: "Apple Platform Answer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
             
             guard validateSDP(description.sdp) else {
                 throw SDPHandlerError.invalidSDPFormat("Generated SDP failed validation")
@@ -335,8 +336,11 @@ extension RTCSession {
             }
             
             self.logger.log(level: .info, message: "Setting remote SDP for connection: \(connection.id)")
+            self.logger.log(level: .info, message: "Remote SDP summary before set connection=\(connection.id): \(RTCSdpDiagnostics.summary(sdp.sdp))")
             try await connection.peerConnection.setRemoteDescription(sdp)
             self.logger.log(level: .info, message: "Successfully set remote SDP\n \(sdp.sdp)")
+            self.logger.log(level: .info, message: "Remote SDP summary after set connection=\(connection.id): \(RTCSdpDiagnostics.summary(sdp.sdp))")
+            self.logger.log(level: .info, message: "PeerConnection media graph after setRemoteSDP connection=\(connection.id): \(RTCPeerConnectionMediaDiagnostics.summary(connection.peerConnection))")
             
         } catch let error as SDPHandlerError {
             self.logger.log(level: .error, message: "Failed to set remote SDP: \(error.localizedDescription)")
@@ -369,6 +373,7 @@ extension RTCSession {
             // SKIP INSERT: android.util.Log.d("AndroidRTCClient", "Android Offer SDP:\n" + description.sdp)
             
             self.logger.log(level: .info, message: "Android Offer SDP:\n\(description.sdp)")
+            self.logger.log(level: .info, message: "Android Offer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
             
             guard validateSDP(description.sdp) else {
                 throw SDPHandlerError.invalidSDPFormat("Generated SDP failed validation")
@@ -399,6 +404,7 @@ extension RTCSession {
             let description = try await client.createAnswer(constraints: constraints)
             
             self.logger.log(level: .info, message: "Android Answer SDP:\n\(description.sdp)")
+            self.logger.log(level: .info, message: "Android Answer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
             
             guard validateSDP(description.sdp) else {
                 throw SDPHandlerError.invalidSDPFormat("Generated SDP failed validation")
@@ -426,8 +432,10 @@ extension RTCSession {
             }
             
             self.logger.log(level: .info, message: "Setting remote SDP for connection: \(connection.id)")
+            self.logger.log(level: .info, message: "Remote SDP summary before set connection=\(connection.id): \(RTCSdpDiagnostics.summary(sdp.sdp))")
             try await client.setRemoteDescription(sdp)
             self.logger.log(level: .info, message: "Successfully set remote SDP\n \(sdp.sdp)")
+            self.logger.log(level: .info, message: "Remote SDP summary after set connection=\(connection.id): \(RTCSdpDiagnostics.summary(sdp.sdp))")
             
         } catch let error as SDPHandlerError {
             self.logger.log(level: .error, message: "Failed to set remote SDP: \(error.localizedDescription)")

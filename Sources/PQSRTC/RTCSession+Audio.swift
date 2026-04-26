@@ -19,6 +19,9 @@
 import WebRTC
 #endif
 import Foundation
+#if os(iOS)
+import AVFoundation
+#endif
 import NeedleTailLogger
 
 /// Errors that can occur during audio operations
@@ -123,6 +126,14 @@ extension RTCSession {
 #endif
     
 #if os(iOS)
+    /// When manual WebRTC audio is already active (CallKit, or ``prepareNonCallKitGroupCallAudio``),
+    /// ``createPeerConnection`` must not run ``configureAudioSession`` again: that path reapplies
+    /// `setCategory` / `setMode` without the idempotency in ``setAudioMode`` and can trigger
+    /// `AURemoteIO` / `ATAudioSessionPropertyManager` -50 while the session is up.
+    nonisolated var shouldSkipPrePeerConnectionConfigureAudioSession: Bool {
+        isAudioActivated && audioSession.useManualAudio
+    }
+
     /// Configures the audio session with proper error handling
     /// - Throws: AudioError if configuration fails
     nonisolated public func configureAudioSession() throws {
@@ -160,6 +171,10 @@ extension RTCSession {
     /// Sets external audio session with proper error handling
     /// - Throws: AudioError if configuration fails
     nonisolated public func setExternalAudioSession() throws {
+        if audioSession.useManualAudio {
+            logger.log(level: .debug, message: "External audio session already configured; skipping")
+            return
+        }
         audioSession.lockForConfiguration()
         defer {
             audioSession.unlockForConfiguration()
@@ -191,26 +206,46 @@ extension RTCSession {
             
             // Track if session was active before changes
             let wasActive = audioSession.isActive
-            
-            // Set the correct category with the desired mode directly
-            // This can be done while the session is active if we have the lock
-            if mode == .videoChat || mode == .voiceChat {
-                try audioSession.setCategory(.playAndRecord, mode: mode)
-            } else {
-                try audioSession.setCategory(.playback, mode: mode)
+
+            // Determine desired category for the requested mode.
+            let desiredCategory: AVAudioSession.Category =
+                (mode == .videoChat || mode == .voiceChat) ? .playAndRecord : .playback
+
+            // IMPORTANT (audio engine stability):
+            // Re-applying `setCategory` / `setMode` / `overrideOutputAudioPort` while
+            // `AVAudioSession` is active can interrupt WebRTC's `AURemoteIO` audio unit
+            // mid-start, surfacing as:
+            //   `ATAudioSessionPropertyManager.mm: FAILED to set property … -50`
+            //   `AURemoteIO StartIO failed (2003329396 = 'what' = kAudioUnitErr_CannotDoInCurrentContext)`
+            // The IOThread then exits and outbound/inbound audio packets stay at zero
+            // even though video continues to flow. To avoid this, only mutate the
+            // session when the requested values differ from the current ones.
+            let categoryNeedsUpdate = audioSession.category != desiredCategory.rawValue
+            let modeNeedsUpdate = audioSession.mode != mode.rawValue
+            if categoryNeedsUpdate || modeNeedsUpdate {
+                try audioSession.setCategory(desiredCategory, mode: mode)
             }
 
             // Log current state
             logger.log(level: .info, message: "Current audio session category: \(audioSession.category)")
             logger.log(level: .info, message: "Current audio session mode: \(audioSession.mode)")
 
-            // Set output port based on mode
+            // Output port: only override when the route doesn't already match the
+            // desired override. Calling `overrideOutputAudioPort` while the audio
+            // unit is starting is the most common trigger for the `'what'` error
+            // above, so it must remain idempotent.
+            let currentOutputs = audioSession.currentRoute.outputs.map(\.portType)
+            let isCurrentlyOnSpeaker = currentOutputs.contains(.builtInSpeaker)
             if mode == .videoChat {
-                try audioSession.overrideOutputAudioPort(.speaker)
+                if !isCurrentlyOnSpeaker {
+                    try audioSession.overrideOutputAudioPort(.speaker)
+                }
             } else {
-                try audioSession.overrideOutputAudioPort(.none)
+                if isCurrentlyOnSpeaker {
+                    try audioSession.overrideOutputAudioPort(.none)
+                }
             }
-            
+
             // Only activate if it wasn't already active
             // If it was active, it remains active and our changes are applied
             if !wasActive {
@@ -276,6 +311,19 @@ extension RTCSession {
         audioSession.isAudioEnabled = false
         
         logger.log(level: .info, message: "Successfully deactivated audio session")
+    }
+
+    /// SFU group calls do not use CallKit. Binds WebRTC to the shared `AVAudioSession` before the
+    /// first group `PeerConnection`, using the same ordering as 1:1 CallKit
+    /// (`setExternalAudioSession` → `setAudioMode` → `activateAudioSession`) on the main actor.
+    @MainActor
+    func prepareNonCallKitGroupCallAudio(supportsVideo: Bool) throws {
+        let mode: AVAudioSession.Mode = supportsVideo ? .videoChat : .voiceChat
+        try setExternalAudioSession()
+        try setAudioMode(mode: mode)
+        if !isAudioActivated {
+            try activateAudioSession(session: AVAudioSession.sharedInstance())
+        }
     }
 #endif
     

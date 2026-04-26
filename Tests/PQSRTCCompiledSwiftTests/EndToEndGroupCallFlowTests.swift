@@ -250,6 +250,109 @@ struct EndToEndGroupCallFlowTests {
 
         await session.shutdown(with: nil)
     }
+
+    @Test
+    func groupCallNegotiation_preservesCallIdentity_whenRoutingViaChannel() async throws {
+        let transport = Transport()
+        let session = await RTCSession(iceServers: ["stun:stun.l.google.com:19302"], username: "u", password: "p", delegate: transport)
+
+        let sharedCommunicationId = UUID().uuidString
+        let channelWireId = "#travel_\(UUID().uuidString.lowercased())"
+        let local = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: UUID().uuidString)
+        let bob = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "")
+        let carol = try Call.Participant(secretName: "carol", nickname: "Carol", deviceId: "")
+        let call = try Call(
+            sharedCommunicationId: sharedCommunicationId,
+            channelWireId: channelWireId,
+            sender: local,
+            recipients: [bob, carol],
+            supportsVideo: true
+        )
+
+        try await session.groupCallNegotiation(call: call, sfuRecipientId: channelWireId)
+
+        let negotiated = await waitUntil {
+            await transport.negotiated.isEmpty == false
+        }
+        #expect(negotiated, "Expected negotiateGroupIdentity to be called during channel-backed join")
+
+        let negotiatedEntry = await transport.negotiated.last
+        #expect(negotiatedEntry?.sfuRecipientId == channelWireId)
+        #expect(negotiatedEntry?.call.sharedCommunicationId == sharedCommunicationId)
+        #expect(negotiatedEntry?.call.channelWireId == channelWireId)
+        #expect(negotiatedEntry?.call.signalingIdentityProps != nil)
+
+        await session.shutdown(with: nil)
+    }
+
+    @Test
+    func channelBackedGroupCall_routesPacketsViaChannelWireId() async throws {
+        let transport = Transport()
+        let session = await RTCSession(iceServers: ["stun:stun.l.google.com:19302"], username: "u", password: "p", delegate: transport)
+
+        let sharedCommunicationId = UUID().uuidString
+        let channelWireId = "#travel_\(UUID().uuidString.lowercased())"
+        let local = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: UUID().uuidString)
+        let bob = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "bob-device")
+        let carol = try Call.Participant(secretName: "carol", nickname: "Carol", deviceId: "carol-device")
+        let call = try Call(
+            sharedCommunicationId: sharedCommunicationId,
+            channelWireId: channelWireId,
+            sender: local,
+            recipients: [bob, carol],
+            supportsVideo: false
+        )
+
+        try await session.groupCallNegotiation(call: call, sfuRecipientId: channelWireId)
+
+        let negotiated = await waitUntil {
+            await transport.negotiated.isEmpty == false
+        }
+        #expect(negotiated, "Expected negotiateGroupIdentity to be called during channel-backed join")
+
+        let sfuKeyStore = KeyManager()
+        let sfuLocalIdentity = try await sfuKeyStore.generateSenderIdentity(
+            connectionId: sharedCommunicationId,
+            secretName: "sfu-\(sharedCommunicationId)"
+        )
+        guard let sfuProps = await sfuLocalIdentity.sessionIdentity.props(symmetricKey: sfuLocalIdentity.symmetricKey) else {
+            Issue.record("Missing SFU identity props")
+            return
+        }
+
+        let sfuExecutor = RatchetExecutor(queue: DispatchQueue(label: "tests.sfu.channel-route"))
+        let sfuRatchet = DoubleRatchetStateManager<SHA256>(executor: sfuExecutor)
+
+        var registrationReply = await transport.negotiated.last!.call
+        registrationReply.signalingIdentityProps = sfuProps
+
+        try await session.createSFUIdentity(sfuRecipientId: channelWireId, call: registrationReply)
+        try await session.beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId: channelWireId)
+
+        let gotOffer = await waitUntil { await transport.sfuMessages.contains(where: { $0.packet.flag == .offer }) }
+        #expect(gotOffer, "Expected encrypted SFU offer packet to be sent")
+
+        let offerPacket = await transport.sfuMessages.last(where: { $0.packet.flag == .offer })!.packet
+        #expect(offerPacket.sfuIdentity == channelWireId)
+
+        try await sfuRatchet.recipientInitialization(
+            sessionIdentity: sfuLocalIdentity.sessionIdentity,
+            sessionSymmetricKey: sfuLocalIdentity.symmetricKey,
+            header: offerPacket.header,
+            localKeys: sfuLocalIdentity.localKeys
+        )
+
+        let decryptedOfferBytes = try await sfuRatchet.ratchetDecrypt(
+            offerPacket.ratchetMessage,
+            sessionId: sfuLocalIdentity.sessionIdentity.id
+        )
+        let decryptedOfferCall = try BinaryDecoder().decode(Call.self, from: decryptedOfferBytes)
+        #expect(decryptedOfferCall.sharedCommunicationId == sharedCommunicationId)
+        #expect(decryptedOfferCall.channelWireId == channelWireId)
+
+        await session.shutdown(with: nil)
+        try? await sfuRatchet.shutdown()
+    }
 }
 
 

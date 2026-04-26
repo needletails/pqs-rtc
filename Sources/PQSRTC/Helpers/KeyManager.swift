@@ -16,6 +16,7 @@
 //
 
 import Foundation
+import Crypto
 import DoubleRatchetKit
 import NeedleTailLogger
 
@@ -40,8 +41,9 @@ public actor KeyManager: SessionIdentityDelegate {
     private let logger: NeedleTailLogger
     
     private let crypto = NeedleTailCrypto()
-
+let id = UUID()
     public init(logger: NeedleTailLogger = NeedleTailLogger("[CallKeyStore]")) {
+        print("INTIALIZED KEY MANAGER id \(id)")
         self.logger = logger
     }
     
@@ -50,13 +52,11 @@ public actor KeyManager: SessionIdentityDelegate {
     public func updateSessionIdentity(_ identity: DoubleRatchetKit.SessionIdentity) async throws {
         // Find the connection identity by searching through all connection identities
         // since they're keyed by connectionId, not session identity UUID
-//        var foundConnectionId: String?
         for (connectionId, var connIdentity) in connectionIdentities {
             if connIdentity.sessionIdentity.id == identity.id {
-//                foundConnectionId = connectionId
                 connIdentity.sessionIdentity = identity
                 connectionIdentities[connectionId] = connIdentity
-                logger.log(level: .debug, message: "Updated session identity: \(identity.id) for connectionId: \(connectionId)")
+                logger.log(level: .info, message: "Updated session identity: \(identity.id) for connectionId: \(connectionId)")
                 return
             }
         }
@@ -66,14 +66,14 @@ public actor KeyManager: SessionIdentityDelegate {
             var updated = connectionIdentity
             updated.sessionIdentity = identity
             connectionIdentities[identity.id.uuidString] = updated
-            logger.log(level: .debug, message: "Updated session identity: \(identity.id)")
+            logger.log(level: .info, message: "Updated session identity: \(identity.id)")
             return
         }
 
         // Ratchet can emit a late identity update after `removeConnectionIdentity` / `clearAll` during
         // hangup; persisting it would be meaningless, so treat as expected teardown noise (not an error).
         logger.log(
-            level: .debug,
+            level: .info,
             message: "Skipping session identity update (no cached connection): \(identity.id)"
         )
     }
@@ -102,16 +102,18 @@ public actor KeyManager: SessionIdentityDelegate {
     /// Removes a session identity.
     /// - Parameter id: The session identity ID
     public func removeSessionIdentity(_ id: UUID) {
-        connectionIdentities.removeValue(forKey: id.uuidString)
-        logger.log(level: .debug, message: "Removed session identity: \(id)")
+        connectionIdentities = connectionIdentities.filter { $0.value.sessionIdentity.id != id }
+        logger.log(level: .info, message: "Removed session identity: \(id)")
     }
     
     /// Removes a connection identity and any pending ciphertext for a given `connectionId`.
     /// - Parameter connectionId: The connection ID associated with the identity
     public func removeConnectionIdentity(connectionId: String) {
-        connectionIdentities.removeValue(forKey: connectionId)
-        pendingCiphertext.removeValue(forKey: connectionId)
-        logger.log(level: .debug, message: "Removed connection identity and pending ciphertext for connectionId: \(connectionId)")
+        for key in identityLookupKeys(for: connectionId) {
+            connectionIdentities.removeValue(forKey: key)
+            pendingCiphertext.removeValue(forKey: key)
+        }
+        logger.log(level: .info, message: "Removed connection identity and pending ciphertext for connectionId: \(connectionId)")
     }
     
     /// Removes all cached data.
@@ -150,26 +152,25 @@ public actor KeyManager: SessionIdentityDelegate {
     /// - Returns: The session identity if found, nil otherwise
     public func fetchConnectionIdentity(connection id: String) throws -> ConnectionSessionIdentity {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let connectionIdentity = connectionIdentities[trimmed] {
-            return connectionIdentity
+        for key in identityLookupKeys(for: trimmed) {
+            if let connectionIdentity = connectionIdentities[key] {
+                return connectionIdentity
+            }
         }
-        
-        // Accept IRC channel-style identifiers (e.g. "#<uuid>") by normalizing before lookup.
-        // This is important for "1:1 via SFU room" calls where signaling may carry `#uuid`
-        // but the identity store may be keyed by `uuid`.
-        let normalized: String = {
-            if trimmed.hasPrefix("#") { return String(trimmed.dropFirst()) }
-            return trimmed
-        }()
-        
-        if let connectionIdentity = connectionIdentities[normalized] {
-            return connectionIdentity
-        }
-        if let connectionIdentity = connectionIdentities["#\(normalized)"] {
-            return connectionIdentity
-        }
-        
+
         throw RTCErrors.invalidConfiguration("Missing connection identity for ID: \(trimmed)")
+    }
+
+    public func fetchConnectionIdentity(_ id: UUID) -> ConnectionSessionIdentity? {
+        connectionIdentities[id.uuidString] ?? connectionIdentities.first { $0.value.sessionIdentity.id == id }?.value
+    }
+
+    public func fetchConnectionIdentityByConnectionId(_ connectionId: String) -> ConnectionSessionIdentity? {
+        try? fetchConnectionIdentity(connection: connectionId)
+    }
+
+    public func fetchSessionIdentity(_ id: UUID) -> SessionIdentity? {
+        fetchConnectionIdentity(id)?.sessionIdentity
     }
     
     /// Stores ciphertext for a connection identity.
@@ -180,10 +181,13 @@ public actor KeyManager: SessionIdentityDelegate {
     ///   - connectionId: The connection ID
     ///   - ciphertext: The ciphertext to store
     public func storeCiphertext(connectionId: String, ciphertext: Data) {
-        if var identity = connectionIdentities[connectionId] {
+        if let identityKey = identityLookupKeys(for: connectionId).first(where: { connectionIdentities[$0] != nil }),
+           var identity = connectionIdentities[identityKey] {
             identity.ciphertext = ciphertext
-            connectionIdentities[connectionId] = identity
-            logger.log(level: .debug, message: "Stored ciphertext for connection: \(connectionId)")
+            for key in identityLookupKeys(for: connectionId) where connectionIdentities[key] != nil {
+                connectionIdentities[key] = identity
+            }
+            logger.log(level: .info, message: "Stored ciphertext for connection: \(connectionId)")
         } else {
             // Store temporarily until identity is created
             pendingCiphertext[connectionId] = ciphertext
@@ -196,11 +200,13 @@ public actor KeyManager: SessionIdentityDelegate {
     /// - Returns: The stored ciphertext, if any (checks both identity and pending storage)
     public func fetchCiphertext(connectionId: String) -> Data? {
         // First check if identity exists and has ciphertext
-        if let identity = connectionIdentities[connectionId], let ciphertext = identity.ciphertext {
-            return ciphertext
+        for key in identityLookupKeys(for: connectionId) {
+            if let identity = connectionIdentities[key], let ciphertext = identity.ciphertext {
+                return ciphertext
+            }
         }
         // Otherwise check pending storage
-        return pendingCiphertext[connectionId]
+        return identityLookupKeys(for: connectionId).compactMap { pendingCiphertext[$0] }.first
     }
     
     // MARK: - CallKeyBundleProvider
@@ -230,17 +236,13 @@ public actor KeyManager: SessionIdentityDelegate {
             oneTime: oneTimeKey,
             mlKEM: try MLKEMPrivateKey(id: kemId, kem.encode()))
         
-        // Create session identity.
-        //
-        // IMPORTANT: Group/SFU calls may use channel-style ids (`#<uuid>`) or
-        // conference ids (`conf-<uuid>`). Normalize those wrappers so both sides
-        // derive the same stable UUID session id for ratchet compatibility.
-        let normalizedConnectionId = connectionId
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .normalizedUUIDConnectionId
-        guard let sessionId = UUID(uuidString: normalizedConnectionId) else {
-            throw RTCErrors.invalidConfiguration("Invalid connectionId (expected UUID, #UUID, conf-UUID, or #conf-UUID): \(connectionId)")
+        // Create session identity. UUID room ids keep their exact UUID. Human-friendly room
+        // stems derive a stable UUID payload for ratchet compatibility.
+        let normalizedConnectionId = normalizedSessionConnectionId(connectionId)
+        guard !normalizedConnectionId.isEmpty else {
+            throw RTCErrors.invalidConfiguration("Invalid empty connectionId")
         }
+        let sessionId = normalizedConnectionId.stableUUIDConnectionId
         let sessionIdentity: SessionIdentity
         
             // Create a placeholder SessionIdentity (will be updated when recipient keys are received)
@@ -285,12 +287,11 @@ public actor KeyManager: SessionIdentityDelegate {
     ) async throws -> ConnectionSessionIdentity {
         
         // Match sender identity derivation for all supported wrappers.
-        let normalizedConnectionId = connectionId
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .normalizedUUIDConnectionId
-        guard let sessionId = UUID(uuidString: normalizedConnectionId) else {
-            throw RTCErrors.invalidConfiguration("Invalid connectionId (expected UUID, #UUID, conf-UUID, or #conf-UUID): \(connectionId)")
+        let normalizedConnectionId = normalizedSessionConnectionId(connectionId)
+        guard !normalizedConnectionId.isEmpty else {
+            throw RTCErrors.invalidConfiguration("Invalid empty connectionId")
         }
+        let sessionId = normalizedConnectionId.stableUUIDConnectionId
         var identity = ConnectionSessionIdentity(
             connectionId: connectionId,
             symmetricKey: dbsk,
@@ -300,14 +301,47 @@ public actor KeyManager: SessionIdentityDelegate {
                 symmetricKey: dbsk))
         
         // Check if there's pending ciphertext for this connection
-        if let pendingCipher = pendingCiphertext[connectionId] {
+        if let pendingKey = identityLookupKeys(for: connectionId).first(where: { pendingCiphertext[$0] != nil }),
+           let pendingCipher = pendingCiphertext[pendingKey] {
             identity.ciphertext = pendingCipher
-            pendingCiphertext.removeValue(forKey: connectionId)
+            pendingCiphertext.removeValue(forKey: pendingKey)
             logger.log(level: .info, message: "Attached pending ciphertext to newly created identity for connection: \(connectionId)")
         }
         
-        connectionIdentities[connectionId] = identity
+        for key in identityLookupKeys(for: connectionId) {
+            connectionIdentities[key] = identity
+        }
         logger.log(level: .info, message: "Created new recipient identity \(identity) on connection identity \(connectionId)")
         return identity
+    }
+
+    private func normalizedSessionConnectionId(_ id: String) -> String {
+        id.trimmingCharacters(in: .whitespacesAndNewlines).normalizedUUIDConnectionId.lowercased()
+    }
+
+    private func identityLookupKeys(for id: String) -> [String] {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let noChannelPrefix = trimmed.normalizedConnectionId
+        let normalized = normalizedSessionConnectionId(trimmed)
+        let sessionId = normalized.stableUUIDConnectionId
+
+        var keys: [String] = []
+        func append(_ key: String) {
+            guard !key.isEmpty, !keys.contains(key) else { return }
+            keys.append(key)
+        }
+
+        append(trimmed)
+        append(trimmed.lowercased())
+        append(noChannelPrefix)
+        append(noChannelPrefix.lowercased())
+        append("#\(noChannelPrefix)")
+        append("#\(noChannelPrefix.lowercased())")
+        append(normalized)
+        append("#\(normalized)")
+        append("conf-\(normalized)")
+        append("#conf-\(normalized)")
+        append(sessionId.uuidString)
+        return keys
     }
 }

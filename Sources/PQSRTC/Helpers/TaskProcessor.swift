@@ -17,6 +17,14 @@ struct Job: Sendable {
     let task: TaskType
 }
 
+/// Deduplicates inbound ``PacketFlag.handshakeComplete`` SFU packets that are re-delivered with
+/// the same ``RatchetMessage`` (e.g. SwiftSFU relay + client path). A second decrypt attempt
+/// fails after the ratchet has already advanced, surfacing as a core-crypto error.
+private struct ProcessedPostCipherHandshakeKey: Hashable, Sendable {
+    let connectionId: String
+    let ratchetMessage: RatchetMessage
+}
+
 actor TaskProcessor {
     
     let jobConsumer: NeedleTailAsyncConsumer<Job>
@@ -27,6 +35,9 @@ actor TaskProcessor {
     var sequenceId = 0
     var logger: NeedleTailLogger
     var isRunning = false
+    
+    /// Ratchet messages already successfully applied for `.handshakeComplete` (per connection).
+    private var processedPostCipherHandshakes: Set<ProcessedPostCipherHandshakeKey> = []
     
     private let executor: RatchetExecutor
     
@@ -80,6 +91,10 @@ actor TaskProcessor {
         }
         let removedCached = beforeCached - jobs.count
         let removedQueued = await jobConsumer.removeQueuedJobs(forConnectionId: normalized)
+
+        processedPostCipherHandshakes = Set(
+            processedPostCipherHandshakes.filter { $0.connectionId != normalized }
+        )
 
         if removedCached > 0 || removedQueued > 0 {
             logger.log(
@@ -302,9 +317,12 @@ actor TaskProcessor {
     
     private func handleWriteMessage(outboundTask: WriteTask) async throws {
         let connectionIdentity = try await keyManager.fetchCallKeyBundle()
+        let identityLookupId = outboundTask.call.resolvedChannelWireId == nil
+            ? outboundTask.roomId.normalizedConnectionId
+            : outboundTask.call.sharedCommunicationId.normalizedConnectionId
         
         // In PQSRTC, we fetch by normalized connectionId (UUID, no "#"); wire format uses "#" for IRC.
-        let connectionSessionIdentity = try await keyManager.fetchConnectionIdentity(connection: outboundTask.roomId.normalizedConnectionId)
+        let connectionSessionIdentity = try await keyManager.fetchConnectionIdentity(connection: identityLookupId)
         
         let identity = connectionSessionIdentity.sessionIdentity
         
@@ -342,11 +360,27 @@ actor TaskProcessor {
     private func handleStreamMessage(inboundTask: StreamTask) async throws {
         let packet = inboundTask.packet
         let roomId = packet.sfuIdentity
+        let identityLookupId = inboundTask.call.resolvedChannelWireId == nil
+            ? roomId.normalizedConnectionId
+            : inboundTask.call.sharedCommunicationId.normalizedConnectionId
+        
+        if packet.flag == .handshakeComplete {
+            let dedupKey = ProcessedPostCipherHandshakeKey(
+                connectionId: identityLookupId,
+                ratchetMessage: packet.ratchetMessage)
+            if processedPostCipherHandshakes.contains(dedupKey) {
+                logger.log(
+                    level: .debug,
+                    message: "Skipping duplicate post-cipher handshakeComplete (already applied). room=\(roomId)"
+                )
+                return
+            }
+        }
         
         logger.log(level: .info, message: "PQS RTC handling encrypted packet", metadata: ["roomId":"\(roomId)", "flag":"\(packet.flag)"])
 
         // Fetch by normalized ID (packet.sfuIdentity may have "#" from IRC).
-        let connectionSessionIdentity = try await keyManager.fetchConnectionIdentity(connection: roomId.normalizedConnectionId)
+        let connectionSessionIdentity = try await keyManager.fetchConnectionIdentity(connection: identityLookupId)
         let connectionIdentity = try await keyManager.fetchCallKeyBundle()
         
         try await ratchetManager.recipientInitialization(
@@ -364,6 +398,13 @@ actor TaskProcessor {
             plaintext: plaintext,
             packet: packet,
             call: inboundTask.call)
+        
+        if packet.flag == .handshakeComplete {
+            processedPostCipherHandshakes.insert(
+                ProcessedPostCipherHandshakeKey(
+                    connectionId: identityLookupId,
+                    ratchetMessage: packet.ratchetMessage))
+        }
     }
 }
 

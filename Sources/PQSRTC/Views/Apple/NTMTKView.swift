@@ -786,9 +786,7 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         guard let renderEncoder = cb.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
             metalDrawInFlight = false
             if shouldRenderOnMetal {
-                logMetalDiagnostic(
-                    "Metal present deferred: failed to create render encoder bounds=\(bounds.size) drawableSize=\(drawableSize)"
-                )
+                logMetalDiagnostic("Metal present deferred: failed to create render encoder bounds=\(bounds.size) drawableSize=\(drawableSize)")
                 scheduleMetalDrawableRetryIfNeeded()
             }
             return
@@ -850,10 +848,30 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
 #else
         scale = layer.contentsScale
 #endif
-        let pixelSize = CGSize(width: pointSize.width * scale, height: pointSize.height * scale)
-        
-        let width = max(1, Int(ceil(pixelSize.width)))
-        let height = max(1, Int(ceil(pixelSize.height)))
+        // `contentsScale` or transient layout can be non-finite; multiplying into pixel size then
+        // `Int(ceil(...))` traps with "Double value cannot be converted to Int … infinite or NaN".
+        if !scale.isFinite || scale <= 0 {
+            scale = 1
+        }
+        let pixelW = pointSize.width * scale
+        let pixelH = pointSize.height * scale
+        guard pixelW.isFinite, pixelH.isFinite, pixelW > 0, pixelH > 0 else {
+            logMetalDiagnostic(
+                "Drawable sizing: non-finite pixel size point=\(pointSize) scale=\(scale) pixel=(\(pixelW), \(pixelH))"
+            )
+            return nil
+        }
+        let ceiledW = ceil(pixelW)
+        let ceiledH = ceil(pixelH)
+        guard ceiledW.isFinite, ceiledH.isFinite else { return nil }
+        // Avoid `Int` overflow if dimensions are pathologically large.
+        let maxDrawable: CGFloat = 32768
+        let clampedW = min(ceiledW, maxDrawable)
+        let clampedH = min(ceiledH, maxDrawable)
+        guard clampedW <= Double(Int.max), clampedH <= Double(Int.max) else { return nil }
+
+        let width = max(1, Int(clampedW))
+        let height = max(1, Int(clampedH))
         return CGSize(width: CGFloat(width), height: CGFloat(height))
     }
 

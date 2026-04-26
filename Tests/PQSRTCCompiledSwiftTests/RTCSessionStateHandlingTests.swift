@@ -1,7 +1,12 @@
 import Foundation
 import Testing
+import NeedleTailLogger
 
 @testable import PQSRTC
+
+#if canImport(WebRTC) && !os(Android)
+import WebRTC
+#endif
 
 @Suite(.serialized)
 struct RTCSessionStateHandlingTests {
@@ -222,4 +227,71 @@ struct RTCSessionStateHandlingTests {
         #expect(dequeA == nil)
         #expect(dequeB == nil)
     }
+
+#if canImport(WebRTC) && !os(Android)
+    private enum PrePcStateStreamTestError: Error {
+        case peerConnectionCreationFailed
+    }
+
+    private func makePeerConnectionForStateOrderingTest() throws -> RTCPeerConnection {
+        let config = RTCConfiguration()
+        config.sdpSemantics = .unifiedPlan
+        let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+        guard let pc = RTCSession.factory.peerConnection(with: config, constraints: constraints, delegate: nil) else {
+            throw PrePcStateStreamTestError.peerConnectionCreationFailed
+        }
+        return pc
+    }
+
+    /// When a peer connection is registered before `createStateStream`, `setConnectingIfReady` must
+    /// not be lost (otherwise the UI can remain on `.ready` / "Ready" indefinitely).
+    @Test("createStateStream after existing connection advances to connecting from ready")
+    func createStateStreamWithPreexistingConnectionReachesConnecting() async throws {
+        let events = TestTransportEvents()
+        let session = await RTCSession(
+            iceServers: [],
+            username: "u",
+            password: "p",
+            delegate: events
+        )
+        defer { Task { await session.shutdown(with: nil) } }
+
+        let sharedId = "pre-pc-then-state"
+        let call = try makeCall(sharedId: sharedId)
+
+        let keyManager = KeyManager()
+        let localIdentity = try await keyManager.generateSenderIdentity(
+            connectionId: sharedId,
+            secretName: "sender"
+        )
+        let (notifStream, notifCont) = AsyncStream<PeerConnectionNotifications?>.makeStream()
+        _ = notifStream
+        let delegateWrapper = RTCPeerConnectionDelegateWrapper(
+            connectionId: sharedId,
+            logger: NeedleTailLogger("[test]"),
+            continuation: notifCont
+        )
+        let connection = RTCConnection(
+            id: sharedId,
+            peerConnection: try makePeerConnectionForStateOrderingTest(),
+            delegateWrapper: delegateWrapper,
+            sender: "sender",
+            recipient: "recipient",
+            localKeys: localIdentity.localKeys,
+            symmetricKey: localIdentity.symmetricKey,
+            sessionIdentity: localIdentity.sessionIdentity,
+            call: call
+        )
+        await session.connectionManager.addConnection(connection)
+
+        try await session.createStateStream(with: call)
+
+        let state = await session.callState.currentState
+        var isConnecting = false
+        if case .connecting = state {
+            isConnecting = true
+        }
+        #expect(isConnecting)
+    }
+#endif
 }

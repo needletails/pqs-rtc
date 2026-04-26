@@ -137,3 +137,16 @@ Next: <doc:Group-Calls>.
 1:1 calls are driven by SDP+ICE methods on ``RTCSession``.
 
 Next: <doc:One-to-One-Calls>.
+
+## Platform requirements and SFU essentials (NeedleTails)
+
+- **Platforms:** iOS 18+ / macOS 15+ (per `Package.swift`), Swift 6.x, WebRTC via the package’s host integration on Apple platforms.
+- **High-level flow:** Create ``RTCSession`` with your ICE list, frame-encryption mode, and ``RTCTransportEvents``; join 1:1 or group SFU as needed; route inbound SFU/IRC payloads into ``RTCSession/handleControlMessage(_:)`` (and 1:1 handlers) per your wire format.
+- **Audio (iOS):** the host binds WebRTC to the system session. PQSRTC exposes `setExternalAudioSession()`, `setAudioMode`, and `activateAudioSession` through your integration. For **inbound** server-SFU + **CallKit**, read <doc:HostAppCallKitAndSFU> before changing answer flow.
+- **Implementation map:** ``RTCSession+GroupCall`` (SFU registration and decrypted control packets), ``RTCSession+State`` (CallKit / `.connected` rules), and the internal `TaskProcessor` for ratchet-encrypted signaling.
+
+### SFU, CallKit, and remote video (next reads)
+
+- <doc:HostAppCallKitAndSFU> — **mandatory** iOS + server SFU ordering
+- <doc:SFUSignalingOverview> — control-plane flags and `handshakeComplete`
+- <doc:SfuRemoteVideoFrameE2EE> — if you use **per-participant** frame encryption on SFU, read before changing the `Call` graph or `RTCConnection` identity fields

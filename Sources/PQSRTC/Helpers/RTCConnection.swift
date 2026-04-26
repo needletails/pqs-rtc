@@ -114,6 +114,8 @@ import FoundationEssentials
     /// Local mic publish track (Apple). Stored so mute can target the same object WebRTC captures from when `RTCRtpSender.track` is nil or swapped during negotiation.
     public var localAudioTrack: WebRTC.RTCAudioTrack?
     public var remoteVideoTrack: WebRTC.RTCVideoTrack?
+    /// Extra sinks (e.g. PiP) attached via ``RTCSession/addAuxiliaryRemoteVideoRenderer``; kept on the connection so SFU renegotiation can move them to a replaced inbound track.
+    var auxiliaryRemoteVideoRenderers: [RTCVideoRenderWrapper] = []
     var dataChannels: [String: RTCDataChannel] = [:]
 
     /// Group-call support (SFU / conference): multiple remote participants can be received on a single PeerConnection.

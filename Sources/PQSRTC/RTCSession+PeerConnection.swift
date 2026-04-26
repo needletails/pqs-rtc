@@ -216,11 +216,17 @@ extension RTCSession {
 #endif
         
 #if os(iOS)
-        do {
-            try self.configureAudioSession()
-        } catch {
-            logger.log(level: .error, message: "Failed to configure audio session: \(error)")
-            throw RTCErrors.mediaError("Failed to configure audio session: \(error.localizedDescription)")
+        if self.shouldSkipPrePeerConnectionConfigureAudioSession {
+            logger.log(
+                level: .info,
+                message: "Skipping configureAudioSession before tracks (AVAudioSession already active with manual WebRTC audio)")
+        } else {
+            do {
+                try self.configureAudioSession()
+            } catch {
+                logger.log(level: .error, message: "Failed to configure audio session: \(error)")
+                throw RTCErrors.mediaError("Failed to configure audio session: \(error.localizedDescription)")
+            }
         }
 #endif
         
@@ -605,6 +611,15 @@ extension RTCSession {
         activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
         await callState.createStreams(with: call)
         handleStateStream()
+        // SFU group bootstrap often creates the `RTCPeerConnection` before the app calls
+        // `createStateStream`. In that case `createPeerConnection` already ran
+        // `setConnectingIfReady` while `CallStateMachine.currentState` was still `nil`, so
+        // the transition was skipped. Once we are `.ready`, retry if a connection exists.
+        if await hasConnection(id: call.sharedCommunicationId) {
+            await setConnectingIfReady(
+                call: call,
+                callDirection: inferredCallDirection(for: call))
+        }
     }
     
     /// Returns the dedicated app-layer state stream for database persistence
@@ -700,8 +715,9 @@ extension RTCSession {
         
         let connectionId = currentCall?.sharedCommunicationId.normalizedConnectionId
 
-        if let connectionId {
+        if let connectionId, let callForTeardown = currentCall {
             await taskProcessor.removeJobs(forConnectionId: connectionId)
+            initialSfuGroupMediaOfferSentConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
             pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
 #if os(Android)
             pendingLocalVideoRenderersByConnectionId.removeValue(forKey: connectionId)
@@ -766,6 +782,7 @@ extension RTCSession {
             // Clear video track references
             connection.localVideoTrack = nil
             connection.remoteVideoTrack = nil
+            connection.auxiliaryRemoteVideoRenderers.removeAll()
             connection.localAudioTrack = nil
             
             await connectionManager.updateConnection(id: connectionId, with: connection)

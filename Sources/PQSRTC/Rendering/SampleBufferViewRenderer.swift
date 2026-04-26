@@ -511,6 +511,25 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         let snap = await makeTelemetrySnapshot()
         return snap.cbAgeMs
     }
+
+    /// Returns true once at least one WebRTC frame callback has been observed.
+    func hasReceivedAnyVideoFrameCallbacks() async -> Bool {
+        let snap = await makeTelemetrySnapshot()
+        return snap.received > 0
+    }
+
+    /// Returns milliseconds since inbound video was expected on this renderer.
+    ///
+    /// Returns:
+    /// - `-1` when inbound expectation was never set
+    /// - elapsed milliseconds since expectation began otherwise
+    func ageMillisecondsSinceInboundVideoExpectationBegan() async -> Int64 {
+        let since = remoteVideoExpectedSinceUptimeNs
+        guard since > 0 else { return -1 }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now >= since else { return -1 }
+        return Int64((now - since) / 1_000_000)
+    }
     
 
     @MainActor

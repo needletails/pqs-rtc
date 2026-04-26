@@ -47,14 +47,57 @@ public enum ConferencePermissionAction: String, Codable, Sendable {
     case screenShare
 }
 
+/// Server-authoritative timing baseline for a conference call.
+public struct ConferenceTiming: Sendable, Equatable, Codable {
+    public var conferenceStartedAtEpochSeconds: TimeInterval?
+    public var serverTimestampEpochSeconds: TimeInterval?
+    public var conferenceDurationSeconds: TimeInterval?
+
+    public init(
+        conferenceStartedAtEpochSeconds: TimeInterval? = nil,
+        serverTimestampEpochSeconds: TimeInterval? = nil,
+        conferenceDurationSeconds: TimeInterval? = nil
+    ) {
+        self.conferenceStartedAtEpochSeconds = conferenceStartedAtEpochSeconds
+        self.serverTimestampEpochSeconds = serverTimestampEpochSeconds
+        self.conferenceDurationSeconds = conferenceDurationSeconds
+    }
+
+    public var hasServerBaseline: Bool {
+        conferenceDurationSeconds != nil || conferenceStartedAtEpochSeconds != nil
+    }
+
+    /// Returns the elapsed conference duration by advancing the server baseline on the local clock.
+    public func elapsedSeconds(at localDate: Date = Date()) -> TimeInterval? {
+        let localEpoch = localDate.timeIntervalSince1970
+        if let conferenceDurationSeconds {
+            let localDelta = serverTimestampEpochSeconds.map { max(0, localEpoch - $0) } ?? 0
+            return max(0, conferenceDurationSeconds + localDelta)
+        }
+        guard let conferenceStartedAtEpochSeconds else {
+            return nil
+        }
+        let serverReference = serverTimestampEpochSeconds ?? localEpoch
+        let serverElapsed = max(0, serverReference - conferenceStartedAtEpochSeconds)
+        let localDelta = serverTimestampEpochSeconds.map { max(0, localEpoch - $0) } ?? 0
+        return serverElapsed + localDelta
+    }
+}
+
 /// Tracks the local user's role and all participant roles for a conference/group call.
 public struct ConferencePermissions: Sendable, Equatable {
     public var localRole: ConferenceRole
     public var participantRoles: [String: ConferenceRole]
+    public var timing: ConferenceTiming?
 
-    public init(localRole: ConferenceRole = .viewer, participantRoles: [String: ConferenceRole] = [:]) {
+    public init(
+        localRole: ConferenceRole = .viewer,
+        participantRoles: [String: ConferenceRole] = [:],
+        timing: ConferenceTiming? = nil
+    ) {
         self.localRole = localRole
         self.participantRoles = participantRoles
+        self.timing = timing
     }
 
     public var canScreenShare: Bool { localRole >= .presenter }

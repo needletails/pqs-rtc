@@ -47,8 +47,35 @@ extension RTCSession {
                             mode = .videoChat
                         }
                     }
-                    // Configure category/mode and activate the session if needed
-                    try setAudioMode(mode: mode)
+
+                    // IMPORTANT (audio engine stability):
+                    // CallKit's `provider:didActivate:` (relayed by the host app via
+                    // `setExternalAudioSession()` + `setAudioMode(...)` + `activateAudioSession(...)`)
+                    // already configures and activates the AVAudioSession before we
+                    // reach `.connected`. Re-applying `setCategory` / `setMode` /
+                    // `overrideOutputAudioPort` here used to race with WebRTC's
+                    // `AURemoteIO` start sequence, producing:
+                    //
+                    // Host apps integrating inbound 1:1 server-SFU: defer SFU media bootstrap until
+                    // after CallKit audio activation. DocC (PQSRTC): "Host app integration: CallKit
+                    // and server SFU (iOS)" in Sources/PQSRTC/PQSRTC.docc/; app pointer:
+                    // nudge-app docs/OneToOneSfuCallKitMedia.md
+                    //
+                    // Re-applying mode here (when the session was already active) produced:
+                    //   `ATAudioSessionPropertyManager.mm: FAILED to set property … -50`
+                    //   `AURemoteIO StartIO failed (kAudioUnitErr_CannotDoInCurrentContext)`
+                    // …which silently kills audio in both directions while video
+                    // continues to flow.
+                    //
+                    // Only reconfigure the session when it isn't active yet (e.g. unit
+                    // tests, custom integrations that don't go through CallKit). When
+                    // the session is already active, just make sure WebRTC's playout/
+                    // recording is enabled so audio actually starts moving.
+                    if !audioSession.isActive {
+                        try setAudioMode(mode: mode)
+                    } else {
+                        logger.log(level: .info, message: "Audio session already active on .connected; skipping redundant setAudioMode to avoid AURemoteIO start race")
+                    }
                     // Explicitly enable WebRTC audio playout/recording
                     setAudio(true)
                 } catch {

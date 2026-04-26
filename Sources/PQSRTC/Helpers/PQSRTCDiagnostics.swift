@@ -20,11 +20,11 @@ public enum PQSRTCDiagnostics: Sendable {
     ///
     /// `NeedleTailMediaKit` / `MetalProcessor` uses the same env var name for matching I420-upload traces.
     public static let remoteVideoTraceLoggingEnabled: Bool = {
-#if DEBUG
+ #if DEBUG
         return true
-#else
-        return ProcessInfo.processInfo.environment["PQSRTC_REMOTE_VIDEO_TRACE_LOGGING"] == "1"
-#endif
+ #else
+         return ProcessInfo.processInfo.environment["PQSRTC_REMOTE_VIDEO_TRACE_LOGGING"] == "1"
+ #endif
     }()
 }
 

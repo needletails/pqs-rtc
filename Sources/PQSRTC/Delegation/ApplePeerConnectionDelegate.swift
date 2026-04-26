@@ -115,7 +115,7 @@ public final class ApplePeerConnectionDelegate: NSObject, WebRTC.RTCPeerConnecti
             let kind = rtpReceiver.track?.kind ?? "unknown"
             let trackId = rtpReceiver.track?.trackId ?? ""
             let streamIds = streams.map { $0.streamId }
-            self.logger.log(level: .info, message: "Receiver added kind=\(kind) trackId=\(trackId) streams=\(streamIds)")
+            self.logger.log(level: .info, message: "Receiver added connection=\(self.connectionId) kind=\(kind) trackId=\(trackId) streams=\(streamIds) pc=\(RTCPeerConnectionMediaDiagnostics.summary(peerConnection))")
             guard !self.connectionId.isEmpty else { return }
             self.continuation.yield(.didAddReceiver(self.connectionId, kind, streamIds, trackId))
         }
@@ -188,7 +188,8 @@ public final class ApplePeerConnectionDelegate: NSObject, WebRTC.RTCPeerConnecti
             guard let self else { return }
             guard !self.isShutdown else { return }
             let trackKind = transceiver.receiver.track?.kind ?? "unknown"
-            self.logger.log(level: .info, message: "Started receiving on transceiver: \(trackKind)")
+            let trackId = transceiver.receiver.track?.trackId ?? "nil"
+            self.logger.log(level: .info, message: "Started receiving on transceiver connection=\(self.connectionId) kind=\(trackKind) trackId=\(trackId) pc=\(RTCPeerConnectionMediaDiagnostics.summary(peerConnection))")
             guard !self.connectionId.isEmpty else { return }
             self.continuation.yield(.startedReceiving(self.connectionId, trackKind))
         }

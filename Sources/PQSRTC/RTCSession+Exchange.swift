@@ -27,23 +27,87 @@ import org.webrtc.__
 #endif
 
 extension RTCSession {
-    
-    
+    /// Refreshes identity props on an outbound signaling payload so locally generated
+    /// offers/answers never leak stale remote frame/signaling identities from a merged call.
+    ///
+    /// This is especially important for 1:1-over-SFU renegotiation, where the answering side can
+    /// reuse a call object that still carries the remote peer's `frameIdentityProps`. Sending that
+    /// stale payload causes the other client to provision the wrong media ratchet identity and
+    /// results in "remote track attached but zero frames rendered" failures.
+    private func refreshLocalIdentityPropsForOutboundSignaling(_ call: Call) async throws -> Call {
+        var call = call
+        let frameBundle = try await keyManager.fetchCallKeyBundle()
+        let signalingBundle = try await pcKeyManager.fetchCallKeyBundle()
+        call.frameIdentityProps = await frameBundle.sessionIdentity.props(symmetricKey: frameBundle.symmetricKey)
+        call.signalingIdentityProps = await signalingBundle.sessionIdentity.props(symmetricKey: signalingBundle.symmetricKey)
+        return call
+    }
+
+    /// Builds the outbound encrypted `.offer` payload after cipher negotiation **without** calling
+    /// ``createOffer``.
+    ///
+    /// SFU group media already sent an offer via ``sendGroupCallOffer``; duplicating
+    /// ``createOffer`` after `call_cipher` breaks WebRTC signaling. Peers still need a follow-up
+    /// ratchet frame carrying refreshed ``Call/frameIdentityProps`` / ``Call/signalingIdentityProps``
+    /// (see ``refreshLocalIdentityPropsForOutboundSignaling``) or remote media stays undecryptable.
+    ///
+    /// This copies SDP bytes from the peer connection’s current local description (or the last group
+    /// `Call.metadata` on Android when needed) and applies the same signaling-identity merge as the
+    /// post-cipher offer path.
+    internal func buildPostCipherSfuGroupOfferPayloadPreservingLocalSdp(call: Call) async throws -> Call {
+        var updated = try await refreshLocalIdentityPropsForOutboundSignaling(call)
+
+#if !os(Android)
+        if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
+           let local = connection.peerConnection.localDescription {
+            let sdp = try SessionDescription(fromRTC: local)
+            updated.metadata = try BinaryEncoder().encode(sdp)
+        }
+#endif
+        if updated.metadata?.isEmpty != false {
+            let norm = call.sharedCommunicationId.normalizedConnectionId
+            if let group = groupCall(forSfuIdentity: norm) {
+                let stored = await group.currentCall
+                if let m = stored.metadata, !m.isEmpty {
+                    updated.metadata = m
+                }
+            }
+        }
+
+        guard let meta = updated.metadata, !meta.isEmpty else {
+            throw RTCErrors.invalidConfiguration("Missing SDP metadata for SFU post-cipher offer refresh")
+        }
+
+        let keyBundle = try await pcKeyManager.fetchCallKeyBundle()
+        guard let localProps = await keyBundle.sessionIdentity.props(symmetricKey: keyBundle.symmetricKey) else {
+            throw RTCErrors.invalidConfiguration("Local Props are missing")
+        }
+        updated.signalingIdentityProps = localProps
+        return updated
+    }
+
+    /// Merges a decrypted post-cipher ``Call`` from ``PacketFlag.handshakeComplete`` (see
+    /// ``finishCryptoSessionCreation``) into the active SFU group/connection without touching SDP.
+    func applyInboundSfuPostCipherHandshakeMerge(resolved: Call, sfuIdentity: String) async throws {
+        let normRoom = sfuIdentity.normalizedConnectionId
+        guard let group = groupCall(forSfuIdentity: normRoom) else {
+            throw RTCErrors.missingGroupCall
+        }
+        await group.applyUpdatedCallForNegotiation(resolved)
+        updateFallbackLatestCall(resolved)
+        if var connection = await connectionManager.findConnection(with: resolved.sharedCommunicationId) {
+            connection.call = resolved
+            await connectionManager.updateConnection(id: connection.id, with: connection)
+        }
+    }
+
     //MARK: Public
-    
+
     public func handleHandshakeCompleted(_ call: Call) async throws {
-//        let copiedSender = call.sender
         let call = try resolveProperRecipient(call: call)
-//        let recipient = copiedSender
-        
         try await startSendingCandidates(call: call)
         if !handshakeComplete {
             setHandshakeComplete(true)
-            
-//            let connectionIdentity = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
-//            guard let remoteProps = await connectionIdentity.sessionIdentity.props(symmetricKey: connectionIdentity.symmetricKey)  else {
-//                throw RTCErrors.invalidConfiguration("Remote session identity props not set for connection: \(call.sharedCommunicationId)")
-//            }
             
             let plaintext = try BinaryEncoder().encode(call)
             let writeTask = WriteTask(
@@ -65,16 +129,10 @@ extension RTCSession {
         answerDeviceId: String
     ) async throws -> Call {
         let call = try resolveProperRecipient(call: call)
-        
-//        let sdpNegotiationMetadata = try PQSRTC.SDPNegotiationMetadata(
-//            offerSecretName: call.sender.secretName,
-//            offerDeviceId: call.sender.deviceId,
-//            answerDeviceId: answerDeviceId)
-//        
         let modified = await modifySDP(
             sdp: sdp.sdp,
             hasVideo: call.supportsVideo,
-            stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+            stripSsrcLines: false)
         
 #if os(Android)
         try await rtcClient.setRemoteDescription(RTCSessionDescription(
@@ -91,10 +149,6 @@ extension RTCSession {
         
         let processedCall = try await createAnswer(call: call)
         
-//        guard let remoteProps = call.signalingIdentityProps else {
-//            throw RTCErrors.invalidConfiguration("Remote Props are nil")
-//        }
-        
         // Encrypt answer and send (roomId normalized; "#" reattached at transport).
         let plaintext = try BinaryEncoder().encode(processedCall)
         let writeTask = WriteTask(
@@ -106,7 +160,14 @@ extension RTCSession {
         try await taskProcessor.feedTask(task: encryptableTask)
         
 #if os(iOS) && canImport(AVKit)
-        try setExternalAudioSession()
+        // Inbound answerer path can run after CallKit activation already configured manual audio.
+        // Re-applying external-audio wiring during SDP handling can race AURemoteIO startup and
+        // leave outbound audio at zero while video continues to flow.
+        if !audioSession.useManualAudio {
+            try setExternalAudioSession()
+        } else {
+            logger.log(level: .debug, message: "Skipping redundant setExternalAudioSession in handleOffer; manual audio already enabled")
+        }
 #endif
         
         if var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
@@ -123,7 +184,7 @@ extension RTCSession {
         let modified = await modifySDP(
             sdp: sdp.sdp,
             hasVideo: call.supportsVideo,
-            stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+            stripSsrcLines: false)
 #if os(Android)
         try await rtcClient.setRemoteDescription(RTCSessionDescription(
             typeDescription: "OFFER",
@@ -133,7 +194,11 @@ extension RTCSession {
                                 WebRTC.RTCSessionDescription(type: sdp.type.rtcSdpType, sdp: modified),
                             call: call)
 #endif
-        return try await createAnswer(call: call)
+        let answered = try await createAnswer(call: call)
+#if canImport(WebRTC) && !os(Android)
+        await rebindInboundRemoteVideoAfterSfuRenegotiationIfNeeded(call: answered)
+#endif
+        return answered
     }
     
     /// Applies an inbound SDP answer (1:1).
@@ -145,7 +210,7 @@ extension RTCSession {
         let modified = await modifySDP(
             sdp: sdp.sdp,
             hasVideo: call.supportsVideo,
-            stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+            stripSsrcLines: false)
         
 #if os(Android)
         try await rtcClient.setRemoteDescription(RTCSessionDescription(
@@ -164,48 +229,63 @@ extension RTCSession {
         armRelayFallbackTimerIfNeeded(for: call)
         
         if !handshakeComplete {
-            let normComm = call.sharedCommunicationId.normalizedConnectionId
-            let isSfuGroupRoom = isGroupCall
-                || groupCalls[normComm] != nil
-                || groupCalls[call.sharedCommunicationId] != nil
-
-            if isSfuGroupRoom {
-                // Conference / SFU group calls often carry an empty `recipients` list; there is no
-                // 1:1 ratchet peer to target for cipher handshake fanout.
-                setHandshakeComplete(true)
-                try await startSendingCandidates(call: call)
-            } else {
-                guard var recipient = call.recipients.first else {
-                    throw RTCErrors.invalidConfiguration("Received handshakeComplete without a recipient in call")
-                }
-
-                var call = call
-
-                guard let sessionParticipant else {
-                    throw RTCErrors.invalidConfiguration("Received a call without a session participant")
-                }
-                if recipient.secretName == sessionParticipant.secretName {
-                    recipient.deviceId = sessionParticipant.deviceId
-
-                    let copiedSender = call.sender
-                    call.recipients = [copiedSender]
-                    call.sender = recipient
-                    recipient = copiedSender
-                }
-
-                let plaintext = try BinaryEncoder().encode(call)
+            // Restored from b368e83: drive the .handshakeComplete WriteTask for every room
+            // (1:1 direct, 1:1 over SFU, and SFU group). The per-pair Double Ratchet machinery
+            // depends on this fanout to derive frame keys on both sides.
+            //
+            // SFU conference rooms can legitimately carry an empty recipients list at this point
+            // (their key distribution runs out-of-band via the conference frame-key exchange),
+            // so for them we just set handshake complete and start sending ICE candidates instead
+            // of throwing.
+            if let prepared = RTCSession.prepareHandshakeCompleteCallForFanout(
+                call: call,
+                sessionParticipant: sessionParticipant
+            ) {
+                let plaintext = try BinaryEncoder().encode(prepared)
                 let writeTask = WriteTask(
                     data: plaintext,
-                    roomId: call.sharedCommunicationId.normalizedConnectionId,
+                    roomId: prepared.sharedCommunicationId.normalizedConnectionId,
                     flag: .handshakeComplete,
-                    call: call)
+                    call: prepared)
                 let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
                 try await taskProcessor.feedTask(task: encryptableTask)
-                setHandshakeComplete(true)
-
-                try await startSendingCandidates(call: call)
+            } else {
+                logger.log(
+                    level: .info,
+                    message: "handleAnswer: empty recipients (likely SFU conference); skipping .handshakeComplete WriteTask")
             }
+            setHandshakeComplete(true)
+            try await startSendingCandidates(call: call)
         }
+    }
+
+    /// Pure helper used by ``handleAnswer`` (and exercised in tests) to decide whether the
+    /// `.handshakeComplete` `WriteTask` should be fanned out for a given inbound answer, and to
+    /// produce the swapped `Call` that goes into the task.
+    ///
+    /// Returns `nil` when the call has no addressable recipient or no resolved session
+    /// participant (e.g. SFU conference rooms whose key distribution runs out-of-band). Returns
+    /// the prepared `Call` otherwise — for 1:1 direct, 1:1-over-SFU, and SFU group rooms.
+    ///
+    /// - Important: This must not be limited to non-SFU rooms. Restricting it (as the
+    ///   `isSfuGroupRoom` short-circuit in commit `57b97ff` did) breaks the per-pair Double
+    ///   Ratchet handshake for SFU calls and surfaces as `FrameCryptor missingKey`.
+    static func prepareHandshakeCompleteCallForFanout(
+        call: Call,
+        sessionParticipant: Call.Participant?
+    ) -> Call? {
+        guard let firstRecipient = call.recipients.first,
+              let sessionParticipant
+        else { return nil }
+        var prepared = call
+        var recipient = firstRecipient
+        if recipient.secretName == sessionParticipant.secretName {
+            recipient.deviceId = sessionParticipant.deviceId
+            let copiedSender = prepared.sender
+            prepared.recipients = [copiedSender]
+            prepared.sender = recipient
+        }
+        return prepared
     }
     
     /// Applies an inbound ICE candidate.
@@ -271,7 +351,11 @@ extension RTCSession {
             let modified = await modifySDP(
                 sdp: description.sdp,
                 hasVideo: hasVideo,
-                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+                // Keep local sender SSRC lines in locally-applied SDP.
+                // Stripping them here can prevent RTP sender streams from activating
+                // on some WebRTC/SFU combinations (symptom: ICE+DTLS connected, but
+                // outbound audio/video packets remain flat at zero).
+                stripSsrcLines: false)
             
             description = RTCSessionDescription(typeDescription: description.typeDescription, sdp: modified)
             
@@ -288,7 +372,11 @@ extension RTCSession {
             let modified = await modifySDP(
                 sdp: description.sdp,
                 hasVideo: hasVideo,
-                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+                // Keep local sender SSRC lines in locally-applied SDP.
+                // Stripping them here can prevent RTP sender streams from activating
+                // on some WebRTC/SFU combinations (symptom: ICE+DTLS connected, but
+                // outbound audio/video packets remain flat at zero).
+                stripSsrcLines: false)
             
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             
@@ -302,10 +390,15 @@ extension RTCSession {
 #endif
             
             logger.log(level: .info, message: "Successfully created offer for call: \(call.sharedCommunicationId)")
-            var call = call
+            var call = try await refreshLocalIdentityPropsForOutboundSignaling(call)
             call.metadata = try BinaryEncoder().encode(sdp)
             return call
             
+        } catch is CancellationError {
+            // Do not treat cooperative cancellation as a call failure — it commonly occurs during
+            // ICE relay fallback (recreate PC) or task hierarchy teardown; finishing here leaves
+            // users with `CallState.failed` + `CancellationError` spuriously.
+            throw CancellationError()
         } catch let error as SDPHandlerError {
             logger.log(level: .error, message: "SDP offer creation failed: \(error.localizedDescription)")
             await callState.transition(to: .failed(inferredCallDirection(for: call), call, error.localizedDescription))
@@ -371,7 +464,11 @@ extension RTCSession {
             let modified = await modifySDP(
                 sdp: description.sdp,
                 hasVideo: call.supportsVideo,
-                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+                // Keep local sender SSRC lines in locally-applied SDP.
+                // Stripping them here can prevent RTP sender streams from activating
+                // on some WebRTC/SFU combinations (symptom: ICE+DTLS connected, but
+                // outbound audio/video packets remain flat at zero).
+                stripSsrcLines: false)
             description = RTCSessionDescription(typeDescription: description.typeDescription, sdp: modified)
             
             logger.log(level: .info, message: "Android Modified Answer SDP:\n\(description.sdp)")
@@ -387,7 +484,11 @@ extension RTCSession {
             let modified = await modifySDP(
                 sdp: description.sdp,
                 hasVideo: call.supportsVideo,
-                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+                // Keep local sender SSRC lines in locally-applied SDP.
+                // Stripping them here can prevent RTP sender streams from activating
+                // on some WebRTC/SFU combinations (symptom: ICE+DTLS connected, but
+                // outbound audio/video packets remain flat at zero).
+                stripSsrcLines: false)
             
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             
@@ -401,11 +502,13 @@ extension RTCSession {
 #endif
             
             logger.log(level: .info, message: "Successfully created answer for call: \(call.sharedCommunicationId)")
-            var callWithSDP = call
+            var callWithSDP = try await refreshLocalIdentityPropsForOutboundSignaling(call)
             let sdpData = try BinaryEncoder().encode(sdp)
             callWithSDP.metadata = sdpData
             return callWithSDP
             
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as SDPHandlerError {
             logger.log(level: .error, message: "SDP answer creation failed: \(error.localizedDescription)")
             await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
@@ -452,7 +555,7 @@ extension RTCSession {
             let modified = await modifySDP(
                 sdp: sdp.sdp,
                 hasVideo: call.supportsVideo,
-                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+                stripSsrcLines: false)
             modifiedSdp = RTCSessionDescription(typeDescription: sdp.typeDescription, sdp: modified)
             
             // Set remote SDP using the new SDPHandler
@@ -523,7 +626,7 @@ extension RTCSession {
             let modified = await modifySDP(
                 sdp: sdp.sdp,
                 hasVideo: call.supportsVideo,
-                stripSsrcLines: call.sharedCommunicationId.isGroupCall)
+                stripSsrcLines: false)
             modifiedSdp = WebRTC.RTCSessionDescription(type: sdp.type, sdp: modified)
             
             // Set remote SDP using the new SDPHandler

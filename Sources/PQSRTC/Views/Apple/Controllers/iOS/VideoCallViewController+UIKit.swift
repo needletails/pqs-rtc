@@ -88,6 +88,10 @@ public final class VideoCallViewController: UICollectionViewController {
     nonisolated(unsafe) private var didEnterBackgroundPiPObserver: NSObjectProtocol?
 
     private var remoteVideoTrackPollTask: Task<Void, Never>?
+    private var remoteRendererRecoveryTask: Task<Void, Never>?
+    private var remoteRendererRecoveryConnectionId: String?
+    private var remoteRendererRecoveryRendererId: ObjectIdentifier?
+    private var lastRemoteRendererRecoveryUptimeNs: UInt64 = 0
     private weak var remoteCameraOffChrome: UIView?
     private var screenTrackStreamTask: Task<Void, Never>?
     private var hasActiveRemoteScreenShare = false
@@ -574,6 +578,10 @@ public final class VideoCallViewController: UICollectionViewController {
             configureLocalPreviewIfNeeded()
             if let connectionId = currentCall?.sharedCommunicationId {
                 await applyMainRemoteTileInboundExpectation(connectionId: connectionId)
+                if let remoteView = videoViews.views.first(where: { $0.videoView.contextName == "sample" })?.videoView,
+                   let remoteRenderer = remoteView.renderer as? SampleBufferViewRenderer {
+                    startRemoteRendererRecoveryIfNeeded(renderer: remoteRenderer, connectionId: connectionId)
+                }
             }
             startRemoteVideoTrackPolling()
             return
@@ -599,6 +607,7 @@ public final class VideoCallViewController: UICollectionViewController {
             with: connectionId)
         await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
         await applyMainRemoteTileInboundExpectation(connectionId: connectionId)
+        startRemoteRendererRecoveryIfNeeded(renderer: remoteRenderer, connectionId: connectionId)
         startRemoteVideoTrackPolling()
         _ = await preparePictureInPictureIfNeeded()
     }
@@ -617,6 +626,7 @@ public final class VideoCallViewController: UICollectionViewController {
     /// Shuts down the remote renderer and removes it from the session.
     func tearDownSampleView() async {
         stopRemoteVideoTrackPolling()
+        stopRemoteRendererRecovery()
         guard let remoteVideoView = videoViews.views.first(where: { $0.videoView.contextName == "sample" })?.videoView else { return }
         guard let remoteVideoRenderer = remoteVideoView.renderer as? SampleBufferViewRenderer else { return }
         await remoteVideoRenderer.setRemoteVideoInboundExpected(false)
@@ -951,6 +961,93 @@ public final class VideoCallViewController: UICollectionViewController {
 
     private static let remoteVideoStaleFrameThresholdMs: Int64 = 1200
 
+    private func stopRemoteRendererRecovery() {
+        remoteRendererRecoveryTask?.cancel()
+        remoteRendererRecoveryTask = nil
+        remoteRendererRecoveryConnectionId = nil
+        remoteRendererRecoveryRendererId = nil
+        lastRemoteRendererRecoveryUptimeNs = 0
+    }
+
+    private func startRemoteRendererRecoveryIfNeeded(
+        renderer: SampleBufferViewRenderer,
+        connectionId: String
+    ) {
+        let normalizedConnectionId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        let rendererId = ObjectIdentifier(renderer)
+        if remoteRendererRecoveryTask != nil,
+           remoteRendererRecoveryConnectionId == normalizedConnectionId,
+           remoteRendererRecoveryRendererId == rendererId {
+            return
+        }
+        stopRemoteRendererRecovery()
+        remoteRendererRecoveryConnectionId = normalizedConnectionId
+        remoteRendererRecoveryRendererId = rendererId
+        remoteRendererRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if Task.isCancelled { return }
+                guard self.isRunning else { continue }
+                guard self.currentCallState != .waiting else { continue }
+                let callbackAgeMs = await renderer.ageMillisecondsSinceLastVideoFrameCallback()
+                let expectationAgeMs = await renderer.ageMillisecondsSinceInboundVideoExpectationBegan()
+                let hasAnyCallbacks = await renderer.hasReceivedAnyVideoFrameCallbacks()
+                let noCallbacksYet = callbackAgeMs < 0
+                    && expectationAgeMs >= 3_000
+                    && !hasAnyCallbacks
+                guard callbackAgeMs > 3_000 || noCallbacksYet else { continue }
+
+                let now = DispatchTime.now().uptimeNanoseconds
+                if self.lastRemoteRendererRecoveryUptimeNs > 0,
+                   now >= self.lastRemoteRendererRecoveryUptimeNs,
+                   now - self.lastRemoteRendererRecoveryUptimeNs < 6_000_000_000 {
+                    continue
+                }
+                self.lastRemoteRendererRecoveryUptimeNs = now
+
+                let inboundFlow = await self.session.evaluateInboundRemoteVideoFlow(connectionId: connectionId)
+                if let flow = inboundFlow {
+                    self.logger.log(
+                        level: .warning,
+                        message: "iOS remote renderer stall probe (callbackAgeMs=\(callbackAgeMs), expectationAgeMs=\(expectationAgeMs), flow=\(flow.state.rawValue), cause=\(flow.likelyCause), dtls=\(flow.dtlsState), pair=\(flow.selectedPairState), inAudioPackets=\(flow.audioPacketsReceived), inVideoPackets=\(flow.packetsReceived), inFrames=\(flow.framesReceived), inDecoded=\(flow.framesDecoded), dAudioPackets=\(flow.deltaAudioPacketsReceived), dVideoPackets=\(flow.deltaPacketsReceived), dFrames=\(flow.deltaFramesReceived), dDecoded=\(flow.deltaFramesDecoded))"
+                    )
+                } else {
+                    self.logger.log(
+                        level: .warning,
+                        message: "iOS remote renderer stall probe (callbackAgeMs=\(callbackAgeMs), expectationAgeMs=\(expectationAgeMs)) could not read inbound flow stats"
+                    )
+                }
+
+                let shouldRecoverRenderer: Bool = {
+                    guard let flow = inboundFlow else { return false }
+                    switch flow.state {
+                    case .advancingIngress, .decodeStalled:
+                        return true
+                    case .noTraffic, .stalledIngress:
+                        return false
+                    }
+                }()
+                guard shouldRecoverRenderer else {
+                    self.logger.log(
+                        level: .warning,
+                        message: "iOS renderer recovery skipped: inbound counters not advancing enough; likelyCause=\(inboundFlow?.likelyCause ?? "unknown") connectionId=\(connectionId)"
+                    )
+                    continue
+                }
+
+                self.logger.log(
+                    level: .warning,
+                    message: "iOS remote renderer stalled with advancing inbound media; restarting stream + rebinding track for connectionId=\(connectionId)"
+                )
+                await renderer.startStream()
+                await self.session.renderRemoteVideo(to: renderer.rtcVideoRenderWrapper, with: connectionId)
+                await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
+                await self.applyMainRemoteTileInboundExpectation(connectionId: connectionId)
+            }
+        }
+    }
+
     /// Combines inbound `isEnabled` (local receive toggle) with “no new frames for a while” so peer camera-off / frozen-last-frame resolve.
     private func remotePartyVideoAppearsActive(connectionId: String) async -> Bool {
         let trackSaysLive = await session.inboundRemoteVideoTrackAppearsEnabled(connectionId: connectionId)
@@ -998,6 +1095,7 @@ public final class VideoCallViewController: UICollectionViewController {
     private func stopRemoteVideoTrackPolling() {
         remoteVideoTrackPollTask?.cancel()
         remoteVideoTrackPollTask = nil
+        stopRemoteRendererRecovery()
         remoteCameraOffChrome?.removeFromSuperview()
         remoteCameraOffChrome = nil
     }

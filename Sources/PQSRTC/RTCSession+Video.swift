@@ -210,9 +210,13 @@ extension RTCSession {
                 }
 
                 // Check if FrameCryptor is attached to this receiver (only relevant when frame encryption is enabled).
+                // SFU group calls store inbound cryptors in `videoReceiverCryptorsByParticipantId`; the legacy
+                // `videoFrameCryptor` slot may be nil until a single receiver is chosen or after UUID→stable rebind.
                 if enableEncryption {
-                    if let frameCryptor = connection.videoFrameCryptor {
-                        if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled {
+                    let hasInboundVideoCryptor = connection.videoFrameCryptor != nil
+                        || !connection.videoReceiverCryptorsByParticipantId.isEmpty
+                    if hasInboundVideoCryptor {
+                        if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, let frameCryptor = connection.videoFrameCryptor {
                             logger.log(level: .trace, message: "FrameCryptor exists and is attached to receiver")
                             logger.log(level: .trace, message: "FrameCryptor enabled: \(frameCryptor.enabled)")
                         }
@@ -282,6 +286,9 @@ extension RTCSession {
             logger.log(level: .warning, message: "addAuxiliaryRemoteVideoRenderer: remote video track nil")
             return
         }
+        if !connection.auxiliaryRemoteVideoRenderers.contains(where: { $0 === renderer }) {
+            connection.auxiliaryRemoteVideoRenderers.append(renderer)
+        }
         videoTrack.add(renderer)
         await manager.updateConnection(id: normalizedId, with: connection)
     }
@@ -291,8 +298,89 @@ extension RTCSession {
         let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Removing auxiliary remote video renderer for connection: \(connectionId)")
         let manager = connectionManager as RTCConnectionManager
-        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
+        guard var connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
+        connection.auxiliaryRemoteVideoRenderers.removeAll { $0 === renderer }
         connection.remoteVideoTrack?.remove(renderer)
+        await manager.updateConnection(id: normalizedId, with: connection)
+    }
+
+    /// After an SFU-driven SDP renegotiation, the inbound camera track on the video transceiver may be
+    /// replaced without another `didAddReceiver` — renderers would stay on the old track and never
+    /// receive frames. Refreshes from live transceivers and re-attaches pending + auxiliary sinks.
+    func rebindInboundRemoteVideoAfterSfuRenegotiationIfNeeded(call: Call) async {
+        guard call.supportsVideo else { return }
+        guard Self.isTrueOneToOneSfuRoom(call: call) else { return }
+
+        let norm = call.sharedCommunicationId.normalizedConnectionId
+        guard var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) else { return }
+        guard let resolved = Self.resolveLiveInboundCameraVideoTrack(from: connection.peerConnection) else {
+            logger.log(level: .debug, message: "rebindInboundRemoteVideoAfterSfuRenegotiationIfNeeded: no live inbound camera track conn=\(norm)")
+            return
+        }
+
+        let previous = connection.remoteVideoTrack
+        if let previous, previous.trackId == resolved.trackId, previous === resolved {
+            return
+        }
+
+        logger.log(
+            level: .info,
+            message: "SFU renegotiation: rebinding remote video renderers oldTrackId=\(previous?.trackId ?? "nil") newTrackId=\(resolved.trackId) conn=\(norm)"
+        )
+
+        if let previous {
+            if let pending = pendingRemoteVideoRenderersByConnectionId[norm] {
+                previous.remove(pending)
+            }
+            for aux in connection.auxiliaryRemoteVideoRenderers {
+                previous.remove(aux)
+            }
+        }
+
+        connection.remoteVideoTrack = resolved
+        let remotePid = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let previous {
+            connection.remoteVideoTracksByParticipantId = connection.remoteVideoTracksByParticipantId.filter { _, track in
+                track !== previous
+            }
+        }
+        if !remotePid.isEmpty {
+            connection.remoteVideoTracksByParticipantId[remotePid] = resolved
+        }
+
+        if let pending = pendingRemoteVideoRenderersByConnectionId[norm] {
+            resolved.add(pending)
+        }
+        for aux in connection.auxiliaryRemoteVideoRenderers {
+            resolved.add(aux)
+        }
+
+        await connectionManager.updateConnection(id: connection.id, with: connection)
+
+        #if canImport(WebRTC)
+        logRtpStatsSnapshotOnce(
+            connectionId: norm,
+            delayNanoseconds: 2_000_000_000,
+            reason: "afterSfuRenegotiationRemoteVideoRebind")
+        startInboundVideoFlowProbe(connectionId: norm)
+        #endif
+    }
+
+    /// First non-screen, non-ended video track exposed by the peer connection's video transceivers / receivers.
+    static func resolveLiveInboundCameraVideoTrack(from pc: WebRTC.RTCPeerConnection) -> WebRTC.RTCVideoTrack? {
+        for t in pc.transceivers where t.mediaType == .video {
+            guard let track = t.receiver.track as? WebRTC.RTCVideoTrack else { continue }
+            if Self.isScreenShareId(track.trackId) { continue }
+            if track.readyState == .ended { continue }
+            return track
+        }
+        for r in pc.receivers {
+            guard let track = r.track as? WebRTC.RTCVideoTrack else { continue }
+            if Self.isScreenShareId(track.trackId) { continue }
+            if track.readyState == .ended { continue }
+            return track
+        }
+        return nil
     }
 
     /// Binds a renderer to a remote participant's screen-share track.

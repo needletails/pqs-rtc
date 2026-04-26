@@ -23,6 +23,64 @@ import DequeModule
 import Foundation
 
 extension RTCSession {
+    internal static func shouldDelayReceiverFrameCryptorBindingForUuidPlaceholder(
+        enableEncryption: Bool,
+        isGroupCallConnection: Bool,
+        frameEncryptionKeyMode: RTCFrameEncryptionKeyMode,
+        participantIdOverride: String?
+    ) -> Bool {
+        guard enableEncryption else { return false }
+        guard isGroupCallConnection else { return false }
+        guard frameEncryptionKeyMode == .perParticipant else { return false }
+        let resolved = participantIdOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !resolved.isEmpty else { return false }
+        return UUID(uuidString: resolved) != nil
+    }
+
+    /// WebRTC/msid recv stream labels often use `secretName_` while `setMessageKey` uses `secretName`.
+    ///
+    /// - **1:1 SFU:** Normalize only when the stripped label matches the resolved remote peer
+    ///   (conservative).
+    /// - **Conference / multi-party SFU:** The same `peer_` msid pattern applies, but
+    ///   ``remoteTrackOwnerParticipantId`` may still be the room id (`conf-…`), so the strict match
+    ///   never succeeds. When the stripped id is not the local participant and not UUID-like, treat
+    ///   it as the publisher `secretName` for FrameCryptor key lookup.
+    internal static func normalizedReceiverFrameKeyParticipantIdForSfuUnderscoreStreamLabel(
+        streamId: String,
+        isOneToOneSfuRoom: Bool,
+        isGroupCallConnection: Bool,
+        effectiveRemoteSecretName: String?,
+        localParticipantSecretName: String?
+    ) -> String? {
+        let s = streamId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.hasSuffix("_") else { return nil }
+        let withoutUnderscore = String(s.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !withoutUnderscore.isEmpty else { return nil }
+
+        let effective = effectiveRemoteSecretName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let local = localParticipantSecretName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if (isOneToOneSfuRoom || isGroupCallConnection),
+           !effective.isEmpty,
+           withoutUnderscore.caseInsensitiveCompare(effective) == .orderedSame {
+            return effective
+        }
+
+        if isOneToOneSfuRoom {
+            // 1:1-over-SFU: only the strict match above.
+            return nil
+        }
+
+        if isGroupCallConnection,
+           !local.isEmpty,
+           withoutUnderscore.caseInsensitiveCompare(local) != .orderedSame,
+           UUID(uuidString: withoutUnderscore) == nil {
+            return withoutUnderscore
+        }
+
+        return nil
+    }
+
     private func shouldHandleNotification(for connectionId: String) -> Bool {
         guard let active = activeConnectionId else { return true }
         return active.normalizedConnectionId == connectionId.normalizedConnectionId
@@ -44,12 +102,19 @@ extension RTCSession {
     ///   - `.shared`: participantId is irrelevant → `nil`
     /// - For SFU/group calls:
     ///   - default: use the participantId derived from `streamIds` (track owner)
-    ///   - production fallback (1:1 SFU rooms): if the SFU emits a UUID-like streamId that doesn't match
-    ///     the real remote participant id, use `connection.remoteParticipantId` so E2EE keys line up.
+    ///   - production fallback (1:1 SFU rooms): if the SFU emits a UUID-like streamId, remap to the
+    ///     **remote peer's** frame id (same as ``remoteTrackOwnerParticipantId`` / sender `localParticipantId`),
+    ///     not the room id in `connection.recipient`, so FrameCryptor key lookup matches `setMessageKey`.
+    ///     This guards a historical outage where remote tracks attached successfully but rendered
+    ///     zero decrypted frames because receiver cryptors were bound to room/placeholder ids.
+    ///   - WebRTC/msid labels often use a trailing underscore (`echo_`, `nudge_`) while frame keys are
+    ///     provisioned under the peer ``secretName`` without that suffix — remap so rebinding after
+    ///     renegotiation does not attach cryptors to ids with no `setMessageKey` entry (symptom: ICE
+    ///     connected, tracks attached, **zero** decrypted video frames).
     private func receiverParticipantIdOverrideForE2EE(
         connection: RTCConnection,
         participantIdFromStreamIds: String
-    ) -> (override: String?, didOverrideToRemote: Bool) {
+    ) -> (override: String?, didOverrideToRemote: Bool, isUuidLikeStreamRemap: Bool) {
         let isGroup = isGroupCallConnection(connection.id)
         let remoteId = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
         let streamId = participantIdFromStreamIds.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -57,36 +122,51 @@ extension RTCSession {
         if !isGroup {
             // 1:1 call
             if frameEncryptionKeyMode == .perParticipant {
-                return (remoteId.isEmpty ? nil : remoteId, false)
+                return (remoteId.isEmpty ? nil : remoteId, false, false)
             }
-            return (nil, false)
+            return (nil, false, false)
         }
 
         // Group call (SFU)
         guard frameEncryptionKeyMode == .perParticipant else {
             // Shared mode: participantId does not affect key lookup
-            return (nil, false)
+            return (nil, false, false)
         }
 
         guard !streamId.isEmpty else {
-            return (nil, false)
+            return (nil, false, false)
         }
 
         // Safe fallback for 1:1 SFU rooms where SFU stream ids are random UUIDs.
         // Conference channels use `conf-<uuid>` room ids and often have empty recipients; do not
         // treat them as 1:1-over-SFU or we remap stream ids to the room string and break E2EE keys.
-        let commNorm = connection.call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
-        let isConferenceStyleRoom = commNorm.hasPrefix("conf-")
-        let isOneToOneSfuRoom = connection.call.recipients.count <= 1 && !isConferenceStyleRoom
+        let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: connection.call)
         let streamLooksLikeUuid = UUID(uuidString: streamId) != nil
         if isOneToOneSfuRoom,
-           streamLooksLikeUuid,
-           !remoteId.isEmpty,
-           streamId != remoteId {
-            return (remoteId, true)
+           streamLooksLikeUuid {
+            let effectiveRemote = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)
+                ?? remoteId
+            if !effectiveRemote.isEmpty,
+               streamId.caseInsensitiveCompare(effectiveRemote) != .orderedSame {
+                return (effectiveRemote, true, true)
+            }
         }
 
-        return (streamId, false)
+        // Native/SFU PeerConnection often publishes recv stream labels as `secretName_` (msid) while
+        // frame encryption keys use `secretName` from the call graph — align cryptor ids with keys.
+        let effectiveRemoteForUnderscore = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)
+            ?? remoteId
+        if let normalized = Self.normalizedReceiverFrameKeyParticipantIdForSfuUnderscoreStreamLabel(
+            streamId: streamId,
+            isOneToOneSfuRoom: isOneToOneSfuRoom,
+            isGroupCallConnection: isGroup,
+            effectiveRemoteSecretName: effectiveRemoteForUnderscore,
+            localParticipantSecretName: connection.localParticipantId
+        ) {
+            return (normalized, true, false)
+        }
+
+        return (streamId, false, false)
     }
 
     /// SFU signaling sometimes attaches recv tracks labeled with the **local** participant id (self-loop /
@@ -105,6 +185,432 @@ extension RTCSession {
         let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
         return effective.caseInsensitiveCompare(local) == .orderedSame
     }
+
+    /// In SFU group calls, a UUID-like stream id is often a transient placeholder before
+    /// renegotiation publishes the stable participant id (`echo`/`nudge`/etc). Binding receiver
+    /// FrameCryptors to that placeholder causes permanent `missingKey` unless we later rebind.
+    private func shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+        connection: RTCConnection,
+        participantIdOverride: String?
+    ) -> Bool {
+        Self.shouldDelayReceiverFrameCryptorBindingForUuidPlaceholder(
+            enableEncryption: enableEncryption,
+            isGroupCallConnection: isGroupCallConnection(connection.id),
+            frameEncryptionKeyMode: frameEncryptionKeyMode,
+            participantIdOverride: participantIdOverride
+        )
+    }
+
+    #if canImport(WebRTC)
+    /// Disables and clears any *UUID-aliased* receiver FrameCryptors before we rebind a stable
+    /// participant id to the same `RTPReceiver`. Two cryptors attached to one receiver in
+    /// libwebrtc is undefined behavior, and a stale alias entry would otherwise linger in the
+    /// per-participant maps after the rebind.
+    ///
+    /// - Returns: An updated `RTCConnection` value (caller must persist via `connectionManager`).
+    private func clearUuidAliasedReceiverCryptors(
+        on connection: RTCConnection,
+        keepingParticipantId stable: String?
+    ) -> RTCConnection {
+        var updated = connection
+        let stableNorm = stable?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        func dropUuidEntries(_ dict: inout [String: RTCFrameCryptor]) {
+            for (key, cryptor) in dict {
+                let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard UUID(uuidString: trimmed) != nil else { continue }
+                if let stableNorm, trimmed.caseInsensitiveCompare(stableNorm) == .orderedSame {
+                    continue
+                }
+                cryptor.enabled = false
+                dict.removeValue(forKey: key)
+            }
+        }
+
+        dropUuidEntries(&updated.videoReceiverCryptorsByParticipantId)
+        dropUuidEntries(&updated.audioReceiverCryptorsByParticipantId)
+
+        // The legacy "single" receiver-cryptor slots can also hold a UUID-bound cryptor that
+        // shares the underlying RTPReceiver. Replacing the slot without disabling first would
+        // leak a still-active cryptor on that receiver.
+        if let existingVideo = updated.videoFrameCryptor {
+            existingVideo.enabled = false
+            updated.videoFrameCryptor = nil
+        }
+        if let existingAudio = updated.audioFrameCryptor {
+            existingAudio.enabled = false
+            updated.audioFrameCryptor = nil
+        }
+        return updated
+    }
+    #endif
+
+    /// When SFU surfaces UUID-like placeholder stream ids, provision an alias key for that UUID
+    /// from the *only* unambiguous remote candidate (true 1:1 SFU rooms) so receiver FrameCryptor
+    /// can start immediately. We deliberately refuse to guess in multi-party calls — picking the
+    /// wrong peer's key would silently bind the cryptor to garbage and produce no decoded frames.
+    ///
+    /// - Returns: `true` only when an alias key was actually provisioned (or already existed).
+    private func tryProvisionUuidAliasFrameKeyIfPossible(
+        for participantId: String,
+        connection: RTCConnection
+    ) async -> Bool {
+        guard enableEncryption else { return false }
+        guard frameEncryptionKeyMode == .perParticipant else { return false }
+        let target = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard UUID(uuidString: target) != nil else { return false }
+        if lastFrameKeyIndexByParticipantId[target] != nil {
+            return true
+        }
+
+        let localNorm = connection.localParticipantId
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        // Build a set of *non-local*, *non-target* candidates that already have a provisioned key.
+        // We never alias from the local slot — that's our own send key and cannot decrypt remote
+        // media regardless of how the SFU labels the stream.
+        var seen: Set<String> = []
+        var candidates: [String] = []
+        let raw = [connection.remoteParticipantId]
+            + connection.call.recipients.map(\.secretName)
+            + Array(lastFrameKeyIndexByParticipantId.keys)
+        for r in raw {
+            let id = r.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty,
+                  id.lowercased() != localNorm,
+                  id.caseInsensitiveCompare(target) != .orderedSame,
+                  lastFrameKeyIndexByParticipantId[id] != nil
+            else { continue }
+            if seen.insert(id.lowercased()).inserted {
+                candidates.append(id)
+            }
+        }
+
+        // Only alias when there is a single, unambiguous remote candidate. With more than one
+        // remote we cannot tell which peer the UUID stream belongs to; defer to the
+        // `addedStream` rebind path once the SFU publishes the stable participant id.
+        guard candidates.count == 1, let source = candidates.first,
+              let sourceIndex = lastFrameKeyIndexByParticipantId[source], sourceIndex >= 0
+        else {
+            return false
+        }
+
+        let sourceKey = exportFrameEncryptionKey(index: sourceIndex, for: source)
+        guard !sourceKey.isEmpty else { return false }
+        await setFrameEncryptionKey(sourceKey, index: sourceIndex, for: target)
+        logger.log(
+            level: .info,
+            message: "Provisioned UUID alias frame key participantId='\(target)' from sourceParticipantId='\(source)' index=\(sourceIndex) connId=\(connection.id)"
+        )
+        return true
+    }
+
+#if canImport(WebRTC)
+    /// Re-binds Apple WebRTC receiver `RTCFrameCryptor`s after receive-side frame keys are injected in
+    /// ``RTCSession/setReceivingMessageKey``.
+    ///
+    /// Android calls `createReceiverEncryptedFrame` from that path; Apple historically only updated the
+    /// key provider. When `didAddReceiver` runs before the ciphertext/`setReceivingMessageKey` step,
+    /// initial cryptors may never observe keys (ICE connected, tracks attached, zero decoded frames).
+    ///
+    /// Scoped to true 1:1-over-SFU and non-group peer connections so we do not overwrite shared
+    /// `videoFrameCryptor` slots used by multi-party SFU layouts.
+    internal func appleReattachReceiverFrameCryptorsAfterReceiveKey(
+        connection: RTCConnection,
+        provisionedRemoteTrackOwnerId: String
+    ) async throws {
+        guard enableEncryption else { return }
+        let provisioned = provisionedRemoteTrackOwnerId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !provisioned.isEmpty else { return }
+
+        let allowAggressiveReattach =
+            Self.isTrueOneToOneSfuRoom(call: connection.call) || !isGroupCallConnection(connection.id)
+        guard allowAggressiveReattach else { return }
+
+        guard var conn = await connectionManager.findConnection(with: connection.id) else { return }
+
+        if Self.isTrueOneToOneSfuRoom(call: conn.call) {
+            appleDisableAllAppleReceiverFrameCryptors(&conn)
+        } else {
+            appleDropUuidAliasedReceiverCryptorMapEntries(&conn, keepingParticipantId: provisioned)
+            appleDisableAppleReceiverFrameCryptorsForParticipant(&conn, provisionedParticipantId: provisioned)
+        }
+        await connectionManager.updateConnection(id: conn.id, with: conn)
+
+        guard var connAfterClear = await connectionManager.findConnection(with: connection.id) else { return }
+
+        try await appleRebindAppleReceiverCryptorsFromTrackMaps(
+            conn: &connAfterClear,
+            provisionedRemoteTrackOwnerId: provisioned)
+        await connectionManager.updateConnection(id: connAfterClear.id, with: connAfterClear)
+    }
+
+    private func appleDisableAllAppleReceiverFrameCryptors(_ conn: inout RTCConnection) {
+        if let c = conn.videoFrameCryptor {
+            c.enabled = false
+            c.delegate = nil
+        }
+        conn.videoFrameCryptor = nil
+        if let c = conn.audioFrameCryptor {
+            c.enabled = false
+            c.delegate = nil
+        }
+        conn.audioFrameCryptor = nil
+        for (_, c) in conn.videoReceiverCryptorsByParticipantId {
+            c.enabled = false
+            c.delegate = nil
+        }
+        conn.videoReceiverCryptorsByParticipantId.removeAll()
+        for (_, c) in conn.audioReceiverCryptorsByParticipantId {
+            c.enabled = false
+            c.delegate = nil
+        }
+        conn.audioReceiverCryptorsByParticipantId.removeAll()
+        for (_, c) in conn.screenReceiverCryptorsByParticipantId {
+            c.enabled = false
+            c.delegate = nil
+        }
+        conn.screenReceiverCryptorsByParticipantId.removeAll()
+    }
+
+    private func appleDropUuidAliasedReceiverCryptorMapEntries(
+        _ conn: inout RTCConnection,
+        keepingParticipantId: String?
+    ) {
+        let stableNorm = keepingParticipantId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        func dropUuidEntries(_ dict: inout [String: RTCFrameCryptor]) {
+            for (key, cryptor) in dict {
+                let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard UUID(uuidString: trimmed) != nil else { continue }
+                if let stableNorm, trimmed.caseInsensitiveCompare(stableNorm) == .orderedSame {
+                    continue
+                }
+                cryptor.enabled = false
+                cryptor.delegate = nil
+                dict.removeValue(forKey: key)
+            }
+        }
+        dropUuidEntries(&conn.videoReceiverCryptorsByParticipantId)
+        dropUuidEntries(&conn.audioReceiverCryptorsByParticipantId)
+    }
+
+    private func appleDisableAppleReceiverFrameCryptorsForParticipant(
+        _ conn: inout RTCConnection,
+        provisionedParticipantId: String
+    ) {
+        let p = provisionedParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let c = conn.videoReceiverCryptorsByParticipantId.removeValue(forKey: p) {
+            c.enabled = false
+            c.delegate = nil
+            if conn.videoFrameCryptor === c {
+                conn.videoFrameCryptor = nil
+            }
+        }
+        if let c = conn.audioReceiverCryptorsByParticipantId.removeValue(forKey: p) {
+            c.enabled = false
+            c.delegate = nil
+            if conn.audioFrameCryptor === c {
+                conn.audioFrameCryptor = nil
+            }
+        }
+        if let c = conn.screenReceiverCryptorsByParticipantId.removeValue(forKey: p) {
+            c.enabled = false
+            c.delegate = nil
+        }
+    }
+
+    private func appleRebindAppleReceiverCryptorsFromTrackMaps(
+        conn: inout RTCConnection,
+        provisionedRemoteTrackOwnerId: String
+    ) async throws {
+        let provisioned = provisionedRemoteTrackOwnerId.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        func matchesProvisioned(effectiveReceiverId: String?) -> Bool {
+            if frameEncryptionKeyMode == .shared { return true }
+            let eff = (effectiveReceiverId ?? conn.remoteParticipantId).trimmingCharacters(in: .whitespacesAndNewlines)
+            return eff.caseInsensitiveCompare(provisioned) == .orderedSame
+        }
+
+        func refreshConn() async {
+            if let latest = await connectionManager.findConnection(with: conn.id) {
+                conn = latest
+            }
+        }
+
+        for (streamPid, videoTrack) in conn.remoteVideoTracksByParticipantId {
+            let isScreenTrack =
+                RTCSession.isScreenShareId(videoTrack.trackId) || RTCSession.isScreenShareId(streamPid)
+            if isScreenTrack {
+                guard let receiver = conn.peerConnection.receivers.first(where: { $0.track?.trackId == videoTrack.trackId })
+                else { continue }
+                let resolved = receiverParticipantIdOverrideForE2EE(
+                    connection: conn,
+                    participantIdFromStreamIds: streamPid
+                )
+                let receiverPid = resolved.override
+                guard matchesProvisioned(effectiveReceiverId: receiverPid) else { continue }
+                if !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: receiverPid) {
+                    try await createEncryptedFrame(
+                        connection: conn,
+                        kind: .screenReceiver(receiver),
+                        participantIdOverride: receiverPid)
+                    await refreshConn()
+                }
+            } else {
+                guard let receiver = conn.peerConnection.receivers.first(where: { $0.track?.trackId == videoTrack.trackId })
+                else { continue }
+                let resolved = receiverParticipantIdOverrideForE2EE(
+                    connection: conn,
+                    participantIdFromStreamIds: streamPid
+                )
+                let receiverPid = resolved.override
+                guard matchesProvisioned(effectiveReceiverId: receiverPid) else { continue }
+
+                if !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: receiverPid),
+                   !shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                    connection: conn,
+                    participantIdOverride: receiverPid) {
+                    try await createEncryptedFrame(
+                        connection: conn,
+                        kind: .videoReceiver(receiver),
+                        participantIdOverride: receiverPid)
+                    await refreshConn()
+                } else if shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                    connection: conn,
+                    participantIdOverride: receiverPid) {
+                    let aliasProvisioned = await tryProvisionUuidAliasFrameKeyIfPossible(
+                        for: receiverPid ?? "",
+                        connection: conn
+                    )
+                    if aliasProvisioned {
+                        try await createEncryptedFrame(
+                            connection: conn,
+                            kind: .videoReceiver(receiver),
+                            participantIdOverride: receiverPid)
+                        await refreshConn()
+                    }
+                }
+            }
+        }
+
+        if let vt = conn.remoteVideoTrack, conn.remoteVideoTracksByParticipantId.isEmpty {
+            let fallbackPid =
+                remoteTrackOwnerParticipantId(connection: conn, call: conn.call)
+                ?? conn.remoteParticipantId
+            let isScreenTrack =
+                RTCSession.isScreenShareId(vt.trackId) || RTCSession.isScreenShareId(fallbackPid)
+            if isScreenTrack {
+                if let receiver = conn.peerConnection.receivers.first(where: { $0.track?.trackId == vt.trackId }) {
+                    let resolved = receiverParticipantIdOverrideForE2EE(
+                        connection: conn,
+                        participantIdFromStreamIds: fallbackPid
+                    )
+                    let receiverPid = resolved.override
+                    if matchesProvisioned(effectiveReceiverId: receiverPid),
+                       !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: receiverPid) {
+                        try await createEncryptedFrame(
+                            connection: conn,
+                            kind: .screenReceiver(receiver),
+                            participantIdOverride: receiverPid)
+                        await refreshConn()
+                    }
+                }
+            } else if let receiver = conn.peerConnection.receivers.first(where: { $0.track?.trackId == vt.trackId }) {
+                let resolved = receiverParticipantIdOverrideForE2EE(
+                    connection: conn,
+                    participantIdFromStreamIds: fallbackPid
+                )
+                let receiverPid = resolved.override
+                if matchesProvisioned(effectiveReceiverId: receiverPid) {
+                    if !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: receiverPid),
+                       !shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                        connection: conn,
+                        participantIdOverride: receiverPid) {
+                        try await createEncryptedFrame(
+                            connection: conn,
+                            kind: .videoReceiver(receiver),
+                            participantIdOverride: receiverPid)
+                        await refreshConn()
+                    } else if shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                        connection: conn,
+                        participantIdOverride: receiverPid) {
+                        let aliasProvisioned = await tryProvisionUuidAliasFrameKeyIfPossible(
+                            for: receiverPid ?? "",
+                            connection: conn
+                        )
+                        if aliasProvisioned {
+                            try await createEncryptedFrame(
+                                connection: conn,
+                                kind: .videoReceiver(receiver),
+                                participantIdOverride: receiverPid)
+                            await refreshConn()
+                        }
+                    }
+                }
+            }
+        }
+
+        for (streamPid, audioTrack) in conn.remoteAudioTracksByParticipantId {
+            guard let receiver = conn.peerConnection.receivers.first(where: { $0.track?.trackId == audioTrack.trackId })
+            else { continue }
+            let resolved = receiverParticipantIdOverrideForE2EE(
+                connection: conn,
+                participantIdFromStreamIds: streamPid
+            )
+            let receiverPid = resolved.override
+            guard matchesProvisioned(effectiveReceiverId: receiverPid) else { continue }
+
+            if !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: receiverPid),
+               !shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                connection: conn,
+                participantIdOverride: receiverPid) {
+                try await createEncryptedFrame(
+                    connection: conn,
+                    kind: .audioReceiver(receiver),
+                    participantIdOverride: receiverPid)
+                await refreshConn()
+            } else if shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                connection: conn,
+                participantIdOverride: receiverPid) {
+                let aliasProvisioned = await tryProvisionUuidAliasFrameKeyIfPossible(
+                    for: receiverPid ?? "",
+                    connection: conn
+                )
+                if aliasProvisioned {
+                    try await createEncryptedFrame(
+                        connection: conn,
+                        kind: .audioReceiver(receiver),
+                        participantIdOverride: receiverPid)
+                    await refreshConn()
+                }
+            }
+        }
+
+        for (streamPid, screenTrack) in conn.remoteScreenTracksByParticipantId {
+            guard let receiver = conn.peerConnection.receivers.first(where: { $0.track?.trackId == screenTrack.trackId })
+            else { continue }
+            let resolved = receiverParticipantIdOverrideForE2EE(
+                connection: conn,
+                participantIdFromStreamIds: streamPid
+            )
+            let receiverPid = resolved.override
+            guard matchesProvisioned(effectiveReceiverId: receiverPid) else { continue }
+            if !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: receiverPid) {
+                try await createEncryptedFrame(
+                    connection: conn,
+                    kind: .screenReceiver(receiver),
+                    participantIdOverride: receiverPid)
+                await refreshConn()
+            }
+        }
+
+        logger.log(
+            level: .info,
+            message: "Apple receiver FrameCryptor reattach finished after setReceivingMessageKey connId=\(conn.id) provisionedRemoteTrackOwner='\(provisioned)'"
+        )
+    }
+#endif
     
     func handlePeerConnectionNotifications(generation: UInt64) async {
         notificationsConsumerIsRunning = true
@@ -161,7 +667,7 @@ extension RTCSession {
             case .signalingStateDidChange(_, let stateChanged):
                 self.logger.log(level: .info, message: "peerConnection new signaling state: \(stateChanged.description)")
                 if stateChanged.description == "stable" {}
-            case .addedStream(_, _):
+            case .addedStream(_, let streamId):
                 self.logger.log(level: .info, message: "peerConnection did add stream")
 #if os(Android)
                 // Mirror Apple: attach sender FrameCryptors when stream is added (fallback if not already created in addAudioToStream/addVideoToStream).
@@ -228,6 +734,57 @@ extension RTCSession {
                     }
                 } catch {
                     logger.log(level: .error, message: "Failed to create sender FrameCryptors in addedStream: \(error)")
+                }
+
+                // For SFU/group calls, the first remote stream id can be UUID-like placeholder.
+                // When a later renegotiation publishes a stable participant id, proactively
+                // rebind receiver cryptors to that id so key lookup aligns.
+                if enableEncryption,
+                   isGroupCallConnection(connection.id),
+                   frameEncryptionKeyMode == .perParticipant {
+                    let trimmedStreamId = streamId.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let (e2eeParticipantId, _, _) = receiverParticipantIdOverrideForE2EE(
+                        connection: connection,
+                        participantIdFromStreamIds: trimmedStreamId
+                    )
+                    let stableParticipantId = e2eeParticipantId ?? trimmedStreamId
+                    let localParticipantId = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !stableParticipantId.isEmpty,
+                       UUID(uuidString: stableParticipantId) == nil,
+                       stableParticipantId.caseInsensitiveCompare(localParticipantId) != .orderedSame {
+                        do {
+                            // Disable any prior UUID-aliased cryptors on the same receivers before
+                            // rebinding to the stable id; otherwise libwebrtc has two cryptors on
+                            // the same RTPReceiver and the alias map keeps stale entries.
+                            let cleaned = clearUuidAliasedReceiverCryptors(
+                                on: connection,
+                                keepingParticipantId: stableParticipantId
+                            )
+                            await connectionManager.updateConnection(id: cleaned.id, with: cleaned)
+
+                            if let videoReceiver = cleaned.peerConnection.transceivers.first(where: {
+                                $0.mediaType == .video && !RTCSession.isScreenShareId($0.receiver.track?.trackId ?? "")
+                            })?.receiver {
+                                try await self.createEncryptedFrame(
+                                    connection: cleaned,
+                                    kind: .videoReceiver(videoReceiver),
+                                    participantIdOverride: stableParticipantId
+                                )
+                            }
+                            if let audioReceiver = cleaned.peerConnection.transceivers.first(where: {
+                                $0.mediaType == .audio
+                            })?.receiver {
+                                try await self.createEncryptedFrame(
+                                    connection: cleaned,
+                                    kind: .audioReceiver(audioReceiver),
+                                    participantIdOverride: stableParticipantId
+                                )
+                            }
+                            logger.log(level: .info, message: "Rebound SFU receiver FrameCryptors to stable participantId='\(stableParticipantId)' for connection=\(connection.id)")
+                        } catch {
+                            logger.log(level: .error, message: "Failed to rebind SFU receiver FrameCryptors for participantId='\(stableParticipantId)': \(error)")
+                        }
+                    }
                 }
                 
 #endif
@@ -389,7 +946,8 @@ extension RTCSession {
                         updated.remoteVideoTrack = videoTrack
                         await connectionManager.updateConnection(id: updated.id, with: updated)
                         
-                        if let pendingRenderer = pendingRemoteVideoRenderersByConnectionId[updated.id] {
+                        let normalizedConnectionId = updated.id.normalizedConnectionId
+                        if let pendingRenderer = pendingRemoteVideoRenderersByConnectionId[normalizedConnectionId] {
                             logger.log(level: .info, message: "Rebinding remote renderer now that remote video track is available (trackId=\(trackId))")
                             connection.remoteVideoTrack?.remove(pendingRenderer)
                             videoTrack.add(pendingRenderer)
@@ -408,10 +966,17 @@ extension RTCSession {
                         )
                         let receiverParticipantId = resolved.override
                         if enableEncryption, resolved.didOverrideToRemote {
-                            self.logger.log(
-                                level: .warning,
-                                message: "⚠️ SFU streamId '\(participantId)' looks UUID-like in 1:1 room; overriding receiver participantId -> '\(connection.remoteParticipantId)' for E2EE key alignment"
-                            )
+                            if resolved.isUuidLikeStreamRemap {
+                                self.logger.log(
+                                    level: .warning,
+                                    message: "⚠️ SFU streamId '\(participantId)' is UUID-shaped in 1:1 room; overriding receiver participantId -> '\(receiverParticipantId ?? "?")' for E2EE key alignment"
+                                )
+                            } else {
+                                self.logger.log(
+                                    level: .info,
+                                    message: "SFU recv label '\(participantId)' remapped for E2EE (e.g. msid `peer_` vs frame key `peer') -> '\(receiverParticipantId ?? "?")'"
+                                )
+                            }
                         }
 
                         // Diagnostics: prove which participantId we bind the receiver FrameCryptor to,
@@ -438,11 +1003,37 @@ extension RTCSession {
                         if enableEncryption {
                             if !shouldSkipGroupReceiverFrameCryptor(
                                 connection: updated,
+                                participantIdOverride: receiverParticipantId),
+                               !shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                                connection: updated,
                                 participantIdOverride: receiverParticipantId) {
                                 try await self.createEncryptedFrame(
                                     connection: updated,
                                     kind: .videoReceiver(receiver),
                                     participantIdOverride: receiverParticipantId)
+                            } else if shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                                connection: updated,
+                                participantIdOverride: receiverParticipantId) {
+                                let aliasProvisioned = await self.tryProvisionUuidAliasFrameKeyIfPossible(
+                                    for: receiverParticipantId ?? "",
+                                    connection: updated
+                                )
+                                if aliasProvisioned {
+                                    try await self.createEncryptedFrame(
+                                        connection: updated,
+                                        kind: .videoReceiver(receiver),
+                                        participantIdOverride: receiverParticipantId
+                                    )
+                                    self.logger.log(
+                                        level: .info,
+                                        message: "Bound video receiver FrameCryptor immediately using UUID alias participantId='\(receiverParticipantId ?? "<nil>")' pending stable SFU id."
+                                    )
+                                } else {
+                                    self.logger.log(
+                                        level: .warning,
+                                        message: "Delaying video receiver FrameCryptor bind for UUID-like participantId='\(receiverParticipantId ?? "<nil>")' until stable SFU participant id arrives."
+                                    )
+                                }
                             } else {
                                 self.logger.log(
                                     level: .debug,
@@ -473,10 +1064,17 @@ extension RTCSession {
                         )
                         let receiverParticipantId = resolved.override
                         if enableEncryption, resolved.didOverrideToRemote {
-                            self.logger.log(
-                                level: .warning,
-                                message: "⚠️ SFU streamId '\(participantId)' looks UUID-like in 1:1 room; overriding receiver participantId -> '\(connection.remoteParticipantId)' for E2EE key alignment"
-                            )
+                            if resolved.isUuidLikeStreamRemap {
+                                self.logger.log(
+                                    level: .warning,
+                                    message: "⚠️ SFU streamId '\(participantId)' is UUID-shaped in 1:1 room; overriding receiver participantId -> '\(receiverParticipantId ?? "?")' for E2EE key alignment"
+                                )
+                            } else {
+                                self.logger.log(
+                                    level: .info,
+                                    message: "SFU recv label '\(participantId)' remapped for E2EE (e.g. msid `peer_` vs frame key `peer') -> '\(receiverParticipantId ?? "?")'"
+                                )
+                            }
                         }
 
                         // Diagnostics: prove which participantId we bind the receiver FrameCryptor to,
@@ -503,11 +1101,37 @@ extension RTCSession {
                         if enableEncryption {
                             if !shouldSkipGroupReceiverFrameCryptor(
                                 connection: updated,
+                                participantIdOverride: receiverParticipantId),
+                               !shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                                connection: updated,
                                 participantIdOverride: receiverParticipantId) {
                                 try await self.createEncryptedFrame(
                                     connection: updated,
                                     kind: .audioReceiver(receiver),
                                     participantIdOverride: receiverParticipantId)
+                            } else if shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                                connection: updated,
+                                participantIdOverride: receiverParticipantId) {
+                                let aliasProvisioned = await self.tryProvisionUuidAliasFrameKeyIfPossible(
+                                    for: receiverParticipantId ?? "",
+                                    connection: updated
+                                )
+                                if aliasProvisioned {
+                                    try await self.createEncryptedFrame(
+                                        connection: updated,
+                                        kind: .audioReceiver(receiver),
+                                        participantIdOverride: receiverParticipantId
+                                    )
+                                    self.logger.log(
+                                        level: .info,
+                                        message: "Bound audio receiver FrameCryptor immediately using UUID alias participantId='\(receiverParticipantId ?? "<nil>")' pending stable SFU id."
+                                    )
+                                } else {
+                                    self.logger.log(
+                                        level: .warning,
+                                        message: "Delaying audio receiver FrameCryptor bind for UUID-like participantId='\(receiverParticipantId ?? "<nil>")' until stable SFU participant id arrives."
+                                    )
+                                }
                             } else {
                                 self.logger.log(
                                     level: .debug,
@@ -528,7 +1152,9 @@ extension RTCSession {
                     continue
                 }
                 self.logger.log(level: .info, message: "peerConnection new connection state: \(newState.description)")
-                if newState.state == .connected, let callDirection = await self.callState.callDirection {
+                if newState.state == .connected {
+                    let callDirection = await self.callState.callDirection
+                        ?? self.inferredCallDirection(for: connection.call)
                     let id: String? = connectionId
                     cancelRelayFallbackTimer(connectionId: connection.id)
                     cancelDisconnectGraceTask()
@@ -618,8 +1244,18 @@ extension RTCSession {
                 if newState.state == .connected || newState.state == .completed {
                     cancelRelayFallbackTimer(connectionId: connection.id)
                     cancelDisconnectGraceTask()
-                    if let callDirection = await self.callState.callDirection,
-                       case .connecting = await self.callState.currentState {
+                    let callDirection = await self.callState.callDirection
+                        ?? self.inferredCallDirection(for: connection.call)
+                    let current = await self.callState.currentState
+                    if case .connecting = current {
+                        await self.callState.transition(
+                            to: .connected(
+                                callDirection,
+                                connection.call))
+                    } else if case .ready = current {
+                        // If `setConnectingIfReady` could not run (e.g. state not `.ready` yet) but
+                        // the native stack still reaches ICE connected, advance so the UI is not
+                        // stuck in "connecting" forever.
                         await self.callState.transition(
                             to: .connected(
                                 callDirection,
@@ -698,8 +1334,9 @@ extension RTCSession {
                     // - For 1:1 calls in perParticipant mode: use remoteParticipantId to match the key
                     let receiverParticipantId: String?
                     if self.isGroupCallConnection(connection.id) {
-                        // Group call: participantId will be set when didAddReceiver fires
-                        receiverParticipantId = nil
+                        // Group call: participantId must come from didAddReceiver/addStream mapping.
+                        // Avoid binding receiver cryptors here to room-id / placeholder ids.
+                        continue
                     } else if self.frameEncryptionKeyMode == .perParticipant {
                         // 1:1 call in perParticipant mode: use remoteParticipantId to match the key
                         receiverParticipantId = connection.remoteParticipantId
@@ -752,11 +1389,18 @@ extension RTCSession {
                 }
             case .shouldNegotiate(_):
                 self.logger.log(level: .info, message: "peerConnection should negotiate")
-                let normId = connection.id.normalizedConnectionId
+                let normId = teardownConnectionIdKey(connection.id)
+                let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: connection.call)
                 if pendingInitialSfuGroupOfferConnectionIds.contains(normId) {
                     self.logger.log(
                         level: .debug,
                         message: "Skipping shouldNegotiate SFU offer during initial group bootstrap for connection=\(connection.id)")
+                } else if isOneToOneSfuRoom {
+                    // 1:1-over-SFU behaves like direct 1:1 signaling role-wise. Auto-offering here
+                    // causes glare when the answerer has already decided not to offer.
+                    self.logger.log(
+                        level: .debug,
+                        message: "Ignoring shouldNegotiate SFU auto-offer for 1:1 room connection=\(connection.id)")
                 } else if isGroupCallConnection(connection.id) {
                     // For SFU/group calls, proactively generate and send a fresh offer when the
                     // peer requests renegotiation (e.g. new remote participants/tracks).

@@ -38,6 +38,30 @@ struct KeyManagerSessionIdentityMappingTests {
     }
 
     @Test
+    func recipientIdentityDerivesStableSessionIdentityId_whenConnectionIdIsShortConferenceRoom() async throws {
+        let keyManager = KeyManager()
+        let connectionId = "#conf-k7m2x9q4r8vd6p3t-uk7m2x9q4r8vd6"
+        let normalizedConnectionId = "k7m2x9q4r8vd6p3t-uk7m2x9q4r8vd6"
+        let expectedSessionId = normalizedConnectionId.stableUUIDConnectionId
+
+        let local = try await keyManager.generateSenderIdentity(connectionId: connectionId, secretName: "alice")
+        let recipientProps = await local.sessionIdentity.props(symmetricKey: local.symmetricKey)
+        #expect(recipientProps != nil)
+        #expect(local.sessionIdentity.id == expectedSessionId)
+
+        guard let recipientProps else { return }
+
+        let recipientIdentity = try await keyManager.createRecipientIdentity(connectionId: connectionId, props: recipientProps)
+        #expect(recipientIdentity.sessionIdentity.id == expectedSessionId)
+        let fetchedByRoute = await keyManager.fetchConnectionIdentityByConnectionId(connectionId)
+        let fetchedByNormalized = await keyManager.fetchConnectionIdentityByConnectionId(normalizedConnectionId)
+        let fetchedBySessionId = await keyManager.fetchConnectionIdentity(expectedSessionId)
+        #expect(fetchedByRoute?.sessionIdentity.id == expectedSessionId)
+        #expect(fetchedByNormalized?.sessionIdentity.id == expectedSessionId)
+        #expect(fetchedBySessionId?.connectionId == connectionId)
+    }
+
+    @Test
     func updateSessionIdentityPersistsToStoredConnectionIdentity() async throws {
         let keyManager = KeyManager()
 

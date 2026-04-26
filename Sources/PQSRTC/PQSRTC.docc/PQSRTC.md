@@ -12,6 +12,8 @@ At a high level:
 - The SDK owns WebRTC state, negotiation, and call lifecycle inside ``RTCSession``.
 - SFU group calls are driven by ``RTCGroupCall``.
 
+For **server-SFU (SwiftSFU)** with NeedleTail-style signaling, also read the articles on **iOS + CallKit** media ordering, **SFU signaling** flags, and **per-participant frame E2EE** (remote video)—see the topics under *Server SFU, CallKit, and frame E2EE* below.
+
 ### What you build vs what the SDK builds
 
 Your app (or backend) is responsible for:
@@ -49,6 +51,12 @@ The SDK supports two group-call keying models:
 - <doc:One-to-One-Calls>
 - <doc:End-to-End-Encryption>
 
+### Server SFU, CallKit, and frame E2EE (NeedleTails)
+
+- <doc:HostAppCallKitAndSFU> — iOS **CallKit** + server SFU **media bootstrap** ordering (inbound 1:1)
+- <doc:SFUSignalingOverview> — control plane, ``PacketFlag``, duplicate `handshakeComplete`
+- <doc:SfuRemoteVideoFrameE2EE> — **remote video** and per-participant **FrameCryptor** identity (`msid`, 1:1 vs `conf-`)
+
 ### Core Types
 
 - ``RTCSession``
@@ -66,6 +74,11 @@ The SDK supports two group-call keying models:
 
 - ``RTCFrameEncryptionKeyMode``
 - ``RTCGroupE2EE``
+
+## Building this documentation
+
+- In **Xcode**: open the `pqs-rtc` package, select the **PQSRTC** target, then **Product → Build Documentation** (⌃⌥⌘D).
+- The DocC catalog is a single bundle at `Sources/PQSRTC/PQSRTC.docc/` (articles under `Articles/`).
 
 @Metadata {
   @DisplayName("PQSRTC")

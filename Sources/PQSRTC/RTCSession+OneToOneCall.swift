@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Crypto
 import DoubleRatchetKit
 import BinaryCodable
 
@@ -72,20 +73,52 @@ extension RTCSession {
     public func answerCall(_ call: Call) async throws {
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).
         activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
-        if isGroupCall {
+        let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: call)
+        if isOneToOneSfuRoom {
+            // 1:1-over-SFU is still a client<->SFU media session on each device, so the answering
+            // participant must negotiate its own peer connection with the SFU.
             shouldOffer = true
+        } else if isGroupCall {
+            shouldOffer = true
+        } else {
+            // Direct 1:1 answerers must not switch to offerer role.
+            shouldOffer = false
         }
         
         guard let recipient = call.recipients.first else {
             throw RTCErrors.invalidConfiguration("Answering a call with no recipients is not supported.")
         }
+
+        // Resolve the local participant's secretName for sender-identity provisioning.
+        //
+        // For direct 1:1, the inbound `Call` keeps the wire orientation: `sender` is the
+        // remote caller and `recipients.first` is the local user — so `recipient.secretName`
+        // is correct.
+        //
+        // For 1:1-over-SFU, the host app (CallManager.answerCall) rewrites the call before
+        // invoking us so that `sender` becomes the local user and `recipients` carries the
+        // remote DR target. Using `recipient.secretName` here would provision the local
+        // frame/signaling identities under the **remote** peer's secretName, leading to
+        // FrameCryptor key-id mismatches and silently undecryptable inbound media.
+        // Prefer the cached `sessionParticipant`; fall back to the SFU-shape sender, then
+        // to the direct-shape recipient.
+        let localSecretName: String = {
+            if let sp = sessionParticipant?.secretName, !sp.isEmpty {
+                return sp
+            }
+            if isOneToOneSfuRoom {
+                return call.sender.secretName
+            }
+            return recipient.secretName
+        }()
+
         let frameLocalIdentity: ConnectionLocalIdentity
         if let foundLocalIdentity = try? await keyManager.fetchCallKeyBundle() {
             frameLocalIdentity = foundLocalIdentity
         } else {
             frameLocalIdentity = try await keyManager.generateSenderIdentity(
                 connectionId: call.sharedCommunicationId,
-                secretName: recipient.secretName
+                secretName: localSecretName
             )
         }
         
@@ -95,7 +128,7 @@ extension RTCSession {
         } else {
             signalingLocalIdentity = try await pcKeyManager.generateSenderIdentity(
                connectionId: call.sharedCommunicationId,
-               secretName: recipient.secretName)
+               secretName: localSecretName)
         }
         
         var call = call
@@ -157,19 +190,46 @@ extension String {
         self.hasPrefix("#") ? String(self.dropFirst()) : self
     }
 
-    /// Normalizes identifiers that should map to a UUID-shaped connection/session id.
+    /// Normalizes identifiers that should map to a stable connection/session stem.
     ///
     /// Accepted forms:
-    /// - `UUID`
-    /// - `#UUID`
-    /// - `conf-UUID`
-    /// - `#conf-UUID`
+    /// - `room`
+    /// - `#room`
+    /// - `conf-room`
+    /// - `#conf-room`
+    ///
+    /// UUID-shaped room stems are preserved for backwards compatibility.
     public var normalizedUUIDConnectionId: String {
-        let noChannelPrefix = self.normalizedConnectionId
+        let noChannelPrefix = self
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .normalizedConnectionId
         if noChannelPrefix.hasPrefix("conf-") {
             return String(noChannelPrefix.dropFirst("conf-".count))
         }
         return noChannelPrefix
+    }
+
+    /// Returns a stable UUID for any supported connection/session id.
+    ///
+    /// If the normalized room stem is already a UUID, the UUID is returned unchanged. Otherwise,
+    /// SHA-256 is used to derive a deterministic UUID payload for ratchet/session APIs that are
+    /// UUID-keyed internally.
+    public var stableUUIDConnectionId: UUID {
+        let normalized = normalizedUUIDConnectionId.lowercased()
+        if let uuid = UUID(uuidString: normalized) {
+            return uuid
+        }
+
+        let digest = SHA256.hash(data: Data(normalized.utf8))
+        var bytes = Array(digest.prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x50
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
     
     public var ensureIRCChannel: String {

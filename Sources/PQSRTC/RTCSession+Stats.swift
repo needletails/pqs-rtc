@@ -176,21 +176,27 @@ extension RTCSession {
             case .stalledEgress, .encodeStalled:
                 return true
             case .noTraffic:
-                // Recover from "video never started" after connection is already carrying audio.
-                return flow.deltaAudioPacketsSent > 0 || flow.audioPacketsSent > 0
+                return true
             case .advancingEgress:
                 return false
             }
         }()
         guard shouldConsiderState else { return false }
-        // If audio is also flat, this is more likely transport and local sender recovery won't help.
-        guard flow.deltaAudioPacketsSent > 0 else { return false }
         guard flow.dtlsState == "connected" else { return false }
         guard flow.selectedPairState == "succeeded" || flow.selectedPairState == "in-progress" || flow.selectedPairState == "inprogress" else { return false }
         guard let connection = await connectionManager.findConnection(with: connectionId) else { return false }
         guard connection.call.supportsVideo else { return false }
         guard connection.localVideoTrack?.isEnabled == true else { return false } // avoid fighting user mute
-        return true
+        // Typical case: audio is advancing while video is flat -> sender-side video stall.
+        if flow.deltaAudioPacketsSent > 0 || flow.audioPacketsSent > 0 {
+            return true
+        }
+        // Also recover when both audio+video are flat but DTLS/ICE are healthy.
+        // This catches "media never started" sessions where transport came up but sender paths never began.
+        if flow.state == .noTraffic {
+            return true
+        }
+        return false
     }
 
     private func performOutboundVideoEgressRecovery(
@@ -209,6 +215,13 @@ extension RTCSession {
             level: .warning,
             message: "Outbound video appears stalled while transport/audio are healthy; attempting sender-side video recovery (connId=\(connectionId), flow=\(flow.state.rawValue), cause=\(flow.likelyCause), dOutVideoPackets=\(flow.deltaPacketsSent), dOutFramesEncoded=\(flow.deltaFramesEncoded), dOutFramesSent=\(flow.deltaFramesSent))"
         )
+
+        // If absolutely no media is flowing despite connected transport, kick both media senders once.
+        if flow.state == .noTraffic && flow.audioPacketsSent == 0 && flow.deltaAudioPacketsSent <= 0 {
+            try? await setAudioTrack(isEnabled: false, connectionId: connectionId)
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            try? await setAudioTrack(isEnabled: true, connectionId: connectionId)
+        }
 
         // Step 1: cheap sender-path toggle.
         await setVideoTrack(isEnabled: false, connectionId: connectionId)
@@ -314,6 +327,39 @@ extension RTCSession {
                 continuation.resume(returning: report)
             }
         }
+    }
+
+    private func compactRtpStatsDetails(report: RTCStatisticsReport) -> String {
+        func string(_ any: Any?) -> String? {
+            if let s = any as? String { return s }
+            if let n = any as? NSNumber { return n.stringValue }
+            return nil
+        }
+
+        var entries: [String] = []
+        for (statId, stat) in report.statistics {
+            guard stat.type == "inbound-rtp" || stat.type == "outbound-rtp" else { continue }
+            let values = stat.values
+            let kind = (string(values["kind"]) ?? string(values["mediaType"]) ?? "?").lowercased()
+            let ssrc = string(values["ssrc"]) ?? "?"
+            let mid = string(values["mid"]) ?? string(values["mediaSourceId"]) ?? "?"
+            let track = string(values["trackIdentifier"]) ?? string(values["trackId"]) ?? "?"
+            let codec = string(values["codecId"]) ?? "?"
+            let transportId = string(values["transportId"]) ?? "?"
+            let packets = string(values["packetsReceived"]) ?? string(values["packetsSent"]) ?? "0"
+            let bytes = string(values["bytesReceived"]) ?? string(values["bytesSent"]) ?? "0"
+            let framesReceived = string(values["framesReceived"]) ?? "0"
+            let framesDecoded = string(values["framesDecoded"]) ?? "0"
+            let framesSent = string(values["framesSent"]) ?? "0"
+            let framesEncoded = string(values["framesEncoded"]) ?? "0"
+            let packetsLost = string(values["packetsLost"]) ?? "0"
+            let jitter = string(values["jitter"]) ?? "?"
+            entries.append("\(stat.type)#\(statId)(kind=\(kind),ssrc=\(ssrc),mid=\(mid),track=\(track),codec=\(codec),transport=\(transportId),packets=\(packets),bytes=\(bytes),framesReceived=\(framesReceived),framesDecoded=\(framesDecoded),framesSent=\(framesSent),framesEncoded=\(framesEncoded),lost=\(packetsLost),jitter=\(jitter))")
+        }
+
+        let sorted = entries.sorted()
+        guard !sorted.isEmpty else { return "rtp=[]" }
+        return sorted.prefix(16).joined(separator: ";")
     }
 
     /// Checks whether inbound remote video counters are advancing for a connection.
@@ -711,9 +757,8 @@ extension RTCSession {
     /// Logs a single snapshot of outbound + inbound RTP stats.
     ///
     /// `reason` is included for correlation (e.g. "periodic", "afterAttachRemoteRenderer").
+    /// This is intentionally low-volume and always available in release builds for black-video triage.
     private func logRtpEgressSnapshot(connectionId: String, report: RTCStatisticsReport, reason: String? = nil) async {
-        guard PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled else { return }
-
         // Aggregate outbound + inbound RTP.
         var audioPacketsSent: Int64 = 0
         var audioBytesSent: Int64 = 0
@@ -811,20 +856,26 @@ extension RTCSession {
         let anomalyNote = (noEgress || noIngressVideo || ingressButNoDecode)
             ? " [anomaly: noEgress=\(noEgress) noIngressVideo=\(noIngressVideo) ingressButNoDecode=\(ingressButNoDecode)]"
             : ""
-        logger.log(
-            level: .trace,
-            message: "RTP stats (connId=\(connectionId)\(reasonDesc))\(anomalyNote): OUT audio packetsSent=\(audioPacketsSent) bytesSent=\(audioBytesSent) | OUT video packetsSent=\(videoPacketsSent) bytesSent=\(videoBytesSent) || IN audio packetsReceived=\(audioPacketsReceived) bytesReceived=\(audioBytesReceived) | IN video packetsReceived=\(videoPacketsReceived) bytesReceived=\(videoBytesReceived) framesReceived=\(videoFramesReceived) framesDecoded=\(videoFramesDecoded) | \(dtlsDesc) | \(pairDesc)"
-        )
+        let rtpDetails = compactRtpStatsDetails(report: report)
+        if noEgress || noIngressVideo || ingressButNoDecode {
+            logger.log(
+                level: .warning,
+                message: "RTP stats (connId=\(connectionId)\(reasonDesc))\(anomalyNote): OUT audio packetsSent=\(audioPacketsSent) bytesSent=\(audioBytesSent) | OUT video packetsSent=\(videoPacketsSent) bytesSent=\(videoBytesSent) || IN audio packetsReceived=\(audioPacketsReceived) bytesReceived=\(audioBytesReceived) | IN video packetsReceived=\(videoPacketsReceived) bytesReceived=\(videoBytesReceived) framesReceived=\(videoFramesReceived) framesDecoded=\(videoFramesDecoded) | \(dtlsDesc) | \(pairDesc) | details=\(rtpDetails)"
+            )
+        } else {
+            logger.log(
+                level: .info,
+                message: "RTP stats (connId=\(connectionId)\(reasonDesc))\(anomalyNote): OUT audio packetsSent=\(audioPacketsSent) bytesSent=\(audioBytesSent) | OUT video packetsSent=\(videoPacketsSent) bytesSent=\(videoBytesSent) || IN audio packetsReceived=\(audioPacketsReceived) bytesReceived=\(audioBytesReceived) | IN video packetsReceived=\(videoPacketsReceived) bytesReceived=\(videoBytesReceived) framesReceived=\(videoFramesReceived) framesDecoded=\(videoFramesDecoded) | \(dtlsDesc) | \(pairDesc)"
+            )
+        }
     }
 
     /// Emits a single `getStats` snapshot after an optional delay.
     ///
-    /// Logged at `.trace` when `PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled` is true
-    /// (DEBUG by default; Release + `PQSRTC_REMOTE_VIDEO_TRACE_LOGGING=1`).
+    /// Always runs to capture low-volume black-video diagnostics in release builds.
     func logRtpStatsSnapshotOnce(connectionId: String, delayNanoseconds: UInt64 = 0, reason: String) {
         let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
         guard !normalizedId.isEmpty else { return }
-        guard PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled else { return }
 
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
@@ -841,4 +892,3 @@ extension RTCSession {
 extension RTCStatisticsReport: @unchecked Sendable {}
 
 #endif
-

@@ -32,16 +32,34 @@ extension RTCSession {
         sfuRecipientId: String,
         supportsVideo: Bool = true
     ) async throws {
-        isGroupCall = true
         let normalizedId = sfuRecipientId.normalizedConnectionId
-        resetAttemptFlagsForNewCall(connectionId: normalizedId)
         // Allow joining an SFU room even if the participant list is currently empty.
-        var call = try Call(
+        let call = try Call(
             groupSharedCommunicationId: normalizedId,
             sender: sender,
             recipients: participants,
             supportsVideo: supportsVideo,
             isActive: true)
+        try await groupCallNegotiation(call: call, sfuRecipientId: sfuRecipientId)
+    }
+
+    /// Starts SFU group-call registration while preserving the caller-supplied call identity.
+    ///
+    /// Use this when the app has a stable internal call UUID (`sharedCommunicationId`) that is
+    /// distinct from the SFU wire route (`sfuRecipientId`, often a channel name). This keeps the
+    /// ratchet/session identity on the UUID while routing SFU packets through the channel.
+    public func groupCallNegotiation(
+        call originalCall: Call,
+        sfuRecipientId: String
+    ) async throws {
+        isGroupCall = true
+        let normalizedId = sfuRecipientId.normalizedConnectionId
+        let normalizedConnectionId = originalCall.sharedCommunicationId.normalizedConnectionId
+        resetAttemptFlagsForNewCall(connectionId: normalizedConnectionId)
+        var call = originalCall
+        if call.channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            call.channelWireId = sfuRecipientId.ensureIRCChannel
+        }
         
         let signalingLocalIdentity: ConnectionLocalIdentity
         if let foundSignalingLocalIdentity = try? await pcKeyManager.fetchCallKeyBundle() {
@@ -49,7 +67,7 @@ extension RTCSession {
         } else {
             signalingLocalIdentity = try await pcKeyManager.generateSenderIdentity(
                connectionId: call.sharedCommunicationId,
-               secretName: sender.secretName)
+               secretName: call.sender.secretName)
         }
         
         // For group calls, these props are used for SFU signaling ratchet remoteKeys.
@@ -87,6 +105,7 @@ extension RTCSession {
     
     public func sendGroupCallOffer(_ call: Call) async throws -> Call {
         var call = call
+        let wireRoomId = call.resolvedChannelWireId ?? call.sharedCommunicationId
         
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).
         activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
@@ -98,7 +117,7 @@ extension RTCSession {
         let offerPlaintext = try BinaryEncoder().encode(call)
         let writeTask = WriteTask(
             data: offerPlaintext,
-            roomId: call.sharedCommunicationId,
+            roomId: wireRoomId,
             flag: .offer,
             call: call)
         let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
@@ -117,17 +136,36 @@ extension RTCSession {
         sfuRecipientId: String,
         call: Call
     ) async throws {
-        
-//        guard let group = groupCall(forSfuIdentity: sfuRecipientId) else {
-//            throw RTCErrors.missingGroupCall
-//        }
         // Identity props must be sent back from the SFU Server's group identity.
         guard let props = call.signalingIdentityProps else { throw EncryptionErrors.missingProps }
+        let connId = call.sharedCommunicationId.normalizedConnectionId
+
+        // Signaling ratchet (SDP/ICE over SFU): `pcKeyManager` + `TaskProcessor`.
         do {
-            _ = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId.normalizedConnectionId)
+            _ = try await pcKeyManager.fetchConnectionIdentity(connection: connId)
         } catch {
             _ = try await pcKeyManager.createRecipientIdentity(
-                connectionId: call.sharedCommunicationId.normalizedConnectionId,
+                connectionId: connId,
+                props: props)
+        }
+
+        // Media / FrameCryptor ratchet: `keyManager` + `ratchetManager`.
+        //
+        // Swift SFU's registration reply intentionally carries **signaling** props only
+        // (`PQSGroupCallAdapter` sets `frameIdentityProps = nil`). There is no separate
+        // SFU payload for frame identities at registration time, but `beginGroupCallMediaAfterSfuRegistrationIfNeeded`
+        // still runs `createPeerConnection` → `setMessageKey` → `deriveMessageKey`, which requires a
+        // **recipient** `ConnectionSessionIdentity` in `keyManager` keyed by the room id.
+        //
+        // The server-negotiated `UnwrappedProps` are the SFU/room peer keys; we install them into
+        // **both** stores so each Double Ratchet (separate `KeyManager` actors, separate DR state)
+        // can initialize. Per-peer frame refinements continue to flow through `receiveCiphertext` /
+        // `call_cipher` as before.
+        do {
+            _ = try await keyManager.fetchConnectionIdentity(connection: connId)
+        } catch {
+            _ = try await keyManager.createRecipientIdentity(
+                connectionId: connId,
                 props: props)
         }
     }
@@ -147,6 +185,27 @@ extension RTCSession {
         }
 
         var mediaCall = await group.currentCall
+        let connId = mediaCall.sharedCommunicationId.normalizedConnectionId
+
+        // Registration + identity provisioning can race app-layer answer flow.
+        // Do not fail the call action when identities are still settling; callers
+        // will invoke this entrypoint again on registration/call_answered retries.
+        do {
+            _ = try await keyManager.fetchConnectionIdentity(connection: connId)
+            _ = try await pcKeyManager.fetchConnectionIdentity(connection: connId)
+        } catch let error as RTCErrors {
+            if case .invalidConfiguration(let message) = error {
+                let lower = message.lowercased()
+                if lower.contains("missing connection identity") || lower.contains("missing local connection identity") {
+                    logger.log(
+                        level: .warning,
+                        message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: identities not ready yet for room=\(normalizedLookup), delaying media bootstrap (\(message))")
+                    return
+                }
+            }
+            throw error
+        }
+
         guard await !hasConnection(id: mediaCall.sharedCommunicationId) else {
             logger.log(
                 level: .debug,
@@ -175,18 +234,49 @@ extension RTCSession {
         }
 
         let recipientRoute = normalizedLookup
-        let bootstrapKey = mediaCall.sharedCommunicationId.normalizedConnectionId
+        // Match ``RTCConnectionManager`` / ``teardownConnectionIdKey`` (strip `#` + lowercase) so
+        // post-cipher bookkeeping survives UUID hex casing differences across call objects.
+        let bootstrapKey = teardownConnectionIdKey(mediaCall.sharedCommunicationId)
         pendingInitialSfuGroupOfferConnectionIds.insert(bootstrapKey)
         defer { pendingInitialSfuGroupOfferConnectionIds.remove(bootstrapKey) }
 
-        _ = try await createPeerConnection(
-            with: mediaCall,
-            sender: mediaCall.sender.secretName,
-            recipient: recipientRoute,
-            localIdentity: frameLocalIdentity,
-            willFinishNegotiation: true)
+#if os(iOS)
+        // No CallKit `didActivate:` for channel/conference SFU — align WebRTC with `AVAudioSession`
+        // before `createPeerConnection` (see `prepareNonCallKitGroupCallAudio`).
+        do {
+            try await self.prepareNonCallKitGroupCallAudio(supportsVideo: mediaCall.supportsVideo)
+        } catch {
+            self.logger.log(
+                level: .error,
+                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: non-CallKit audio prep failed before SFU PeerConnection: \(error)")
+            throw error
+        }
+#endif
+
+        // Default `willFinishNegotiation: false` so `setMessageKey` runs at PC creation, matching
+        // the b368e83-era behavior. The per-pair Double Ratchet then derives FrameCryptor keys
+        // for every entry in `call.recipients`, mirroring how 1:1 direct works today.
+        do {
+            _ = try await createPeerConnection(
+                with: mediaCall,
+                sender: mediaCall.sender.secretName,
+                recipient: recipientRoute,
+                localIdentity: frameLocalIdentity)
+        } catch let error as RTCErrors {
+            if case .invalidConfiguration(let message) = error {
+                let lower = message.lowercased()
+                if lower.contains("missing connection identity") || lower.contains("missing local connection identity") {
+                    logger.log(
+                        level: .warning,
+                        message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: createPeerConnection deferred for room=\(normalizedLookup) (\(message))")
+                    return
+                }
+            }
+            throw error
+        }
 
         let updatedCall = try await sendGroupCallOffer(mediaCall)
+        initialSfuGroupMediaOfferSentConnectionIds.insert(bootstrapKey)
         await group.applyUpdatedCallForNegotiation(updatedCall)
     }
     
@@ -194,10 +284,11 @@ extension RTCSession {
     ///
     /// Prefer using ``RTCGroupCall/join()`` unless you are building your own group facade.
     ///
-    /// - Important: This intentionally skips the 1:1 Double Ratchet handshake.
-    ///   For group calls, frame keys must be distributed via the control plane and applied using
-    ///   `setFrameEncryptionKey(_:index:for:)` (control-plane injected keys) or via sender-key
-    ///   distribution inside ``RTCGroupCall``.
+    /// Frame-level E2EE for SFU group calls is driven by the same per-pair Double Ratchet path
+    /// used for 1:1 direct: `setMessageKey` runs at PC creation, ciphertext fans out to every
+    /// participant in `call.recipients`, and each peer's `setReceivingMessageKey` provisions the
+    /// per-participant frame key on its side. Conference rooms (which carry an empty recipients
+    /// list) opt out of this path and use the conference frame-key exchange instead.
     func startGroupCall(call: Call, sfuRecipientId: String) async throws -> Call {
         var call = call
         
@@ -415,7 +506,7 @@ extension RTCSession {
             let answerPlaintext = try BinaryEncoder().encode(processedCall)
             let writeTask = WriteTask(
                 data: answerPlaintext,
-                roomId: call.sharedCommunicationId.normalizedConnectionId,
+                roomId: (call.resolvedChannelWireId ?? call.sharedCommunicationId).normalizedConnectionId,
                 flag: .answer,
                 call: processedCall)
             try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
@@ -433,8 +524,18 @@ extension RTCSession {
             }
             await group.setDemuxId(participant.demuxId, for: participant.id)
         case .handshakeComplete:
-            logger.log(level: .info, message: "Handshake complete")
+            // Post-cipher SFU identity refresh (see ``finishCryptoSessionCreation``): same SDP
+            // bytes + updated `signalingIdentityProps` / `frameIdentityProps`. Not an SDP
+            // negotiation — merge into the stored call + key material without
+            // `setRemoteDescription` / `createAnswer`.
+            let decoded = try BinaryDecoder().decode(Call.self, from: plaintext)
+            let resolved = try resolveProperRecipient(call: decoded)
+            try await applyInboundSfuPostCipherHandshakeMerge(resolved: resolved, sfuIdentity: packet.sfuIdentity)
+            logger.log(
+                level: .info,
+                message: "Applied inbound SFU post-cipher identity handshake for room=\(packet.sfuIdentity)"
+            )
         }
     }
-    
+
 }

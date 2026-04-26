@@ -102,7 +102,7 @@ public actor RTCSession {
     
     /// Called internally when a wrapper is created (or when timing out) to resume waiters.
     internal func resumeVideoCaptureWrapperWaiters(connectionId: String, wrapper: RTCVideoCaptureWrapper?) {
-        let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
         guard !trimmed.isEmpty else { return }
         guard let waiters = pendingVideoCaptureWrapperWaiters.removeValue(forKey: trimmed), !waiters.isEmpty else { return }
         for waiter in waiters {
@@ -409,6 +409,12 @@ public actor RTCSession {
     /// finishes the initial ``sendGroupCallOffer``.
     var pendingInitialSfuGroupOfferConnectionIds: Set<String> = []
     
+    /// Normalized connection ids where ``beginGroupCallMediaAfterSfuRegistrationIfNeeded`` already
+    /// sent the first encrypted offer via ``sendGroupCallOffer``. ``finishCryptoSessionCreation``
+    /// must not call ``createOffer`` again after `call_cipher` or WebRTC can stay in
+    /// `have-local-offer` and reject inbound SFU renegotiation offers.
+    var initialSfuGroupMediaOfferSentConnectionIds: Set<String> = []
+    
 #if canImport(WebRTC)
     /// Delegate that surfaces frame-cryptor events for debugging and monitoring.
     var frameCryptorDelegate = FrameCryptorDelegate()
@@ -596,7 +602,11 @@ public actor RTCSession {
     ///
     /// Username matching is case-insensitive because the server keys roles by IRC nick
     /// while the client uses `secretName`, and casing can differ across transports.
-    public func updateConferenceRoles(localUsername: String, participantRoles: [String: String]) {
+    public func updateConferenceRoles(
+        localUsername: String,
+        participantRoles: [String: String],
+        timing: ConferenceTiming? = nil
+    ) {
         var typedRoles: [String: ConferenceRole] = [:]
         for (username, roleString) in participantRoles {
             typedRoles[username] = ConferenceRole(rawValue: roleString) ?? .viewer
@@ -605,7 +615,7 @@ public actor RTCSession {
         let localRole = typedRoles.first(where: { $0.key.lowercased() == lowercasedLocal })?.value
             ?? typedRoles[localUsername]
             ?? .viewer
-        conferencePermissions = ConferencePermissions(localRole: localRole, participantRoles: typedRoles)
+        conferencePermissions = ConferencePermissions(localRole: localRole, participantRoles: typedRoles, timing: timing)
         notifyConferencePermissionsChanged()
     }
 
@@ -771,8 +781,7 @@ public actor RTCSession {
         RTCGroupCall(
             call: call,
             sfuRecipientId: sfuRecipientId,
-            localIdentity: localIdentity
-        )
+            localIdentity: localIdentity)
     }
 
     // MARK: - Public data-channel API
@@ -997,6 +1006,12 @@ public actor RTCSession {
         self.ratchetSalt = ratchetSalt
         self.frameEncryptionKeyMode = frameEncryptionKeyMode
         self.enableEncryption = enableEncryption
+        if enableEncryption {
+            logger.log(
+                level: .warning,
+                message: "⚠️ TEMP DEBUG: FrameCryptor is DISABLED for this RTCSession to isolate media pipeline issues."
+            )
+        }
         self.delegate = delegate
         self.ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
         self.pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
@@ -1010,7 +1025,6 @@ public actor RTCSession {
         
         // taskProcessor is lazy and will be initialized on first access
         // This avoids using self before all stored properties are initialized
-        
         logger.log(level: .trace, message: "Created RTCSession")
     }
 

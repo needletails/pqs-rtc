@@ -32,6 +32,10 @@ let session = RTCSession(
 
 For multiparty, use `RTCGroupCall` (SFU-style) instead of building N×(N-1) peer connections.
 
+## Documentation (DocC)
+
+The Swift **DocC** catalog for the `PQSRTC` target is a **single** bundle at [`Sources/PQSRTC/PQSRTC.docc/`](Sources/PQSRTC/PQSRTC.docc/) (articles in `Articles/`; root `PQSRTC.md`). In Xcode, open this package and use **Product → Build Documentation** (⌃⌥⌘D) to browse articles, including **host app + CallKit + server SFU** for iOS, and **remote video / per-participant frame E2EE** on the SFU (`SfuRemoteVideoFrameE2EE.md` in the catalog).
+
 ## Building
 
 ### Apple (SwiftPM)

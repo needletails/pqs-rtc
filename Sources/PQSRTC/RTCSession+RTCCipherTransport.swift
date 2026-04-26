@@ -22,6 +22,54 @@ import DoubleRatchetKit
 #endif
 
 extension RTCSession {
+    /// True iff this call should use 1:1 SFU symmetric frame-key slots (local + peer), not
+    /// per-peer group slots.
+    ///
+    /// Nudge's 1:1 relay sets `channelWireId` to the same IRC room as `sharedCommunicationId`
+    /// (`#<uuid>` / UUID). Merges can bump `recipients.count` to 2 without introducing a second
+    /// peer — we still must treat that as 1:1 relay. True multi-party UUID SFU rooms are excluded
+    /// when there is more than one distinct recipient `secretName`.
+    ///
+    /// In this shape both endpoints can safely share the same per-message key in both the local
+    /// and remote frame-key slots; for multi-party calls Double-Ratchet produces a distinct key
+    /// per direction/peer and slot mirroring corrupts other peers' keys.
+    internal static func isTrueOneToOneSfuRoom(call: Call) -> Bool {
+        let commNorm = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        if commNorm.hasPrefix("conf-") { return false }
+
+        // Guard against plain direct 1:1 P2P calls (UUID communication id + no SFU wire route).
+        // Those calls must not enter 1:1-SFU-only paths (shared frame-key ring, offerer role, etc.).
+        guard isEphemeralSfuWireMatchesCommunication(call: call) else { return false }
+
+        let distinctPeers = Set(
+            call.recipients.map {
+                $0.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }
+        )
+        if distinctPeers.count > 1 { return false }
+        return true
+    }
+
+    /// `groupCallNegotiation` sets `channelWireId` to the same room string as the RTC identity for Nudge 1:1-as-SFU relay.
+    private static func isEphemeralSfuWireMatchesCommunication(call: Call) -> Bool {
+        let commNorm = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard UUID(uuidString: commNorm) != nil else { return false }
+        let wire = call.channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !wire.isEmpty else { return false }
+        return wire.normalizedConnectionId == commNorm
+    }
+
+    internal static func resolveRemoteFrameKeyParticipantIdForSetMessageKey(
+        call: Call,
+        connectionRemoteParticipantId: String,
+        oneToOneResolvedRemoteTrackOwner: String?
+    ) -> String {
+        if isTrueOneToOneSfuRoom(call: call) {
+            return oneToOneResolvedRemoteTrackOwner ?? connectionRemoteParticipantId
+        }
+        return connectionRemoteParticipantId
+    }
+    
     
     /// Resolves which participant owns inbound media for frame-key provisioning.
     ///
@@ -29,10 +77,29 @@ extension RTCSession {
     /// participant on the answering side. If we then use `call.sender.secretName` as the remote
     /// track owner, we provision the receive key under the local participant id and the actual
     /// remote media stays undecryptable on subsequent calls.
-    private func remoteTrackOwnerParticipantId(
+    ///
+    /// - Note: Group SFU PCs use the **room id** as `RTCConnection.recipient` for routing; the
+    ///   remote peer still encrypts with their `localParticipantId` (secretName). Frame keys must
+    ///   be provisioned under that peer id, not the room string, or receiver FrameCryptors never
+    ///   resolve keys (no remote video).
+    func remoteTrackOwnerParticipantId(
         connection: RTCConnection,
         call: Call
     ) -> String? {
+        // Fast path: single-recipient call where `recipient` is the room id — map to the peer's
+        // secretName even if `groupCall(forSfuIdentity:)` is not registered yet (startup races).
+        if call.recipients.count == 1 {
+            let peer = call.recipients[0].secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !peer.isEmpty {
+                let roomNorm = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+                let remoteNorm = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+                if !roomNorm.isEmpty,
+                   remoteNorm.caseInsensitiveCompare(roomNorm) == .orderedSame {
+                    return peer
+                }
+            }
+        }
+
         let isSfuRoom =
             groupCall(forSfuIdentity: connection.id) != nil ||
             groupCall(forSfuIdentity: call.sharedCommunicationId) != nil
@@ -68,6 +135,23 @@ extension RTCSession {
         }
 
         return senderId.isEmpty ? recipientIds.first : senderId
+    }
+
+    /// Second participant id for ``setMessageKey`` in per-participant mode.
+    ///
+    /// For **1:1 SFU** calls, `RTCConnection.recipient` is the room id; we map to the peer's
+    /// `secretName` so keys match sender/receiver FrameCryptors. For **multi-party** channel/group
+    /// SFU calls, `remoteTrackOwnerParticipantId` can resolve to `call.sender` (same as local) —
+    /// keep the **room id** as the routing key like pre-1:1 fix behavior.
+    private func remoteFrameKeyParticipantIdForSetMessageKey(
+        connection: RTCConnection,
+        call: Call
+    ) -> String {
+        return Self.resolveRemoteFrameKeyParticipantIdForSetMessageKey(
+            call: call,
+            connectionRemoteParticipantId: connection.remoteParticipantId,
+            oneToOneResolvedRemoteTrackOwner: remoteTrackOwnerParticipantId(connection: connection, call: call)
+        )
     }
     
     public func createCryptoPeerConnection(with call: Call) async throws {
@@ -191,14 +275,8 @@ extension RTCSession {
             recipient = call.sender
         }
         
-        // Treat `sharedCommunicationId` as a UUID; accepted wrappers:
-        // `#uuid`, `conf-uuid`, and `#conf-uuid`.
-        let uuidString = resolvedCall.sharedCommunicationId
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .normalizedUUIDConnectionId
-        guard let callId = UUID(uuidString: uuidString) else {
-            throw RTCErrors.invalidConfiguration("Call has an invalid UUID as sharedCommunicationId (expected UUID/#UUID/conf-UUID/#conf-UUID)")
-        }
+        // Preserve UUID room ids as-is, and derive a stable UUID for shorter production room codes.
+        let callId = resolvedCall.sharedCommunicationId.stableUUIDConnectionId
         pendingAnswerCallId = callId
         if callAnswerStatesById[callId] == nil {
             callAnswerStatesById[callId] = .pending
@@ -223,6 +301,51 @@ extension RTCSession {
             defer { offerInFlightConnectionIds.remove(connId) }
             switch await connectionManager.findConnection(with: connId)?.cipherNegotiationState {
             case .complete:
+                // SFU group / 1:1-as-SFU: the first encrypted offer is already emitted from
+                // `beginGroupCallMediaAfterSfuRegistrationIfNeeded` → `sendGroupCallOffer`.
+                // Running `createOffer` again after `call_cipher` completes leaves the PC in
+                // `have-local-offer` and the next inbound SFU SDP (`offer`) fails with
+                // "CALLED IN WRONG STATE: HAVE-LOCAL-OFFER".
+                let normId = teardownConnectionIdKey(resolvedCall.sharedCommunicationId)
+                let initialOfferSent = initialSfuGroupMediaOfferSentConnectionIds.contains(normId)
+                let initialOfferBootstrapInFlight = pendingInitialSfuGroupOfferConnectionIds.contains(normId)
+                // Guard both states:
+                // 1) initial offer already sent
+                // 2) initial offer still bootstrapping (post-cipher can race this marker)
+                // In both cases a post-cipher `createOffer` can leave the PC in `have-local-offer`
+                // and crash on the next inbound SFU offer with SDPHandlerError 3.
+                if initialOfferSent || initialOfferBootstrapInFlight {
+                    // Do **not** call `createOffer` again (breaks signaling). Still send refreshed
+                    // `Call` (same SDP in metadata + updated ratchet props), but use
+                    // `.handshakeComplete` — not `.offer`. A second `.offer` makes the SFU run
+                    // `setRemoteDescription(offer)` while a leg can still be `have-local-offer`
+                    // (glare with the answerer's post-cipher offer), which matches server
+                    // `SETREMOTEDESCRIPTION(OFFER) FAILED: HAVE-LOCAL-OFFER` and loses media.
+                    logger.log(
+                        level: .info,
+                        message: "Skipping post-cipher WebRTC createOffer (initialOfferSent=\(initialOfferSent) bootstrapInFlight=\(initialOfferBootstrapInFlight)); sending refreshed SFU identity payload (.handshakeComplete) for \(resolvedCall.sharedCommunicationId)"
+                    )
+                    do {
+                        var refreshed = try await buildPostCipherSfuGroupOfferPayloadPreservingLocalSdp(call: resolvedCall)
+                        let payload = try BinaryEncoder().encode(refreshed)
+                        let writeTask = WriteTask(
+                            data: payload,
+                            roomId: refreshed.sharedCommunicationId.normalizedConnectionId,
+                            flag: .handshakeComplete,
+                            call: refreshed)
+                        let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
+                        try await taskProcessor.feedTask(task: encryptableTask)
+                        return refreshed
+                    } catch {
+                        // During very early bootstrap, local SDP can still be unavailable. Avoid
+                        // re-entering `createOffer` here; preserving current signaling state is safer.
+                        logger.log(
+                            level: .warning,
+                            message: "Skipping post-cipher identity refresh payload because local SDP is not ready yet for \(resolvedCall.sharedCommunicationId): \(error.localizedDescription)"
+                        )
+                        return resolvedCall
+                    }
+                }
                 var resolvedCall = try await createOffer(call: resolvedCall)
                 
                 let keyBundle = try await pcKeyManager.fetchCallKeyBundle()
@@ -523,41 +646,74 @@ extension RTCSession {
             // - Shared-key mode: one key ring for all participants.
             // - Per-participant mode (participant-scoped key ring): for 1:1 we set the same key for both
             //   local and remote participant IDs so sender/receiver cryptors can resolve keys.
-            if frameEncryptionKeyMode == .shared {
+            let useSharedFrameKeyRingForOneToOneSfu = Self.isTrueOneToOneSfuRoom(call: call)
+            if frameEncryptionKeyMode == .shared || useSharedFrameKeyRingForOneToOneSfu {
                 keyProvider.setSharedKey(messageKey, with: Int32(index))
+                let modeLabel = useSharedFrameKeyRingForOneToOneSfu ? "1:1 SFU forced-shared" : "shared"
+                logger.log(level: .info, message: "🔑 Derived+provisioned \(modeLabel) frame key (setMessageKey) index=\(index) connId=\(connection.id)")
             } else {
+                // Always provision the local sender slot — that's what our sender FrameCryptor
+                // (bound with participantId == connection.localParticipantId) reads to encrypt.
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.localParticipantId)
-                keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.remoteParticipantId)
-            }
-            
-            // Diagnostics: show which participant ids got provisioned from the 1:1 ratchet-derived key.
-            if frameEncryptionKeyMode == .shared {
-                logger.log(level: .debug, message: "🔑 Derived+provisioned shared frame key (setMessageKey) index=\(index) connId=\(connection.id)")
-            } else {
-                logger.log(level: .debug, message: "🔑 Derived+provisioned per-participant frame key (setMessageKey) index=\(index) connId=\(connection.id) local='\(connection.localParticipantId)' remote='\(connection.remoteParticipantId)'")
+                lastFrameKeyIndexByParticipantId[connection.localParticipantId] = index
+
+                // True 1:1 SFU room: optionally mirror into the remote slot as a bootstrap aid.
+                // IMPORTANT: only do this if the remote slot is empty. If receive-side derivation
+                // already provisioned that slot, clobbering it with our send key breaks decrypt.
+                if Self.isTrueOneToOneSfuRoom(call: call) {
+                    let remoteForFrameKeys = remoteFrameKeyParticipantIdForSetMessageKey(connection: connection, call: call)
+                    if lastFrameKeyIndexByParticipantId[remoteForFrameKeys] == nil {
+                        keyProvider.setKey(messageKey, with: Int32(index), forParticipant: remoteForFrameKeys)
+                        lastFrameKeyIndexByParticipantId[remoteForFrameKeys] = index
+                        logger.log(
+                            level: .debug,
+                            message: "🔑 Derived+provisioned per-participant frame key (setMessageKey, 1:1 SFU bootstrap mirror) index=\(index) connId=\(connection.id) local='\(connection.localParticipantId)' remoteFrameKeyTarget='\(remoteForFrameKeys)'"
+                        )
+                    } else {
+                        logger.log(
+                            level: .debug,
+                            message: "🔑 Skipped setMessageKey mirror for existing remote slot (1:1 SFU) participantId='\(remoteForFrameKeys)' connId=\(connection.id)"
+                        )
+                    }
+                } else {
+                    logger.log(
+                        level: .debug,
+                        message: "🔑 Derived+provisioned per-participant frame key (setMessageKey, group/conf) index=\(index) connId=\(connection.id) local='\(connection.localParticipantId)' (per-peer remote slots populated on receive)"
+                    )
+                }
             }
         }
 #elseif os(Android)
         // Only provision frame keys on Android when frame encryption is enabled.
         // JNI keyProvider calls must run on main thread; MainActor ensures that.
         if enableEncryption {
-            if frameEncryptionKeyMode == .shared {
+            let useSharedFrameKeyRingForOneToOneSfu = Self.isTrueOneToOneSfuRoom(call: call)
+            if frameEncryptionKeyMode == .shared || useSharedFrameKeyRingForOneToOneSfu {
                 rtcClient.setSharedKey(
                     messageKey,
                     with: Int32(index),
                     ratchetSalt: ratchetSalt)
             } else {
-                // For 1:1, provision both local+remote IDs with the same key so send/recv match.
                 rtcClient.setKey(
                     messageKey,
                     with: Int32(index),
                     forParticipant: connection.localParticipantId,
                     ratchetSalt: ratchetSalt)
-                rtcClient.setKey(
-                    messageKey,
-                    with: Int32(index),
-                    forParticipant: connection.remoteParticipantId,
-                    ratchetSalt: ratchetSalt)
+                lastFrameKeyIndexByParticipantId[connection.localParticipantId] = index
+
+                // True 1:1 SFU only: bootstrap mirror into remote slot (Android parity with Apple).
+                // Skip if the slot is already populated to avoid clobbering receive keys.
+                if Self.isTrueOneToOneSfuRoom(call: call) {
+                    let remoteForFrameKeys = remoteFrameKeyParticipantIdForSetMessageKey(connection: connection, call: call)
+                    if lastFrameKeyIndexByParticipantId[remoteForFrameKeys] == nil {
+                        rtcClient.setKey(
+                            messageKey,
+                            with: Int32(index),
+                            forParticipant: remoteForFrameKeys,
+                            ratchetSalt: ratchetSalt)
+                        lastFrameKeyIndexByParticipantId[remoteForFrameKeys] = index
+                    }
+                }
             }
             // Mirror Apple: attach sender FrameCryptors once the key is set (in case tracks were added before key derivation).
             try await createEncryptedFrame(connection: connection)
@@ -587,6 +743,15 @@ extension RTCSession {
             ciphertext: ciphertext)
         
         let remoteParticipantId = remoteTrackOwnerParticipantId ?? connection.remoteParticipantId
+        if !Self.isTrueOneToOneSfuRoom(call: connection.call),
+           remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(
+            connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+           ) == .orderedSame {
+            logger.log(
+                level: .warning,
+                message: "setReceivingMessageKey resolved remoteTrackOwner to local participant ('\(remoteParticipantId)') for non-1:1 connection=\(connection.id). Awaiting stable remote participant id before receiver cryptor binding."
+            )
+        }
         
 #if canImport(WebRTC)
         // Only apply frame keys when frame encryption is enabled.
@@ -595,45 +760,79 @@ extension RTCSession {
             guard let keyProvider else {
                 throw RTCErrors.invalidConfiguration("FrameCryptorKeyProvider is nil (enableEncryption=true)")
             }
-            if frameEncryptionKeyMode == .shared {
+            let useSharedFrameKeyRingForOneToOneSfu = Self.isTrueOneToOneSfuRoom(call: connection.call)
+            if frameEncryptionKeyMode == .shared || useSharedFrameKeyRingForOneToOneSfu {
                 // Shared-key mode: same media key & index is used for decrypting frames, independent of participantId.
                 keyProvider.setSharedKey(messageKey, with: Int32(index))
             } else {
-                // Per-participant mode: provision local + remote track owner with the same key.
-                // For 1:1-group (room connection), remoteTrackOwnerParticipantId is the cipher sender (track owner).
-                keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.localParticipantId)
+                // Per-participant mode: this key is the receive key for the *specific* remote
+                // track owner (cipher sender). Provision ONLY that slot. Mirroring it to other
+                // peers' slots — or to the local slot in multi-party calls — would clobber per-peer
+                // receive keys and our own send key, since Double-Ratchet derives a distinct key
+                // per direction/peer.
                 keyProvider.setKey(messageKey, with: Int32(index), forParticipant: remoteParticipantId)
+                lastFrameKeyIndexByParticipantId[remoteParticipantId] = index
+
+                // True 1:1 SFU room only: optional bootstrap mirror into local sender slot.
+                // If local already has a sender key, do not overwrite it with receive material.
+                if Self.isTrueOneToOneSfuRoom(call: connection.call) {
+                    if lastFrameKeyIndexByParticipantId[connection.localParticipantId] == nil {
+                        keyProvider.setKey(messageKey, with: Int32(index), forParticipant: connection.localParticipantId)
+                        lastFrameKeyIndexByParticipantId[connection.localParticipantId] = index
+                    } else {
+                        logger.log(
+                            level: .debug,
+                            message: "🔑 Skipped setReceivingMessageKey local mirror for existing sender slot (1:1 SFU) participantId='\(connection.localParticipantId)' connId=\(connection.id)"
+                        )
+                    }
+                }
             }
             
             // Diagnostics: show which ids got provisioned for receiving.
-            if frameEncryptionKeyMode == .shared {
-                logger.log(level: .debug, message: "🔑 Derived+provisioned shared frame key (setReceivingMessageKey) index=\(index) connId=\(connection.id)")
+            if frameEncryptionKeyMode == .shared || useSharedFrameKeyRingForOneToOneSfu {
+                let modeLabel = useSharedFrameKeyRingForOneToOneSfu ? "1:1 SFU forced-shared" : "shared"
+                logger.log(level: .info, message: "🔑 Derived+provisioned \(modeLabel) frame key (setReceivingMessageKey) index=\(index) connId=\(connection.id)")
             } else {
                 logger.log(level: .debug, message: "🔑 Derived+provisioned per-participant frame key (setReceivingMessageKey) index=\(index) connId=\(connection.id) local='\(connection.localParticipantId)' remoteTrackOwner='\(remoteParticipantId)'")
             }
+
+            // Android mirrors this with `createReceiverEncryptedFrame` in the branch below. On Apple we
+            // only inject into `RTCFrameCryptorKeyProvider` here; if RTP receivers were bound before
+            // the receive key existed, receiver cryptors may never decrypt. Reattach for 1:1 SFU and
+            // direct (non-SFU-group) calls only — multi-party group PCs share `videoFrameCryptor`
+            // slots across peers and need a narrower fix than blind rebind.
+            try await appleReattachReceiverFrameCryptorsAfterReceiveKey(
+                connection: connection,
+                provisionedRemoteTrackOwnerId: remoteParticipantId)
         }
 #elseif os(Android)
         if enableEncryption {
             // JNI keyProvider calls must run on main thread; MainActor ensures that.
-            if frameEncryptionKeyMode == .shared {
-                // Match Apple as closely as possible: set the shared media key at the moment
-                // we derive it for receiving.
+            let useSharedFrameKeyRingForOneToOneSfu = Self.isTrueOneToOneSfuRoom(call: connection.call)
+            if frameEncryptionKeyMode == .shared || useSharedFrameKeyRingForOneToOneSfu {
                 rtcClient.setSharedKey(
                     messageKey,
                     with: Int32(index),
                     ratchetSalt: ratchetSalt)
             } else {
-                // For 1:1 / 1:1-group, provision both local+remote IDs with the same key.
+                // Provision ONLY the cipher sender's slot. See Apple branch for rationale.
                 rtcClient.setKey(
                     messageKey,
                     with: Int32(index),
-                    forParticipant: connection.localParticipantId,
+                    forParticipant: remoteParticipantId,
                     ratchetSalt: ratchetSalt)
-                rtcClient.setKey(
-                    messageKey,
-                    with: Int32(index),
-                    forParticipant:remoteParticipantId,
-                    ratchetSalt: ratchetSalt)
+                lastFrameKeyIndexByParticipantId[remoteParticipantId] = index
+
+                if Self.isTrueOneToOneSfuRoom(call: connection.call) {
+                    if lastFrameKeyIndexByParticipantId[connection.localParticipantId] == nil {
+                        rtcClient.setKey(
+                            messageKey,
+                            with: Int32(index),
+                            forParticipant: connection.localParticipantId,
+                            ratchetSalt: ratchetSalt)
+                        lastFrameKeyIndexByParticipantId[connection.localParticipantId] = index
+                    }
+                }
             }
             
             // Attach receiver cryptors (Android needs explicit receiver attachment).
@@ -807,12 +1006,13 @@ extension RTCSession {
         
         if await !hasConnection(id: call.sharedCommunicationId) {
             
+            // Default `willFinishNegotiation: false` so `setMessageKey` runs at PC creation,
+            // matching the b368e83-era timing for SFU receiver-bootstrap PCs.
             _ = try await createPeerConnection(
                 with: call,
                 sender: call.sender.secretName,
                 recipient: recipient,
-                localIdentity: localFrameIdentity,
-                willFinishNegotiation: true)
+                localIdentity: localFrameIdentity)
             
         } else {
             if var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
@@ -893,11 +1093,12 @@ extension RTCSession {
         var callForWire = call
         callForWire.metadata = try BinaryEncoder().encode(candidate)
         let plaintext = try BinaryEncoder().encode(callForWire)
+        let wireRoomId = call.resolvedChannelWireId ?? call.sharedCommunicationId
         
         // Ensure sender initialization occurred before ratchet encrypting (idempotent). roomId normalized; "#" reattached at transport.
         let writeTask = WriteTask(
             data: plaintext,
-            roomId: call.sharedCommunicationId.normalizedConnectionId,
+            roomId: wireRoomId.normalizedConnectionId,
             flag: .candidate,
             call: call)
         let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
