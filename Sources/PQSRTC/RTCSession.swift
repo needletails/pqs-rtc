@@ -378,6 +378,9 @@ public actor RTCSession {
     // - good bandwidth: raise bitrate/fps automatically for better quality
     var adaptiveVideoSendTasksByConnectionId: [String: Task<Void, Never>] = [:]
     var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int)] = [:]
+#if os(iOS)
+    var adaptiveVideoThermalStateByConnectionId: [String: String] = [:]
+#endif
 #endif
     
     // MARK: - Teardown idempotency
@@ -559,6 +562,22 @@ public actor RTCSession {
         }
     }
 
+    /// Snapshot of currently mapped remote camera participants for a group/SFU connection.
+    public func activeRemoteParticipantIds(connectionId: String) async -> Set<String> {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard let connection = await connectionManager.findConnection(with: normalizedId) else {
+            return []
+        }
+        let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return Set(connection.remoteVideoTracksByParticipantId.keys.compactMap { participant in
+            let trimmed = participant.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            guard UUID(uuidString: trimmed) == nil else { return nil }
+            guard trimmed.lowercased() != local else { return nil }
+            return trimmed
+        })
+    }
+
     func finishAllRemoteParticipantTrackStreams() {
         for (_, continuation) in remoteParticipantTrackContinuations {
             continuation.finish()
@@ -602,6 +621,23 @@ public actor RTCSession {
     ///
     /// Username matching is case-insensitive because the server keys roles by IRC nick
     /// while the client uses `secretName`, and casing can differ across transports.
+    static func conferenceParticipantIdentityKey(_ participant: String) -> String {
+        var normalized = participant.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.hasPrefix(screenStreamPrefix) {
+            normalized.removeFirst(screenStreamPrefix.count)
+        }
+        if normalized.hasSuffix("_") {
+            normalized.removeLast()
+        }
+        if let separator = normalized.firstIndex(of: "_") {
+            let suffix = normalized[normalized.index(after: separator)...]
+            if suffix == "nil" || UUID(uuidString: String(suffix)) != nil {
+                normalized = String(normalized[..<separator])
+            }
+        }
+        return normalized
+    }
+
     public func updateConferenceRoles(
         localUsername: String,
         participantRoles: [String: String],
@@ -611,11 +647,66 @@ public actor RTCSession {
         for (username, roleString) in participantRoles {
             typedRoles[username] = ConferenceRole(rawValue: roleString) ?? .viewer
         }
-        let lowercasedLocal = localUsername.lowercased()
-        let localRole = typedRoles.first(where: { $0.key.lowercased() == lowercasedLocal })?.value
-            ?? typedRoles[localUsername]
+        if typedRoles.isEmpty, !conferencePermissions.participantRoles.isEmpty {
+            conferencePermissions = ConferencePermissions(
+                localRole: conferencePermissions.localRole,
+                participantRoles: conferencePermissions.participantRoles,
+                timing: timing ?? conferencePermissions.timing
+            )
+            notifyConferencePermissionsChanged()
+            return
+        }
+        let localKey = Self.conferenceParticipantIdentityKey(localUsername)
+        if typedRoles.first(where: { Self.conferenceParticipantIdentityKey($0.key) == localKey }) == nil,
+           let existing = conferencePermissions.participantRoles.first(where: { Self.conferenceParticipantIdentityKey($0.key) == localKey }) {
+            typedRoles[existing.key] = existing.value
+        }
+        let localRole = typedRoles.first(where: { Self.conferenceParticipantIdentityKey($0.key) == localKey })?.value
             ?? .viewer
-        conferencePermissions = ConferencePermissions(localRole: localRole, participantRoles: typedRoles, timing: timing)
+        conferencePermissions = ConferencePermissions(
+            localRole: localRole,
+            participantRoles: typedRoles,
+            timing: timing ?? conferencePermissions.timing
+        )
+        notifyConferencePermissionsChanged()
+    }
+
+    /// Seeds/maintains a best-effort participant list from active media while waiting for
+    /// the SFU's role NOTICE. Server role updates remain authoritative when they arrive.
+    public func mergeConferenceParticipants(
+        localUsername: String,
+        activeRemoteParticipants: Set<String>,
+        localDefaultRole: ConferenceRole
+    ) {
+        var roles = conferencePermissions.participantRoles
+
+        func existingKey(for participant: String) -> String? {
+            let normalized = Self.conferenceParticipantIdentityKey(participant)
+            guard !normalized.isEmpty else { return nil }
+            return roles.keys.first { Self.conferenceParticipantIdentityKey($0) == normalized }
+        }
+
+        let local = localUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !local.isEmpty, existingKey(for: local) == nil {
+            roles[local] = roles.isEmpty ? localDefaultRole : conferencePermissions.localRole
+        }
+
+        for participant in activeRemoteParticipants {
+            let trimmed = participant.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, UUID(uuidString: trimmed) == nil else { continue }
+            if existingKey(for: trimmed) == nil {
+                roles[trimmed] = .viewer
+            }
+        }
+
+        let localRole = existingKey(for: local).flatMap { roles[$0] } ?? conferencePermissions.localRole
+        let updated = ConferencePermissions(
+            localRole: localRole,
+            participantRoles: roles,
+            timing: conferencePermissions.timing
+        )
+        guard updated != conferencePermissions else { return }
+        conferencePermissions = updated
         notifyConferencePermissionsChanged()
     }
 

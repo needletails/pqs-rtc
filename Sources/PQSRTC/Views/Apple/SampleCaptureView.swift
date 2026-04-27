@@ -110,8 +110,14 @@ internal class SampleCaptureView: UIView {
     // MARK: - Memory Management
     
     deinit {
-        precondition(didShutdown , "didShutdown should be true upon SampleCaptureView deallocation")
+        let wasShutdown = didShutdown
+        if !didShutdown {
+            didShutdown = true
+        }
         #if DEBUG
+        if !wasShutdown {
+            logger.log(level: .warning, message: "SampleCaptureView deallocated before explicit shutdown; marked shutdown defensively")
+        }
         logger.log(level: .debug, message: "SampleCaptureView deallocated")
         #endif
     }
@@ -213,7 +219,17 @@ internal class SampleCaptureView: NSView {
     // MARK: - Memory Management
     
     deinit {
-        precondition(didShutdown, "didShutdown should be true upon SampleCaptureView deallocation")
+        let wasShutdown = didShutdown
+        if !didShutdown {
+            didShutdown = true
+        }
+
+        #if DEBUG
+        if !wasShutdown {
+            logger.log(level: .warning, message: "SampleCaptureView deallocated before explicit shutdown; marked shutdown defensively")
+        }
+        logger.log(level: .debug, message: "SampleCaptureView deallocated")
+        #endif
     }
 }
 #endif

@@ -72,11 +72,27 @@ public final class RemoteViewItemCell: UICollectionViewCell {
         super.prepareForReuse()
         // Ensure reused cells never accumulate multiple NTMTKViews or constraints.
         contentView.subviews.forEach { $0.removeFromSuperview() }
+        contentView.layer.borderWidth = 0
+        contentView.layer.borderColor = nil
     }
 
     /// Installs a video view as the cell’s sole content, pinned edge-to-edge.
     func setVideoView(_ view: UIView) {
         contentView.subviews.forEach { $0.removeFromSuperview() }
+        let contextName = (view as? NTMTKView)?.contextName ?? ""
+        let isScreenShare = contextName.hasPrefix("screen_")
+        let cornerRadius: CGFloat = isScreenShare ? 16 : 12
+
+        contentView.layer.cornerRadius = cornerRadius
+        contentView.layer.cornerCurve = .continuous
+        contentView.layer.masksToBounds = true
+        contentView.layer.borderWidth = isScreenShare ? 1 : 0.75
+        contentView.layer.borderColor = UIColor.white.withAlphaComponent(isScreenShare ? 0.18 : 0.12).cgColor
+
+        view.layer.cornerRadius = cornerRadius
+        view.layer.cornerCurve = .continuous
+        view.layer.masksToBounds = true
+        view.clipsToBounds = true
         contentView.addSubview(view)
         view.anchors(top: contentView.topAnchor, leading: contentView.leadingAnchor, bottom: contentView.bottomAnchor, trailing: contentView.trailingAnchor)
     }
@@ -191,10 +207,10 @@ public struct VideoViewModel: Hashable, Identifiable {
     /// `true` when this tile renders a screen-share track rather than a camera feed.
     public let isScreenShare: Bool
 
-    /// The remote participant who owns this screen-share track (empty for camera tiles).
+    /// The remote participant who owns this remote camera or screen-share track.
     public let participantId: String
 
-    /// The peer connection this screen tile was bound to (empty for camera tiles).
+    /// The peer connection this remote participant tile was bound to.
     public let connectionId: String
     
     // MARK: - Initialization
@@ -223,11 +239,11 @@ public struct VideoViewModel: Hashable, Identifiable {
         self.connectionId = ""
     }
 
-    /// Creates a screen-share video view model.
-    public init(videoView: NTMTKView, participantId: String, connectionId: String) {
+    /// Creates a remote participant video view model.
+    public init(videoView: NTMTKView, participantId: String, connectionId: String, isScreenShare: Bool = true) {
         self.id = UUID()
         self.videoView = videoView
-        self.isScreenShare = true
+        self.isScreenShare = isScreenShare
         self.participantId = participantId
         self.connectionId = connectionId
     }

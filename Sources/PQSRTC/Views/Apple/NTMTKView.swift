@@ -507,7 +507,17 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     }
     
     deinit {
-        // Clean up resources synchronously in deinit
+        // Deinit is a last-resort fallback; normal teardown should call shutdownMetalStream().
+        if let sampleCaptureView = captureView as? SampleCaptureView {
+            Task { @MainActor in
+                sampleCaptureView.shutdown()
+            }
+        }
+        if let previewCaptureView = captureView as? PreviewCaptureView {
+            Task { @MainActor in
+                previewCaptureView.removeSession()
+            }
+        }
         remoteVideoPresentWatchdogTask?.cancel()
         remoteVideoPresentWatchdogTask = nil
         postResizeRedrawTask?.cancel()
@@ -560,12 +570,6 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         streamTask?.cancel()
         streamTask = nil
 
-        if let sampleRenderer = renderer as? SampleBufferViewRenderer {
-            Task { await sampleRenderer.shutdown() }
-        } else if let previewRenderer = renderer as? PreviewViewRender {
-            Task { await previewRenderer.stopCaptureSession() }
-        }
-
         if let sampleCaptureView = captureView as? SampleCaptureView {
             sampleCaptureView.shutdown()
         }
@@ -578,6 +582,12 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
                     previewCaptureView.removeSession()
                 }
             }
+        }
+
+        if let sampleRenderer = renderer as? SampleBufferViewRenderer {
+            Task { await sampleRenderer.shutdown() }
+        } else if let previewRenderer = renderer as? PreviewViewRender {
+            Task { await previewRenderer.stopCaptureSession() }
         }
 
         captureView?.removeFromSuperview()

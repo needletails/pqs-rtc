@@ -105,6 +105,17 @@ extension RTCSession {
     
     public func sendGroupCallOffer(_ call: Call) async throws -> Call {
         var call = call
+        let offerKey = call.sharedCommunicationId.normalizedConnectionId
+        guard !offerInFlightConnectionIds.contains(offerKey) else {
+            logger.log(
+                level: .warning,
+                message: "SFU offer already in flight for \(offerKey); skipping duplicate renegotiation offer"
+            )
+            return call
+        }
+        offerInFlightConnectionIds.insert(offerKey)
+        defer { offerInFlightConnectionIds.remove(offerKey) }
+
         let wireRoomId = call.resolvedChannelWireId ?? call.sharedCommunicationId
         
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).

@@ -44,6 +44,7 @@ class ControllerView: NSView {
     private var previewTrailingConstraint: NSLayoutConstraint?
     private var previewWidthConstraint: NSLayoutConstraint?
     private var previewHeightConstraint: NSLayoutConstraint?
+    private let connectedPreviewCornerRadius: CGFloat = 16
     
     /// Hosts caller name + status above the scroll view so labels are not clipped by the collection view.
     private let callInfoChrome: NSVisualEffectView = {
@@ -159,6 +160,11 @@ class ControllerView: NSView {
     override func layout() {
         super.layout()
         bringLocalPreviewOverlayToFront()
+        if let currentPreviewView {
+            let isConnectedPreviewLayout = currentPreviewView.superview === localPreviewOverlay
+                && previewOverlayConstraints.contains(where: \.isActive)
+            applyLocalPreviewCornerStyle(isConnected: isConnectedPreviewLayout, to: currentPreviewView)
+        }
     }
     
     /// Keeps the PiP overlay above the scroll view, collection churn, and any full-screen
@@ -376,6 +382,7 @@ class ControllerView: NSView {
         view.layer?.zPosition = 1001
         view.isHidden = false
         view.alphaValue = 1
+        applyConnectedLocalPreviewCornerStyle(to: view)
         pipLayoutLog.log(
             level: .info,
             message: "addConnectedLocalVideoView context=\(view.contextName) tam=\(view.translatesAutoresizingMaskIntoConstraints) mask=\(view.autoresizingMask.rawValue) overlayBounds=\(String(describing: localPreviewOverlay.bounds.size))"
@@ -425,10 +432,12 @@ class ControllerView: NSView {
                     context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                     self.localPreviewOverlay.layoutSubtreeIfNeeded()
                     self.layoutSubtreeIfNeeded()
+                    self.applyLocalPreviewCornerStyle(isConnected: true, to: view)
                 }
             } else {
                 schedulePiPLayoutCommit()
             }
+            applyLocalPreviewCornerStyle(isConnected: true, to: view)
             logPiPLayoutSnapshot(phase: "fastPathAfter", view: view)
             return
         }
@@ -502,12 +511,7 @@ class ControllerView: NSView {
                     message: "updateVideoConstraints updated existing PiP w=\(previewWidthConstraint?.constant ?? -1) h=\(previewHeightConstraint?.constant ?? -1)"
                 )
             }
-            view.layer?.cornerRadius = 10
-            view.layer?.cornerCurve = .continuous
-            // The PiP frame is already correct in the logs; keep the host clipped so the embedded
-            // preview layer cannot visually spill outside and look "huge".
-            view.layer?.masksToBounds = true
-            view.layer?.shadowOpacity = 0
+            applyLocalPreviewCornerStyle(isConnected: true, to: view)
         } else {
             pipLayoutLog.log(level: .info, message: "updateVideoConstraints disconnected → pin to documentView fill")
             NSLayoutConstraint.deactivate(previewOverlayConstraints)
@@ -517,9 +521,7 @@ class ControllerView: NSView {
                 leading: documentView.leadingAnchor,
                 bottom: documentView.bottomAnchor,
                 trailing: documentView.trailingAnchor)
-            
-            view.layer?.cornerRadius = 0
-            view.layer?.shadowOpacity = 0
+            applyLocalPreviewCornerStyle(isConnected: false, to: view)
         }
         
         if animated, window != nil {
@@ -528,12 +530,38 @@ class ControllerView: NSView {
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 self.localPreviewOverlay.layoutSubtreeIfNeeded()
                 self.layoutSubtreeIfNeeded()
+                self.applyLocalPreviewCornerStyle(isConnected: isConnected, to: view)
             }
         } else {
             schedulePiPLayoutCommit()
         }
+        applyLocalPreviewCornerStyle(isConnected: isConnected, to: view)
         if isConnected, view.superview === localPreviewOverlay {
             logPiPLayoutSnapshot(phase: "fullPathEnd", view: view)
+        }
+    }
+
+    func applyConnectedLocalPreviewCornerStyle(to view: NTMTKView) {
+        applyLocalPreviewCornerStyle(isConnected: true, to: view)
+    }
+
+    private func applyLocalPreviewCornerStyle(isConnected: Bool, to view: NTMTKView) {
+        let radius = isConnected ? connectedPreviewCornerRadius : 0
+        view.wantsLayer = true
+        view.layer?.cornerRadius = radius
+        view.layer?.cornerCurve = .continuous
+        view.layer?.masksToBounds = isConnected
+        view.layer?.shadowOpacity = 0
+
+        guard let captureView = view.captureView else { return }
+        captureView.wantsLayer = true
+        captureView.layer?.cornerRadius = radius
+        captureView.layer?.cornerCurve = .continuous
+        captureView.layer?.masksToBounds = isConnected
+
+        if let previewCaptureView = captureView as? PreviewCaptureView {
+            previewCaptureView.previewLayer.cornerRadius = radius
+            previewCaptureView.previewLayer.masksToBounds = isConnected
         }
     }
     

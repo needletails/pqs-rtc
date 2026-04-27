@@ -124,11 +124,10 @@ extension RTCSession {
         }
         let task = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            let deadline = DispatchTime.now().uptimeNanoseconds + 180_000_000_000 // 3m
+            let fastProbeDeadline = DispatchTime.now().uptimeNanoseconds + 180_000_000_000 // first 3m
             var consecutiveStalledEgressSamples = 0
 
             while !Task.isCancelled {
-                if DispatchTime.now().uptimeNanoseconds > deadline { break }
                 guard await self.connectionManager.findConnection(with: normalizedId) != nil else { break }
 
                 if let flow = await self.evaluateOutboundLocalVideoFlow(connectionId: normalizedId) {
@@ -151,7 +150,9 @@ extension RTCSession {
                     self.logger.log(level: .trace, message: "Outbound video probe could not read stats for connectionId=\(normalizedId)")
                 }
 
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                let now = DispatchTime.now().uptimeNanoseconds
+                let sleepNs: UInt64 = now <= fastProbeDeadline ? 2_000_000_000 : 10_000_000_000
+                try? await Task.sleep(nanoseconds: sleepNs)
             }
         }
 
@@ -610,7 +611,12 @@ extension RTCSession {
                 if !current.peerConnection.senders.contains(where: { $0.track?.kind == kRTCMediaStreamTrackKindVideo }) { break }
 
                 let report = await self.collectStats(peerConnection: current.peerConnection)
-                let cfg = await self.sfuVideoQualityProfile.adaptiveConfig
+                let baseCfg = await self.sfuVideoQualityProfile.adaptiveConfig
+#if os(iOS)
+                let cfg = await self.thermalAdjustedAdaptiveVideoConfig(baseCfg, connectionId: normalizedId)
+#else
+                let cfg = baseCfg
+#endif
 
                 func double(_ any: Any?) -> Double? {
                     if let n = any as? NSNumber { return n.doubleValue }
@@ -640,7 +646,7 @@ extension RTCSession {
                 }
 
                 guard let available = availableOutgoingBps, available > 0 else {
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
                     continue
                 }
 
@@ -735,7 +741,8 @@ extension RTCSession {
                     nowUptimeNs: nowUptimeNs
                 )
 
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                let sleepNs: UInt64 = deltaOk ? 2_000_000_000 : 5_000_000_000
+                try? await Task.sleep(nanoseconds: sleepNs)
             }
         }
 
@@ -748,11 +755,36 @@ extension RTCSession {
             task.cancel()
         }
         adaptiveVideoLastAppliedByConnectionId.removeValue(forKey: normalizedId)
+#if os(iOS)
+        adaptiveVideoThermalStateByConnectionId.removeValue(forKey: normalizedId)
+#endif
     }
 
     private func setAdaptiveVideoLastApplied(connectionId: String, bitrateBps: Int, framerate: Int) {
         adaptiveVideoLastAppliedByConnectionId[connectionId] = (bitrateBps, framerate)
     }
+
+#if os(iOS)
+    private func thermalAdjustedAdaptiveVideoConfig(
+        _ baseConfig: RTCVideoQualityProfile.AdaptiveConfig,
+        connectionId: String
+    ) -> RTCVideoQualityProfile.AdaptiveConfig {
+        let thermalState = ProcessInfo.processInfo.thermalState
+        let label = String(describing: thermalState)
+        if adaptiveVideoThermalStateByConnectionId[connectionId] != label {
+            adaptiveVideoThermalStateByConnectionId[connectionId] = label
+            let adjusted = baseConfig.adjustedForThermalState(thermalState)
+            let message: Message = "iOS thermal video profile connectionId=\(connectionId) thermalState=\(label) maxBitrateBps=\(adjusted.maxBitrateBps) fps=\(adjusted.lowFps)-\(adjusted.highFps)"
+            if thermalState == .serious || thermalState == .critical {
+                logger.log(level: .warning, message: message)
+            } else {
+                logger.log(level: .info, message: message)
+            }
+            return adjusted
+        }
+        return baseConfig.adjustedForThermalState(thermalState)
+    }
+#endif
     
     /// Logs a single snapshot of outbound + inbound RTP stats.
     ///

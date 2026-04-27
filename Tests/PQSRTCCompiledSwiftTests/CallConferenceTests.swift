@@ -133,4 +133,83 @@ struct CallConferenceTests {
         )
         #expect(call.resolvedChannelWireId == nil)
     }
+
+    // MARK: - Screen share permission scope
+
+    @Test("screen share permissions are not enforced for direct one-to-one calls")
+    func screenSharePermissionScopeAllowsDirectOneToOne() throws {
+        let sender = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: "d1")
+        let recipient = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "d2")
+        let call = try Call(sharedCommunicationId: UUID().uuidString, sender: sender, recipients: [recipient])
+
+        #expect(RTCSession.shouldEnforceScreenShareConferencePermissions(call: call, permissions: ConferencePermissions()) == false)
+    }
+
+    @Test("screen share permissions are enforced for conferences")
+    func screenSharePermissionScopeEnforcesConference() throws {
+        let sender = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: "d1")
+        var call = try Call(
+            sharedCommunicationId: "#conf-ABCDEF",
+            channelWireId: "#conf-ABCDEF",
+            sender: sender,
+            recipients: []
+        )
+        call.conferencePassword = "secret"
+
+        #expect(RTCSession.shouldEnforceScreenShareConferencePermissions(call: call, permissions: ConferencePermissions()) == true)
+    }
+
+    @Test("screen share permissions are enforced once roles are known")
+    func screenSharePermissionScopeEnforcesKnownRoles() throws {
+        let sender = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: "d1")
+        let recipient = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "d2")
+        let call = try Call(sharedCommunicationId: "#team", channelWireId: "#team", sender: sender, recipients: [recipient])
+        let permissions = ConferencePermissions(localRole: .viewer, participantRoles: ["alice": .viewer])
+
+        #expect(RTCSession.shouldEnforceScreenShareConferencePermissions(call: call, permissions: permissions) == true)
+    }
+
+    @Test("screen share participant ids normalize add and remove keys")
+    func screenShareParticipantIdsNormalizeAddAndRemoveKeys() {
+        #expect(RTCSession.resolvedScreenShareParticipantId(
+            streamIds: ["screen_echo"],
+            trackId: "screen_echo_#conf-room",
+            fallback: "#conf-room"
+        ) == "echo")
+        #expect(RTCSession.participantIdFromScreenShareId("screen_echo") == "echo")
+    }
+
+    @Test("conference role updates preserve server timing and normalize participant keys")
+    func conferenceRoleUpdatesPreserveTimingAndNormalizeKeys() async {
+        let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
+        defer { Task { await session.shutdown(with: nil) } }
+
+        let timing = ConferenceTiming(
+            conferenceStartedAtEpochSeconds: 100,
+            serverTimestampEpochSeconds: 160,
+            conferenceDurationSeconds: 60
+        )
+
+        await session.updateConferenceRoles(
+            localUsername: "nudge",
+            participantRoles: ["nudge": "host", "echo": "viewer"],
+            timing: timing
+        )
+        await session.mergeConferenceParticipants(
+            localUsername: "nudge",
+            activeRemoteParticipants: ["echo_", "screen_echo"],
+            localDefaultRole: .viewer
+        )
+        await session.updateConferenceRoles(
+            localUsername: "nudge_",
+            participantRoles: ["nudge": "host", "echo": "cohost"],
+            timing: nil
+        )
+
+        let permissions = await session.conferencePermissions
+        #expect(permissions.localRole == .host)
+        #expect(permissions.participantRoles["echo"] == .cohost)
+        #expect(permissions.participantRoles.keys.filter { RTCSession.conferenceParticipantIdentityKey($0) == "echo" }.count == 1)
+        #expect(permissions.timing == timing)
+    }
 }

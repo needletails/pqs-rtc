@@ -317,12 +317,17 @@ public struct CollectionViewSections {
 
     // MARK: - Screen-share dominant layout
 
-    /// Layout where a single screen-share tile dominates (top 70%) and camera thumbnails
-    /// sit in a horizontal strip (bottom 30%).
+    /// Layout where a single screen-share tile dominates and camera thumbnails stay secondary.
+    /// Screen share should feel like the presentation surface, not another equal participant tile.
     ///
     /// - Parameter cameraTileCount: Number of camera tiles in the strip (0 means screen only).
     public func screenShareDominantSection(cameraTileCount: Int) -> NSCollectionLayoutSection {
         return createScreenShareDominantLayout(cameraTileCount: cameraTileCount, groupAbsoluteExtent: nil)
+    }
+
+    /// iOS section-provider variant with the current collection view size.
+    public func screenShareDominantSection(cameraTileCount: Int, containerSize: CGSize) -> NSCollectionLayoutSection {
+        return createScreenShareDominantLayout(cameraTileCount: cameraTileCount, groupAbsoluteExtent: containerSize)
     }
 
     #if os(macOS)
@@ -336,6 +341,19 @@ public struct CollectionViewSections {
         cameraTileCount: Int,
         groupAbsoluteExtent: CGSize?
     ) -> NSCollectionLayoutSection {
+        func outerLayoutSize(for extent: CGSize?) -> NSCollectionLayoutSize {
+            if let extent {
+                return NSCollectionLayoutSize(
+                    widthDimension: .absolute(max(1, extent.width)),
+                    heightDimension: .absolute(max(1, extent.height))
+                )
+            }
+            return NSCollectionLayoutSize(
+                widthDimension: .fractionalWidth(1.0),
+                heightDimension: .fractionalHeight(1.0)
+            )
+        }
+
         guard cameraTileCount > 0 else {
             if let g = groupAbsoluteExtent {
                 let s = NSCollectionLayoutSize(
@@ -352,27 +370,14 @@ public struct CollectionViewSections {
             return fullScreenItem()
         }
 
-        let dominantFraction: CGFloat = 0.72
-        let stripFraction: CGFloat = 1.0 - dominantFraction
+        let visibleCameraCount = max(1, cameraTileCount)
+        let isWide = groupAbsoluteExtent.map { $0.width > max(1, $0.height) * 1.08 } ?? false
 
         let screenItem = NSCollectionLayoutItem(layoutSize: NSCollectionLayoutSize(
             widthDimension: .fractionalWidth(1.0),
             heightDimension: .fractionalHeight(1.0)
         ))
-
-        let screenRowSize: NSCollectionLayoutSize
-        if let g = groupAbsoluteExtent {
-            screenRowSize = NSCollectionLayoutSize(
-                widthDimension: .absolute(max(1, g.width)),
-                heightDimension: .absolute(max(1, g.height * dominantFraction))
-            )
-        } else {
-            screenRowSize = NSCollectionLayoutSize(
-                widthDimension: .fractionalWidth(1.0),
-                heightDimension: .fractionalHeight(dominantFraction)
-            )
-        }
-        let screenRow = NSCollectionLayoutGroup.horizontal(layoutSize: screenRowSize, subitems: [screenItem])
+        screenItem.contentInsets = NSDirectionalEdgeInsets(top: 2, leading: 2, bottom: 2, trailing: 2)
 
         let cameraItem = NSCollectionLayoutItem(layoutSize: NSCollectionLayoutSize(
             widthDimension: .fractionalWidth(1.0),
@@ -380,39 +385,106 @@ public struct CollectionViewSections {
         ))
         cameraItem.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 4, bottom: 4, trailing: 4)
 
-        let cameraStripSize: NSCollectionLayoutSize
-        if let g = groupAbsoluteExtent {
-            cameraStripSize = NSCollectionLayoutSize(
-                widthDimension: .absolute(max(1, g.width)),
-                heightDimension: .absolute(max(1, g.height * stripFraction))
-            )
-        } else {
-            cameraStripSize = NSCollectionLayoutSize(
+        func cameraGridGroup(columns: Int, rows: Int, layoutSize: NSCollectionLayoutSize) -> NSCollectionLayoutGroup {
+            let rowSize = NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1.0),
-                heightDimension: .fractionalHeight(stripFraction)
+                heightDimension: .fractionalHeight(1.0 / CGFloat(max(1, rows)))
+            )
+            let row = NSCollectionLayoutGroup.horizontal(
+                layoutSize: rowSize,
+                subitem: cameraItem,
+                count: max(1, columns)
+            )
+            return NSCollectionLayoutGroup.vertical(
+                layoutSize: layoutSize,
+                subitem: row,
+                count: max(1, rows)
             )
         }
-        let cameraStrip = NSCollectionLayoutGroup.horizontal(
-            layoutSize: cameraStripSize,
-            subitem: cameraItem,
-            count: cameraTileCount
-        )
 
-        let outerSize: NSCollectionLayoutSize
-        if let g = groupAbsoluteExtent {
-            outerSize = NSCollectionLayoutSize(
-                widthDimension: .absolute(max(1, g.width)),
-                heightDimension: .absolute(max(1, g.height))
-            )
+        let outerSize = outerLayoutSize(for: groupAbsoluteExtent)
+        let outerGroup: NSCollectionLayoutGroup
+        if isWide {
+            let columns = visibleCameraCount <= 2 ? 1 : 2
+            let rows = Int(ceil(Double(visibleCameraCount) / Double(columns)))
+            let screenFraction: CGFloat = visibleCameraCount <= 2 ? 0.86 : 0.82
+            let screenSize: NSCollectionLayoutSize
+            let cameraSize: NSCollectionLayoutSize
+            if let g = groupAbsoluteExtent {
+                screenSize = NSCollectionLayoutSize(
+                    widthDimension: .absolute(max(1, g.width * screenFraction)),
+                    heightDimension: .absolute(max(1, g.height))
+                )
+                cameraSize = NSCollectionLayoutSize(
+                    widthDimension: .absolute(max(1, g.width * (1.0 - screenFraction))),
+                    heightDimension: .absolute(max(1, g.height))
+                )
+            } else {
+                screenSize = NSCollectionLayoutSize(
+                    widthDimension: .fractionalWidth(screenFraction),
+                    heightDimension: .fractionalHeight(1.0)
+                )
+                cameraSize = NSCollectionLayoutSize(
+                    widthDimension: .fractionalWidth(1.0 - screenFraction),
+                    heightDimension: .fractionalHeight(1.0)
+                )
+            }
+            let screenGroup = NSCollectionLayoutGroup.horizontal(layoutSize: screenSize, subitems: [screenItem])
+            let cameraGroup = cameraGridGroup(columns: columns, rows: rows, layoutSize: cameraSize)
+            outerGroup = NSCollectionLayoutGroup.horizontal(layoutSize: outerSize, subitems: [screenGroup, cameraGroup])
         } else {
-            outerSize = NSCollectionLayoutSize(
-                widthDimension: .fractionalWidth(1.0),
-                heightDimension: .fractionalHeight(1.0)
-            )
+            let columns: Int
+            switch visibleCameraCount {
+            case 1:
+                columns = 1
+            case 2:
+                columns = 2
+            case 3:
+                columns = 3
+            case 4:
+                columns = 4
+            default:
+                columns = 4
+            }
+            let rows = Int(ceil(Double(visibleCameraCount) / Double(columns)))
+            let screenFraction: CGFloat
+            switch visibleCameraCount {
+            case 1:
+                screenFraction = 0.88
+            case 2...4:
+                screenFraction = 0.84
+            default:
+                screenFraction = rows > 2 ? 0.76 : 0.80
+            }
+            let cameraFraction = 1.0 - screenFraction
+            let screenSize: NSCollectionLayoutSize
+            let cameraSize: NSCollectionLayoutSize
+            if let g = groupAbsoluteExtent {
+                screenSize = NSCollectionLayoutSize(
+                    widthDimension: .absolute(max(1, g.width)),
+                    heightDimension: .absolute(max(1, g.height * screenFraction))
+                )
+                cameraSize = NSCollectionLayoutSize(
+                    widthDimension: .absolute(max(1, g.width)),
+                    heightDimension: .absolute(max(1, g.height * cameraFraction))
+                )
+            } else {
+                screenSize = NSCollectionLayoutSize(
+                    widthDimension: .fractionalWidth(1.0),
+                    heightDimension: .fractionalHeight(screenFraction)
+                )
+                cameraSize = NSCollectionLayoutSize(
+                    widthDimension: .fractionalWidth(1.0),
+                    heightDimension: .fractionalHeight(cameraFraction)
+                )
+            }
+            let screenGroup = NSCollectionLayoutGroup.horizontal(layoutSize: screenSize, subitems: [screenItem])
+            let cameraGroup = cameraGridGroup(columns: columns, rows: rows, layoutSize: cameraSize)
+            outerGroup = NSCollectionLayoutGroup.vertical(layoutSize: outerSize, subitems: [screenGroup, cameraGroup])
         }
-        let outerGroup = NSCollectionLayoutGroup.vertical(layoutSize: outerSize, subitems: [screenRow, cameraStrip])
 
-        return NSCollectionLayoutSection(group: outerGroup)
+        let section = NSCollectionLayoutSection(group: outerGroup)
+        return section
     }
 }
 #endif

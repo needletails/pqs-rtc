@@ -153,6 +153,7 @@ class ControllerView: UIView {
     private var previewFullscreenConstraints: [NSLayoutConstraint] = []
     private var previewWidthConstraint: NSLayoutConstraint?
     private var previewHeightConstraint: NSLayoutConstraint?
+    private let connectedPreviewCornerRadius: CGFloat = 16
         
     // MARK: - Blur support (used by the view controller)
     /// Blur effect used when obscuring video (e.g. during local mute).
@@ -168,6 +169,15 @@ class ControllerView: UIView {
     required init?(coder aDecoder: NSCoder) {
         assertionFailure("ControllerView is intended to be initialized programmatically")
         return nil
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+
+        guard let currentPreviewView else { return }
+        let isConnectedPreviewLayout = currentPreviewView.superview === self
+            && previewOverlayConstraints.contains(where: \.isActive)
+        applyLocalPreviewCornerStyle(isConnected: isConnectedPreviewLayout, to: currentPreviewView)
     }
     
     // MARK: - Size Management (used by the view controller for preview layout)
@@ -271,14 +281,7 @@ class ControllerView: UIView {
                 previewHeightConstraint?.constant = max(1, size.height - 5)
             }
             
-            // Match macOS PiP (`ControllerView+AppKit.updateVideoConstraints`): continuous corners + clip
-            // so the Metal preview doesn’t draw square through a rounded frame.
-            view.layer.cornerRadius = 10
-            if #available(iOS 13.0, *) {
-                view.layer.cornerCurve = .continuous
-            }
-            view.layer.masksToBounds = true
-            view.layer.shadowOpacity = 0
+            applyLocalPreviewCornerStyle(isConnected: true, to: view)
         } else {
             // Fullscreen mode (pre-connect / local-only).
             NSLayoutConstraint.deactivate(previewOverlayConstraints)
@@ -293,17 +296,54 @@ class ControllerView: UIView {
                 NSLayoutConstraint.activate(previewFullscreenConstraints)
             }
             
-            // Reset rounding when fullscreen.
-            view.layer.cornerRadius = 0
-            view.layer.masksToBounds = false
-            view.layer.shadowOpacity = 0
+            applyLocalPreviewCornerStyle(isConnected: false, to: view)
         }
         
         // Smooth resizing feels much more “polished”, especially when minimizing and rotating.
         if animated, window != nil {
             UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseInOut, .allowUserInteraction]) {
                 self.layoutIfNeeded()
+                self.applyLocalPreviewCornerStyle(isConnected: isConnected, to: view)
+            } completion: { [weak self, weak view] _ in
+                guard let self, let view else { return }
+                self.applyLocalPreviewCornerStyle(isConnected: isConnected, to: view)
             }
+        } else {
+            setNeedsLayout()
+            layoutIfNeeded()
+            applyLocalPreviewCornerStyle(isConnected: isConnected, to: view)
+        }
+    }
+
+    func applyConnectedLocalPreviewCornerStyle(to view: NTMTKView) {
+        applyLocalPreviewCornerStyle(isConnected: true, to: view)
+    }
+
+    private func applyLocalPreviewCornerStyle(isConnected: Bool, to view: NTMTKView) {
+        let radius = isConnected ? connectedPreviewCornerRadius : 0
+        view.clipsToBounds = isConnected
+        view.layer.cornerRadius = radius
+        view.layer.needsDisplayOnBoundsChange = true
+        if #available(iOS 13.0, *) {
+            view.layer.cornerCurve = .continuous
+        }
+        view.layer.masksToBounds = isConnected
+        view.layer.shadowOpacity = 0
+        view.setNeedsLayout()
+
+        guard let captureView = view.captureView else { return }
+        captureView.clipsToBounds = isConnected
+        captureView.layer.cornerRadius = radius
+        captureView.layer.needsDisplayOnBoundsChange = true
+        if #available(iOS 13.0, *) {
+            captureView.layer.cornerCurve = .continuous
+        }
+        captureView.layer.masksToBounds = isConnected
+        captureView.setNeedsLayout()
+
+        if let previewCaptureView = captureView as? PreviewCaptureView {
+            previewCaptureView.previewLayer.cornerRadius = radius
+            previewCaptureView.previewLayer.masksToBounds = isConnected
         }
     }
 
@@ -345,4 +385,3 @@ class ControllerView: UIView {
     }
 }
 #endif
-

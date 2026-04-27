@@ -42,6 +42,19 @@ extension RTCVideoQualityProfile {
     var adaptiveConfig: AdaptiveConfig {
         switch self {
         case .standard:
+#if os(iOS)
+            return AdaptiveConfig(
+                // iPhone sustained-call default: keep encoder/network work bounded for long rooms.
+                minBitrateBps: 150_000,
+                maxBitrateBps: 1_500_000,
+                startingBitrateBps: 650_000,
+                startingFramerate: 15,
+                headroomFactor: 0.65,
+                highFpsThresholdBps: 1_000_000,
+                lowFps: 10,
+                highFps: 15
+            )
+#else
             return AdaptiveConfig(
                 // Allow survival on truly poor uplinks. WebRTC will still adapt below ceilings.
                 // Keeping this too high causes "freeze until keyframe" symptoms on slow/latent internet.
@@ -55,7 +68,20 @@ extension RTCVideoQualityProfile {
                 lowFps: 10,
                 highFps: 30
             )
+#endif
         case .high:
+#if os(iOS)
+            return AdaptiveConfig(
+                minBitrateBps: 200_000,
+                maxBitrateBps: 2_200_000,
+                startingBitrateBps: 900_000,
+                startingFramerate: 15,
+                headroomFactor: 0.65,
+                highFpsThresholdBps: 1_400_000,
+                lowFps: 10,
+                highFps: 20
+            )
+#else
             return AdaptiveConfig(
                 minBitrateBps: 300_000,
                 maxBitrateBps: 6_000_000,
@@ -66,7 +92,20 @@ extension RTCVideoQualityProfile {
                 lowFps: 10,
                 highFps: 30
             )
+#endif
         case .highest:
+#if os(iOS)
+            return AdaptiveConfig(
+                minBitrateBps: 250_000,
+                maxBitrateBps: 3_000_000,
+                startingBitrateBps: 1_100_000,
+                startingFramerate: 20,
+                headroomFactor: 0.65,
+                highFpsThresholdBps: 1_800_000,
+                lowFps: 12,
+                highFps: 24
+            )
+#else
             return AdaptiveConfig(
                 minBitrateBps: 400_000,
                 maxBitrateBps: 8_000_000,
@@ -77,7 +116,75 @@ extension RTCVideoQualityProfile {
                 lowFps: 10,
                 highFps: 30
             )
+#endif
         }
     }
 }
 
+#if os(iOS)
+extension RTCVideoQualityProfile.AdaptiveConfig {
+    func adjustedForThermalState(_ state: ProcessInfo.ThermalState) -> Self {
+        switch state {
+        case .nominal:
+            return self
+        case .fair:
+            return capped(
+                maxBitrateBps: 1_100_000,
+                startingBitrateBps: 550_000,
+                headroomFactor: 0.55,
+                lowFps: min(lowFps, 10),
+                highFps: min(highFps, 12)
+            )
+        case .serious:
+            return capped(
+                maxBitrateBps: 750_000,
+                startingBitrateBps: 400_000,
+                headroomFactor: 0.45,
+                lowFps: min(lowFps, 8),
+                highFps: min(highFps, 10)
+            )
+        case .critical:
+            return capped(
+                maxBitrateBps: 450_000,
+                startingBitrateBps: 300_000,
+                headroomFactor: 0.35,
+                lowFps: min(lowFps, 5),
+                highFps: min(highFps, 8)
+            )
+        @unknown default:
+            return capped(
+                maxBitrateBps: 750_000,
+                startingBitrateBps: 400_000,
+                headroomFactor: 0.45,
+                lowFps: min(lowFps, 8),
+                highFps: min(highFps, 10)
+            )
+        }
+    }
+
+    private func capped(
+        maxBitrateBps capMaxBitrateBps: Int,
+        startingBitrateBps capStartingBitrateBps: Int,
+        headroomFactor capHeadroomFactor: Double,
+        lowFps capLowFps: Int,
+        highFps capHighFps: Int
+    ) -> Self {
+        let nextMax = min(maxBitrateBps, capMaxBitrateBps)
+        let nextMin = min(minBitrateBps, nextMax)
+        let cappedStarting = min(min(startingBitrateBps, capStartingBitrateBps), nextMax)
+        let nextStarting = max(nextMin, cappedStarting)
+        let nextLowFps = max(1, capLowFps)
+        let nextHighFps = max(nextLowFps, capHighFps)
+        return Self(
+            minBitrateBps: nextMin,
+            maxBitrateBps: nextMax,
+            startingBitrateBps: nextStarting,
+            startingFramerate: min(startingFramerate, nextHighFps),
+            headroomFactor: min(headroomFactor, capHeadroomFactor),
+            highFpsThresholdBps: min(highFpsThresholdBps, nextMax),
+            lowFps: nextLowFps,
+            highFps: nextHighFps
+        )
+    }
+}
+#endif

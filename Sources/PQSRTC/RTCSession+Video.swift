@@ -252,6 +252,40 @@ extension RTCSession {
         await manager.updateConnection(id: normalizedId, with: connection)
     }
 
+    /// Binds a renderer to a specific remote participant's camera track.
+    ///
+    /// Group/conference calls receive multiple camera tracks over one SFU PeerConnection; the
+    /// participant id identifies the track owner and must map to
+    /// ``RTCConnection/remoteVideoTracksByParticipantId``.
+    @discardableResult
+    func renderRemoteVideoForParticipant(to renderer: RTCVideoRenderWrapper, connectionId: String, participantId: String) async -> Bool {
+        let normalizedId = connectionId.normalizedConnectionId
+        logger.log(level: .info, message: "Rendering remote camera for participant=\(participantId) connection=\(connectionId)")
+        let manager = connectionManager as RTCConnectionManager
+
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
+            logger.log(level: .error, message: "renderRemoteVideoForParticipant: connection not found for \(connectionId)")
+            return false
+        }
+
+        guard let videoTrack = connection.remoteVideoTracksByParticipantId[participantId] else {
+            logger.log(level: .warning, message: "renderRemoteVideoForParticipant: camera track not found for participant=\(participantId)")
+            return false
+        }
+
+        videoTrack.remove(renderer)
+        videoTrack.add(renderer)
+        logger.log(level: .info, message: "Remote camera renderer attached for participant=\(participantId) trackId=\(videoTrack.trackId)")
+        #if canImport(WebRTC)
+        logRtpStatsSnapshotOnce(
+            connectionId: normalizedId,
+            delayNanoseconds: 2_000_000_000,
+            reason: "afterAttachRemoteParticipantRenderer:\(participantId)")
+        startInboundVideoFlowProbe(connectionId: normalizedId)
+        #endif
+        return true
+    }
+
     /// Whether inbound remote video should be treated as live for UI (camera-off overlay).
     ///
     /// On the receive side, `RTCVideoTrack.isEnabled` is mostly a **local** output toggle and often
@@ -412,6 +446,14 @@ extension RTCSession {
         let manager = connectionManager as RTCConnectionManager
         guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
         connection.remoteScreenTracksByParticipantId[participantId]?.remove(renderer)
+    }
+
+    /// Removes a renderer previously bound via ``renderRemoteVideoForParticipant(to:connectionId:participantId:)``.
+    func removeRemoteForParticipant(renderer: RTCVideoRenderWrapper, connectionId: String, participantId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        let manager = connectionManager as RTCConnectionManager
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
+        connection.remoteVideoTracksByParticipantId[participantId]?.remove(renderer)
     }
 
     func removeRemote(renderer: RTCVideoRenderWrapper, connectionId: String) async {

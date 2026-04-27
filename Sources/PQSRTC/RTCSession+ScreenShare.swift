@@ -37,6 +37,22 @@ extension RTCSession {
         return suffix.isEmpty ? nil : suffix
     }
 
+    static func resolvedScreenShareParticipantId(
+        streamIds: [String],
+        trackId: String,
+        fallback: String
+    ) -> String {
+        let candidates = streamIds + [trackId]
+        for candidate in candidates {
+            guard let participant = participantIdFromScreenShareId(candidate) else { continue }
+            let trimmed = participant.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: - Public API
 
     /// Adds a screen share track to the peer connection as a second video sender.
@@ -48,13 +64,22 @@ extension RTCSession {
         target: ScreenShareTarget,
         connectionId: String
     ) async throws {
-        guard conferencePermissions.canScreenShare else {
-            throw RTCErrors.permissionDenied("Screen sharing requires Presenter role or higher")
-        }
-
         let normalizedId = connectionId.normalizedConnectionId
         guard var connection = await connectionManager.findConnection(with: normalizedId) else {
             throw RTCErrors.connectionNotFound
+        }
+
+        let permissions = conferencePermissions
+        let shouldEnforcePermissions = Self.shouldEnforceScreenShareConferencePermissions(
+            call: connection.call,
+            permissions: permissions
+        )
+        guard !shouldEnforcePermissions || permissions.canScreenShare else {
+            logger.log(
+                level: .warning,
+                message: "Screen share denied by conference permissions role=\(permissions.localRole.rawValue) participants=\(permissions.participantRoles.count)"
+            )
+            throw RTCErrors.permissionDenied("Screen sharing requires Presenter role or higher")
         }
 
         if connection.localScreenTrack != nil {
@@ -107,7 +132,24 @@ extension RTCSession {
 
         await connectionManager.updateConnection(id: normalizedId, with: connection)
 #endif
+        try await renegotiateScreenShareForSfuIfNeeded(
+            connectionId: normalizedId,
+            reason: "started"
+        )
         logger.log(level: .info, message: "Screen share track added for connection \(normalizedId)")
+    }
+
+    static func shouldEnforceScreenShareConferencePermissions(
+        call: Call,
+        permissions: ConferencePermissions
+    ) -> Bool {
+        if Self.isTrueOneToOneSfuRoom(call: call) {
+            return false
+        }
+        if call.conferencePassword != nil {
+            return true
+        }
+        return !permissions.participantRoles.isEmpty
     }
 
     /// Removes the screen share track and stops capture.
@@ -139,7 +181,56 @@ extension RTCSession {
         connection.screenCaptureWrapper = nil
         await connectionManager.updateConnection(id: normalizedId, with: connection)
 #endif
+        do {
+            try await renegotiateScreenShareForSfuIfNeeded(
+                connectionId: normalizedId,
+                reason: "stopped"
+            )
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "Screen share removed locally but SFU renegotiation failed for connection \(normalizedId): \(error)"
+            )
+        }
         logger.log(level: .info, message: "Screen share track removed for connection \(normalizedId)")
+    }
+
+    private func renegotiateScreenShareForSfuIfNeeded(
+        connectionId: String,
+        reason: String
+    ) async throws {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard var connection = await connectionManager.findConnection(with: normalizedId) else {
+            logger.log(
+                level: .warning,
+                message: "Screen share \(reason): no connection found for SFU renegotiation id=\(normalizedId)"
+            )
+            return
+        }
+
+        let wireRoomId = connection.call.resolvedChannelWireId ?? connection.call.sharedCommunicationId
+        let isSfuGroupConnection = connection.id.isGroupCall
+            || wireRoomId.isGroupCall
+            || groupCall(forSfuIdentity: normalizedId) != nil
+            || groupCall(forSfuIdentity: wireRoomId) != nil
+        guard isSfuGroupConnection, !Self.isTrueOneToOneSfuRoom(call: connection.call) else {
+            logger.log(
+                level: .debug,
+                message: "Screen share \(reason): no SFU group renegotiation needed for connection=\(connection.id)"
+            )
+            return
+        }
+
+        let updatedCall = try await sendGroupCallOffer(connection.call)
+        connection.call = updatedCall
+        await connectionManager.updateConnection(id: normalizedId, with: connection)
+        if let group = groupCall(forSfuIdentity: wireRoomId) ?? groupCall(forSfuIdentity: normalizedId) {
+            await group.applyUpdatedCallForNegotiation(updatedCall)
+        }
+        logger.log(
+            level: .info,
+            message: "Screen share \(reason): sent SFU renegotiation offer for connection=\(connection.id)"
+        )
     }
 
     // MARK: - Internal: create local screen track

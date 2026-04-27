@@ -104,12 +104,28 @@ actor PreviewViewRender: RendererDelegate {
             
             await setSessionLayer()
             if let session = layer.session {
-                session.sessionPreset = .high
+                applyPreferredCaptureSessionPreset(to: session)
             }
         streamTask = Task(priority: .high) { [weak self] in
             guard let self else { return }
             try await initializeCaptureStream()
         }
+    }
+
+    private func applyPreferredCaptureSessionPreset(to session: AVCaptureSession) {
+#if os(iOS)
+        let presets: [AVCaptureSession.Preset] = [.hd1280x720, .medium]
+        for preset in presets where session.canSetSessionPreset(preset) {
+            session.sessionPreset = preset
+            logger.log(level: .info, message: "Configured iOS camera capture preset=\(preset.rawValue) for sustained video call")
+            return
+        }
+        logger.log(level: .warning, message: "Unable to set sustained iOS capture preset; keeping preset=\(session.sessionPreset.rawValue)")
+#else
+        if session.canSetSessionPreset(.high) {
+            session.sessionPreset = .high
+        }
+#endif
     }
     
     private func setSessionLayer() async {
@@ -230,6 +246,9 @@ actor PreviewViewRender: RendererDelegate {
             return
         }
         session.addInput(input)
+#if os(iOS)
+        applySustainedCallFrameRate(to: captureDevice)
+#endif
         
         // Local capture setup
         let output = AVCaptureVideoDataOutput()
@@ -323,6 +342,9 @@ actor PreviewViewRender: RendererDelegate {
                 return
             }
             session.addInput(newInput)
+#if os(iOS)
+            applySustainedCallFrameRate(to: captureDevice)
+#endif
         } catch {
             logger.log(level: .error, message: "Failed to add preferred video device: \(error.localizedDescription)")
             return
@@ -372,6 +394,29 @@ actor PreviewViewRender: RendererDelegate {
         }
         applyLocalVideoMirroringToPreviewLayerConnection(mirrored)
     }
+
+#if os(iOS)
+    private func applySustainedCallFrameRate(to captureDevice: AVCaptureDevice, fps: Int32 = 15) {
+        let requestedFps = Double(fps)
+        guard captureDevice.activeFormat.videoSupportedFrameRateRanges.contains(where: {
+            requestedFps >= $0.minFrameRate && requestedFps <= $0.maxFrameRate
+        }) else {
+            logger.log(level: .warning, message: "iOS camera active format does not support sustained fps=\(fps)")
+            return
+        }
+
+        do {
+            try captureDevice.lockForConfiguration()
+            defer { captureDevice.unlockForConfiguration() }
+            let frameDuration = CMTime(value: 1, timescale: fps)
+            captureDevice.activeVideoMinFrameDuration = frameDuration
+            captureDevice.activeVideoMaxFrameDuration = frameDuration
+            logger.log(level: .info, message: "Configured iOS camera capture fps=\(fps) for sustained video call")
+        } catch {
+            logger.log(level: .warning, message: "Unable to configure iOS camera sustained fps=\(fps): \(error.localizedDescription)")
+        }
+    }
+#endif
     
     private var rtcVideoCaptureWrapper: RTCVideoCaptureWrapper?
     func setCapture(_ rtcVideoCaptureWrapper: RTCVideoCaptureWrapper?) {
@@ -536,8 +581,8 @@ actor PreviewViewRender: RendererDelegate {
                     self.logger.log(level: .info, message: "✅ First camera frame injected into WebRTC")
                 }
 
-                if PQSRTCDiagnostics.criticalBugLoggingEnabled, injectedFrameCount % 120 == 0 {
-                    // Roughly every ~4s at 30fps. Low-noise, but proves ongoing injection.
+                if PQSRTCDiagnostics.criticalBugLoggingEnabled, injectedFrameCount % 900 == 0 {
+                    // Roughly every minute at 15fps. Enough for long-call diagnostics without heaty log churn.
                     let lastMsAgo: UInt64 = {
                         let now = DispatchTime.now().uptimeNanoseconds
                         guard now >= lastInjectionUptimeNs else { return 0 }

@@ -149,7 +149,7 @@ extension RTCSession {
 
         guard let state = await callState.currentState else { return false }
         switch state {
-        case .connecting:
+        case .connecting, .connected:
             break
         default:
             return false

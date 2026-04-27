@@ -92,8 +92,11 @@ public final class VideoCallViewController: UICollectionViewController {
     private var remoteRendererRecoveryConnectionId: String?
     private var remoteRendererRecoveryRendererId: ObjectIdentifier?
     private var lastRemoteRendererRecoveryUptimeNs: UInt64 = 0
+    private var participantRendererRecoveryTasksByKey: [String: Task<Void, Never>] = [:]
+    private var lastParticipantRendererRecoveryUptimeNsByKey: [String: UInt64] = [:]
     private weak var remoteCameraOffChrome: UIView?
     private var screenTrackStreamTask: Task<Void, Never>?
+    private var participantTrackStreamTask: Task<Void, Never>?
     private var hasActiveRemoteScreenShare = false
     
     /// Creates an iOS call UI controller bound to a specific ``RTCSession``.
@@ -340,6 +343,7 @@ public final class VideoCallViewController: UICollectionViewController {
     public override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         startRemoteScreenTrackObservation()
+        startRemoteParticipantTrackObservation()
     }
 
     private func startRemoteScreenTrackObservation() {
@@ -353,6 +357,29 @@ public final class VideoCallViewController: UICollectionViewController {
                     await self.createScreenView(connectionId: event.connectionId, participantId: event.participantId)
                 } else {
                     await self.tearDownScreenView(participantId: event.participantId)
+                }
+            }
+        }
+    }
+
+    private func startRemoteParticipantTrackObservation() {
+        participantTrackStreamTask?.cancel()
+        participantTrackStreamTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let stream = await self.session.remoteParticipantTrackStream()
+            for await event in stream {
+                guard !Task.isCancelled else { return }
+                guard event.kind == "video" else { continue }
+                if event.isActive {
+                    await self.createParticipantCameraView(
+                        connectionId: event.connectionId,
+                        participantId: event.participantId
+                    )
+                } else {
+                    await self.tearDownParticipantCameraView(
+                        connectionId: event.connectionId,
+                        participantId: event.participantId
+                    )
                 }
             }
         }
@@ -466,16 +493,19 @@ public final class VideoCallViewController: UICollectionViewController {
 
         screenTrackStreamTask?.cancel()
         screenTrackStreamTask = nil
-        for model in videoViews.views where model.isScreenShare {
+        for model in videoViews.views where isScreenShareModel(model) {
             await tearDownScreenView(participantId: model.participantId)
         }
         hasActiveRemoteScreenShare = false
+        participantTrackStreamTask?.cancel()
+        participantTrackStreamTask = nil
+        await tearDownAllParticipantCameraViews()
 
+        await tearDownPreviewView()
+        await tearDownSampleView()
         if let call = self.currentCall {
             await session.shutdown(with: call)
         }
-        await tearDownPreviewView()
-        await tearDownSampleView()
         
         // Remove any remaining local preview view from the hierarchy
         if let localView = videoViews.views.first(where: { $0.videoView.contextName == "preview" })?.videoView {
@@ -573,15 +603,24 @@ public final class VideoCallViewController: UICollectionViewController {
     /// - Parameter removePreview: If `true`, removes the preview from the collection snapshot
     ///   so the remote video takes the full screen; the preview is instead overlaid on top.
     func createSampleView(removePreview: Bool = true) async {
+        guard let connectionId = currentCall?.sharedCommunicationId else { return }
+        if shouldUseParticipantCameraTiles() {
+            await assignExistingParticipantTracks(connectionId: connectionId)
+            await performQuery(removePreview: true)
+            configureLocalPreviewIfNeeded()
+            scheduleConnectedLocalPreviewStyleReapply()
+            await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
+            return
+        }
+
         // Idempotency: avoid creating duplicate remote renderers if call-state re-emits `.connected`.
         if videoViews.views.contains(where: { $0.videoView.contextName == "sample" }) {
             configureLocalPreviewIfNeeded()
-            if let connectionId = currentCall?.sharedCommunicationId {
-                await applyMainRemoteTileInboundExpectation(connectionId: connectionId)
-                if let remoteView = videoViews.views.first(where: { $0.videoView.contextName == "sample" })?.videoView,
-                   let remoteRenderer = remoteView.renderer as? SampleBufferViewRenderer {
-                    startRemoteRendererRecoveryIfNeeded(renderer: remoteRenderer, connectionId: connectionId)
-                }
+            scheduleConnectedLocalPreviewStyleReapply()
+            await applyMainRemoteTileInboundExpectation(connectionId: connectionId)
+            if let remoteView = videoViews.views.first(where: { $0.videoView.contextName == "sample" })?.videoView,
+               let remoteRenderer = remoteView.renderer as? SampleBufferViewRenderer {
+                startRemoteRendererRecoveryIfNeeded(renderer: remoteRenderer, connectionId: connectionId)
             }
             startRemoteVideoTrackPolling()
             return
@@ -597,11 +636,11 @@ public final class VideoCallViewController: UICollectionViewController {
         videoViews.views.append(.init(videoView: remoteVideoView))
         await performQuery(removePreview: true)
         configureLocalPreviewIfNeeded()
+        scheduleConnectedLocalPreviewStyleReapply()
         
         await remoteVideoView.startRendering()
         guard let remoteRenderer = remoteVideoView.renderer as? SampleBufferViewRenderer else { return }
         pipDelegate = remoteRenderer
-        guard let connectionId = currentCall?.sharedCommunicationId else { return }
         await self.session.renderRemoteVideo(
             to: remoteRenderer.rtcVideoRenderWrapper,
             with: connectionId)
@@ -625,6 +664,10 @@ public final class VideoCallViewController: UICollectionViewController {
     
     /// Shuts down the remote renderer and removes it from the session.
     func tearDownSampleView() async {
+        if shouldUseParticipantCameraTiles() {
+            await tearDownAllParticipantCameraViews()
+            return
+        }
         stopRemoteVideoTrackPolling()
         stopRemoteRendererRecovery()
         guard let remoteVideoView = videoViews.views.first(where: { $0.videoView.contextName == "sample" })?.videoView else { return }
@@ -636,11 +679,188 @@ public final class VideoCallViewController: UICollectionViewController {
         await session.removeRemote(renderer: remoteVideoRenderer.rtcVideoRenderWrapper, connectionId: connectionId)
         remoteVideoView.shutdownMetalStream()
     }
+
+    private func shouldUseParticipantCameraTiles() -> Bool {
+        guard let call = currentCall else { return false }
+        let normalizedSharedId = call.sharedCommunicationId.normalizedConnectionId
+        return call.conferencePassword != nil
+            || call.resolvedChannelWireId != nil
+            || call.recipients.count > 1
+            || normalizedSharedId.hasPrefix("conf-")
+    }
+
+    private func participantCameraContextName(_ participantId: String) -> String {
+        "camera_\(participantId)"
+    }
+
+    private func shouldCreateParticipantCameraTile(participantId: String) -> Bool {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if UUID(uuidString: trimmed) != nil {
+            logger.log(level: .info, message: "Skipping UUID-like SFU placeholder camera tile participant=\(trimmed)")
+            return false
+        }
+        return true
+    }
+
+    private func isParticipantCameraModel(_ model: VideoViewModel) -> Bool {
+        !model.isScreenShare
+            && !model.participantId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && model.videoView.contextName.hasPrefix("camera_")
+    }
+
+    private func isScreenShareModel(_ model: VideoViewModel) -> Bool {
+        model.isScreenShare || model.videoView.contextName.hasPrefix("screen_")
+    }
+
+    private func screenShareModel(matching rawParticipantId: String, allowSingleFallback: Bool) -> VideoViewModel? {
+        let participantId = rawParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contextName = "screen_\(participantId)"
+        if let exact = videoViews.views.first(where: { $0.videoView.contextName == contextName }) {
+            return exact
+        }
+
+        let screenModels = videoViews.views.filter(isScreenShareModel)
+        let participantKey = RTCSession.conferenceParticipantIdentityKey(participantId)
+        if !participantKey.isEmpty,
+           let normalized = screenModels.first(where: { RTCSession.conferenceParticipantIdentityKey($0.participantId) == participantKey }) {
+            return normalized
+        }
+
+        if allowSingleFallback, screenModels.count == 1 {
+            return screenModels.first
+        }
+        return nil
+    }
+
+    private func screenShareFirst(_ models: [VideoViewModel]) -> [VideoViewModel] {
+        models.sorted { lhs, rhs in
+            let lhsScreen = isScreenShareModel(lhs)
+            let rhsScreen = isScreenShareModel(rhs)
+            if lhsScreen != rhsScreen {
+                return lhsScreen && !rhsScreen
+            }
+            let lhsName = lhs.participantId.isEmpty ? lhs.videoView.contextName : lhs.participantId
+            let rhsName = rhs.participantId.isEmpty ? rhs.videoView.contextName : rhs.participantId
+            if lhsName != rhsName {
+                return lhsName.localizedCaseInsensitiveCompare(rhsName) == .orderedAscending
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    private func assignExistingParticipantTracks(connectionId: String) async {
+        guard shouldUseParticipantCameraTiles() else { return }
+        let normalizedId = connectionId.normalizedConnectionId
+        guard let connection = await session.connectionManager.findConnection(with: normalizedId) else { return }
+        for participantId in connection.remoteVideoTracksByParticipantId.keys.sorted() {
+            guard shouldCreateParticipantCameraTile(participantId: participantId) else { continue }
+            await createParticipantCameraView(connectionId: connectionId, participantId: participantId)
+        }
+    }
+
+    private func createParticipantCameraView(connectionId: String, participantId rawParticipantId: String) async {
+        guard shouldUseParticipantCameraTiles() else { return }
+        let participantId = rawParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !participantId.isEmpty else { return }
+        guard shouldCreateParticipantCameraTile(participantId: participantId) else { return }
+        let contextName = participantCameraContextName(participantId)
+        if videoViews.views.contains(where: { $0.videoView.contextName == contextName }) {
+            if let existingRenderer = videoViews.views.first(where: { $0.videoView.contextName == contextName })?.videoView.renderer as? SampleBufferViewRenderer {
+                startParticipantRendererRecoveryIfNeeded(
+                    renderer: existingRenderer,
+                    connectionId: connectionId,
+                    participantId: participantId
+                )
+            }
+            return
+        }
+
+        let cameraView: NTMTKView
+        do {
+            cameraView = try NTMTKView(type: .sample, contextName: contextName)
+        } catch {
+            logger.log(level: .error, message: "Failed to create participant camera view: \(error)")
+            return
+        }
+
+        let model = VideoViewModel(
+            videoView: cameraView,
+            participantId: participantId,
+            connectionId: connectionId,
+            isScreenShare: false
+        )
+        videoViews.views.append(model)
+        await performQuery(removePreview: true)
+        configureLocalPreviewIfNeeded()
+
+        await cameraView.startRendering()
+        guard let cameraRenderer = cameraView.renderer as? SampleBufferViewRenderer else {
+            videoViews.views.removeAll(where: { $0.videoView.contextName == contextName })
+            await performQuery(removePreview: true)
+            logger.log(level: .error, message: "Participant camera renderer unavailable, removing orphan tile for participant=\(participantId)")
+            return
+        }
+
+        let didAttach = await session.renderRemoteVideoForParticipant(
+            to: cameraRenderer.rtcVideoRenderWrapper,
+            connectionId: connectionId,
+            participantId: participantId
+        )
+        guard didAttach else {
+            await cameraRenderer.shutdown()
+            cameraView.shutdownMetalStream()
+            videoViews.views.removeAll(where: { $0.videoView.contextName == contextName })
+            await performQuery(removePreview: true)
+            logger.log(level: .warning, message: "Participant camera tile removed because no camera track was available for participant=\(participantId)")
+            return
+        }
+        await cameraRenderer.setRemoteVideoInboundExpected(true)
+        startParticipantRendererRecoveryIfNeeded(
+            renderer: cameraRenderer,
+            connectionId: connectionId,
+            participantId: participantId
+        )
+        logger.log(level: .info, message: "Remote participant camera view created for participant=\(participantId)")
+    }
+
+    private func tearDownParticipantCameraView(connectionId: String, participantId rawParticipantId: String) async {
+        let participantId = rawParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !participantId.isEmpty else { return }
+        stopParticipantRendererRecovery(connectionId: connectionId, participantId: participantId)
+        let contextName = participantCameraContextName(participantId)
+        guard let model = videoViews.views.first(where: { $0.videoView.contextName == contextName }) else { return }
+
+        if let cameraRenderer = model.videoView.renderer as? SampleBufferViewRenderer {
+            await cameraRenderer.setRemoteVideoInboundExpected(false)
+            await session.removeRemoteForParticipant(
+                renderer: cameraRenderer.rtcVideoRenderWrapper,
+                connectionId: connectionId,
+                participantId: participantId
+            )
+            await cameraRenderer.shutdown()
+        }
+        model.videoView.shutdownMetalStream()
+        videoViews.views.removeAll(where: { $0.videoView.contextName == contextName })
+        await performQuery(removePreview: true)
+        logger.log(level: .info, message: "Remote participant camera view removed for participant=\(participantId)")
+    }
+
+    private func tearDownAllParticipantCameraViews() async {
+        let cameraModels = videoViews.views.filter(isParticipantCameraModel)
+        for model in cameraModels {
+            await tearDownParticipantCameraView(
+                connectionId: model.connectionId,
+                participantId: model.participantId
+            )
+        }
+        stopAllParticipantRendererRecovery()
+    }
     
     /// Creates and renders a remote screen-share tile, promoting it to the dominant position.
     func createScreenView(connectionId: String, participantId: String) async {
         let contextName = "screen_\(participantId)"
-        if videoViews.views.contains(where: { $0.videoView.contextName == contextName }) { return }
+        if screenShareModel(matching: participantId, allowSingleFallback: false) != nil { return }
 
         let screenView: NTMTKView
         do {
@@ -659,7 +879,7 @@ public final class VideoCallViewController: UICollectionViewController {
         await screenView.startRendering()
         guard let screenRenderer = screenView.renderer as? SampleBufferViewRenderer else {
             videoViews.views.removeAll(where: { $0.videoView.contextName == contextName })
-            hasActiveRemoteScreenShare = videoViews.views.contains(where: { $0.isScreenShare })
+            hasActiveRemoteScreenShare = videoViews.views.contains(where: isScreenShareModel)
             await performQuery(removePreview: true)
             logger.log(level: .error, message: "Screen share renderer unavailable, removing orphan tile for participant=\(participantId)")
             return
@@ -677,8 +897,17 @@ public final class VideoCallViewController: UICollectionViewController {
 
     /// Removes a remote screen-share tile and returns to normal layout.
     func tearDownScreenView(participantId: String) async {
-        let contextName = "screen_\(participantId)"
-        guard let model = videoViews.views.first(where: { $0.videoView.contextName == contextName }) else { return }
+        guard let model = screenShareModel(matching: participantId, allowSingleFallback: true) else {
+            hasActiveRemoteScreenShare = videoViews.views.contains(where: isScreenShareModel)
+            await performQuery(removePreview: true)
+            if !hasActiveRemoteScreenShare {
+                await videoCallDelegate?.remoteScreenShareDidChange(participantId: participantId, isSharing: false)
+            }
+            logger.log(level: .warning, message: "Screen share teardown had no matching tile for participant=\(participantId); activeScreenShare=\(hasActiveRemoteScreenShare)")
+            return
+        }
+        let actualParticipantId = model.participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rendererParticipantId = actualParticipantId.isEmpty ? participantId : actualParticipantId
         let screenView = model.videoView
         if let screenRenderer = screenView.renderer as? SampleBufferViewRenderer {
             await screenRenderer.setRemoteVideoInboundExpected(false)
@@ -689,16 +918,16 @@ public final class VideoCallViewController: UICollectionViewController {
                 await session.removeRemoteScreenVideoRenderer(
                     screenRenderer.rtcVideoRenderWrapper,
                     connectionId: connectionId,
-                    participantId: participantId)
+                    participantId: rendererParticipantId)
             }
         }
         screenView.shutdownMetalStream()
         videoViews.removeView(model)
-        hasActiveRemoteScreenShare = videoViews.views.contains(where: { $0.isScreenShare })
+        hasActiveRemoteScreenShare = videoViews.views.contains(where: isScreenShareModel)
         await performQuery(removePreview: videoViews.views.contains(where: { $0.videoView.contextName == "sample" }))
 
-        await videoCallDelegate?.remoteScreenShareDidChange(participantId: participantId, isSharing: false)
-        logger.log(level: .info, message: "Remote screen share view removed for participant=\(participantId)")
+        await videoCallDelegate?.remoteScreenShareDidChange(participantId: rendererParticipantId, isSharing: false)
+        logger.log(level: .info, message: "Remote screen share view removed for participant=\(rendererParticipantId) requestedParticipant=\(participantId)")
     }
 
     /// Adds a "Presenting" badge to a screen-share tile (idempotent).
@@ -757,21 +986,21 @@ public final class VideoCallViewController: UICollectionViewController {
     /// Rebuilds and applies the diffable-data-source snapshot from the current Metal view list.
     func performQuery(removePreview: Bool = false) async {
         var snapshot = NSDiffableDataSourceSnapshot<ConferenceCallSections, VideoViewModel>()
-        await dataSource?.apply(snapshot)
-        
         var data = await videoViews.getViews()
         if removePreview {
             data.removeAll(where: { $0.videoView.contextName == "preview" })
         }
-        updateLayoutForItemCount(data.count)
+        let hasScreenShareInData = data.contains(where: isScreenShareModel)
+        if hasScreenShareInData {
+            data = screenShareFirst(data)
+        }
+        updateLayoutForItemCount(data.count, hasScreenShare: hasScreenShareInData)
         if data.isEmpty {
-            snapshot.deleteSections([.initial])
-            snapshot.deleteItems(data)
             await dataSource?.apply(snapshot, animatingDifferences: false)
         } else {
             snapshot.appendSections([.initial])
             snapshot.appendItems(data, toSection: .initial)
-            await dataSource?.apply(snapshot)
+            await dataSource?.apply(snapshot, animatingDifferences: false)
         }
         updateConferencePageIndicator(totalItems: data.count)
     }
@@ -783,6 +1012,7 @@ public final class VideoCallViewController: UICollectionViewController {
         if localView.superview !== controllerView {
             controllerView.addSubview(localView)
         }
+        controllerView.applyConnectedLocalPreviewCornerStyle(to: localView)
         localView.isAccessibilityElement = true
         localView.accessibilityLabel = "Local preview"
         
@@ -810,7 +1040,18 @@ public final class VideoCallViewController: UICollectionViewController {
             view: localView,
             animated: true)
         controllerView.bringSubviewToFront(localView)
+        controllerView.setNeedsLayout()
+        controllerView.layoutIfNeeded()
+        controllerView.applyConnectedLocalPreviewCornerStyle(to: localView)
         bringControlsToFront()
+    }
+
+    private func scheduleConnectedLocalPreviewStyleReapply() {
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, self.isConnected() else { return }
+            self.configureLocalPreviewIfNeeded()
+        }
     }
     
     // MARK: - Controls view injection
@@ -872,7 +1113,7 @@ public final class VideoCallViewController: UICollectionViewController {
             case .initial:
                 if let item = collectionView.dequeueReusableCell(withReuseIdentifier: RemoteViewItemCell.reuseIdentifier, for: indexPath) as? RemoteViewItemCell {
                     self.setCollectionViewItem(item: item, viewModel: model)
-                    if model.isScreenShare {
+                    if self.isScreenShareModel(model) {
                         self.addPresenterBadge(to: model.videoView)
                     }
                     return item
@@ -888,7 +1129,12 @@ public final class VideoCallViewController: UICollectionViewController {
     static func createLayout(itemCount: Int, hasScreenShare: Bool = false) -> UICollectionViewCompositionalLayout {
         if hasScreenShare, itemCount > 1 {
             let cameraTileCount = itemCount - 1
-            return UICollectionViewCompositionalLayout(section: sections.screenShareDominantSection(cameraTileCount: cameraTileCount))
+            return UICollectionViewCompositionalLayout { _, environment in
+                sections.screenShareDominantSection(
+                    cameraTileCount: cameraTileCount,
+                    containerSize: environment.container.effectiveContentSize
+                )
+            }
         }
         if itemCount > 1 {
             return UICollectionViewCompositionalLayout(section: sections.conferenceViewSection(itemCount: itemCount))
@@ -897,15 +1143,17 @@ public final class VideoCallViewController: UICollectionViewController {
         }
     }
 
-    private func updateLayoutForItemCount(_ itemCount: Int) {
+    private func updateLayoutForItemCount(_ itemCount: Int, hasScreenShare: Bool? = nil) {
+        let hasScreenShare = hasScreenShare ?? hasActiveRemoteScreenShare
+        hasActiveRemoteScreenShare = hasScreenShare
         let nextType: SectionType
-        if hasActiveRemoteScreenShare, itemCount > 1 {
+        if hasScreenShare, itemCount > 1 {
             nextType = .conference
         } else {
             nextType = itemCount > 1 ? .conference : .fullscreen
         }
         collectionView.setCollectionViewLayout(
-            Self.createLayout(itemCount: max(1, itemCount), hasScreenShare: hasActiveRemoteScreenShare),
+            Self.createLayout(itemCount: max(1, itemCount), hasScreenShare: hasScreenShare),
             animated: false
         )
         currentSectionType = nextType
@@ -967,6 +1215,24 @@ public final class VideoCallViewController: UICollectionViewController {
         remoteRendererRecoveryConnectionId = nil
         remoteRendererRecoveryRendererId = nil
         lastRemoteRendererRecoveryUptimeNs = 0
+    }
+
+    private func participantRendererRecoveryKey(connectionId: String, participantId: String) -> String {
+        "\(connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId)|\(participantId.trimmingCharacters(in: .whitespacesAndNewlines))"
+    }
+
+    private func stopParticipantRendererRecovery(connectionId: String, participantId: String) {
+        let key = participantRendererRecoveryKey(connectionId: connectionId, participantId: participantId)
+        participantRendererRecoveryTasksByKey.removeValue(forKey: key)?.cancel()
+        lastParticipantRendererRecoveryUptimeNsByKey.removeValue(forKey: key)
+    }
+
+    private func stopAllParticipantRendererRecovery() {
+        for task in participantRendererRecoveryTasksByKey.values {
+            task.cancel()
+        }
+        participantRendererRecoveryTasksByKey.removeAll()
+        lastParticipantRendererRecoveryUptimeNsByKey.removeAll()
     }
 
     private func startRemoteRendererRecoveryIfNeeded(
@@ -1044,6 +1310,89 @@ public final class VideoCallViewController: UICollectionViewController {
                 await self.session.renderRemoteVideo(to: renderer.rtcVideoRenderWrapper, with: connectionId)
                 await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
                 await self.applyMainRemoteTileInboundExpectation(connectionId: connectionId)
+            }
+        }
+    }
+
+    private func startParticipantRendererRecoveryIfNeeded(
+        renderer: SampleBufferViewRenderer,
+        connectionId: String,
+        participantId: String
+    ) {
+        let normalizedConnectionId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        let trimmedParticipantId = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedConnectionId.isEmpty, !trimmedParticipantId.isEmpty else { return }
+        let key = participantRendererRecoveryKey(connectionId: normalizedConnectionId, participantId: trimmedParticipantId)
+        if let existing = participantRendererRecoveryTasksByKey[key], !existing.isCancelled {
+            return
+        }
+
+        participantRendererRecoveryTasksByKey[key] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if Task.isCancelled { return }
+                guard self.isRunning else { continue }
+                guard self.currentCallState != .waiting else { continue }
+
+                let callbackAgeMs = await renderer.ageMillisecondsSinceLastVideoFrameCallback()
+                let expectationAgeMs = await renderer.ageMillisecondsSinceInboundVideoExpectationBegan()
+                let hasAnyCallbacks = await renderer.hasReceivedAnyVideoFrameCallbacks()
+                let noCallbacksYet = callbackAgeMs < 0
+                    && expectationAgeMs >= 3_000
+                    && !hasAnyCallbacks
+                guard callbackAgeMs > 3_000 || noCallbacksYet else { continue }
+
+                let now = DispatchTime.now().uptimeNanoseconds
+                let last = self.lastParticipantRendererRecoveryUptimeNsByKey[key] ?? 0
+                if last > 0, now >= last, now - last < 6_000_000_000 {
+                    continue
+                }
+                self.lastParticipantRendererRecoveryUptimeNsByKey[key] = now
+
+                let inboundFlow = await self.session.evaluateInboundRemoteVideoFlow(connectionId: normalizedConnectionId)
+                if let flow = inboundFlow {
+                    self.logger.log(
+                        level: .warning,
+                        message: "iOS participant camera stall probe (participant=\(trimmedParticipantId), callbackAgeMs=\(callbackAgeMs), expectationAgeMs=\(expectationAgeMs), flow=\(flow.state.rawValue), cause=\(flow.likelyCause), dtls=\(flow.dtlsState), pair=\(flow.selectedPairState), inAudioPackets=\(flow.audioPacketsReceived), inVideoPackets=\(flow.packetsReceived), inFrames=\(flow.framesReceived), inDecoded=\(flow.framesDecoded), dAudioPackets=\(flow.deltaAudioPacketsReceived), dVideoPackets=\(flow.deltaPacketsReceived), dFrames=\(flow.deltaFramesReceived), dDecoded=\(flow.deltaFramesDecoded))"
+                    )
+                } else {
+                    self.logger.log(
+                        level: .warning,
+                        message: "iOS participant camera stall probe (participant=\(trimmedParticipantId), callbackAgeMs=\(callbackAgeMs), expectationAgeMs=\(expectationAgeMs)) could not read inbound flow stats"
+                    )
+                }
+
+                let shouldRecoverRenderer: Bool = {
+                    guard let flow = inboundFlow else { return false }
+                    switch flow.state {
+                    case .advancingIngress, .decodeStalled:
+                        return true
+                    case .noTraffic, .stalledIngress:
+                        return false
+                    }
+                }()
+                guard shouldRecoverRenderer else {
+                    self.logger.log(
+                        level: .warning,
+                        message: "iOS participant camera recovery skipped: inbound counters not advancing enough; participant=\(trimmedParticipantId) likelyCause=\(inboundFlow?.likelyCause ?? "unknown") connectionId=\(normalizedConnectionId)"
+                    )
+                    continue
+                }
+
+                self.logger.log(
+                    level: .warning,
+                    message: "iOS participant camera renderer stalled with advancing inbound media; restarting stream + rebinding participant track participant=\(trimmedParticipantId) connectionId=\(normalizedConnectionId)"
+                )
+                await renderer.startStream()
+                let didAttach = await self.session.renderRemoteVideoForParticipant(
+                    to: renderer.rtcVideoRenderWrapper,
+                    connectionId: normalizedConnectionId,
+                    participantId: trimmedParticipantId
+                )
+                if didAttach {
+                    await renderer.setRemoteVideoInboundExpected(true)
+                }
             }
         }
     }
@@ -1563,10 +1912,6 @@ extension VideoCallViewController: CallActionDelegate {
             logger.log(level: .error, message: "Error invoking didEnd on transport delegate: \(error)")
         }
         
-        // Fully tear down the RTC session (peer connections, cryptors, etc.)
-        await session.shutdown(with: currentCall)
-        
-        // Finally clean up local UI resources
         await tearDownCall()
         dismiss(animated: true)
     }

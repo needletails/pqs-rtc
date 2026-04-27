@@ -539,7 +539,8 @@ public struct AndroidVideoCallView: View {
             session: session,
             remoteCount: remoteCount
         )
-        let remotePages = paginateRemotes(resources.remoteCaptureViews, pageSize: 12)
+        let remotePageSize = hasActiveRemoteScreenShare ? 8 : 12
+        let remotePages = paginateRemotes(resources.remoteCaptureViews, pageSize: remotePageSize)
 
         ZStack {
             GeometryReader { geo in
@@ -550,12 +551,13 @@ public struct AndroidVideoCallView: View {
                             captureView: resources.screenCaptureView
                         )
                         .frame(maxWidth: .infinity)
-                        .frame(height: geo.size.height * 0.55)
+                        .frame(height: geo.size.height * 0.66)
                         .onAppear {
                             Task { @MainActor in
                                 await resources.controller.setScreenView(resources.screenCaptureView)
                             }
                         }
+                        .background(Color.black)
                     }
 
                     if remotePages.count > 1 {
@@ -571,6 +573,8 @@ public struct AndroidVideoCallView: View {
                             }
                         }
                         .tabViewStyle(.page(indexDisplayMode: .always))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.black.opacity(hasActiveRemoteScreenShare ? 0.92 : 1.0))
                         .overlay(alignment: .top) {
                             Text("Page \(currentRemotePage + 1)/\(remotePages.count)")
                                 .font(.footnote)
@@ -591,6 +595,8 @@ public struct AndroidVideoCallView: View {
                                 }
                             }
                         )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.black.opacity(hasActiveRemoteScreenShare ? 0.92 : 1.0))
                     }
                 }
                 
