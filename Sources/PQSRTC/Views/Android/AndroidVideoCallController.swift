@@ -222,11 +222,14 @@ public actor AndroidVideoCallController: CallActionDelegate {
     }
     
     public func muteAudio() async {
-        let shouldMute = !isMutingAudio
+        await setAudioMuted(!isMutingAudio)
+    }
+
+    public func setAudioMuted(_ muted: Bool) async {
         guard let callId = self.currentCall?.sharedCommunicationId else { return }
         do {
-            try await self.session.setAudioTrack(isEnabled: !shouldMute, connectionId: callId)
-            isMutingAudio = shouldMute
+            try await self.session.setAudioTrack(isEnabled: !muted, connectionId: callId)
+            isMutingAudio = muted
         } catch {}
     }
     
@@ -355,7 +358,13 @@ public actor AndroidVideoCallController: CallActionDelegate {
             logger.log(level: .info, message: "Assigned view to participant=\(event.participantId), remaining unassigned=\(unassignedViews.count)")
         } else {
             logger.log(level: .info, message: "Participant track removed: participant=\(event.participantId)")
-            if let view = participantViewAssignments.removeValue(forKey: event.participantId) {
+            let eventKey = RTCSession.conferenceParticipantIdentityKey(event.participantId)
+            let assignmentKey = participantViewAssignments.keys.first { participantId in
+                participantId == event.participantId
+                    || (!eventKey.isEmpty && RTCSession.conferenceParticipantIdentityKey(participantId) == eventKey)
+            }
+            if let assignmentKey,
+               let view = participantViewAssignments.removeValue(forKey: assignmentKey) {
                 await session.removeRemoteForParticipant(view: view, connectionId: connectionId, participantId: event.participantId)
                 unassignedViews.append(view)
                 // A previously unassigned participant track may already exist in the connection map.

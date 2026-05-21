@@ -19,23 +19,22 @@ For **server-SFU (SwiftSFU)** with NeedleTail-style signaling, also read the art
 Your app (or backend) is responsible for:
 
 - Routing SDP offers/answers and ICE candidates to the correct peer/SFU.
-- Delivering opaque ciphertext blobs (for 1:1 Double Ratchet and optional group sender-key distribution).
+- Delivering opaque ciphertext blobs for 1:1 Double Ratchet / `call_cipher`.
+- Distributing SFU group sender frame keys over your encrypted application route.
 - Maintaining call membership/roster for group calls.
 
 The SDK is responsible for:
 
 - Creating and managing PeerConnections.
 - Managing the encryption key provider / FrameCryptors for audio+video frames.
-- (Optional) Running pairwise Double Ratchet sessions used for 1:1 calls and group sender-key distribution.
+- Running pairwise Double Ratchet sessions used for 1:1 call setup and 1:1 SFU media-ratchet exchange.
 
-### Group-call keying models
+### Group-call keying model
 
-The SDK supports two group-call keying models:
-
-- **Control-plane injected keys**: your app/server distributes frame keys and calls ``RTCGroupCall/setFrameEncryptionKey(_:index:for:)``.
-- **Sender-key distribution**: each sender encrypts media with a per-sender key and distributes that key to other members using pairwise Double Ratchet messages.
-
-> Tip: Start with control-plane injected keys if you already have an SFU + membership service. Move to sender keys when you want the SDK to handle pairwise encryption for sender-key distribution.
+Encrypted SFU group media uses **application-injected per-sender frame keys**. Your app distributes
+each sender's frame key over an encrypted application route, then calls
+``RTCSession/setFrameEncryptionKey(_:index:for:)`` for the sender participant id. PQSRTC does not
+derive group media frame keys from pairwise `call_cipher`; that path is reserved for 1:1 media.
 
 ## Topics
 
@@ -55,6 +54,8 @@ The SDK supports two group-call keying models:
 
 - <doc:HostAppCallKitAndSFU> — iOS **CallKit** + server SFU **media bootstrap** ordering (inbound 1:1)
 - <doc:SFUSignalingOverview> — control plane, ``PacketFlag``, duplicate `handshakeComplete`
+- <doc:OneToOneSfuFrameE2EE> — `call_cipher`, frame identity props, and 1:1 SFU FrameCryptor key agreement
+- <doc:GroupSfuFrameE2EE> — group/conference sender keys and the app-injected FrameCryptor contract
 - <doc:SfuRemoteVideoFrameE2EE> — **remote video** and per-participant **FrameCryptor** identity (`msid`, 1:1 vs `conf-`)
 
 ### Core Types
@@ -73,7 +74,8 @@ The SDK supports two group-call keying models:
 ### E2EE
 
 - ``RTCFrameEncryptionKeyMode``
-- ``RTCGroupE2EE``
+- ``RatchetMessagePacket``
+- ``PacketFlag``
 
 ## Building this documentation
 

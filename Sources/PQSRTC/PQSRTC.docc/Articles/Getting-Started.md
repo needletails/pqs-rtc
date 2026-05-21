@@ -37,7 +37,7 @@ struct MyTransport: RTCTransportEvents {
     // Use `packet.flag` to distinguish offer/answer/candidate.
   }
 
-  func sendSfuMessage(_ packet: RTCGroupE2EE.RatchetMessagePacket, call: Call) async throws {
+  func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws {
     // Group calls: Send encrypted SFU signaling packet.
     // Use `packet.flag` to distinguish offer/answer/candidate.
   }
@@ -49,9 +49,10 @@ struct MyTransport: RTCTransportEvents {
     call: Call
   ) async throws {
     // Deliver opaque ciphertext to a specific recipient.
-    // Used for 1:1 DoubleRatchet and (optionally) group sender-key distribution.
+    // Used for 1:1 DoubleRatchet / call_cipher media-ratchet exchange.
     // - `recipient` is an app-level identifier (e.g. secretName).
     // - `connectionId` is a stable string you should round-trip back on receive.
+    // - preserve `call.frameIdentityProps` and `call.signalingIdentityProps`.
   }
 
   func didEnd(call: Call, endState: CallStateMachine.EndState) async throws {
@@ -104,13 +105,14 @@ try await groupCall.handleControlMessage(.sfuAnswer(answerSdp))
 try await groupCall.handleControlMessage(.sfuCandidate(candidate))
 ```
 
-### Inbound ciphertext
+### Inbound ciphertext and frame keys
 
-Ciphertext is intentionally opaque to your transport. You only need to route it to the right call.
+Pairwise `call_cipher` ciphertext is intentionally opaque to your transport. For 1:1 calls, route
+it into the ongoing call setup (see <doc:One-to-One-Calls> and <doc:OneToOneSfuFrameE2EE>).
 
-- For group calls, if you use sender-key distribution over the transport, call:
-  ``RTCGroupCall/handleCiphertextFromParticipant(fromParticipantId:connectionId:ciphertext:)``
-- For 1:1 calls, you typically route ciphertext into the ongoing call setup (see <doc:One-to-One-Calls>).
+For encrypted SFU group calls, distribute per-sender frame keys over your own encrypted app route
+and inject them with ``RTCSession/setFrameEncryptionKey(_:index:for:)``. Do not feed group sender
+keys into the 1:1 `call_cipher` media-ratchet path. See <doc:GroupSfuFrameE2EE>.
 
 ## 4) Choose a call style
 
@@ -149,4 +151,6 @@ Next: <doc:One-to-One-Calls>.
 
 - <doc:HostAppCallKitAndSFU> — **mandatory** iOS + server SFU ordering
 - <doc:SFUSignalingOverview> — control-plane flags and `handshakeComplete`
+- <doc:OneToOneSfuFrameE2EE> — `call_cipher`, frame identity props, and 1:1 SFU FrameCryptor key agreement
+- <doc:GroupSfuFrameE2EE> — group/conference sender keys and app-injected frame keys
 - <doc:SfuRemoteVideoFrameE2EE> — if you use **per-participant** frame encryption on SFU, read before changing the `Call` graph or `RTCConnection` identity fields

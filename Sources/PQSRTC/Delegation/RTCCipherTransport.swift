@@ -26,17 +26,31 @@ import BinaryCodable
 ///
 /// See <doc:Transport> for practical routing guidance.
 public protocol RTCTransportEvents: Sendable {
-    /// Sends an opaque ciphertext blob to a specific recipient.
+    /// Sends an opaque media-ratchet ciphertext blob to a specific recipient.
     ///
     /// The SDK uses ciphertext messages for:
-    /// - 1:1 Double Ratchet handshake/ratcheting
-    /// - Optional group sender-key distribution (when using ``RTCGroupCall`` sender keys)
+    /// - 1:1 Double Ratchet handshake/ratcheting, including 1:1-over-SFU `call_cipher`
+    ///
+    /// The transport must treat `ciphertext` as opaque bytes and must preserve the accompanying
+    /// ``Call`` payload. For 1:1 SFU frame E2EE, the `call` argument intentionally carries this
+    /// sender's current ``Call/frameIdentityProps`` and ``Call/signalingIdentityProps``. The
+    /// receiver uses those props to replace any provisional SFU/room identity before deriving
+    /// its receive frame key.
+    ///
+    /// Do not add a separate "target" side channel for call cipher routing. Route the message to
+    /// `recipient`, round-trip `connectionId`, and deliver the same `ciphertext` + `call` pair to
+    /// the peer's `receiveCiphertext` path. Rewrapping is fine as long as those three fields are
+    /// lossless and unmodified.
+    ///
+    /// For channel-backed group or `conf-` media rooms, do not use this pairwise `call_cipher`
+    /// payload to derive frame keys. Group media uses application-injected per-sender frame keys
+    /// installed with ``RTCSession/setFrameEncryptionKey(_:index:for:)``.
     ///
     /// - Parameters:
     ///   - recipient: Application-level recipient identifier (often a participant `secretName`).
     ///   - connectionId: A stable routing identifier that must be round-tripped back on receive.
     ///   - ciphertext: Opaque payload (do not parse or modify).
-    ///   - call: Call context for routing (typically `call.sharedCommunicationId`).
+    ///   - call: Call context and identity props for the peer's media/signaling ratchets.
     func sendCiphertext(recipient: String, connectionId: String, ciphertext: Data, call: Call) async throws
 
     // MARK: - SFU group-call signaling (encrypted)
@@ -72,11 +86,12 @@ public protocol RTCTransportEvents: Sendable {
     /// - Parameter call: The call that was answered on this device
     func sendCallAnsweredAuxDevice(_ call: Call) async throws
     
-    /// Sends an encrypted 1:1 message.
+    /// Sends an encrypted 1:1 signaling message.
     ///
-    /// The packet contains an encrypted `Call` object with SDP offer in metadata.
-    /// Default behavior encodes the packet and forwards it through `sendCiphertext(...)` using
-    /// `recipient = packet.sfuIdentity` and `connectionId = call.sharedCommunicationId`.
+    /// The packet contains an encrypted `Call` object. Use `packet.flag` to route SDP offers,
+    /// answers, ICE candidates, and post-cipher `handshakeComplete` payloads through your
+    /// application's signaling protocol. This method has no default wire format; the application
+    /// must encode and send the packet consistently with its inbound decode path.
     func sendOneToOneMessage(_ packet: RatchetMessagePacket, recipient: Call.Participant) async throws
     
     /// Called when the SDK ends a call.

@@ -320,11 +320,17 @@ public struct Call: Sendable, Codable, Equatable {
     public var sharedMessageId: String?
     
     /// A unique identifier for the shared communication session.
-    /// Used to group related calls and manage the overall communication session.
+    ///
+    /// This value is also the primary WebRTC connection id used by PQSRTC to correlate SDP, ICE,
+    /// `call_cipher`, and frame-key state. Transports should round-trip it unchanged except for
+    /// documented normalization (`#` channel prefix, UUID normalization) at their own routing edge.
     public var sharedCommunicationId: String
 
     /// Optional canonical wire id for channel-scoped group calls.
-    /// Falls back to `sharedCommunicationId` for older payloads.
+    ///
+    /// Server SFU group calls use this as the room/channel route. Ephemeral 1:1-over-SFU relay
+    /// calls may also carry a `#<uuid>` route, but ``resolvedChannelWireId`` deliberately returns
+    /// `nil` for those rooms so they are not treated as multi-party channel calls.
     public var channelWireId: String?
 
     /// Optional user-facing channel title for UI only.
@@ -370,10 +376,19 @@ public struct Call: Sendable, Codable, Equatable {
     /// Used to determine the current state of the call.
     public var isActive: Bool
     
-    /// RTC Frame Props
+    /// Frame/media ratchet identity props for the participant that sent this `Call` payload.
+    ///
+    /// These props are distinct from signaling identity props. They are used to derive media frame
+    /// keys that are installed into the FrameCryptor key provider. For `call_cipher` transport,
+    /// the outbound side must refresh this field to its own current local frame identity before
+    /// sending; the inbound side treats it as the authoritative remote frame identity.
     public var frameIdentityProps: SessionIdentity.UnwrappedProps?
     
-    ///Signalling props
+    /// Signaling ratchet identity props for the participant that sent this `Call` payload.
+    ///
+    /// These props protect SDP/ICE/control-plane messages. They are intentionally separate from
+    /// ``frameIdentityProps`` so media ratchet state cannot be confused with signaling ratchet
+    /// state. Do not use signaling props to debug or derive frame keys.
     public var signalingIdentityProps: SessionIdentity.UnwrappedProps?
     
     /// Additional metadata associated with the call.
@@ -542,6 +557,8 @@ public struct Call: Sendable, Codable, Equatable {
     ///
     /// Returns `nil` for ephemeral 1:1 SFU relay rooms (`#<uuid>`) regardless of
     /// whether `channelWireId` was set explicitly (e.g. by `init(groupSharedCommunicationId:)`).
+    /// This keeps 1:1 SFU frame-key logic peer-based while still allowing the host transport to
+    /// route the underlying control messages through an ephemeral SFU room.
     public var resolvedChannelWireId: String? {
         let candidate: String
         if let explicit = channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {

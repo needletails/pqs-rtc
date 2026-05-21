@@ -96,6 +96,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     let rtcVideoRenderWrapper: RTCVideoRenderWrapper
     private let layerBox: SampleBufferDisplayLayerBox
     private let ciContext: CIContext
+    private let rendersScreenShare: Bool
     @MainActor var bounds: CGRect
     private weak var delegate: BufferToMetalDelegate?
     
@@ -174,14 +175,16 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         layerBox: SampleBufferDisplayLayerBox,
         ciContext: CIContext,
         bounds: CGRect,
+        rendersScreenShare: Bool = false,
         logger: NeedleTailLogger = NeedleTailLogger("[SampleBufferViewRenderer]")
     ) {
         self.layerBox = layerBox
         self.ciContext = ciContext
+        self.rendersScreenShare = rendersScreenShare
         self.bounds = bounds
         self.logger = logger
-        self.rtcVideoRenderWrapper = RTCVideoRenderWrapper(id: "SampleBufferViewRenderer")
-        logger.log(level: .info, message: "SampleBufferViewRenderer initialized with bounds: \(bounds)")
+        self.rtcVideoRenderWrapper = RTCVideoRenderWrapper(id: rendersScreenShare ? "ScreenShareRenderer" : "SampleBufferViewRenderer")
+        logger.log(level: .info, message: "SampleBufferViewRenderer initialized with bounds: \(bounds) rendersScreenShare=\(rendersScreenShare)")
     }
     
     deinit {
@@ -708,9 +711,8 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             
             let scaleMode: ScaleMode
 #if os(iOS)
-            // Restore historical iOS call-tile behavior: fill the available bounds.
-            // This matches prior UX where remote video fully occupied the phone viewport.
-            scaleMode = .aspectFill
+            // Camera tiles fill the viewport; screen shares must fit so a desktop is never cropped on phones.
+            scaleMode = rendersScreenShare ? .aspectFitHorizontal : .aspectFill
 #elseif os(macOS)
             scaleMode = .aspectFitHorizontal
 #endif
@@ -954,8 +956,8 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             )
             let scaleMode: ScaleMode
 #if os(iOS)
-            // Keep iOS remote behavior consistent with main call tile UX: fill viewport.
-            scaleMode = .aspectFill
+            // Camera tiles fill the viewport; screen shares must fit so a desktop is never cropped on phones.
+            scaleMode = rendersScreenShare ? .aspectFitHorizontal : .aspectFill
 #else
             scaleMode = .aspectFitHorizontal
 #endif

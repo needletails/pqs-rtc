@@ -514,6 +514,9 @@ extension RTCSession {
         // Wake any controller waiting for the wrapper so it can bind capture injection.
         if let wrapper = updatedConnection.rtcVideoCaptureWrapper {
             resumeVideoCaptureWrapperWaiters(connectionId: connection.id, wrapper: wrapper)
+#if os(iOS) || os(macOS)
+            await rebindRegisteredLocalPreviewCaptureIfNeeded(connectionId: connection.id, wrapper: wrapper)
+#endif
         }
         
         logger.log(level: .info, message: "Successfully created local video track for connection: \(connection.id)")
@@ -549,6 +552,9 @@ extension RTCSession {
             if let wrapper = connection.rtcVideoCaptureWrapper {
                 // Wake controllers that may still be waiting for a wrapper after a late reconnect.
                 resumeVideoCaptureWrapperWaiters(connectionId: normalizedId, wrapper: wrapper)
+#if os(iOS) || os(macOS)
+                await rebindRegisteredLocalPreviewCaptureIfNeeded(connectionId: normalizedId, wrapper: wrapper)
+#endif
             }
         }
 

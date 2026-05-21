@@ -59,7 +59,7 @@ extension RTCSession {
                     // Host apps integrating inbound 1:1 server-SFU: defer SFU media bootstrap until
                     // after CallKit audio activation. DocC (PQSRTC): "Host app integration: CallKit
                     // and server SFU (iOS)" in Sources/PQSRTC/PQSRTC.docc/; app pointer:
-                    // nudge-app docs/OneToOneSfuCallKitMedia.md
+                    // nudge-app Sources/Nudge/Documentation.docc/OneToOneSfuCallKitMedia.md
                     //
                     // Re-applying mode here (when the session was already active) produced:
                     //   `ATAudioSessionPropertyManager.mm: FAILED to set property … -50`

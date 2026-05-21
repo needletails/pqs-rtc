@@ -64,6 +64,19 @@ extension RTCSession {
         target: ScreenShareTarget,
         connectionId: String
     ) async throws {
+        try await addScreenTrackToStream(
+            target: target,
+            options: ScreenShareOptions(),
+            connectionId: connectionId
+        )
+    }
+
+    /// Adds a screen share track to the peer connection with the selected capture options.
+    public func addScreenTrackToStream(
+        target: ScreenShareTarget,
+        options: ScreenShareOptions,
+        connectionId: String
+    ) async throws {
         let normalizedId = connectionId.normalizedConnectionId
         guard var connection = await connectionManager.findConnection(with: normalizedId) else {
             throw RTCErrors.connectionNotFound
@@ -112,6 +125,7 @@ extension RTCSession {
 #elseif canImport(WebRTC)
         let (screenTrack, updatedConnection) = try await createLocalScreenTrack(
             target: target,
+            options: options,
             with: connection
         )
         connection = updatedConnection
@@ -159,9 +173,31 @@ extension RTCSession {
             return
         }
 
+        let localParticipantId = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let localParticipantKey = Self.conferenceParticipantIdentityKey(localParticipantId)
+        var reflectedLocalScreenParticipants: [String] = []
+
+        if !localParticipantKey.isEmpty {
+            for participantId in Array(connection.remoteScreenTracksByParticipantId.keys)
+            where Self.conferenceParticipantIdentityKey(participantId) == localParticipantKey {
+                connection.remoteScreenTracksByParticipantId.removeValue(forKey: participantId)
+#if canImport(WebRTC) && !os(Android)
+                if let cryptor = connection.screenReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
+                    cryptor.enabled = false
+                    cryptor.delegate = nil
+                }
+                connection.screenReceiverCryptorBindingsByParticipantId.removeValue(forKey: participantId)
+#endif
+                reflectedLocalScreenParticipants.append(participantId)
+            }
+        }
+
 #if os(Android)
         rtcClient.stopScreenCapture()
         connection.localScreenTrack = nil
+        if !reflectedLocalScreenParticipants.isEmpty {
+            connection.remoteScreenTrack = nil
+        }
         await connectionManager.updateConnection(id: normalizedId, with: connection)
 #elseif canImport(WebRTC)
         if let screenTrack = connection.localScreenTrack {
@@ -181,6 +217,11 @@ extension RTCSession {
         connection.screenCaptureWrapper = nil
         await connectionManager.updateConnection(id: normalizedId, with: connection)
 #endif
+        for participantId in reflectedLocalScreenParticipants {
+            notifyRemoteScreenTrackChanged(
+                RemoteScreenTrackEvent(connectionId: normalizedId, participantId: participantId, isActive: false)
+            )
+        }
         do {
             try await renegotiateScreenShareForSfuIfNeeded(
                 connectionId: normalizedId,
@@ -240,6 +281,7 @@ extension RTCSession {
     /// frames, and returns the configured screen track.
     internal func createLocalScreenTrack(
         target: ScreenShareTarget,
+        options: ScreenShareOptions = ScreenShareOptions(),
         with connection: RTCConnection
     ) async throws -> (WebRTC.RTCVideoTrack, RTCConnection) {
         var updatedConnection = connection
@@ -251,8 +293,13 @@ extension RTCSession {
         updatedConnection.screenCaptureWrapper = RTCVideoCaptureWrapper(delegate: videoSource)
 
         #if os(macOS)
-        let captureSource = MacScreenCaptureSource()
-        try await captureSource.startCapture(target: target, videoSource: videoSource)
+        let connectionId = connection.id
+        let captureSource = MacScreenCaptureSource { [weak self] in
+            Task { [weak self] in
+                await self?.removeScreenTrackFromStream(connectionId: connectionId)
+            }
+        }
+        try await captureSource.startCapture(target: target, options: options, videoSource: videoSource)
         _macScreenCaptureSourceStorage = captureSource
         #elseif os(iOS)
         let captureSource = iOSScreenCaptureSource()

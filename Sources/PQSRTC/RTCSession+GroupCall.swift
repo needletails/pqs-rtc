@@ -24,6 +24,69 @@ extension RTCSession {
         groupCall(forSfuIdentity: roomId)
     }
 
+    private func mergeGroupCallForMediaBootstrap(
+        stored: Call,
+        update: Call,
+        sfuRecipientId: String
+    ) -> Call {
+        func participantKey(_ secretName: String) -> String {
+            secretName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+
+        var merged = stored
+
+        if merged.sharedMessageId == nil {
+            merged.sharedMessageId = update.sharedMessageId
+        }
+
+        let updatedWireId = update.channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !updatedWireId.isEmpty {
+            merged.channelWireId = update.channelWireId
+        } else if merged.channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            merged.channelWireId = sfuRecipientId.ensureIRCChannel
+        }
+
+        if merged.channelDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            merged.channelDisplayName = update.channelDisplayName
+        }
+        merged.supportsVideo = update.supportsVideo
+
+        var participantBySecret: [String: Call.Participant] = [:]
+        participantBySecret[participantKey(update.sender.secretName)] = update.sender
+        for participant in update.recipients {
+            participantBySecret[participantKey(participant.secretName)] = participant
+        }
+
+        let senderKey = participantKey(merged.sender.secretName)
+        if merged.sender.deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let replacement = participantBySecret[senderKey],
+           !replacement.deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            merged.sender.deviceId = replacement.deviceId
+        }
+
+        merged.recipients = merged.recipients.map { recipient in
+            var recipient = recipient
+            let recipientKey = participantKey(recipient.secretName)
+            if let replacement = participantBySecret[recipientKey],
+               !replacement.deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                recipient.deviceId = replacement.deviceId
+            }
+            return recipient
+        }
+
+        if merged.recipients.isEmpty, !update.recipients.isEmpty {
+            merged.recipients = update.recipients
+        }
+        if merged.frameIdentityProps == nil {
+            merged.frameIdentityProps = update.frameIdentityProps
+        }
+        if merged.signalingIdentityProps == nil {
+            merged.signalingIdentityProps = update.signalingIdentityProps
+        }
+
+        return merged
+    }
+
     /// Creates the room and room keys this is the entry point for group calls.
     /// Store and find by normalized ID (no "#"); transport layer reattaches "#" for IRC.
     public func groupCallNegotiation(
@@ -152,26 +215,22 @@ extension RTCSession {
         let connId = call.sharedCommunicationId.normalizedConnectionId
 
         // Signaling ratchet (SDP/ICE over SFU): `pcKeyManager` + `TaskProcessor`.
-        do {
-            _ = try await pcKeyManager.fetchConnectionIdentity(connection: connId)
-        } catch {
-            _ = try await pcKeyManager.createRecipientIdentity(
-                connectionId: connId,
-                props: props)
-        }
+        //
+        // This identity is authoritative for encrypted SFU packets. A peer `call_cipher` can arrive
+        // before registration and create a room-scoped signaling identity with the peer's props; if
+        // we keep that provisional identity, the next `.offer` / `.candidate` is encrypted to the
+        // peer instead of the SFU and the server rejects it with `maxSkippedHeadersExceeded`.
+        _ = try await pcKeyManager.createRecipientIdentity(
+            connectionId: connId,
+            props: props)
 
-        // Media / FrameCryptor ratchet: `keyManager` + `ratchetManager`.
+        // Provisional media ratchet bootstrap: `keyManager` + `ratchetManager`.
         //
-        // Swift SFU's registration reply intentionally carries **signaling** props only
-        // (`PQSGroupCallAdapter` sets `frameIdentityProps = nil`). There is no separate
-        // SFU payload for frame identities at registration time, but `beginGroupCallMediaAfterSfuRegistrationIfNeeded`
-        // still runs `createPeerConnection` → `setMessageKey` → `deriveMessageKey`, which requires a
-        // **recipient** `ConnectionSessionIdentity` in `keyManager` keyed by the room id.
-        //
-        // The server-negotiated `UnwrappedProps` are the SFU/room peer keys; we install them into
-        // **both** stores so each Double Ratchet (separate `KeyManager` actors, separate DR state)
-        // can initialize. Per-peer frame refinements continue to flow through `receiveCiphertext` /
-        // `call_cipher` as before.
+        // True 1:1 SFU relay later replaces this provisional entry through `call_cipher`
+        // `frameIdentityProps`. Channel-backed groups and `conf-` rooms do not use pairwise
+        // `call_cipher` for media keys; their sender frame keys are injected by the host app under
+        // each sender's participant id. We still keep the provisional room identity for legacy
+        // bootstrap code that expects one before media setup starts.
         do {
             _ = try await keyManager.fetchConnectionIdentity(connection: connId)
         } catch {
@@ -184,15 +243,32 @@ extension RTCSession {
     /// After SFU `.registration` completes (``createSFUIdentity``), creates the SFU peer connection
     /// and sends the initial encrypted offer when a local ``RTCGroupCall`` exists.
     ///
-    /// No-op if there is no registered group for `sfuRecipientId`, or if a connection already exists
-    /// (idempotent for duplicate registrations).
-    public func beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId: String) async throws {
+    /// No-op if there is no registered group for `sfuRecipientId`, or if the initial SFU media offer
+    /// was already sent (idempotent for duplicate registrations).
+    ///
+    /// Cipher negotiation can create the room `PeerConnection` before registration finishes. That
+    /// connection is reusable, but it is not enough for SFU media: the room still needs one initial
+    /// `.offer` so the server can attach local source tracks and replay them to other participants.
+    public func beginGroupCallMediaAfterSfuRegistrationIfNeeded(
+        sfuRecipientId: String,
+        updatedCall: Call? = nil
+    ) async throws {
         let normalizedLookup = sfuRecipientId.normalizedConnectionId
         guard let group = groupCall(forSfuIdentity: normalizedLookup) else {
             logger.log(
                 level: .warning,
                 message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: no RTCGroupCall for sfuRecipientId=\(sfuRecipientId) normalized=\(normalizedLookup) (registration reply may not have arrived, or room id does not match groupCallNegotiation)")
             return
+        }
+
+        if let updatedCall {
+            let stored = await group.currentCall
+            let merged = mergeGroupCallForMediaBootstrap(
+                stored: stored,
+                update: updatedCall,
+                sfuRecipientId: sfuRecipientId)
+            await group.applyUpdatedCallForNegotiation(merged)
+            updateFallbackLatestCall(merged)
         }
 
         var mediaCall = await group.currentCall
@@ -217,17 +293,6 @@ extension RTCSession {
             throw error
         }
 
-        guard await !hasConnection(id: mediaCall.sharedCommunicationId) else {
-            logger.log(
-                level: .debug,
-                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: connection already exists for \(mediaCall.sharedCommunicationId)")
-            return
-        }
-
-        logger.log(
-            level: .info,
-            message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: creating SFU PeerConnection and offer for room=\(normalizedLookup)")
-
         let frameLocalIdentity: ConnectionLocalIdentity
         if let existingIdentity = try? await keyManager.fetchCallKeyBundle() {
             frameLocalIdentity = existingIdentity
@@ -248,6 +313,39 @@ extension RTCSession {
         // Match ``RTCConnectionManager`` / ``teardownConnectionIdKey`` (strip `#` + lowercase) so
         // post-cipher bookkeeping survives UUID hex casing differences across call objects.
         let bootstrapKey = teardownConnectionIdKey(mediaCall.sharedCommunicationId)
+        if var existingConnection = await connectionManager.findConnection(with: mediaCall.sharedCommunicationId) {
+            guard !initialSfuGroupMediaOfferSentConnectionIds.contains(bootstrapKey) else {
+                logger.log(
+                    level: .debug,
+                    message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: connection already exists and initial SFU offer already sent for \(mediaCall.sharedCommunicationId)")
+                return
+            }
+
+            logger.log(
+                level: .info,
+                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: reusing pre-created SFU PeerConnection and sending initial offer for room=\(normalizedLookup)")
+
+            existingConnection.call = mediaCall
+            await connectionManager.updateConnection(id: existingConnection.id, with: existingConnection)
+
+            pendingInitialSfuGroupOfferConnectionIds.insert(bootstrapKey)
+            defer { pendingInitialSfuGroupOfferConnectionIds.remove(bootstrapKey) }
+
+            let updatedCall = try await sendGroupCallOffer(mediaCall)
+            initialSfuGroupMediaOfferSentConnectionIds.insert(bootstrapKey)
+            await group.applyUpdatedCallForNegotiation(updatedCall)
+
+            if var refreshedConnection = await connectionManager.findConnection(with: mediaCall.sharedCommunicationId) {
+                refreshedConnection.call = updatedCall
+                await connectionManager.updateConnection(id: refreshedConnection.id, with: refreshedConnection)
+            }
+            return
+        }
+
+        logger.log(
+            level: .info,
+            message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: creating SFU PeerConnection and offer for room=\(normalizedLookup)")
+
         pendingInitialSfuGroupOfferConnectionIds.insert(bootstrapKey)
         defer { pendingInitialSfuGroupOfferConnectionIds.remove(bootstrapKey) }
 
@@ -264,9 +362,10 @@ extension RTCSession {
         }
 #endif
 
-        // Default `willFinishNegotiation: false` so `setMessageKey` runs at PC creation, matching
-        // the b368e83-era behavior. The per-pair Double Ratchet then derives FrameCryptor keys
-        // for every entry in `call.recipients`, mirroring how 1:1 direct works today.
+        // Default `willFinishNegotiation: false` so 1:1 SFU relay calls still run the `call_cipher`
+        // sender path at PC creation. Channel/conference group rooms are detected inside
+        // `setMessageKey` and use application-injected per-sender frame keys instead; a pairwise
+        // `call_cipher` bootstrap cannot represent one outbound group RTP stream for many peers.
         do {
             _ = try await createPeerConnection(
                 with: mediaCall,
@@ -289,55 +388,22 @@ extension RTCSession {
         let updatedCall = try await sendGroupCallOffer(mediaCall)
         initialSfuGroupMediaOfferSentConnectionIds.insert(bootstrapKey)
         await group.applyUpdatedCallForNegotiation(updatedCall)
-    }
-    
-    /// Starts a group call by creating a single PeerConnection intended to connect to an SFU.
-    ///
-    /// Prefer using ``RTCGroupCall/join()`` unless you are building your own group facade.
-    ///
-    /// Frame-level E2EE for SFU group calls is driven by the same per-pair Double Ratchet path
-    /// used for 1:1 direct: `setMessageKey` runs at PC creation, ciphertext fans out to every
-    /// participant in `call.recipients`, and each peer's `setReceivingMessageKey` provisions the
-    /// per-participant frame key on its side. Conference rooms (which carry an empty recipients
-    /// list) opt out of this path and use the conference frame-key exchange instead.
-    func startGroupCall(call: Call, sfuRecipientId: String) async throws -> Call {
-        var call = call
-        
-        // Mark this call's PeerConnection as the active one (SFU uses a single PC).
-        activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
 
-        // Create the offer (sets local SDP, triggers ICE gathering).
-        call = try await createOffer(call: call)
-        
-        // Encrypt and send; roomId normalized, "#" reattached at transport.
-        let offerPlaintext = try BinaryEncoder().encode(call)
-        let writeTask = WriteTask(
-            data: offerPlaintext,
-            roomId: sfuRecipientId.normalizedConnectionId,
-            flag: .offer,
-            call: call)
-        let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
-        try await taskProcessor.feedTask(task: encryptableTask)
-        
-        // Enable ICE trickle for SFU calls.
-        // Without this, candidates remain buffered and ICE can stall in `checking`.
-        do {
-            try await startSendingCandidates(call: call)
-        } catch {
-            logger.log(level: .warning, message: "Failed to start sending SFU ICE candidates after offer (will continue buffering): \(error)")
+        if var refreshedConnection = await connectionManager.findConnection(with: mediaCall.sharedCommunicationId) {
+            refreshedConnection.call = updatedCall
+            await connectionManager.updateConnection(id: refreshedConnection.id, with: refreshedConnection)
         }
-        
-        return call
     }
-    
     
     /// Single entrypoint to apply decoded control-plane messages.
     ///
     /// This is the intended transport-agnostic surface: your app owns the networking and
     /// calls into this API as messages arrive.
     ///
-    /// Your networking layer should decode inbound SFU signaling, roster updates, and key
-    /// distribution messages into ``ControlMessage`` and call this method.
+    /// Your networking layer should decode inbound SFU signaling and roster updates into
+    /// ``ControlMessage`` and call this method. Media frame keys are not delivered through this enum;
+    /// inject them with ``setFrameEncryptionKey(_:index:for:)`` after your app-level sender-key
+    /// exchange resolves the track owner participant id.
     public func handleControlMessage(_ message: RTCGroupCall.ControlMessage) async throws {
         switch message {
         case .sfuAnswer(let packet):
@@ -435,7 +501,7 @@ extension RTCSession {
         let encryptableTask = EncryptableTask(task: .streamMessage(streamTask))
         try await taskProcessor.feedTask(task: encryptableTask)
     }
-    
+
     // MARK: Roster
     func handleParticpants(_ packet: RatchetMessagePacket) async throws {
         // Get call from groupCalls
@@ -528,6 +594,7 @@ extension RTCSession {
                 throw RTCErrors.missingGroupCall
             }
             await group.updateParticipants(participants)
+            await pruneRemoteMediaForGroupRoster(participants, group: group, sfuIdentity: packet.sfuIdentity)
         case .participantDemuxId:
             let participant: RTCGroupCall.Participant = try BinaryDecoder().decode(RTCGroupCall.Participant.self, from: plaintext)
             guard let group = groupCall(forSfuIdentity: packet.sfuIdentity) else {
@@ -544,9 +611,264 @@ extension RTCSession {
             try await applyInboundSfuPostCipherHandshakeMerge(resolved: resolved, sfuIdentity: packet.sfuIdentity)
             logger.log(
                 level: .info,
-                message: "Applied inbound SFU post-cipher identity handshake for room=\(packet.sfuIdentity)"
+                message: "Applied inbound SFU post-cipher identity handshake for room=\(packet.sfuIdentity)")
+        }
+    }
+
+#if canImport(WebRTC) && !os(Android)
+    private struct GroupRemoteMediaPruneResult {
+        var didUpdate = false
+        var removedVideoParticipants: [String] = []
+        var removedAudioParticipants: [String] = []
+        var removedScreenParticipants: [String] = []
+    }
+
+    private func retireFrameKeyIndex(forParticipantId participantId: String) {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return }
+        lastFrameKeyIndexByParticipantId = lastFrameKeyIndexByParticipantId.filter { existing, _ in
+            Self.conferenceParticipantIdentityKey(existing) != participantKey
+        }
+    }
+
+    private func pruneRemoteMedia(
+        on connection: inout RTCConnection,
+        shouldPruneParticipant: (String) -> Bool
+    ) -> GroupRemoteMediaPruneResult {
+        var result = GroupRemoteMediaPruneResult()
+
+        for participantId in Array(connection.remoteVideoTracksByParticipantId.keys) where shouldPruneParticipant(participantId) {
+            let track = connection.remoteVideoTracksByParticipantId.removeValue(forKey: participantId)
+            if let track, connection.remoteVideoTrack === track {
+                connection.remoteVideoTrack = nil
+            }
+            if let cryptor = connection.videoReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
+                cryptor.enabled = false
+                cryptor.delegate = nil
+                if connection.videoFrameCryptor === cryptor {
+                    connection.videoFrameCryptor = nil
+                }
+            }
+            connection.videoReceiverCryptorBindingsByParticipantId.removeValue(forKey: participantId)
+            result.removedVideoParticipants.append(participantId)
+            result.didUpdate = true
+        }
+
+        for participantId in Array(connection.remoteAudioTracksByParticipantId.keys) where shouldPruneParticipant(participantId) {
+            let track = connection.remoteAudioTracksByParticipantId.removeValue(forKey: participantId)
+            track?.isEnabled = false
+            if let cryptor = connection.audioReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
+                cryptor.enabled = false
+                cryptor.delegate = nil
+                if connection.audioFrameCryptor === cryptor {
+                    connection.audioFrameCryptor = nil
+                }
+            }
+            connection.audioReceiverCryptorBindingsByParticipantId.removeValue(forKey: participantId)
+            result.removedAudioParticipants.append(participantId)
+            result.didUpdate = true
+        }
+
+        for participantId in Array(connection.remoteScreenTracksByParticipantId.keys) where shouldPruneParticipant(participantId) {
+            connection.remoteScreenTracksByParticipantId.removeValue(forKey: participantId)
+            if let cryptor = connection.screenReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
+                cryptor.enabled = false
+                cryptor.delegate = nil
+            }
+            connection.screenReceiverCryptorBindingsByParticipantId.removeValue(forKey: participantId)
+            result.removedScreenParticipants.append(participantId)
+            result.didUpdate = true
+        }
+
+        return result
+    }
+
+    private func emitRemoteMediaPruneEvents(
+        connectionId: String,
+        result: GroupRemoteMediaPruneResult
+    ) {
+        for participantId in result.removedVideoParticipants {
+            notifyRemoteParticipantTrackChanged(
+                RemoteParticipantTrackEvent(connectionId: connectionId, participantId: participantId, kind: "video", isActive: false)
+            )
+        }
+        for participantId in result.removedScreenParticipants {
+            notifyRemoteScreenTrackChanged(
+                RemoteScreenTrackEvent(connectionId: connectionId, participantId: participantId, isActive: false)
             )
         }
     }
+
+    /// Removes one departed participant's receiver media and FrameCryptors from a live group call.
+    ///
+    /// Use this for server-authoritative participant-leave signals in channel-backed group calls.
+    /// It deliberately does not close the peer connection: remaining participants keep their media,
+    /// while the departed participant's stale receiver FrameCryptors and remembered frame-key index
+    /// are retired so a later rejoin must install a fresh sender key before decrypting media.
+    public func removeRemoteParticipantFromGroupCall(
+        connectionId: String,
+        participantId: String
+    ) async {
+        let targetKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !targetKey.isEmpty else { return }
+
+        let normalizedId = connectionId.normalizedConnectionId
+        guard var connection = await connectionManager.findConnection(with: normalizedId) else {
+            logger.log(
+                level: .debug,
+                message: "No group connection found while pruning departed participant=\(participantId) connection=\(connectionId)"
+            )
+            retireFrameKeyIndex(forParticipantId: participantId)
+            return
+        }
+
+        let result = pruneRemoteMedia(on: &connection) { candidate in
+            Self.conferenceParticipantIdentityKey(candidate) == targetKey
+        }
+        retireFrameKeyIndex(forParticipantId: participantId)
+
+        guard result.didUpdate else {
+            notifyRemoteParticipantTrackChanged(
+                RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
+            )
+            notifyRemoteScreenTrackChanged(
+                RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
+            )
+            logger.log(
+                level: .debug,
+                message: "No receiver media to prune for departed participant=\(participantId) connection=\(connection.id)"
+            )
+            return
+        }
+
+        await connectionManager.updateConnection(id: connection.id, with: connection)
+        emitRemoteMediaPruneEvents(connectionId: connection.id, result: result)
+
+        logger.log(
+            level: .info,
+            message: "Pruned departed SFU participant media participant=\(participantId) connection=\(connection.id) video=\(result.removedVideoParticipants.count) audio=\(result.removedAudioParticipants.count) screen=\(result.removedScreenParticipants.count)"
+        )
+    }
+
+    /// Removes receiver tracks and FrameCryptors for participants the SFU roster no longer advertises.
+    ///
+    /// SDP renegotiation is the normal source of truth for media, but conference rooms can also
+    /// publish roster updates when a participant leaves. Treat those updates as an additional cleanup
+    /// signal so old receiver cryptors cannot keep decoding against a participant that has departed.
+    private func pruneRemoteMediaForGroupRoster(
+        _ participants: [RTCGroupCall.Participant],
+        group: RTCGroupCall,
+        sfuIdentity: String
+    ) async {
+        let call = await group.currentCall
+        guard var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
+            return
+        }
+
+        let localKey = Self.conferenceParticipantIdentityKey(connection.localParticipantId)
+        let activeKeys = Set(participants.compactMap { participant -> String? in
+            let key = Self.conferenceParticipantIdentityKey(participant.id)
+            guard !key.isEmpty, UUID(uuidString: key) == nil, key != localKey else { return nil }
+            return key
+        })
+        guard !participants.isEmpty else { return }
+
+        func shouldPruneParticipant(_ participantId: String) -> Bool {
+            let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, UUID(uuidString: trimmed) == nil else { return false }
+            let key = Self.conferenceParticipantIdentityKey(trimmed)
+            guard !key.isEmpty, key != localKey else { return false }
+            return !activeKeys.contains(key)
+        }
+
+        let result = pruneRemoteMedia(on: &connection, shouldPruneParticipant: shouldPruneParticipant)
+        guard result.didUpdate else { return }
+        await connectionManager.updateConnection(id: connection.id, with: connection)
+
+        let removedParticipants = Set(
+            result.removedVideoParticipants
+                + result.removedAudioParticipants
+                + result.removedScreenParticipants
+        )
+        for participantId in removedParticipants {
+            retireFrameKeyIndex(forParticipantId: participantId)
+        }
+        emitRemoteMediaPruneEvents(connectionId: connection.id, result: result)
+
+        logger.log(
+            level: .info,
+            message: "Pruned stale SFU receiver media after roster update room=\(sfuIdentity) connection=\(connection.id) activeParticipants=\(activeKeys.count)"
+        )
+    }
+#endif
+
+#if os(Android)
+    /// Removes one departed participant's receiver media from a live Android group call.
+    ///
+    /// Android does not keep Apple `RTCFrameCryptor` bindings, but it still needs the same
+    /// participant-scoped cleanup so UI tiles disappear and a rejoin waits for a fresh frame key.
+    public func removeRemoteParticipantFromGroupCall(
+        connectionId: String,
+        participantId: String
+    ) async {
+        let targetKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !targetKey.isEmpty else { return }
+        lastFrameKeyIndexByParticipantId = lastFrameKeyIndexByParticipantId.filter { existing, _ in
+            Self.conferenceParticipantIdentityKey(existing) != targetKey
+        }
+
+        let normalizedId = connectionId.normalizedConnectionId
+        guard var connection = await connectionManager.findConnection(with: normalizedId) else { return }
+
+        func shouldRemove(_ candidate: String) -> Bool {
+            Self.conferenceParticipantIdentityKey(candidate) == targetKey
+        }
+
+        var removedVideoParticipants: [String] = []
+        var removedScreenParticipants: [String] = []
+
+        for participantId in Array(connection.remoteVideoTracksByParticipantId.keys) where shouldRemove(participantId) {
+            connection.remoteVideoTracksByParticipantId.removeValue(forKey: participantId)
+            removedVideoParticipants.append(participantId)
+        }
+        for participantId in Array(connection.remoteScreenTracksByParticipantId.keys) where shouldRemove(participantId) {
+            connection.remoteScreenTracksByParticipantId.removeValue(forKey: participantId)
+            removedScreenParticipants.append(participantId)
+        }
+
+        guard !removedVideoParticipants.isEmpty || !removedScreenParticipants.isEmpty else {
+            notifyRemoteParticipantTrackChanged(
+                RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
+            )
+            notifyRemoteScreenTrackChanged(
+                RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
+            )
+            return
+        }
+        await connectionManager.updateConnection(id: connection.id, with: connection)
+
+        for participantId in removedVideoParticipants {
+            notifyRemoteParticipantTrackChanged(
+                RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
+            )
+        }
+        for participantId in removedScreenParticipants {
+            notifyRemoteScreenTrackChanged(
+                RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
+            )
+        }
+    }
+#elseif !canImport(WebRTC)
+    public func removeRemoteParticipantFromGroupCall(
+        connectionId: String,
+        participantId: String
+    ) async {
+        let targetKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !targetKey.isEmpty else { return }
+        lastFrameKeyIndexByParticipantId = lastFrameKeyIndexByParticipantId.filter { existing, _ in
+            Self.conferenceParticipantIdentityKey(existing) != targetKey
+        }
+    }
+#endif
 
 }

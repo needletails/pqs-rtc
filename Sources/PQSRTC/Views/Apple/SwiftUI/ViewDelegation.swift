@@ -28,6 +28,9 @@ public protocol CallActionDelegate: AnyObject, Sendable {
     /// Mutes or unmutes the local microphone.
     func muteAudio() async
 
+    /// Sets the local microphone muted state explicitly.
+    func setAudioMuted(_ muted: Bool) async
+
     /// Mutes or unmutes the local camera/video track.
     func muteVideo() async
 
@@ -38,6 +41,9 @@ public protocol CallActionDelegate: AnyObject, Sendable {
 
     /// Starts screen sharing with the given target.
     func startScreenShare(target: ScreenShareTarget) async
+
+    /// Starts screen sharing with the given target and capture preferences.
+    func startScreenShare(target: ScreenShareTarget, options: ScreenShareOptions) async
 
     /// Stops the active screen share.
     func stopScreenShare() async
@@ -54,7 +60,14 @@ public extension CallActionDelegate {
     /// Default no-op PiP implementation.
     func showPictureInPicture(_ show: Bool) async {}
 
+    func setAudioMuted(_ muted: Bool) async {
+        await muteAudio()
+    }
+
     func startScreenShare(target: ScreenShareTarget) async {}
+    func startScreenShare(target: ScreenShareTarget, options: ScreenShareOptions) async {
+        await startScreenShare(target: target)
+    }
     func stopScreenShare() async {}
 }
 

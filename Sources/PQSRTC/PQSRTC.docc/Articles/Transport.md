@@ -11,9 +11,9 @@ Instead, you implement ``RTCTransportEvents`` and route inbound messages back in
 - Decide how peers find each other (push, websocket, APNs/FCM, etc.)
 - Serialize messages (JSON, protobuf, msgpack, …)
 - Route messages to the correct call instance (typically by ``Call/sharedCommunicationId``)
-- Route opaque ciphertext blobs for:
-  - 1:1 Double Ratchet handshake/ratcheting
-  - (optional) group sender-key distribution
+- Route opaque 1:1 `call_cipher` blobs for Double Ratchet handshake/ratcheting.
+- For encrypted group media, distribute per-sender frame keys over an encrypted app-defined route
+  and inject them with ``RTCSession/setFrameEncryptionKey(_:index:for:)``.
 
 ### The SDK
 
@@ -74,10 +74,51 @@ Serialize ``IceCandidate`` and route inbound via:
 
 Ciphertext is opaque to your transport.
 
-You must route it:
+For 1:1 calls, route it into the call setup flow (see <doc:One-to-One-Calls>).
 
-- **1:1**: into the call setup flow (see <doc:One-to-One-Calls>)
-- **Group** (sender-key distribution): into ``RTCGroupCall/handleCiphertextFromParticipant(fromParticipantId:connectionId:ciphertext:)``
+For group media, sender-key envelopes are host-defined. They should carry the room id, sender
+participant id, key index, and key bytes, then the receiver should call
+``RTCSession/setFrameEncryptionKey(_:index:for:)`` for that sender id. Do not deliver group sender
+keys into the pairwise `call_cipher` receive path.
+
+### 1:1 SFU call_cipher
+
+For 1:1 calls relayed through an SFU room, ``RTCTransportEvents/sendCiphertext(recipient:connectionId:ciphertext:call:)``
+is also the `call_cipher` media-ratchet identity exchange.
+
+The transport contract is:
+
+- Preserve `ciphertext` exactly.
+- Preserve and deliver `connectionId` back to the peer's receive path.
+- Preserve the encoded ``Call``. Its ``Call/frameIdentityProps`` and
+  ``Call/signalingIdentityProps`` are part of the key agreement.
+- Route to the `recipient` peer. Do not invent a second target field for call cipher routing.
+
+The SFU room id is a transport route, not the frame-key participant id. See
+<doc:OneToOneSfuFrameE2EE> before changing this path.
+
+### Group sender-key transport
+
+For channel-backed group calls and `conf-` rooms, media keys are not derived from pairwise
+`call_cipher`. Your application distributes a sender key for each publisher. A typical envelope is:
+
+```json
+{
+  "type": "groupSenderFrameKey",
+  "roomId": "#team-room",
+  "senderSecretName": "alice",
+  "keyIndex": 0,
+  "frameKey": "<opaque bytes>"
+}
+```
+
+On receive:
+
+```swift
+await session.setFrameEncryptionKey(frameKey, index: keyIndex, for: senderSecretName)
+```
+
+See <doc:GroupSfuFrameE2EE>.
 
 ## Joining an SFU group call
 

@@ -26,9 +26,8 @@ import DoubleRatchetKit
 /// `RTCGroupCall` provides:
 /// - A single entrypoint for decoded control-plane messages: ``handleControlMessage(_:)``
 /// - A stream of high-level events (state/roster/track arrival): ``events()``
-/// - Helpers for key distribution:
-///   - Control-plane injected keys via ``setFrameEncryptionKey(_:index:for:)``
-///   - Optional sender-key distribution via ``rotateAndSendLocalSenderKeyForCurrentParticipants()``
+/// - Receiver identity events that let the host app inject per-sender frame keys with
+///   ``RTCSession/setFrameEncryptionKey(_:index:for:)``.
 ///
 /// See <doc:Group-Calls>.
 public actor RTCGroupCall: RTCSessionMediaEvents {
@@ -92,12 +91,6 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
     private var state: State = .idle
     private var participantsById: [String: Participant] = [:]
 
-    // Group E2EE (sender keys over pairwise Double Ratchet)
-    private var identityPropsByParticipantId: [String: SessionIdentity.UnwrappedProps] = [:]
-    private var e2eeSessionIdByParticipantId: [String: UUID] = [:]
-    private var e2eeHandshakeSentToParticipantIds: Set<String> = []
-    private var localSenderKeyIndex: Int = 0
-
     private let eventsStream: AsyncStream<Event>
     private let eventsContinuation: AsyncStream<Event>.Continuation
 
@@ -140,7 +133,7 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
     /// Joins the group call facade (roster / event stream state).
     ///
     /// The SFU ``RTCPeerConnection`` and initial offer are created only after the server
-    /// acknowledges registration (see ``RTCSession/beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId:)``),
+    /// acknowledges registration (see ``RTCSession/beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId:updatedCall:)``),
     /// once `pcKeyManager` has the SFU signaling identity.
     public func join() async throws {
         guard state == .idle else { return }

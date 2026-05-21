@@ -279,8 +279,13 @@ let id = UUID()
     
     /// Creates and stores a recipient identity for a peer.
     ///
-    /// If ciphertext arrived before the identity existed, it will be attached to the newly
-    /// created identity.
+    /// If ciphertext arrived before the identity existed, it is attached to the newly created
+    /// identity. If an identity already exists for an equivalent connection-id alias, its stored
+    /// ciphertext is preserved while the props are replaced.
+    ///
+    /// That overwrite behavior is intentional for SFU calls: the first identity can be a
+    /// provisional room/SFU bootstrap identity, and a later `call_cipher` carries the concrete
+    /// peer frame identity that must become authoritative before media keys are derived.
     public func createRecipientIdentity(
         connectionId: String,
         props: SessionIdentity.UnwrappedProps
@@ -292,6 +297,14 @@ let id = UUID()
             throw RTCErrors.invalidConfiguration("Invalid empty connectionId")
         }
         let sessionId = normalizedConnectionId.stableUUIDConnectionId
+        let lookupKeys = identityLookupKeys(for: connectionId)
+        let existingCiphertext = lookupKeys.compactMap { key -> Data? in
+            if let ciphertext = connectionIdentities[key]?.ciphertext {
+                return ciphertext
+            }
+            return pendingCiphertext[key]
+        }.first
+
         var identity = ConnectionSessionIdentity(
             connectionId: connectionId,
             symmetricKey: dbsk,
@@ -299,16 +312,16 @@ let id = UUID()
                 id: sessionId,
                 props: props,
                 symmetricKey: dbsk))
-        
-        // Check if there's pending ciphertext for this connection
-        if let pendingKey = identityLookupKeys(for: connectionId).first(where: { pendingCiphertext[$0] != nil }),
-           let pendingCipher = pendingCiphertext[pendingKey] {
-            identity.ciphertext = pendingCipher
-            pendingCiphertext.removeValue(forKey: pendingKey)
+
+        if let existingCiphertext {
+            identity.ciphertext = existingCiphertext
+            for key in lookupKeys {
+                pendingCiphertext.removeValue(forKey: key)
+            }
             logger.log(level: .info, message: "Attached pending ciphertext to newly created identity for connection: \(connectionId)")
         }
         
-        for key in identityLookupKeys(for: connectionId) {
+        for key in lookupKeys {
             connectionIdentities[key] = identity
         }
         logger.log(level: .info, message: "Created new recipient identity \(identity) on connection identity \(connectionId)")

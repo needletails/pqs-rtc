@@ -30,6 +30,20 @@ public enum ScreenShareTarget: Sendable {
     case androidScreen
 }
 
+/// User-selected screen sharing preferences.
+public struct ScreenShareOptions: Sendable, Equatable {
+    public var shareSystemAudio: Bool
+    public var optimizeForVideo: Bool
+
+    public init(
+        shareSystemAudio: Bool = false,
+        optimizeForVideo: Bool = false
+    ) {
+        self.shareSystemAudio = shareSystemAudio
+        self.optimizeForVideo = optimizeForVideo
+    }
+}
+
 /// Fired by ``RTCSession/remoteScreenTrackStream()`` whenever a remote participant
 /// starts or stops sharing their screen.
 public struct RemoteScreenTrackEvent: Sendable {
@@ -51,8 +65,9 @@ public struct RemoteScreenTrackEvent: Sendable {
 }
 
 /// Fired by ``RTCSession/remoteParticipantTrackStream()`` when a remote participant's
-/// camera video track is added or removed. The Android controller subscribes to this
-/// stream to dynamically assign ``AndroidSampleCaptureView`` instances to participants.
+/// participant-camera track is added or removed. The `kind` field is generic so future
+/// media events can share the same shape, but the built-in video-call controllers subscribe
+/// to `"video"` events to assign renderers.
 public struct RemoteParticipantTrackEvent: Sendable {
     public let connectionId: String
     public let participantId: String

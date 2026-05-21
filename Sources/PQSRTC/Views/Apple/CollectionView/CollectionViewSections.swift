@@ -99,6 +99,26 @@ public struct CollectionViewSections {
         
         return createConferenceLayout(itemCount: itemCount, groupAbsoluteExtent: nil)
     }
+
+    #if os(iOS)
+    /// Conference layout sized for the current collection view container.
+    ///
+    /// Portrait phones need a different shape than desktop/landscape: a fixed `2 x 1`
+    /// layout makes two-person calls look like narrow vertical strips. This variant
+    /// chooses rows/columns from the live container and sizes the page group around a
+    /// camera-friendly aspect ratio, centering any remaining space.
+    public func conferenceViewSection(itemCount: Int, containerSize: CGSize) -> NSCollectionLayoutSection {
+        guard itemCount > 0 else {
+            assertionFailure("Item count must be greater than 0")
+            return createSingleItemLayout()
+        }
+
+        return createConferenceLayout(
+            itemCount: itemCount,
+            groupAbsoluteExtent: nil,
+            containerSize: containerSize)
+    }
+    #endif
     
     #if os(macOS)
     /// Conference row with a non-zero group extent so items do not collapse when the compositional container is briefly `.zero` during window resize.
@@ -135,17 +155,14 @@ public struct CollectionViewSections {
     private func createFullScreenLayout() -> NSCollectionLayoutSection {
         let itemSize = NSCollectionLayoutSize(
             widthDimension: .fractionalWidth(1.0),
-            heightDimension: .fractionalHeight(1.0)
-        )
+            heightDimension: .fractionalHeight(1.0))
         let item = NSCollectionLayoutItem(layoutSize: itemSize)
         
         let group = NSCollectionLayoutGroup.horizontal(
             layoutSize: NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1.0),
-                heightDimension: .fractionalHeight(1.0)
-            ),
-            subitems: [item]
-        )
+                heightDimension: .fractionalHeight(1.0)),
+            subitems: [item])
         
         return NSCollectionLayoutSection(group: group)
     }
@@ -155,18 +172,15 @@ public struct CollectionViewSections {
     private func createAspectRatioLayout(aspectRatio: CGFloat) -> NSCollectionLayoutSection {
         let itemSize = NSCollectionLayoutSize(
             widthDimension: .fractionalWidth(1.0),
-            heightDimension: .fractionalWidth(1.0 / aspectRatio)
-        )
+            heightDimension: .fractionalWidth(1.0 / aspectRatio))
         
         let item = NSCollectionLayoutItem(layoutSize: itemSize)
         
         let group = NSCollectionLayoutGroup.horizontal(
             layoutSize: NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1.0),
-                heightDimension: .fractionalWidth(1.0 / aspectRatio)
-            ),
-            subitems: [item]
-        )
+                heightDimension: .fractionalWidth(1.0 / aspectRatio)),
+            subitems: [item])
         
         return NSCollectionLayoutSection(group: group)
     }
@@ -183,18 +197,15 @@ public struct CollectionViewSections {
             let h = max(1, g.height)
             groupLayoutSize = NSCollectionLayoutSize(
                 widthDimension: .absolute(w),
-                heightDimension: .absolute(h)
-            )
+                heightDimension: .absolute(h))
         } else {
             groupLayoutSize = NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1.0),
-                heightDimension: .fractionalHeight(1.0)
-            )
+                heightDimension: .fractionalHeight(1.0))
         }
         let group = NSCollectionLayoutGroup.horizontal(
             layoutSize: groupLayoutSize,
-            subitems: [item]
-        )
+            subitems: [item])
         return NSCollectionLayoutSection(group: group)
     }
     
@@ -207,67 +218,326 @@ public struct CollectionViewSections {
     private func createConferenceLayout(
         itemCount: Int,
         contentInsets: NSDirectionalEdgeInsets = defaultContentInsets,
-        groupAbsoluteExtent: CGSize? = nil
+        groupAbsoluteExtent: CGSize? = nil,
+        containerSize: CGSize? = nil
     ) -> NSCollectionLayoutSection {
         #if os(iOS)
         let maxItemsPerPage = 12
         let usesPaging = itemCount > maxItemsPerPage
         let layoutItemCount = min(itemCount, maxItemsPerPage)
         #else
-        // Keep macOS non-scrollable for resize stability; do not rely on horizontal paging gestures.
         let usesPaging = false
         let layoutItemCount = itemCount
         #endif
 
-        let grid = conferenceGridDimensions(for: layoutItemCount)
-        let tunedInsets = conferenceContentInsets(base: contentInsets, for: layoutItemCount)
+        let resolvedContainerSize = groupAbsoluteExtent ?? containerSize
+        let baseInsets = conferenceContentInsets(base: contentInsets, for: layoutItemCount)
 
-        let tileSize = NSCollectionLayoutSize(
-            widthDimension: .fractionalWidth(1.0),
-            heightDimension: .fractionalHeight(1.0)
-        )
-        let tile = NSCollectionLayoutItem(layoutSize: tileSize)
-        tile.contentInsets = tunedInsets
-
-        let rowSize = NSCollectionLayoutSize(
-            widthDimension: .fractionalWidth(1.0),
-            heightDimension: .fractionalHeight(1.0 / CGFloat(grid.rows))
-        )
-        let rowGroup = NSCollectionLayoutGroup.horizontal(
-            layoutSize: rowSize,
-            subitem: tile,
-            count: grid.columns
-        )
-
-        let pageGroupSize: NSCollectionLayoutSize
-        if let g = groupAbsoluteExtent {
-            let w = max(1, g.width)
-            let h = max(1, g.height)
-            pageGroupSize = NSCollectionLayoutSize(
-                widthDimension: .absolute(w),
-                heightDimension: .absolute(h)
+        let groupSize: NSCollectionLayoutSize
+        if let resolvedContainerSize {
+            groupSize = NSCollectionLayoutSize(
+                widthDimension: .absolute(max(1, resolvedContainerSize.width)),
+                heightDimension: .absolute(max(1, resolvedContainerSize.height))
             )
         } else {
-            pageGroupSize = NSCollectionLayoutSize(
+            groupSize = NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1.0),
                 heightDimension: .fractionalHeight(1.0)
             )
         }
 
-        let pageGroup = NSCollectionLayoutGroup.vertical(
-            layoutSize: pageGroupSize,
-            subitem: rowGroup,
-            count: grid.rows
-        )
+        let group = NSCollectionLayoutGroup.custom(layoutSize: groupSize) { environment in
+            let containerWidth = resolvedContainerSize?.width
+                ?? environment.container.effectiveContentSize.width
 
-        let section = NSCollectionLayoutSection(group: pageGroup)
+            let containerHeight = resolvedContainerSize?.height
+                ?? environment.container.effectiveContentSize.height
+
+            return Self.conferenceCustomItems(
+                itemCount: layoutItemCount,
+                containerSize: CGSize(width: containerWidth, height: containerHeight),
+                insets: baseInsets
+            )
+        }
+
+        let section = NSCollectionLayoutSection(group: group)
+
         #if os(iOS)
         if usesPaging {
             section.orthogonalScrollingBehavior = .groupPaging
         }
         #endif
+
         return section
     }
+
+    private static func conferenceCustomItems(
+        itemCount: Int,
+        containerSize: CGSize,
+        insets: NSDirectionalEdgeInsets
+    ) -> [NSCollectionLayoutGroupCustomItem] {
+        guard itemCount > 0 else { return [] }
+
+        let targetAspect: CGFloat = 16.0 / 9.0
+
+        let availableWidth = max(
+            1,
+            containerSize.width - insets.leading - insets.trailing
+        )
+
+        let availableHeight = max(
+            1,
+            containerSize.height - insets.top - insets.bottom
+        )
+
+        let spacing: CGFloat = {
+            #if os(iOS)
+            return containerSize.width < 600 ? 6 : 10
+            #else
+            return 10
+            #endif
+        }()
+
+        let grid = bestConferenceGrid(
+            itemCount: itemCount,
+            availableSize: CGSize(width: availableWidth, height: availableHeight),
+            spacing: spacing,
+            targetAspect: targetAspect
+        )
+
+        let columns = max(1, grid.columns)
+        let rows = max(1, grid.rows)
+
+        let totalHorizontalSpacing = CGFloat(columns - 1) * spacing
+        let totalVerticalSpacing = CGFloat(rows - 1) * spacing
+
+        let maxTileWidth = (availableWidth - totalHorizontalSpacing) / CGFloat(columns)
+        let maxTileHeight = (availableHeight - totalVerticalSpacing) / CGFloat(rows)
+
+        let tile = conferenceTileSize(
+            columns: columns,
+            rows: rows,
+            availableSize: CGSize(width: availableWidth, height: availableHeight),
+            spacing: spacing,
+            targetAspect: targetAspect
+        )
+
+        let tileWidth = tile.width
+        let tileHeight = tile.height
+
+        let gridWidth = CGFloat(columns) * tileWidth + totalHorizontalSpacing
+        let gridHeight = CGFloat(rows) * tileHeight + totalVerticalSpacing
+
+        let originX = insets.leading + max(0, availableWidth - gridWidth) / 2
+        let originY = insets.top + max(0, availableHeight - gridHeight) / 2
+
+        return (0..<itemCount).map { index in
+            let row = index / columns
+            let column = index % columns
+
+            let itemsInThisRow = min(columns, itemCount - row * columns)
+
+            let rowWidth =
+                CGFloat(itemsInThisRow) * tileWidth +
+                CGFloat(max(0, itemsInThisRow - 1)) * spacing
+
+            let rowOriginX = originX + max(0, gridWidth - rowWidth) / 2
+
+            let frame = CGRect(
+                x: rowOriginX + CGFloat(column) * (tileWidth + spacing),
+                y: originY + CGFloat(row) * (tileHeight + spacing),
+                width: tileWidth,
+                height: tileHeight
+            )
+
+            return NSCollectionLayoutGroupCustomItem(frame: frame)
+        }
+    }
+
+    private static func bestConferenceGrid(
+        itemCount: Int,
+        availableSize: CGSize,
+        spacing: CGFloat,
+        targetAspect: CGFloat
+    ) -> (columns: Int, rows: Int) {
+        guard itemCount > 0 else {
+            return (1, 1)
+        }
+
+        if itemCount == 1 {
+            return (1, 1)
+        }
+
+        if itemCount == 2 {
+            #if os(macOS)
+            return (2, 1)
+            #else
+            let sideBySide = conferenceTileSize(
+                columns: 2,
+                rows: 1,
+                availableSize: availableSize,
+                spacing: spacing,
+                targetAspect: targetAspect
+            )
+
+            let stacked = conferenceTileSize(
+                columns: 1,
+                rows: 2,
+                availableSize: availableSize,
+                spacing: spacing,
+                targetAspect: targetAspect
+            )
+
+            if sideBySide.area >= stacked.area * 0.85 {
+                return (2, 1)
+            } else {
+                return (1, 2)
+            }
+            #endif
+        }
+
+        var bestGrid = (columns: 1, rows: itemCount)
+        var bestScore: CGFloat = -CGFloat.greatestFiniteMagnitude
+
+        for columns in 1...itemCount {
+            let rows = Int(ceil(Double(itemCount) / Double(columns)))
+
+            let tile = conferenceTileSize(
+                columns: columns,
+                rows: rows,
+                availableSize: availableSize,
+                spacing: spacing,
+                targetAspect: targetAspect
+            )
+
+            guard tile.width > 0, tile.height > 0 else {
+                continue
+            }
+
+            var score = tile.area
+
+            score += CGFloat(columns) * tile.area * 0.03
+
+            #if os(iOS)
+            if itemCount >= 3, columns == 1 {
+                score *= 0.85
+            }
+            #endif
+
+            if score > bestScore {
+                bestScore = score
+                bestGrid = (columns, rows)
+            }
+        }
+
+        return bestGrid
+    }
+
+    private static func conferenceTileSize(
+        columns: Int,
+        rows: Int,
+        availableSize: CGSize,
+        spacing: CGFloat,
+        targetAspect: CGFloat
+    ) -> (width: CGFloat, height: CGFloat, area: CGFloat) {
+        let totalHorizontalSpacing = CGFloat(max(0, columns - 1)) * spacing
+        let totalVerticalSpacing = CGFloat(max(0, rows - 1)) * spacing
+
+        let maxTileWidth = (availableSize.width - totalHorizontalSpacing) / CGFloat(columns)
+        let maxTileHeight = (availableSize.height - totalVerticalSpacing) / CGFloat(rows)
+
+        guard maxTileWidth > 0, maxTileHeight > 0 else {
+            return (0, 0, 0)
+        }
+
+        if maxTileWidth / maxTileHeight > targetAspect {
+            let height = maxTileHeight
+            let width = height * targetAspect
+            return (width, height, width * height)
+        } else {
+            let width = maxTileWidth
+            let height = width / targetAspect
+            return (width, height, width * height)
+        }
+    }
+    
+
+    private struct ConferenceLayoutMetrics {
+        let columns: Int
+        let rows: Int
+        let groupSize: CGSize
+        let sectionInsets: NSDirectionalEdgeInsets
+    }
+
+    #if os(iOS)
+    private func conferenceLayoutMetrics(
+        for itemCount: Int,
+        in containerSize: CGSize?
+    ) -> ConferenceLayoutMetrics? {
+        guard let containerSize,
+              containerSize.width > 1,
+              containerSize.height > 1 else {
+            return nil
+        }
+
+        let availableWidth = max(1, containerSize.width)
+        let availableHeight = max(1, containerSize.height)
+        let isPortraitPhoneShape = availableHeight > availableWidth * 1.12
+        let targetAspect = isPortraitPhoneShape ? CGFloat(4.0 / 3.0) : Self.defaultAspectRatio
+        let maxColumns = min(itemCount, isPortraitPhoneShape ? 3 : 4)
+
+        var best: (columns: Int, rows: Int, size: CGSize, score: CGFloat)?
+
+        for columns in 1...maxColumns {
+            let rows = Int(ceil(Double(itemCount) / Double(columns)))
+            let widthBoundTileWidth = availableWidth / CGFloat(columns)
+            let widthBoundTileHeight = widthBoundTileWidth / targetAspect
+            var groupWidth = availableWidth
+            var groupHeight = widthBoundTileHeight * CGFloat(rows)
+
+            if groupHeight > availableHeight {
+                let heightBoundTileHeight = availableHeight / CGFloat(rows)
+                let heightBoundTileWidth = heightBoundTileHeight * targetAspect
+                groupWidth = min(availableWidth, heightBoundTileWidth * CGFloat(columns))
+                groupHeight = availableHeight
+            }
+
+            let tileWidth = groupWidth / CGFloat(columns)
+            let tileHeight = groupHeight / CGFloat(rows)
+            let aspectError = abs((tileWidth / max(1, tileHeight)) - targetAspect)
+            let area = groupWidth * groupHeight
+            let portraitStackBonus: CGFloat = isPortraitPhoneShape && columns == 1 && itemCount <= 4 ? 80_000 : 0
+            let overflowPenalty: CGFloat = groupWidth > availableWidth || groupHeight > availableHeight ? 1_000_000 : 0
+            let score = area + portraitStackBonus - (aspectError * 120_000) - overflowPenalty
+
+            if best == nil || score > best!.score {
+                best = (columns, rows, CGSize(width: max(1, groupWidth), height: max(1, groupHeight)), score)
+            }
+        }
+
+        let fallbackGrid = conferenceGridDimensions(for: itemCount)
+        let resolved = best ?? (
+            columns: fallbackGrid.columns,
+            rows: fallbackGrid.rows,
+            size: CGSize(width: availableWidth, height: availableHeight),
+            score: 0
+        )
+        let topInset = max(0, (availableHeight - resolved.size.height) / 2)
+        let leadingInset = max(0, (availableWidth - resolved.size.width) / 2)
+
+        return ConferenceLayoutMetrics(
+            columns: resolved.columns,
+            rows: resolved.rows,
+            groupSize: resolved.size,
+            sectionInsets: NSDirectionalEdgeInsets(
+                top: topInset,
+                leading: leadingInset,
+                bottom: topInset,
+                trailing: leadingInset
+            )
+        )
+    }
+    #endif
 
     /// Produces a balanced rows x columns grid for conference tiles.
     private func conferenceGridDimensions(for itemCount: Int) -> (columns: Int, rows: Int) {

@@ -229,34 +229,70 @@ extension RTCSession {
         armRelayFallbackTimerIfNeeded(for: call)
         
         if !handshakeComplete {
-            // Restored from b368e83: drive the .handshakeComplete WriteTask for every room
-            // (1:1 direct, 1:1 over SFU, and SFU group). The per-pair Double Ratchet machinery
-            // depends on this fanout to derive frame keys on both sides.
+            // Restored from b368e83: drive the .handshakeComplete WriteTask for every addressable
+            // room (1:1 direct, 1:1 over SFU, and SFU group). For 1:1 media this also completes
+            // the pairwise media-ratchet flow. For channel/conference group media, frame keys are
+            // app-injected per sender; this packet remains signaling/readiness state, not group
+            // media-key derivation.
             //
             // SFU conference rooms can legitimately carry an empty recipients list at this point
-            // (their key distribution runs out-of-band via the conference frame-key exchange),
+            // (their media keys arrive via the app-level group sender-key exchange),
             // so for them we just set handshake complete and start sending ICE candidates instead
             // of throwing.
-            if let prepared = RTCSession.prepareHandshakeCompleteCallForFanout(
+            let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: call)
+            let normId = teardownConnectionIdKey(call.sharedCommunicationId)
+            if Self.shouldDeferOneToOneSfuHandshakeComplete(
+                isOneToOneSfuRoom: isOneToOneSfuRoom,
+                frameEncryptionEnabled: enableEncryption,
+                receiveKeyReady: oneToOneSfuReceiveKeyReadyConnectionIds.contains(normId)
+            ) {
+                logger.log(
+                    level: .info,
+                    message: "Deferring 1:1 SFU handshakeComplete until call_cipher receive key is installed connId=\(call.sharedCommunicationId)")
+            } else if let prepared = RTCSession.prepareHandshakeCompleteCallForFanout(
                 call: call,
                 sessionParticipant: sessionParticipant
             ) {
-                let plaintext = try BinaryEncoder().encode(prepared)
-                let writeTask = WriteTask(
-                    data: plaintext,
-                    roomId: prepared.sharedCommunicationId.normalizedConnectionId,
-                    flag: .handshakeComplete,
-                    call: prepared)
-                let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
-                try await taskProcessor.feedTask(task: encryptableTask)
+                if isOneToOneSfuRoom {
+                    if !oneToOneSfuPostCipherHandshakeSentConnectionIds.contains(normId) {
+                        let plaintext = try BinaryEncoder().encode(prepared)
+                        let writeTask = WriteTask(
+                            data: plaintext,
+                            roomId: prepared.sharedCommunicationId.normalizedConnectionId,
+                            flag: .handshakeComplete,
+                            call: prepared)
+                        let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
+                        try await taskProcessor.feedTask(task: encryptableTask)
+                        oneToOneSfuPostCipherHandshakeSentConnectionIds.insert(normId)
+                    }
+                } else {
+                    let plaintext = try BinaryEncoder().encode(prepared)
+                    let writeTask = WriteTask(
+                        data: plaintext,
+                        roomId: prepared.sharedCommunicationId.normalizedConnectionId,
+                        flag: .handshakeComplete,
+                        call: prepared)
+                    let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
+                    try await taskProcessor.feedTask(task: encryptableTask)
+                }
             } else {
                 logger.log(
                     level: .info,
                     message: "handleAnswer: empty recipients (likely SFU conference); skipping .handshakeComplete WriteTask")
             }
-            setHandshakeComplete(true)
+            if !isOneToOneSfuRoom || !enableEncryption || oneToOneSfuReceiveKeyReadyConnectionIds.contains(normId) {
+                setHandshakeComplete(true)
+            }
             try await startSendingCandidates(call: call)
         }
+    }
+
+    static func shouldDeferOneToOneSfuHandshakeComplete(
+        isOneToOneSfuRoom: Bool,
+        frameEncryptionEnabled: Bool,
+        receiveKeyReady: Bool
+    ) -> Bool {
+        isOneToOneSfuRoom && frameEncryptionEnabled && !receiveKeyReady
     }
 
     /// Pure helper used by ``handleAnswer`` (and exercised in tests) to decide whether the

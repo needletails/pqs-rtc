@@ -10,58 +10,53 @@ struct RTCSessionCryptoKeyResolutionTests {
         try Call.Participant(secretName: secret, nickname: "n", deviceId: device)
     }
 
-    @Test("setMessageKey uses peer id for true 1:1 SFU rooms")
-    func setMessageKeyUsesPeerIdForOneToOneSfu() throws {
+    @Test("setMessageKey uses local sender id for true 1:1 SFU rooms")
+    func setMessageKeyUsesLocalSenderIdForOneToOneSfu() throws {
         let call = try Call(
             sharedCommunicationId: roomUUID,
             channelWireId: "#\(roomUUID)",
             sender: try participant("local"),
             recipients: [try participant("echo")],
             supportsVideo: true)
-        let resolved = RTCSession.resolveRemoteFrameKeyParticipantIdForSetMessageKey(
-            call: call,
-            connectionRemoteParticipantId: roomUUID,
-            oneToOneResolvedRemoteTrackOwner: "echo"
-        )
-        #expect(resolved == "echo")
+        #expect(RTCSession.isTrueOneToOneSfuRoom(call: call) == true)
+        let resolved = RTCSession.senderFrameKeyParticipantIdForSetMessageKey(
+            connectionLocalParticipantId: "nudge")
+        #expect(resolved == "nudge")
     }
 
-    @Test("setMessageKey keeps routing recipient id for multi-party group calls")
-    func setMessageKeyUsesRoutingIdForGroupCall() throws {
+    @Test("setMessageKey uses local sender id for multi-party group calls")
+    func setMessageKeyUsesLocalSenderIdForGroupCall() throws {
         let call = try Call(
             sharedCommunicationId: groupRoomUUID,
             channelWireId: "#\(groupRoomUUID)",
             sender: try participant("a"),
             recipients: [try participant("nudge", device: "d1"), try participant("echo", device: "d2")],
             supportsVideo: true)
-        let resolved = RTCSession.resolveRemoteFrameKeyParticipantIdForSetMessageKey(
-            call: call,
-            connectionRemoteParticipantId: groupRoomUUID,
-            oneToOneResolvedRemoteTrackOwner: "nudge"
-        )
-        #expect(resolved == groupRoomUUID)
+        #expect(RTCSession.isTrueOneToOneSfuRoom(call: call) == false)
+        let resolved = RTCSession.senderFrameKeyParticipantIdForSetMessageKey(
+            connectionLocalParticipantId: "a")
+        #expect(resolved == "a")
     }
 
-    @Test("setMessageKey keeps routing id for conf rooms even with one recipient")
-    func setMessageKeyUsesRoutingIdForConferenceRoom() throws {
+    @Test("setMessageKey uses local sender id for conf rooms even with one recipient")
+    func setMessageKeyUsesLocalSenderIdForConferenceRoom() throws {
         let confId = "conf-7f79fef9-f2cb-420f-bd57-2ce87e6d24aa"
         let call = try Call(
             sharedCommunicationId: confId,
             sender: try participant("local"),
             recipients: [try participant("echo")],
             supportsVideo: true)
-        let resolved = RTCSession.resolveRemoteFrameKeyParticipantIdForSetMessageKey(
-            call: call,
-            connectionRemoteParticipantId: confId,
-            oneToOneResolvedRemoteTrackOwner: "echo"
-        )
-        #expect(resolved == confId)
+        #expect(RTCSession.isTrueOneToOneSfuRoom(call: call) == false)
+        let resolved = RTCSession.senderFrameKeyParticipantIdForSetMessageKey(
+            connectionLocalParticipantId: "local")
+        #expect(resolved == "local")
     }
 
     @Test("true 1:1 SFU rooms are recognized")
     func trueOneToOneSfuDetection() throws {
         let call = try Call(
             sharedCommunicationId: roomUUID,
+            channelWireId: "#\(roomUUID)",
             sender: try participant("local"),
             recipients: [try participant("echo")],
             supportsVideo: true)
@@ -76,6 +71,47 @@ struct RTCSessionCryptoKeyResolutionTests {
             recipients: [try participant("nudge", device: "d1"), try participant("echo", device: "d2")],
             supportsVideo: true)
         #expect(RTCSession.isTrueOneToOneSfuRoom(call: call) == false)
+    }
+
+    @Test("channel group rooms use application-injected sender frame keys")
+    func channelGroupUsesApplicationInjectedFrameKeys() throws {
+        let call = try Call(
+            sharedCommunicationId: groupRoomUUID,
+            channelWireId: "#israel_\(groupRoomUUID)",
+            sender: try participant("nudge"),
+            recipients: [
+                try participant("echo", device: "d1"),
+                try participant("bob", device: "d2"),
+            ],
+            supportsVideo: true)
+
+        #expect(RTCSession.isTrueOneToOneSfuRoom(call: call) == false)
+        #expect(RTCSession.usesApplicationInjectedGroupFrameKeys(call: call) == true)
+    }
+
+    @Test("1:1 SFU relay rooms keep pairwise call_cipher frame keys")
+    func oneToOneSfuDoesNotUseApplicationInjectedGroupFrameKeys() throws {
+        let call = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: "#\(roomUUID)",
+            sender: try participant("nudge"),
+            recipients: [try participant("echo")],
+            supportsVideo: true)
+
+        #expect(RTCSession.isTrueOneToOneSfuRoom(call: call) == true)
+        #expect(RTCSession.usesApplicationInjectedGroupFrameKeys(call: call) == false)
+    }
+
+    @Test("conference rooms use application-injected sender frame keys")
+    func conferenceUsesApplicationInjectedFrameKeys() throws {
+        let confId = "conf-7f79fef9-f2cb-420f-bd57-2ce87e6d24aa"
+        let call = try Call(
+            sharedCommunicationId: confId,
+            sender: try participant("local"),
+            recipients: [],
+            supportsVideo: true)
+
+        #expect(RTCSession.usesApplicationInjectedGroupFrameKeys(call: call) == true)
     }
 
     @Test("ephemeral 1:1 relay with duplicate recipient rows still counts as 1:1 SFU")
@@ -186,15 +222,8 @@ struct RTCSessionCryptoKeyResolutionTests {
     }
 
     @Test("group UUID stream then stable stream transition keeps key provisioning coherent")
-    func groupUuidToStableParticipantTransitionSimulation() async throws {
-        let session = await RTCSession(
-            iceServers: ["stun:stun.l.google.com:19302"],
-            username: "u",
-            password: "p",
-            frameEncryptionKeyMode: .perParticipant,
-            enableEncryption: false
-        )
-
+    func groupUuidToStableParticipantTransitionSimulation() throws {
+        var lastFrameKeyIndexByParticipantId: [String: Int] = [:]
         let groupCall = try Call(
             sharedCommunicationId: groupRoomUUID,
             channelWireId: "#\(groupRoomUUID)",
@@ -202,19 +231,15 @@ struct RTCSessionCryptoKeyResolutionTests {
             recipients: [try participant("nudge", device: "d1"), try participant("echo", device: "d2")],
             supportsVideo: true)
 
-        // Group calls keep room-routed recipient id for setMessageKey (multi-recipient).
-        let resolvedRemoteForSender = RTCSession.resolveRemoteFrameKeyParticipantIdForSetMessageKey(
-            call: groupCall,
-            connectionRemoteParticipantId: groupRoomUUID,
-            oneToOneResolvedRemoteTrackOwner: "nudge"
-        )
-        #expect(resolvedRemoteForSender == groupRoomUUID)
+        #expect(RTCSession.isTrueOneToOneSfuRoom(call: groupCall) == false)
+        let senderParticipant = RTCSession.senderFrameKeyParticipantIdForSetMessageKey(
+            connectionLocalParticipantId: groupCall.sender.secretName)
+        #expect(senderParticipant == "a")
 
-        // Simulate sender-side key provisioning result from setMessageKey.
-        session.lastFrameKeyIndexByParticipantId["nudge"] = 7
-        session.lastFrameKeyIndexByParticipantId[resolvedRemoteForSender] = 7
-        #expect(session.lastFrameKeyIndexByParticipantId["nudge"] == 7)
-        #expect(session.lastFrameKeyIndexByParticipantId[groupRoomUUID] == 7)
+        // Simulate sender-side key provisioning result from setMessageKey: local slot only.
+        lastFrameKeyIndexByParticipantId[senderParticipant] = 7
+        #expect(lastFrameKeyIndexByParticipantId[senderParticipant] == 7)
+        #expect(lastFrameKeyIndexByParticipantId[groupRoomUUID] == nil)
 
         // First inbound receiver comes with UUID-like placeholder stream id.
         let uuidStreamId = "0dd54da6-6ef4-4002-bd3f-5cda1d4fcfa1"
@@ -225,7 +250,7 @@ struct RTCSessionCryptoKeyResolutionTests {
             participantIdOverride: uuidStreamId
         )
         #expect(shouldDelayUuid == true)
-        #expect(session.lastFrameKeyIndexByParticipantId[uuidStreamId] == nil)
+        #expect(lastFrameKeyIndexByParticipantId[uuidStreamId] == nil)
 
         // Later renegotiation publishes stable participant id; binding should proceed.
         let stableParticipant = "echo"
@@ -238,10 +263,8 @@ struct RTCSessionCryptoKeyResolutionTests {
         #expect(shouldDelayStable == false)
 
         // Simulate receive-side key injection for stable participant.
-        session.lastFrameKeyIndexByParticipantId[stableParticipant] = 7
-        #expect(session.lastFrameKeyIndexByParticipantId[stableParticipant] == 7)
-
-        await session.shutdown(with: nil)
+        lastFrameKeyIndexByParticipantId[stableParticipant] = 7
+        #expect(lastFrameKeyIndexByParticipantId[stableParticipant] == 7)
     }
 
     // MARK: - handleAnswer .handshakeComplete fanout regression
@@ -277,6 +300,26 @@ struct RTCSessionCryptoKeyResolutionTests {
             call: call,
             sessionParticipant: try participant("local", device: "local-device"))
         #expect(prepared != nil)
+    }
+
+    @Test("1:1 SFU media readiness only waits for receive key when FrameCryptor is enabled")
+    func oneToOneSfuMediaReadinessWaitsOnlyWhenFrameCryptorEnabled() throws {
+        #expect(RTCSession.shouldDeferOneToOneSfuHandshakeComplete(
+            isOneToOneSfuRoom: true,
+            frameEncryptionEnabled: true,
+            receiveKeyReady: false) == true)
+        #expect(RTCSession.shouldDeferOneToOneSfuHandshakeComplete(
+            isOneToOneSfuRoom: true,
+            frameEncryptionEnabled: true,
+            receiveKeyReady: true) == false)
+        #expect(RTCSession.shouldDeferOneToOneSfuHandshakeComplete(
+            isOneToOneSfuRoom: true,
+            frameEncryptionEnabled: false,
+            receiveKeyReady: false) == false)
+        #expect(RTCSession.shouldDeferOneToOneSfuHandshakeComplete(
+            isOneToOneSfuRoom: false,
+            frameEncryptionEnabled: true,
+            receiveKeyReady: false) == false)
     }
 
     @Test("handleAnswer fans out .handshakeComplete WriteTask for SFU group rooms")

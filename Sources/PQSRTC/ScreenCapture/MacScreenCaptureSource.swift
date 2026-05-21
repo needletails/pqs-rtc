@@ -14,6 +14,8 @@
 //
 
 #if os(macOS)
+import AppKit
+import CoreGraphics
 import ScreenCaptureKit
 import WebRTC
 import CoreMedia
@@ -28,6 +30,12 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
     private weak var videoSource: RTCVideoSource?
     private let kNanosecondsPerSecond: Float64 = 1_000_000_000
     private lazy var capturer = RTCVideoCapturer()
+    private let onUnexpectedStop: (@Sendable () -> Void)?
+
+    init(onUnexpectedStop: (@Sendable () -> Void)? = nil) {
+        self.onUnexpectedStop = onUnexpectedStop
+        super.init()
+    }
 
     /// Enumerate available displays and windows.
     static func availableContent() async throws -> SCShareableContent {
@@ -36,6 +44,19 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
 
     /// Begin capture for the given target and deliver frames to `videoSource`.
     func startCapture(target: ScreenShareTarget, videoSource: RTCVideoSource) async throws {
+        try await startCapture(
+            target: target,
+            options: ScreenShareOptions(),
+            videoSource: videoSource
+        )
+    }
+
+    /// Begin capture for the given target and deliver frames to `videoSource`.
+    func startCapture(
+        target: ScreenShareTarget,
+        options: ScreenShareOptions,
+        videoSource: RTCVideoSource
+    ) async throws {
         if stream != nil {
             await stopCapture()
         }
@@ -67,24 +88,37 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
         switch target {
         case .entireScreen(let displayID):
             if let display = content.displays.first(where: { $0.displayID == displayID }) {
-                config.width = display.width
-                config.height = display.height
+                let sourcePixels = displayPixelSize(for: display)
+                let targetPixels = captureOutputSize(for: sourcePixels, options: options)
+                config.width = targetPixels.width
+                config.height = targetPixels.height
             }
-        case .window:
-            config.width = 1920
-            config.height = 1080
+        case .window(let windowID, _):
+            if let window = content.windows.first(where: { $0.windowID == windowID }) {
+                let sourcePixels = windowPixelSize(for: window)
+                let targetPixels = captureOutputSize(for: sourcePixels, options: options)
+                config.width = targetPixels.width
+                config.height = targetPixels.height
+            }
         default:
             break
         }
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        config.minimumFrameInterval = options.optimizeForVideo
+            ? CMTime(value: 1, timescale: 60)
+            : CMTime(value: 1, timescale: 30)
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = true
+        config.scalesToFit = true
+        if #available(macOS 14.0, *) {
+            config.preservesAspectRatio = true
+        }
+        config.queueDepth = 4
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: self)
         try scStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
         try await scStream.startCapture()
         self.stream = scStream
-        logger.log(level: .info, message: "Screen capture started")
+        logger.log(level: .info, message: "Screen capture started output=\(config.width)x\(config.height) optimizeForVideo=\(options.optimizeForVideo)")
     }
 
     /// Stop capturing and release the stream.
@@ -98,6 +132,44 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
         self.stream = nil
         self.videoSource = nil
         logger.log(level: .info, message: "Screen capture stopped")
+    }
+
+    private func captureOutputSize(for sourcePixels: CGSize, options: ScreenShareOptions) -> (width: Int, height: Int) {
+        let sourceWidth = max(2, sourcePixels.width)
+        let sourceHeight = max(2, sourcePixels.height)
+        let maxLongEdge: CGFloat = options.optimizeForVideo ? 1920 : 2048
+        let longEdge = max(sourceWidth, sourceHeight)
+        let scale = min(1, maxLongEdge / max(longEdge, 1))
+        let width = Int(max(2, (sourceWidth * scale).rounded(.toNearestOrAwayFromZero)))
+        let height = Int(max(2, (sourceHeight * scale).rounded(.toNearestOrAwayFromZero)))
+        return (width: width, height: height)
+    }
+
+    private func displayPixelSize(for display: SCDisplay) -> CGSize {
+        let pixelWidth = CGDisplayPixelsWide(display.displayID)
+        let pixelHeight = CGDisplayPixelsHigh(display.displayID)
+        if pixelWidth > 0, pixelHeight > 0 {
+            return CGSize(width: CGFloat(pixelWidth), height: CGFloat(pixelHeight))
+        }
+        return CGSize(width: CGFloat(max(2, display.width)), height: CGFloat(max(2, display.height)))
+    }
+
+    private func windowPixelSize(for window: SCWindow) -> CGSize {
+        let pointSize = window.frame.size
+        let scale = backingScaleFactor(for: window.frame)
+        let pixelWidth = max(2, pointSize.width * scale)
+        let pixelHeight = max(2, pointSize.height * scale)
+        return CGSize(width: pixelWidth, height: pixelHeight)
+    }
+
+    private func backingScaleFactor(for frame: CGRect) -> CGFloat {
+        let matches = NSScreen.screens.filter { screen in
+            screen.frame.intersects(frame) || screen.visibleFrame.intersects(frame)
+        }
+        let best = matches.max { lhs, rhs in
+            lhs.frame.intersection(frame).area < rhs.frame.intersection(frame).area
+        } ?? NSScreen.main
+        return best?.backingScaleFactor ?? 1
     }
 }
 
@@ -119,6 +191,14 @@ extension MacScreenCaptureSource: SCStreamDelegate {
         logger.log(level: .error, message: "SCStream stopped with error: \(error)")
         self.stream = nil
         self.videoSource = nil
+        onUnexpectedStop?()
+    }
+}
+
+private extension CGRect {
+    var area: CGFloat {
+        guard !isNull, !isInfinite, width > 0, height > 0 else { return 0 }
+        return width * height
     }
 }
 #endif

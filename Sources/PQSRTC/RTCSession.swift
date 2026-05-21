@@ -109,6 +109,34 @@ public actor RTCSession {
             waiter.resume(returning: wrapper)
         }
     }
+
+#if os(iOS) || os(macOS)
+    internal func bindLocalPreviewCaptureRenderer(
+        _ renderer: PreviewViewRender,
+        connectionId: String
+    ) async {
+        let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !trimmed.isEmpty else { return }
+        localPreviewCaptureRenderersByConnectionId[trimmed] = renderer
+
+        if let wrapper = await connectionManager.findConnection(with: trimmed)?.rtcVideoCaptureWrapper {
+            await renderer.setCapture(wrapper)
+        } else if let wrapper = await waitForVideoCaptureWrapper(connectionId: trimmed) {
+            await renderer.setCapture(wrapper)
+        }
+    }
+
+    internal func rebindRegisteredLocalPreviewCaptureIfNeeded(
+        connectionId: String,
+        wrapper: RTCVideoCaptureWrapper
+    ) async {
+        let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !trimmed.isEmpty else { return }
+        guard let renderer = localPreviewCaptureRenderersByConnectionId[trimmed] else { return }
+        await renderer.setCapture(wrapper)
+        logger.log(level: .info, message: "Rebound local preview capture to fresh WebRTC video source for connectionId=\(trimmed)")
+    }
+#endif
 #endif
     
     // MARK: - Core runtime infrastructure
@@ -417,7 +445,21 @@ public actor RTCSession {
     /// must not call ``createOffer`` again after `call_cipher` or WebRTC can stay in
     /// `have-local-offer` and reject inbound SFU renegotiation offers.
     var initialSfuGroupMediaOfferSentConnectionIds: Set<String> = []
-    
+
+    /// Normalized connection ids whose peer `call_cipher` has installed the receive frame key.
+    ///
+    /// True 1:1-over-SFU calls must not bind receiver FrameCryptors until this is set. Binding
+    /// first can permanently attach a cryptor to a room UUID or other placeholder id before the
+    /// real remote track owner key exists.
+    var oneToOneSfuReceiveKeyReadyConnectionIds: Set<String> = []
+
+    /// Normalized connection ids that have already emitted the post-cipher `.handshakeComplete`.
+    ///
+    /// For encrypted 1:1-over-SFU calls this readiness signal is sent only after the peer's
+    /// `call_cipher` has installed our receive key. When frame encryption is disabled, the same
+    /// signal can be sent immediately after the answer path reaches this stage.
+    var oneToOneSfuPostCipherHandshakeSentConnectionIds: Set<String> = []
+
 #if canImport(WebRTC)
     /// Delegate that surfaces frame-cryptor events for debugging and monitoring.
     var frameCryptorDelegate = FrameCryptorDelegate()
@@ -450,6 +492,9 @@ public actor RTCSession {
     var pendingLocalVideoRenderersByConnectionId: [String: AndroidPreviewCaptureView] = [:]
 #else
     var pendingRemoteVideoRenderersByConnectionId: [String: RTCVideoRenderWrapper] = [:]
+#if os(iOS) || os(macOS)
+    var localPreviewCaptureRenderersByConnectionId: [String: PreviewViewRender] = [:]
+#endif
 #endif
     
     /// Pending local video enabled state requested by UI before the connection exists.
@@ -621,7 +666,7 @@ public actor RTCSession {
     ///
     /// Username matching is case-insensitive because the server keys roles by IRC nick
     /// while the client uses `secretName`, and casing can differ across transports.
-    static func conferenceParticipantIdentityKey(_ participant: String) -> String {
+    public static func conferenceParticipantIdentityKey(_ participant: String) -> String {
         var normalized = participant.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if normalized.hasPrefix(screenStreamPrefix) {
             normalized.removeFirst(screenStreamPrefix.count)
@@ -651,6 +696,9 @@ public actor RTCSession {
             conferencePermissions = ConferencePermissions(
                 localRole: conferencePermissions.localRole,
                 participantRoles: conferencePermissions.participantRoles,
+                raisedHands: conferencePermissions.raisedHands,
+                participantAudioEnabled: conferencePermissions.participantAudioEnabled,
+                participantVideoEnabled: conferencePermissions.participantVideoEnabled,
                 timing: timing ?? conferencePermissions.timing
             )
             notifyConferencePermissionsChanged()
@@ -666,6 +714,9 @@ public actor RTCSession {
         conferencePermissions = ConferencePermissions(
             localRole: localRole,
             participantRoles: typedRoles,
+            raisedHands: conferencePermissions.raisedHands,
+            participantAudioEnabled: conferencePermissions.participantAudioEnabled,
+            participantVideoEnabled: conferencePermissions.participantVideoEnabled,
             timing: timing ?? conferencePermissions.timing
         )
         notifyConferencePermissionsChanged()
@@ -703,10 +754,184 @@ public actor RTCSession {
         let updated = ConferencePermissions(
             localRole: localRole,
             participantRoles: roles,
+            raisedHands: conferencePermissions.raisedHands,
+            participantAudioEnabled: conferencePermissions.participantAudioEnabled,
+            participantVideoEnabled: conferencePermissions.participantVideoEnabled,
             timing: conferencePermissions.timing
         )
         guard updated != conferencePermissions else { return }
         conferencePermissions = updated
+        notifyConferencePermissionsChanged()
+    }
+
+    /// Removes a departed participant from best-effort conference presence state.
+    ///
+    /// Server role NOTICEs remain authoritative when they arrive. This cleanup handles the gap where
+    /// media has already disappeared but the app is still showing fallback participant state derived
+    /// from prior receiver-track activity.
+    public func removeConferenceParticipant(_ participantId: String) {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return }
+
+        func removingParticipant<Value>(
+            from map: [String: Value]
+        ) -> [String: Value] {
+            map.filter { key, _ in
+                Self.conferenceParticipantIdentityKey(key) != participantKey
+            }
+        }
+
+        let updated = ConferencePermissions(
+            localRole: conferencePermissions.localRole,
+            participantRoles: removingParticipant(from: conferencePermissions.participantRoles),
+            raisedHands: removingParticipant(from: conferencePermissions.raisedHands),
+            participantAudioEnabled: removingParticipant(from: conferencePermissions.participantAudioEnabled),
+            participantVideoEnabled: removingParticipant(from: conferencePermissions.participantVideoEnabled),
+            timing: conferencePermissions.timing
+        )
+        guard updated != conferencePermissions else { return }
+        conferencePermissions = updated
+        notifyConferencePermissionsChanged()
+    }
+
+    /// Updates the raised-hand indicator for a conference participant.
+    public func updateConferenceHandRaised(participantId: String, isRaised: Bool) {
+        let rawParticipantId = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let participantKey = Self.conferenceParticipantIdentityKey(rawParticipantId)
+        guard !participantKey.isEmpty else { return }
+
+        var permissions = conferencePermissions
+        let existingHandKey = permissions.raisedHands.keys.first {
+            Self.conferenceParticipantIdentityKey($0) == participantKey
+        }
+        let handKey = existingHandKey
+            ?? permissions.participantRoles.keys.first { Self.conferenceParticipantIdentityKey($0) == participantKey }
+            ?? rawParticipantId
+
+        if isRaised {
+            permissions.raisedHands[handKey] = true
+            if permissions.participantRoles[handKey] == nil {
+                permissions.participantRoles[handKey] = .viewer
+            }
+        } else if let existingHandKey {
+            permissions.raisedHands.removeValue(forKey: existingHandKey)
+        } else {
+            permissions.raisedHands.removeValue(forKey: handKey)
+        }
+
+        guard permissions != conferencePermissions else { return }
+        conferencePermissions = permissions
+        notifyConferencePermissionsChanged()
+    }
+
+    /// Replaces the raised-hand snapshot from the SFU while preserving the current role map.
+    public func replaceConferenceRaisedHands(_ raisedHands: [String: Bool]) {
+        var permissions = conferencePermissions
+        var nextRaisedHands: [String: Bool] = [:]
+
+        for (participantId, isRaised) in raisedHands where isRaised {
+            let rawParticipantId = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let participantKey = Self.conferenceParticipantIdentityKey(rawParticipantId)
+            guard !participantKey.isEmpty else { continue }
+            let handKey = permissions.participantRoles.keys.first {
+                Self.conferenceParticipantIdentityKey($0) == participantKey
+            } ?? rawParticipantId
+            nextRaisedHands[handKey] = true
+            if permissions.participantRoles[handKey] == nil {
+                permissions.participantRoles[handKey] = .viewer
+            }
+        }
+
+        permissions.raisedHands = nextRaisedHands
+        guard permissions != conferencePermissions else { return }
+        conferencePermissions = permissions
+        notifyConferencePermissionsChanged()
+    }
+
+    /// Replaces participant mic/camera snapshots from the SFU while preserving roles and hands.
+    public func replaceConferenceParticipantMediaState(
+        audioEnabled: [String: Bool]?,
+        videoEnabled: [String: Bool]?
+    ) {
+        guard audioEnabled != nil || videoEnabled != nil else { return }
+        var permissions = conferencePermissions
+
+        func canonicalMap(_ values: [String: Bool]?) -> [String: Bool] {
+            guard let values else { return [:] }
+            var result: [String: Bool] = [:]
+            for (participantId, enabled) in values {
+                let rawParticipantId = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                let participantKey = Self.conferenceParticipantIdentityKey(rawParticipantId)
+                guard !participantKey.isEmpty else { continue }
+                let stateKey = permissions.participantRoles.keys.first {
+                    Self.conferenceParticipantIdentityKey($0) == participantKey
+                } ?? rawParticipantId
+                result[stateKey] = enabled
+            }
+            return result
+        }
+
+        if audioEnabled != nil {
+            permissions.participantAudioEnabled = canonicalMap(audioEnabled)
+        }
+        if videoEnabled != nil {
+            permissions.participantVideoEnabled = canonicalMap(videoEnabled)
+        }
+
+        guard permissions != conferencePermissions else { return }
+        conferencePermissions = permissions
+        notifyConferencePermissionsChanged()
+    }
+
+    /// Tracks best-effort participant mic/camera state from moderation commands.
+    public func updateConferenceParticipantMediaState(
+        targetParticipantId: String?,
+        audioEnabled: Bool?,
+        videoEnabled: Bool?
+    ) {
+        guard audioEnabled != nil || videoEnabled != nil else { return }
+
+        var permissions = conferencePermissions
+        let trimmedTarget = targetParticipantId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isAllParticipantsCommand = trimmedTarget == nil || trimmedTarget?.isEmpty == true || trimmedTarget == "*"
+
+        func existingParticipantKey(for participant: String) -> String? {
+            let normalized = Self.conferenceParticipantIdentityKey(participant)
+            guard !normalized.isEmpty else { return nil }
+            return permissions.participantRoles.keys.first {
+                Self.conferenceParticipantIdentityKey($0) == normalized
+            } ?? permissions.participantAudioEnabled.keys.first {
+                Self.conferenceParticipantIdentityKey($0) == normalized
+            } ?? permissions.participantVideoEnabled.keys.first {
+                Self.conferenceParticipantIdentityKey($0) == normalized
+            }
+        }
+
+        let targetKeys: [String]
+        if isAllParticipantsCommand {
+            targetKeys = permissions.participantRoles
+                .filter { $0.value < .cohost }
+                .map(\.key)
+        } else if let trimmedTarget, let existing = existingParticipantKey(for: trimmedTarget) {
+            targetKeys = [existing]
+        } else if let trimmedTarget, !trimmedTarget.isEmpty {
+            targetKeys = [trimmedTarget]
+        } else {
+            targetKeys = []
+        }
+
+        guard !targetKeys.isEmpty else { return }
+        for key in targetKeys {
+            if let audioEnabled {
+                permissions.participantAudioEnabled[key] = audioEnabled
+            }
+            if let videoEnabled {
+                permissions.participantVideoEnabled[key] = videoEnabled
+            }
+        }
+
+        guard permissions != conferencePermissions else { return }
+        conferencePermissions = permissions
         notifyConferencePermissionsChanged()
     }
 
@@ -720,6 +945,28 @@ public actor RTCSession {
         conferencePermissionContinuations.removeAll()
     }
 
+    /// Stores the initial local mic/camera preference so pre-call choices survive SFU registration timing.
+    public func prepareInitialLocalMediaState(
+        connectionId: String,
+        audioEnabled: Bool,
+        videoEnabled: Bool
+    ) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard !normalizedId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+        pendingAudioEnabledByConnectionId[normalizedId] = audioEnabled
+        pendingVideoEnabledByConnectionId[normalizedId] = videoEnabled
+
+        if await connectionManager.findConnection(with: normalizedId) != nil {
+            do {
+                try await setAudioTrack(isEnabled: audioEnabled, connectionId: normalizedId)
+            } catch {
+                logger.log(level: .warning, message: "Failed to apply initial audio enabled=\(audioEnabled) for \(normalizedId): \(error)")
+            }
+            await setVideoTrack(isEnabled: videoEnabled, connectionId: normalizedId)
+        }
+    }
+
     private func notifyConferencePermissionsChanged() {
         for (_, continuation) in conferencePermissionContinuations {
             continuation.yield(conferencePermissions)
@@ -727,23 +974,57 @@ public actor RTCSession {
     }
 
 #if canImport(WebRTC)
-    /// Context for deferring `setReceivingMessageKey` until RTP receivers exist (Apple WebRTC).
+    /// Legacy/test context for Apple receive-key retries.
+    ///
+    /// The current `call_cipher` path derives and stores the receive key immediately, even when
+    /// RTP receivers have not been added yet. Receiver FrameCryptor binding waits for the key,
+    /// not the other way around. This context is retained for older retry hooks and tests.
     struct PendingAppleDeferredReceiveFrameKeyContext: Sendable {
         let remoteTrackOwnerParticipantId: String?
     }
 
-    /// Apple WebRTC: when `receiveCiphertext` runs before any RTP receiver exists, we defer
-    /// ``RTCSession/setReceivingMessageKey`` until `didAddReceiver` / `startedReceiving`.
-    /// Key: ``String/normalizedConnectionId`` for the connection.
+    /// Keyed by ``String/normalizedConnectionId`` for legacy/test receive-key retry hooks.
     var pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId: [String: PendingAppleDeferredReceiveFrameKeyContext] = [:]
 #endif
 
-    // MARK: - Frame key provisioning diagnostics (DEBUG-only consumers)
+    /// Deduplication key for inbound `call_cipher` payloads.
+    ///
+    /// Duplicates are defined by both connection id and exact ciphertext bytes. A refreshed
+    /// `call_cipher` intentionally has different bytes and must be processed, because it can carry
+    /// a new sender frame identity and restart the receive media ratchet at key index 0.
+    struct InboundCallCiphertextKey: Hashable, Sendable {
+        let connectionId: String
+        let ciphertext: Data
+    }
+
+    /// `call_cipher` payloads currently being processed by this actor.
+    var inboundCallCiphertextsInFlight: Set<InboundCallCiphertextKey> = []
+
+    /// `call_cipher` payloads already consumed successfully.
+    var processedInboundCallCiphertexts: Set<InboundCallCiphertextKey> = []
+
+    // MARK: - Frame key provisioning state
     //
-    // We track the latest key index provisioned per participant so we can emit targeted diagnostics
-    // if a receiver cryptor is created before the app/server has injected keys for that participant.
-    // This does not affect crypto correctness; it is purely a guardrail for production operations.
+    // WebRTC FrameCryptors have their own keyIndex in addition to the provider's key ring.
+    // Keep the latest provisioned indices here so late-bound sender/receiver cryptors use
+    // the same slot that was populated in the provider.
     var lastFrameKeyIndexByParticipantId: [String: Int] = [:]
+    var lastSharedFrameKeyIndex: Int = 0
+
+    // Sender frame keys are ratchet-derived. More than one overlapping `setMessageKey` for the
+    // same connection advances the sender key index without the peer necessarily installing that
+    // new receive slot, which shows up as FrameCryptor `missingKey`.
+    var senderFrameKeyProvisioningConnectionIds: Set<String> = []
+
+    /// Connections whose outbound sender frame key has already been derived and installed.
+    var senderFrameKeyProvisionedConnectionIds: Set<String> = []
+
+    /// Last remote frame-identity fingerprint used for each sender media ratchet.
+    ///
+    /// If an inbound `call_cipher` replaces provisional room/SFU identity props with the real peer
+    /// props, the fingerprint changes and our sender key must be refreshed so the peer derives the
+    /// same receive key at index 0.
+    var senderFrameKeyIdentityFingerprintByConnectionId: [String: String] = [:]
 
     public var isGroupCall = false
 
@@ -1080,9 +1361,7 @@ public actor RTCSession {
         iceTransportPolicyStrategy: RTCIceTransportPolicyStrategy = .allThenRelay(timeoutMilliseconds: 4_000),
         iceDisconnectGracePeriodMs: UInt64 = 8_000,
         logger: NeedleTailLogger = NeedleTailLogger("[RTCSession]"),
-        ratchetSalt: Data = "PQSRTCFrameEncryptionSalt".data(using: .utf8)!,
-        frameEncryptionKeyMode: RTCFrameEncryptionKeyMode = .shared,
-        enableEncryption: Bool = false,
+        cryptorConfig: CryptorConfiguration = .init(),
         delegate: RTCTransportEvents?
     ) async {
         let (notificationStream, notificationContinuation) = AsyncStream<PeerConnectionNotifications?>.makeStream()
@@ -1094,15 +1373,12 @@ public actor RTCSession {
         self.iceTransportPolicyStrategy = iceTransportPolicyStrategy
         self.iceDisconnectGracePeriodMs = iceDisconnectGracePeriodMs
         self.logger = logger
-        self.ratchetSalt = ratchetSalt
-        self.frameEncryptionKeyMode = frameEncryptionKeyMode
-        self.enableEncryption = enableEncryption
-        if enableEncryption {
-            logger.log(
-                level: .warning,
-                message: "⚠️ TEMP DEBUG: FrameCryptor is DISABLED for this RTCSession to isolate media pipeline issues."
-            )
-        }
+        self.ratchetSalt = cryptorConfig.ratchetSalt
+        self.frameEncryptionKeyMode = cryptorConfig.mode
+        self.enableEncryption = cryptorConfig.mode != .none
+        logger.log(
+            level: enableEncryption ? .info : .warning,
+            message: "FrameCryptor is \(self.enableEncryption ? "ENABLED" : "DISABLED") for this RTCSession.")
         self.delegate = delegate
         self.ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
         self.pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
@@ -1135,8 +1411,7 @@ public actor RTCSession {
             uncryptedMagicBytes: "PQSRTCMagicBytes".data(using: .utf8)!,
             failureTolerance: -1,
             keyRingSize: 16,
-            discardFrameWhenCryptorNotReady: true
-        )
+            discardFrameWhenCryptorNotReady: true)
     }
 #endif
 
@@ -1161,6 +1436,20 @@ public actor RTCSession {
             throw RTCErrors.invalidConfiguration("RTCTransportEvents delegate not set")
         }
         return delegate
+    }
+
+
+    public struct CryptorConfiguration: Sendable {
+        let ratchetSalt: Data
+        let mode: RTCFrameEncryptionKeyMode
+
+        public init(
+            ratchetSalt: Data = "PQSRTCFrameEncryptionSalt".data(using: .utf8)!,
+            mode: RTCFrameEncryptionKeyMode = .perParticipant
+        ) {
+            self.ratchetSalt = ratchetSalt
+            self.mode = mode
+        }
     }
 }
 
@@ -1354,6 +1643,7 @@ public struct RTCDataChannelMessage: Sendable {
 public enum RTCFrameEncryptionKeyMode: Sendable {
     case shared
     case perParticipant
+    case none
 }
 
 /* SKIP @bridge */ public enum RTCIceTransportPolicyStrategy: Sendable, Equatable {

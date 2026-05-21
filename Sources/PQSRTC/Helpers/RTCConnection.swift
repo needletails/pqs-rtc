@@ -120,15 +120,20 @@ import FoundationEssentials
 
     /// Group-call support (SFU / conference): multiple remote participants can be received on a single PeerConnection.
     ///
-    /// The SDK maps `participantId` → track/cryptor as tracks arrive via Unified Plan receiver events.
+    /// The SDK maps stable sender `participantId` -> track/cryptor. Apple receivers can appear first
+    /// under UUID-like SFU placeholders, so `RTCSession` later reconciles these maps from SDP `msid`
+    /// lines before binding receiver FrameCryptors.
     public var remoteVideoTracksByParticipantId: [String: WebRTC.RTCVideoTrack] = [:]
     public var remoteAudioTracksByParticipantId: [String: WebRTC.RTCAudioTrack] = [:]
     /// Screen share tracks received from remote participants, keyed by participant ID.
     public var remoteScreenTracksByParticipantId: [String: WebRTC.RTCVideoTrack] = [:]
     var videoReceiverCryptorsByParticipantId: [String: RTCFrameCryptor] = [:]
     var audioReceiverCryptorsByParticipantId: [String: RTCFrameCryptor] = [:]
+    var videoReceiverCryptorBindingsByParticipantId: [String: RTCReceiverCryptorBinding] = [:]
+    var audioReceiverCryptorBindingsByParticipantId: [String: RTCReceiverCryptorBinding] = [:]
     var screenSenderCryptor: RTCFrameCryptor?
     var screenReceiverCryptorsByParticipantId: [String: RTCFrameCryptor] = [:]
+    var screenReceiverCryptorBindingsByParticipantId: [String: RTCReceiverCryptorBinding] = [:]
 #endif
     
 #if os(Android)
@@ -309,3 +314,17 @@ struct RTCPeerConnectionDelegateWrapper: Sendable {
     }
 #endif
 }
+
+#if canImport(WebRTC) && !os(Android)
+/// Stable metadata for an Apple receiver FrameCryptor binding.
+///
+/// `RTCFrameCryptor` itself owns the native receiver attachment. We keep this
+/// lightweight value so rebinding is idempotent across renegotiation and so a
+/// stale cryptor is disabled before a new participant id or receiver binding is
+/// attached to the same media track.
+struct RTCReceiverCryptorBinding: Sendable, Equatable {
+    let participantId: String
+    let trackId: String
+    let receiverId: String
+}
+#endif

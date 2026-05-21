@@ -88,15 +88,24 @@ public struct ConferenceTiming: Sendable, Equatable, Codable {
 public struct ConferencePermissions: Sendable, Equatable {
     public var localRole: ConferenceRole
     public var participantRoles: [String: ConferenceRole]
+    public var raisedHands: [String: Bool]
+    public var participantAudioEnabled: [String: Bool]
+    public var participantVideoEnabled: [String: Bool]
     public var timing: ConferenceTiming?
 
     public init(
         localRole: ConferenceRole = .viewer,
         participantRoles: [String: ConferenceRole] = [:],
+        raisedHands: [String: Bool] = [:],
+        participantAudioEnabled: [String: Bool] = [:],
+        participantVideoEnabled: [String: Bool] = [:],
         timing: ConferenceTiming? = nil
     ) {
         self.localRole = localRole
         self.participantRoles = participantRoles
+        self.raisedHands = raisedHands
+        self.participantAudioEnabled = participantAudioEnabled
+        self.participantVideoEnabled = participantVideoEnabled
         self.timing = timing
     }
 

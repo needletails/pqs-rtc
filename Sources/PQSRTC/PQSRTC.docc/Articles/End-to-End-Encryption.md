@@ -38,33 +38,28 @@ For frame-level E2EE to work, the sender and receiver must use the same `partici
 
 In group calls, that remote track owner ID is what your roster/control plane calls the participant.
 
-## Group calls: two keying models
+For 1:1 calls relayed through an SFU, the remote track owner is still the peer, even though the
+PeerConnection and transport route may be keyed by an ephemeral room id. The `call_cipher` exchange
+is what aligns the two peers' frame identities and media-ratchet sessions. See
+<doc:OneToOneSfuFrameE2EE>.
 
-### A) Control-plane injected keys
+## Group calls: per-sender frame keys
 
-Your app/server distributes media keys out-of-band and injects them using:
+Encrypted SFU group calls use sender keys injected by the host app:
 
-- ``RTCGroupCall/setFrameEncryptionKey(_:index:for:)``
+- Each sender generates a per-sender media key.
+- The host app encrypts and sends that sender key to each other group member.
+- Each receiver installs the key with ``RTCSession/setFrameEncryptionKey(_:index:for:)`` under the
+  sender / track-owner participant id.
+- The SFU forwards encrypted RTP and never sees media keys.
 
 Important:
 
 - `participantId` refers to the **sender / track owner**.
-- `index` is the key ring index (rotations can be modeled as incrementing indices).
+- `index` is the FrameCryptor key-ring index.
+- Pairwise `call_cipher` is not the group media keying primitive. It is reserved for 1:1 media.
 
-### B) Sender keys
-
-This follows the sender-key distribution model:
-
-- Each sender generates a per-sender media key.
-- The sender encrypts that key to each other member using pairwise Double Ratchet.
-- The SFU never sees media keys.
-
-In this SDK:
-
-- Sender rotates and sends:
-  - ``RTCGroupCall/rotateAndSendLocalSenderKeyForCurrentParticipants()``
-- Receiver applies inbound sender keys after decrypting:
-  - ``RTCGroupCall/handleCiphertextFromParticipant(fromParticipantId:connectionId:ciphertext:)``
+See <doc:GroupSfuFrameE2EE>.
 
 ## Participant ID mapping in SFU calls
 
@@ -86,6 +81,9 @@ session.setRemoteParticipantIdResolver { streamIds, trackId, trackKind in
 - `missingKey`: receiver cryptor is running but no key exists for the participantId/index.
   - Verify you applied the key with the correct participantId.
   - Verify your resolver returns the same participantId your control plane uses.
+  - For 1:1 SFU, verify the inbound `call_cipher` ``Call/frameIdentityProps`` belongs to the
+    remote peer and that the receive key was installed under the remote track owner, not the room id.
+  - For group SFU, verify the app injected a sender key for the remote sender id, not the room id.
 
 - `internalError`: typically indicates platform WebRTC errors or unexpected cryptor state.
   - Confirm you are setting keys *before* expecting decrypt.

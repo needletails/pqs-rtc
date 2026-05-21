@@ -48,4 +48,3 @@ public struct RatchetMessagePacket: Codable, Sendable, Equatable {
         }
     
 }
-

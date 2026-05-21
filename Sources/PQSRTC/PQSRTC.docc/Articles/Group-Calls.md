@@ -18,11 +18,14 @@ You provide an app-defined transport (``RTCTransportEvents``) for exchanging off
 
 ``RTCGroupCall`` is a small SFU group-call facade over ``RTCSession``.
 
-- `join()` starts the SFU call and triggers ``RTCTransportEvents/sendOffer(call:)``.
+- `join()` starts the SFU call flow; after SFU identity negotiation, PQSRTC emits an encrypted
+  offer via ``RTCTransportEvents/sendSfuMessage(_:call:)``.
 - `handleControlMessage(.sfuAnswer(_))` / `handleControlMessage(.sfuCandidate(_))` apply SFU signaling.
-- `handleControlMessage(.participants(_))` / `handleControlMessage(.participantDemuxId(participantId:demuxId:))` apply roster updates.
-- `handleControlMessage(.frameKey(participantId:index:key:))` injects frame keys (control-plane keying).
-- `rotateAndSendLocalSenderKeyForCurrentParticipants()` distributes sender keys (true group E2EE).
+- `handleControlMessage(.participants(_))` / `handleControlMessage(.participantDemuxId(_))` apply roster updates.
+  Participant roster updates are also cleanup signals: when a stable participant leaves, PQSRTC
+  removes that participant's stored receiver tracks and FrameCryptors.
+- `events()` reports stable participant/track owners so the host can inject per-sender frame keys with
+  ``RTCSession/setFrameEncryptionKey(_:index:for:)``.
 
 ### Participant identifiers
 
@@ -32,6 +35,11 @@ The SDK needs a stable `participantId` for each sender so that:
 - frame-level keys can be applied to the correct sender/track owner.
 
 Default convention: `participantId == streamIds.first` (from the WebRTC receiver event).
+
+For Apple SFU calls, the first receiver callback can contain a UUID-like placeholder. PQSRTC
+reconciles the stable owner later from SDP `msid` lines after `setRemoteDescription`. This applies
+to camera and audio: both receivers for a sender must resolve to the same stable `participantId`
+before encrypted media can decode correctly.
 
 If your SFU uses a different convention, configure a resolver:
 
@@ -61,15 +69,14 @@ struct MyTransport: RTCTransportEvents {
     // Use `packet.flag` to distinguish offer/answer/candidate.
   }
 
-  func sendSfuMessage(_ packet: RTCGroupE2EE.RatchetMessagePacket, call: Call) async throws {
+  func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws {
     // Group-call (SFU): forward the encoded packet to your SFU/signaling service.
     // Use `packet.flag` to distinguish offer/answer/candidate.
-    // Default implementation forwards through sendCiphertext(...).
   }
 
   func sendCiphertext(recipient: String, connectionId: String, ciphertext: Data, call: Call) async throws {
     // Opaque ciphertext transport.
-    // Used for 1:1 Double Ratchet handshake payloads and (optionally) group sender-key distribution.
+    // Used for 1:1 Double Ratchet / call_cipher payloads.
   }
 
   func didEnd(call: Call, endState: CallStateMachine.EndState) async throws {
@@ -143,6 +150,10 @@ try await groupCall.handleControlMessage(.sfuCandidate(candidatePacket))
 ## Roster + demux updates
 
 Your control plane should tell the client who is in the call, and (optionally) any SFU demux ids.
+Send the full current roster when possible. If the roster removes `alice`, the SDK prunes `alice`'s
+camera, audio, screen-share receiver maps, and receiver FrameCryptors. Avoid sending a transient
+empty roster during reconnect unless everyone has really left, because an empty roster is ignored as
+non-authoritative cleanup input.
 
 ```swift
 await groupCall.handleControlMessage(
@@ -157,52 +168,50 @@ await groupCall.handleControlMessage(
 )
 ```
 
-## E2EE keying models
+## E2EE keying model
 
-You have two supported keying models for group calls.
+Encrypted group media uses application-injected **per-sender frame keys**.
 
-### 1) Control-plane injected keys
+The important rule: the `participantId` used with
+``RTCSession/setFrameEncryptionKey(_:index:for:)`` must identify the **track owner / sender id**.
 
-Your app/server distributes frame keys out-of-band and injects them.
-
-Important rule: the `participantId` used here must identify the **track owner / sender id**.
+Local sender setup:
 
 ```swift
-await groupCall.handleControlMessage(
-  .frameKey(participantId: "alice", index: 0, key: aliceMediaKey)
+let localSenderId = call.sender.secretName
+let localFrameKey = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+
+await session.setFrameEncryptionKey(localFrameKey, index: 0, for: localSenderId)
+```
+
+Remote sender setup after your host transport receives an encrypted sender-key envelope:
+
+```swift
+await session.setFrameEncryptionKey(
+  remoteFrameKey,
+  index: remoteKeyIndex,
+  for: remoteSenderSecretName
 )
 ```
 
-### 2) Sender keys over Double Ratchet (true group E2EE)
+Your app must distribute the local frame key to every current participant and to late joiners. A
+minimal encrypted sender-key envelope contains:
 
-In this model:
+- room id
+- sender participant id
+- frame key bytes
+- key index
 
-- Each sender encrypts outbound media with a per-sender key.
-- That sender key is distributed to each group member using pairwise Double Ratchet encrypted messages.
-- The SFU forwards encrypted RTP frames and never sees media keys.
+The envelope can be carried over an app-defined encrypted call-control route. Some host apps keep a
+legacy metadata name such as `conferenceFrameKey`; that name is only wire compatibility. The SDK API
+contract is still: call ``RTCSession/setFrameEncryptionKey(_:index:for:)`` with the sender's stable
+participant id.
 
-Workflow:
+Do not derive group media frame keys from pairwise `call_cipher`. Pairwise `call_cipher` is the
+1:1 media-ratchet identity exchange; group media has one outbound RTP stream per sender, so all
+receivers of that sender need the same key bytes under the same sender id.
 
-1) Provide each participant’s ratchet identity props to the group call.
+If encrypted video is correct but encrypted audio is garbled, check that the audio receiver was
+reconciled to the same sender id as the video receiver and that a sender key exists for that id.
 
-```swift
-try await groupCall.handleControlMessage(.participantIdentity(identity))
-```
-
-2) Rotate + send a new local sender key.
-
-```swift
-try await groupCall.rotateAndSendLocalSenderKeyForCurrentParticipants()
-```
-
-3) When you receive ciphertext from another participant, deliver it to the group call.
-
-```swift
-try await groupCall.handleCiphertextFromParticipant(
-  fromParticipantId: fromId,
-  connectionId: connectionId,
-  ciphertext: ciphertext
-)
-```
-
-See also <doc:End-to-End-Encryption>.
+See <doc:GroupSfuFrameE2EE> and <doc:End-to-End-Encryption>.

@@ -436,12 +436,14 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
             sendSubviewToBack(view)
 #endif
             let layer = view.layer as! AVSampleBufferDisplayLayer
-            layer.videoGravity = .resizeAspectFill
+            let rendersScreenShare = contextName.hasPrefix("screen_")
+            layer.videoGravity = rendersScreenShare ? .resizeAspect : .resizeAspectFill
             let layerBox = SampleBufferDisplayLayerBox(layer: layer)
             let renderer = SampleBufferViewRenderer(
                 layerBox: layerBox,
                 ciContext: ciContext,
-                bounds: self.bounds
+                bounds: self.bounds,
+                rendersScreenShare: rendersScreenShare
             )
             
             await renderer.setDelegate(self)

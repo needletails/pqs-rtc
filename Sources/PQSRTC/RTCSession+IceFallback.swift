@@ -96,6 +96,9 @@ extension RTCSession {
         let normalizedId = normalizedFallbackConnectionId(for: connectionId)
         clearFallbackState(connectionId: normalizedId)
         resetTeardownIdempotency(forConnectionId: connectionId)
+        oneToOneSfuReceiveKeyReadyConnectionIds.remove(normalizedId)
+        oneToOneSfuPostCipherHandshakeSentConnectionIds.remove(normalizedId)
+        senderFrameKeyIdentityFingerprintByConnectionId.removeValue(forKey: normalizedId)
 
         logger.log(level: .debug, message: "Reset per-connection retry flags for new call attempt: \(normalizedId)")
     }
@@ -237,8 +240,8 @@ extension RTCSession {
         cancelRelayFallbackTimer(connectionId: connectionId)
         readyForCandidatesByConnectionId[connectionId] = nil
         iceDequeByConnectionId[connectionId] = nil
-        pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
 #if os(Android)
+        pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
         pendingLocalVideoRenderersByConnectionId.removeValue(forKey: connectionId)
 #endif
         pcState = .none
@@ -263,10 +266,24 @@ extension RTCSession {
             connection.audioFrameCryptor?.delegate = nil
             connection.audioSenderCryptor?.delegate = nil
             connection.screenSenderCryptor?.delegate = nil
+            for (_, cryptor) in connection.videoReceiverCryptorsByParticipantId {
+                cryptor.enabled = false
+                cryptor.delegate = nil
+            }
+            connection.videoReceiverCryptorsByParticipantId.removeAll()
+            connection.videoReceiverCryptorBindingsByParticipantId.removeAll()
+            for (_, cryptor) in connection.audioReceiverCryptorsByParticipantId {
+                cryptor.enabled = false
+                cryptor.delegate = nil
+            }
+            connection.audioReceiverCryptorsByParticipantId.removeAll()
+            connection.audioReceiverCryptorBindingsByParticipantId.removeAll()
             for (_, cryptor) in connection.screenReceiverCryptorsByParticipantId {
                 cryptor.enabled = false
                 cryptor.delegate = nil
             }
+            connection.screenReceiverCryptorsByParticipantId.removeAll()
+            connection.screenReceiverCryptorBindingsByParticipantId.removeAll()
             for participantId in connection.remoteScreenTracksByParticipantId.keys {
                 notifyRemoteScreenTrackChanged(
                     RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)

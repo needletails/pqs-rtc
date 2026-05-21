@@ -143,8 +143,7 @@ extension RTCSession {
                 iceServers: self.iceServers,
                 username: self.username,
                 password: self.password,
-                iceTransportPolicy: selectedIcePolicy
-            )
+                iceTransportPolicy: selectedIcePolicy)
             logger.log(level: .info, message: "Successfully initialized factory for connection: \(call.sharedCommunicationId)")
             
             connection = RTCConnection(
@@ -252,24 +251,7 @@ extension RTCSession {
         if call.supportsVideo {
             connection = try await self.addVideoToStream(with: connection)
         }
-        
-        if !willFinishNegotiation {
-            // Once media is attached, perform the 1:1 ciphertext handshake so signaling can proceed.
-            // FrameCryptor (media frame encryption) is independently gated by `enableEncryption`.
-            try await setMessageKey(connection: connection, call: call)
-            if let foundConnection = await connectionManager.findConnection(with: connection.id) {
-                connection = foundConnection
-            }
-        }
         #else
-        if !willFinishNegotiation {
-            // Always perform the 1:1 ciphertext handshake so signaling can proceed.
-            // FrameCryptor (media frame encryption) is independently gated by `enableEncryption`.
-            try await setMessageKey(connection: connection, call: call)
-            if let foundConnection = await connectionManager.findConnection(with: connection.id) {
-                connection = foundConnection
-            }
-        }
         // Add audio and video tracks (this may trigger notifications immediately)
         connection = try await self.addAudioToStream(with: connection)
         if call.supportsVideo {
@@ -296,7 +278,19 @@ extension RTCSession {
         }
         
         logger.log(level: .info, message: "Successfully created peer connection with id: \(call.sharedCommunicationId) policy=\(selectedIcePolicy.rawValue)")
-        
+
+        if !willFinishNegotiation {
+            // Once the PeerConnection and local media senders exist, perform the ciphertext
+            // handshake and provision the local sender frame key.
+            if let latestConnection = await connectionManager.findConnection(with: connection.id) {
+                connection = latestConnection
+            }
+            try await setMessageKey(connection: connection, call: call)
+            if let foundConnection = await connectionManager.findConnection(with: connection.id) {
+                connection = foundConnection
+            }
+        }
+
         await setConnectingIfReady(call: call, callDirection: inferredCallDirection(for: call))
         return connection
     }
@@ -375,6 +369,9 @@ extension RTCSession {
         iceDequeByConnectionId.removeAll()
         readyForCandidatesByConnectionId.removeAll()
         pendingRemoteVideoRenderersByConnectionId.removeAll()
+#if os(iOS) || os(macOS)
+        localPreviewCaptureRenderersByConnectionId.removeAll()
+#endif
 #if canImport(WebRTC)
         pendingAppleDeferredReceiveFrameKeyContextByNormalizedConnectionId.removeAll()
 #endif
@@ -718,7 +715,12 @@ extension RTCSession {
         if let connectionId, let callForTeardown = currentCall {
             await taskProcessor.removeJobs(forConnectionId: connectionId)
             initialSfuGroupMediaOfferSentConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
+            oneToOneSfuReceiveKeyReadyConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
+            oneToOneSfuPostCipherHandshakeSentConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
             pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
+#if os(iOS) || os(macOS)
+            localPreviewCaptureRenderersByConnectionId.removeValue(forKey: connectionId)
+#endif
 #if os(Android)
             pendingLocalVideoRenderersByConnectionId.removeValue(forKey: connectionId)
 #endif
@@ -757,6 +759,18 @@ extension RTCSession {
             connection.videoSenderCryptor = nil
             connection.audioFrameCryptor = nil
             connection.audioSenderCryptor = nil
+            for (_, cryptor) in connection.videoReceiverCryptorsByParticipantId {
+                cryptor.enabled = false
+                cryptor.delegate = nil
+            }
+            connection.videoReceiverCryptorsByParticipantId.removeAll()
+            connection.videoReceiverCryptorBindingsByParticipantId.removeAll()
+            for (_, cryptor) in connection.audioReceiverCryptorsByParticipantId {
+                cryptor.enabled = false
+                cryptor.delegate = nil
+            }
+            connection.audioReceiverCryptorsByParticipantId.removeAll()
+            connection.audioReceiverCryptorBindingsByParticipantId.removeAll()
             
             // Clean up screen share resources
             connection.screenSenderCryptor?.enabled = false
@@ -767,6 +781,7 @@ extension RTCSession {
                 cryptor.delegate = nil
             }
             connection.screenReceiverCryptorsByParticipantId.removeAll()
+            connection.screenReceiverCryptorBindingsByParticipantId.removeAll()
             if connection.localScreenTrack != nil, let captureSource = screenCaptureSourceForCurrentPlatform {
                 await stopPlatformScreenCapture(captureSource)
             }
@@ -778,6 +793,14 @@ extension RTCSession {
                 )
             }
             connection.remoteScreenTracksByParticipantId.removeAll()
+
+            for participantId in connection.remoteVideoTracksByParticipantId.keys {
+                notifyRemoteParticipantTrackChanged(
+                    RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
+                )
+            }
+            connection.remoteVideoTracksByParticipantId.removeAll()
+            connection.remoteAudioTracksByParticipantId.removeAll()
             
             // Clear video track references
             connection.localVideoTrack = nil
@@ -872,6 +895,9 @@ extension RTCSession {
 
             // Clear any buffered renderer requests since they are scoped to old connections.
             pendingRemoteVideoRenderersByConnectionId.removeAll()
+#if os(iOS) || os(macOS)
+            localPreviewCaptureRenderersByConnectionId.removeAll()
+#endif
 #if os(Android)
             pendingLocalVideoRenderersByConnectionId.removeAll()
 #endif
@@ -899,6 +925,18 @@ extension RTCSession {
 
         // Clear any queued outbound candidates.
         iceDequeByConnectionId.removeAll()
+        inboundCallCiphertextsInFlight.removeAll()
+        processedInboundCallCiphertexts.removeAll()
+        senderFrameKeyProvisioningConnectionIds.removeAll()
+        senderFrameKeyProvisionedConnectionIds.removeAll()
+        senderFrameKeyIdentityFingerprintByConnectionId.removeAll()
+        oneToOneSfuReceiveKeyReadyConnectionIds.removeAll()
+        oneToOneSfuPostCipherHandshakeSentConnectionIds.removeAll()
+        lastFrameKeyIndexByParticipantId.removeAll()
+        lastSharedFrameKeyIndex = 0
+#if canImport(WebRTC) && !os(Android)
+        keyProvider = nil
+#endif
         
         // Clean up candidate buffers
         for (_, consumer) in inboundCandidateConsumers {

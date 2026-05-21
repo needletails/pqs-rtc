@@ -148,14 +148,14 @@ public struct AndroidScreenShareCompose: ContentComposer {
             }
         }
 
-        Box(modifier: context.modifier.fillMaxWidth()) {
+        Box(modifier: context.modifier.fillMaxSize()) {
             androidx.compose.ui.viewinterop.AndroidView(
                 factory: { ctx in
                     client.initializeSurfaceRenderer(renderer, mirror: false)
                     renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
                     renderer
                 },
-                modifier: Modifier.fillMaxWidth().aspectRatio(Float(16.0 / 9.0)),
+                modifier: Modifier.fillMaxSize(),
                 update: { _ in }
             )
 

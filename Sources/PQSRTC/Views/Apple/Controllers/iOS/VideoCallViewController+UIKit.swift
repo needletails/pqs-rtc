@@ -55,6 +55,10 @@ public final class VideoCallViewController: UICollectionViewController {
     /// For SwiftUI call chrome: re-sync toggle state after ``muteVideo()`` / ``muteAudio()`` (avoids optimistic UI drift).
     public var isLocalVideoMutedForDisplay: Bool { isMutingVideo }
     public var isLocalAudioMutedForDisplay: Bool { isMutingAudio }
+    public func applyInitialLocalMuteDisplayState(videoMuted: Bool, audioMuted: Bool) {
+        isMutingVideo = videoMuted
+        isMutingAudio = audioMuted
+    }
     private weak var controlsView: UIView?
     private var duration: TimeInterval = 0
     private var isRunning = true
@@ -78,6 +82,7 @@ public final class VideoCallViewController: UICollectionViewController {
     private let conferencePageSize = 12
     private let conferencePageIndicatorLabel = UILabel()
     private var lastConferencePageIndicatorSignature = ""
+    private var lastConferenceLayoutBoundsSize: CGSize = .zero
     private var isMinimized = false
     private static let sections = CollectionViewSections()
     private var loadedPreviewItem = false
@@ -387,6 +392,13 @@ public final class VideoCallViewController: UICollectionViewController {
 
     public override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        let boundsSize = collectionView.bounds.size
+        if currentSectionType == .conference,
+           abs(boundsSize.width - lastConferenceLayoutBoundsSize.width) > 0.5 ||
+            abs(boundsSize.height - lastConferenceLayoutBoundsSize.height) > 0.5 {
+            lastConferenceLayoutBoundsSize = boundsSize
+            collectionView.collectionViewLayout.invalidateLayout()
+        }
         updateConferencePageIndicator()
     }
 
@@ -573,14 +585,7 @@ public final class VideoCallViewController: UICollectionViewController {
         guard let connectionId = currentCall?.sharedCommunicationId else { return }
         guard let previewRenderer = localVideoView.renderer as? PreviewViewRender else { return }
         
-        // Bind capture injection into WebRTC as soon as the wrapper exists.
-        // This is event-driven (no retry loop): if the wrapper isn't ready yet, we await it.
-        if let wrapper = (await session.connectionManager.findConnection(with: connectionId))?.rtcVideoCaptureWrapper {
-            await previewRenderer.setCapture(wrapper)
-        } else if let wrapper = await session.waitForVideoCaptureWrapper(connectionId: connectionId) {
-            await previewRenderer.setCapture(wrapper)
-        }
-        
+        await session.bindLocalPreviewCaptureRenderer(previewRenderer, connectionId: connectionId)
         await self.session.renderLocalVideo(to: previewRenderer.rtcVideoRenderWrapper, connectionId: connectionId)
         await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
         await applyLocalVideoMirroringFromUserDefaults()
@@ -709,6 +714,21 @@ public final class VideoCallViewController: UICollectionViewController {
             && model.videoView.contextName.hasPrefix("camera_")
     }
 
+    private func participantCameraModel(matching rawParticipantId: String) -> VideoViewModel? {
+        let participantId = rawParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contextName = participantCameraContextName(participantId)
+        if let exact = videoViews.views.first(where: { $0.videoView.contextName == contextName }) {
+            return exact
+        }
+
+        let participantKey = RTCSession.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return nil }
+        return videoViews.views.first {
+            isParticipantCameraModel($0)
+                && RTCSession.conferenceParticipantIdentityKey($0.participantId) == participantKey
+        }
+    }
+
     private func isScreenShareModel(_ model: VideoViewModel) -> Bool {
         model.isScreenShare || model.videoView.contextName.hasPrefix("screen_")
     }
@@ -828,22 +848,21 @@ public final class VideoCallViewController: UICollectionViewController {
         let participantId = rawParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !participantId.isEmpty else { return }
         stopParticipantRendererRecovery(connectionId: connectionId, participantId: participantId)
-        let contextName = participantCameraContextName(participantId)
-        guard let model = videoViews.views.first(where: { $0.videoView.contextName == contextName }) else { return }
+        guard let model = participantCameraModel(matching: participantId) else { return }
 
         if let cameraRenderer = model.videoView.renderer as? SampleBufferViewRenderer {
             await cameraRenderer.setRemoteVideoInboundExpected(false)
             await session.removeRemoteForParticipant(
                 renderer: cameraRenderer.rtcVideoRenderWrapper,
                 connectionId: connectionId,
-                participantId: participantId
+                participantId: model.participantId
             )
             await cameraRenderer.shutdown()
         }
         model.videoView.shutdownMetalStream()
-        videoViews.views.removeAll(where: { $0.videoView.contextName == contextName })
+        videoViews.views.removeAll(where: { $0.id == model.id })
         await performQuery(removePreview: true)
-        logger.log(level: .info, message: "Remote participant camera view removed for participant=\(participantId)")
+        logger.log(level: .info, message: "Remote participant camera view removed for participant=\(model.participantId) requestedParticipant=\(participantId)")
     }
 
     private func tearDownAllParticipantCameraViews() async {
@@ -1132,12 +1151,15 @@ public final class VideoCallViewController: UICollectionViewController {
             return UICollectionViewCompositionalLayout { _, environment in
                 sections.screenShareDominantSection(
                     cameraTileCount: cameraTileCount,
-                    containerSize: environment.container.effectiveContentSize
-                )
+                    containerSize: environment.container.effectiveContentSize)
             }
         }
         if itemCount > 1 {
-            return UICollectionViewCompositionalLayout(section: sections.conferenceViewSection(itemCount: itemCount))
+            return UICollectionViewCompositionalLayout { _, environment in
+                sections.conferenceViewSection(
+                    itemCount: itemCount,
+                    containerSize: environment.container.effectiveContentSize)
+            }
         } else {
             return UICollectionViewCompositionalLayout(section: sections.fullScreenItem())
         }
@@ -1154,8 +1176,7 @@ public final class VideoCallViewController: UICollectionViewController {
         }
         collectionView.setCollectionViewLayout(
             Self.createLayout(itemCount: max(1, itemCount), hasScreenShare: hasScreenShare),
-            animated: false
-        )
+            animated: false)
         currentSectionType = nextType
     }
 
@@ -1918,15 +1939,23 @@ extension VideoCallViewController: CallActionDelegate {
     
     /// Toggles the local audio track and updates the session.
     public func muteAudio() async {
+        await setAudioMuted(!isMutingAudio)
+    }
+
+    /// Sets the local audio track to a specific muted/unmuted state.
+    public func setAudioMuted(_ muted: Bool) async {
         guard let callId = await resolvedMuteConnectionId() else {
             logger.log(level: .warning, message: "muteAudio: missing connection id")
             return
         }
-        let shouldMute = !isMutingAudio
+        guard isMutingAudio != muted else {
+            await videoCallDelegate?.localMuteDisplayDidChange(videoMuted: isMutingVideo, audioMuted: isMutingAudio)
+            return
+        }
         do {
             // When muted, disable the local microphone track.
-            try await session.setAudioTrack(isEnabled: !shouldMute, connectionId: callId)
-            isMutingAudio = shouldMute
+            try await session.setAudioTrack(isEnabled: !muted, connectionId: callId)
+            isMutingAudio = muted
             await videoCallDelegate?.localMuteDisplayDidChange(videoMuted: isMutingVideo, audioMuted: isMutingAudio)
         } catch {
             logger.log(level: .error, message: "Failed to set audio track: \(error)")
@@ -1980,12 +2009,17 @@ extension VideoCallViewController: CallActionDelegate {
 
     /// Starts screen sharing with the given target.
     public func startScreenShare(target: ScreenShareTarget) async {
+        await startScreenShare(target: target, options: ScreenShareOptions())
+    }
+
+    /// Starts screen sharing with the given target and capture preferences.
+    public func startScreenShare(target: ScreenShareTarget, options: ScreenShareOptions) async {
         guard let connectionId = await resolvedMuteConnectionId() else {
             logger.log(level: .warning, message: "startScreenShare: no active connection")
             return
         }
         do {
-            try await session.addScreenTrackToStream(target: target, connectionId: connectionId)
+            try await session.addScreenTrackToStream(target: target, options: options, connectionId: connectionId)
             await videoCallDelegate?.screenShareDidChange(isSharing: true)
         } catch {
             logger.log(level: .error, message: "startScreenShare failed: \(error)")

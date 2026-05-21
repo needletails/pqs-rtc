@@ -43,6 +43,10 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
         await viewController?.muteAudio()
     }
 
+    public func setAudioMuted(_ muted: Bool) async {
+        await viewController?.setAudioMuted(muted)
+    }
+
     public func muteVideo() async {
         await viewController?.muteVideo()
     }
@@ -53,6 +57,10 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
 
     public func startScreenShare(target: ScreenShareTarget) async {
         await viewController?.startScreenShare(target: target)
+    }
+
+    public func startScreenShare(target: ScreenShareTarget, options: ScreenShareOptions) async {
+        await viewController?.startScreenShare(target: target, options: options)
     }
 
     public func stopScreenShare() async {
@@ -90,6 +98,10 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
     @Binding var isScreenSharing: Bool
     /// `true` when any remote participant is actively screen-sharing.
     @Binding var hasActiveRemoteScreenShare: Bool
+    private let initialLocalVideoMuted: Bool
+    private let initialLocalAudioMuted: Bool
+    private let conferenceRaisedHands: [String: Bool]
+    private let conferenceRaisedHandBadgeTopClearance: CGFloat
     private let controlsView: AnyView?
 
     /// Creates a representable that hosts a `VideoCallViewController`.
@@ -121,6 +133,10 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         isAudioMuted: Binding<Bool>,
         isScreenSharing: Binding<Bool> = .constant(false),
         hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
+        conferenceRaisedHands: [String: Bool] = [:],
+        conferenceRaisedHandBadgeTopClearance: CGFloat = 0,
+        initialLocalVideoMuted: Bool = false,
+        initialLocalAudioMuted: Bool = false,
         controlsView: AnyView? = nil
     ) {
         self.session = session
@@ -135,6 +151,10 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         self._isAudioMuted = isAudioMuted
         self._isScreenSharing = isScreenSharing
         self._hasActiveRemoteScreenShare = hasActiveRemoteScreenShare
+        self.initialLocalVideoMuted = initialLocalVideoMuted
+        self.initialLocalAudioMuted = initialLocalAudioMuted
+        self.conferenceRaisedHands = conferenceRaisedHands
+        self.conferenceRaisedHandBadgeTopClearance = conferenceRaisedHandBadgeTopClearance
         self.controlsView = controlsView
     }
     
@@ -151,6 +171,10 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         isAudioMuted: Binding<Bool>,
         isScreenSharing: Binding<Bool> = .constant(false),
         hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
+        conferenceRaisedHands: [String: Bool] = [:],
+        conferenceRaisedHandBadgeTopClearance: CGFloat = 0,
+        initialLocalVideoMuted: Bool = false,
+        initialLocalAudioMuted: Bool = false,
         @ViewBuilder controlsView: () -> Controls
     ) {
         self.init(
@@ -166,6 +190,10 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
             isAudioMuted: isAudioMuted,
             isScreenSharing: isScreenSharing,
             hasActiveRemoteScreenShare: hasActiveRemoteScreenShare,
+            conferenceRaisedHands: conferenceRaisedHands,
+            conferenceRaisedHandBadgeTopClearance: conferenceRaisedHandBadgeTopClearance,
+            initialLocalVideoMuted: initialLocalVideoMuted,
+            initialLocalAudioMuted: initialLocalAudioMuted,
             controlsView: AnyView(controlsView())
         )
     }
@@ -179,6 +207,10 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
             delegate = vc
         }
         vc.videoCallDelegate = context.coordinator
+        vc.applyInitialLocalMuteDisplayState(
+            videoMuted: initialLocalVideoMuted,
+            audioMuted: initialLocalAudioMuted
+        )
         
         if let controlsView {
             let hosting = UIHostingController(rootView: controlsView)
@@ -272,6 +304,10 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
         await viewController?.muteAudio()
     }
 
+    public func setAudioMuted(_ muted: Bool) async {
+        await viewController?.setAudioMuted(muted)
+    }
+
     public func muteVideo() async {
         await viewController?.muteVideo()
     }
@@ -282,6 +318,10 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
 
     public func startScreenShare(target: ScreenShareTarget) async {
         await viewController?.startScreenShare(target: target)
+    }
+
+    public func startScreenShare(target: ScreenShareTarget, options: ScreenShareOptions) async {
+        await viewController?.startScreenShare(target: target, options: options)
     }
 
     public func stopScreenShare() async {
@@ -314,6 +354,10 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
     @Binding var isAudioMuted: Bool
     @Binding var isScreenSharing: Bool
     @Binding var hasActiveRemoteScreenShare: Bool
+    private let initialLocalVideoMuted: Bool
+    private let initialLocalAudioMuted: Bool
+    private let conferenceRaisedHands: [String: Bool]
+    private let conferenceRaisedHandBadgeTopClearance: CGFloat
     private let controlsView: AnyView?
 
     /// Creates a representable that hosts a `VideoCallViewController`.
@@ -345,6 +389,10 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         isAudioMuted: Binding<Bool>,
         isScreenSharing: Binding<Bool> = .constant(false),
         hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
+        conferenceRaisedHands: [String: Bool] = [:],
+        conferenceRaisedHandBadgeTopClearance: CGFloat = 0,
+        initialLocalVideoMuted: Bool = false,
+        initialLocalAudioMuted: Bool = false,
         controlsView: AnyView? = nil
     ) {
         self.session = session
@@ -359,6 +407,10 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         self._isAudioMuted = isAudioMuted
         self._isScreenSharing = isScreenSharing
         self._hasActiveRemoteScreenShare = hasActiveRemoteScreenShare
+        self.initialLocalVideoMuted = initialLocalVideoMuted
+        self.initialLocalAudioMuted = initialLocalAudioMuted
+        self.conferenceRaisedHands = conferenceRaisedHands
+        self.conferenceRaisedHandBadgeTopClearance = conferenceRaisedHandBadgeTopClearance
         self.controlsView = controlsView
     }
     
@@ -375,6 +427,10 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         isAudioMuted: Binding<Bool>,
         isScreenSharing: Binding<Bool> = .constant(false),
         hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
+        conferenceRaisedHands: [String: Bool] = [:],
+        conferenceRaisedHandBadgeTopClearance: CGFloat = 0,
+        initialLocalVideoMuted: Bool = false,
+        initialLocalAudioMuted: Bool = false,
         @ViewBuilder controlsView: () -> Controls
     ) {
         self.init(
@@ -390,6 +446,10 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
             isAudioMuted: isAudioMuted,
             isScreenSharing: isScreenSharing,
             hasActiveRemoteScreenShare: hasActiveRemoteScreenShare,
+            conferenceRaisedHands: conferenceRaisedHands,
+            conferenceRaisedHandBadgeTopClearance: conferenceRaisedHandBadgeTopClearance,
+            initialLocalVideoMuted: initialLocalVideoMuted,
+            initialLocalAudioMuted: initialLocalAudioMuted,
             controlsView: AnyView(controlsView())
         )
     }
@@ -403,6 +463,10 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         }
         vc.usesEmbeddedControls = true
         vc.videoCallDelegate = context.coordinator
+        vc.applyInitialLocalMuteDisplayState(
+            videoMuted: initialLocalVideoMuted,
+            audioMuted: initialLocalAudioMuted
+        )
         
         if let controlsView {
             let hosting = NSHostingController(rootView: controlsView)
@@ -510,5 +574,3 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
     }
 }
 #endif
-
-

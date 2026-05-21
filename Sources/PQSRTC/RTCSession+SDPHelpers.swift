@@ -341,6 +341,7 @@ extension RTCSession {
             self.logger.log(level: .info, message: "Successfully set remote SDP\n \(sdp.sdp)")
             self.logger.log(level: .info, message: "Remote SDP summary after set connection=\(connection.id): \(RTCSdpDiagnostics.summary(sdp.sdp))")
             await reconcileAppleRemoteParticipantCameraTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
+            await reconcileAppleRemoteParticipantAudioTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
             await reconcileAppleRemoteScreenTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
             self.logger.log(level: .info, message: "PeerConnection media graph after setRemoteSDP connection=\(connection.id): \(RTCPeerConnectionMediaDiagnostics.summary(connection.peerConnection))")
             

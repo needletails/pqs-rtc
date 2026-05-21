@@ -34,7 +34,7 @@ Your signaling service is responsible for:
 - Exchanging **SDP offers/answers**.
 - Relaying **ICE candidates**.
 - Publishing roster updates (for group calls).
-- (Optional E2EE) transporting encrypted control messages used for handshake and/or sender-key distribution.
+- (Optional E2EE) transporting encrypted 1:1 `call_cipher` messages and SFU group sender-key envelopes.
 
 PQSRTC stays transport-agnostic. You provide an implementation of ``RTCTransportEvents`` and decide how to send these messages (WebSocket, HTTP+polling, gRPC, etc.).
 

@@ -8,6 +8,10 @@ The SDK exposes two layers:
 - **E2EE handshake**: an opaque ciphertext exchange over your transport (``RTCTransportEvents/sendCiphertext(recipient:connectionId:ciphertext:call:)``)
 
 > Note: 1:1 calls can be used with either ``RTCFrameEncryptionKeyMode/shared`` or ``RTCFrameEncryptionKeyMode/perParticipant``. Group calls should use `perParticipant`.
+>
+> If your 1:1 call is relayed through an SFU room and frame encryption is enabled, also read
+> <doc:OneToOneSfuFrameE2EE>. The transport still sends opaque ciphertext, but that ciphertext
+> carries the media-ratchet identity exchange that FrameCryptors depend on.
 
 ## High-level sequence
 
@@ -92,3 +96,5 @@ try await session.handleAnswer(call: call, sdp: answer)
 - If the caller never sends an offer after `finishCryptoSessionCreation`, check that you set `setCanAnswer(true)` (or `setCallAnswerState(_:for:)`).
 - If you see “RTCTransportEvents delegate not set”, ensure you passed a transport delegate into ``RTCSession/init(iceServers:username:password:logger:ratchetSalt:frameEncryptionKeyMode:delegate:)`` or called ``RTCSession/setDelegate(_:)``.
 - If audio/video decrypts as `missingKey`, ensure both sides are consistently using the same participant IDs (see <doc:End-to-End-Encryption>).
+- If 1:1 SFU media renders with FrameCryptor disabled but not when enabled, check the `call_cipher`
+  contract in <doc:OneToOneSfuFrameE2EE> before changing PeerConnection or receiver creation.
