@@ -44,23 +44,48 @@ extension RTCSession {
                 let rawTarget = Int(available * cfg.headroomFactor)
                 let targetBps = max(cfg.minBitrateBps, min(cfg.maxBitrateBps, rawTarget))
                 let targetFps: Int = (targetBps >= cfg.highFpsThresholdBps) ? cfg.highFps : cfg.lowFps
+                let targetScale = RTCVideoQualityProfile.resolutionScaleDownBy(for: targetBps)
 
                 let last = await self.adaptiveVideoLastAppliedByConnectionId[normalizedId]
                 let lastBps = last?.bitrateBps ?? 0
                 let lastFps = last?.framerate ?? 0
+                let lastScale = last?.scaleResolutionDownBy ?? 0
                 let deltaOk: Bool
                 if lastBps == 0 {
                     deltaOk = true
                 } else {
                     let ratio = Double(abs(targetBps - lastBps)) / Double(max(1, lastBps))
-                    deltaOk = ratio >= 0.15 || targetFps != lastFps
+                    deltaOk = ratio >= 0.15 || targetFps != lastFps || abs(targetScale - lastScale) >= 0.25
                 }
 
                 if deltaOk {
-                    self.rtcClient.setVideoSenderEncodings(maxBitrateBps: targetBps, maxFramerate: targetFps)
-                    await self.setAdaptiveVideoLastApplied(connectionId: normalizedId, bitrateBps: targetBps, framerate: targetFps)
-                    self.logger.log(level: .debug, message: "Adaptive video send applied (Android, connId=\(normalizedId)): maxBitrateBps=\(targetBps) maxFramerate=\(targetFps) (availableOutgoingBitrate=\(Int(available)))")
+                    self.rtcClient.setVideoSenderEncodings(maxBitrateBps: targetBps, maxFramerate: targetFps, scaleResolutionDownBy: targetScale)
+                    await self.setAdaptiveVideoLastApplied(connectionId: normalizedId, bitrateBps: targetBps, framerate: targetFps, scaleResolutionDownBy: targetScale)
+                    self.logger.log(level: .info, message: "Adaptive video send applied (Android, connId=\(normalizedId)): maxBitrateBps=\(targetBps) maxFramerate=\(targetFps) scaleResolutionDownBy=\(targetScale) (availableOutgoingBitrate=\(Int(available)))")
                 }
+
+                let quality: RTCNetworkQuality
+                if available < 150_000 {
+                    quality = .veryPoor
+                } else if available < 300_000 {
+                    quality = .poor
+                } else if available < 700_000 {
+                    quality = .fair
+                } else if available < 1_500_000 {
+                    quality = .good
+                } else {
+                    quality = .excellent
+                }
+
+                await self.emitNetworkQualityUpdateIfNeeded(
+                    connectionId: normalizedId,
+                    quality: quality,
+                    availableOutgoingBitrateBps: Int(available),
+                    rttMs: nil,
+                    appliedVideoMaxBitrateBps: targetBps,
+                    appliedVideoMaxFramerate: targetFps,
+                    nowUptimeNs: DispatchTime.now().uptimeNanoseconds
+                )
 
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
@@ -77,8 +102,8 @@ extension RTCSession {
         adaptiveVideoLastAppliedByConnectionId.removeValue(forKey: normalizedId)
     }
 
-    private func setAdaptiveVideoLastApplied(connectionId: String, bitrateBps: Int, framerate: Int) {
-        adaptiveVideoLastAppliedByConnectionId[connectionId] = (bitrateBps, framerate)
+    private func setAdaptiveVideoLastApplied(connectionId: String, bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double) {
+        adaptiveVideoLastAppliedByConnectionId[connectionId] = (bitrateBps, framerate, scaleResolutionDownBy)
     }
 }
 #endif

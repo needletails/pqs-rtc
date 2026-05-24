@@ -313,6 +313,17 @@ extension RTCSession {
         // Match ``RTCConnectionManager`` / ``teardownConnectionIdKey`` (strip `#` + lowercase) so
         // post-cipher bookkeeping survives UUID hex casing differences across call objects.
         let bootstrapKey = teardownConnectionIdKey(mediaCall.sharedCommunicationId)
+        guard !sfuGroupMediaBootstrapInFlightConnectionIds.contains(bootstrapKey) else {
+            logger.log(
+                level: .info,
+                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: bootstrap already in flight for room=\(normalizedLookup); skipping duplicate")
+            return
+        }
+        sfuGroupMediaBootstrapInFlightConnectionIds.insert(bootstrapKey)
+        defer {
+            sfuGroupMediaBootstrapInFlightConnectionIds.remove(bootstrapKey)
+        }
+
         if var existingConnection = await connectionManager.findConnection(with: mediaCall.sharedCommunicationId) {
             guard !initialSfuGroupMediaOfferSentConnectionIds.contains(bootstrapKey) else {
                 logger.log(
@@ -594,7 +605,9 @@ extension RTCSession {
                 throw RTCErrors.missingGroupCall
             }
             await group.updateParticipants(participants)
+#if canImport(WebRTC) && !os(Android)
             await pruneRemoteMediaForGroupRoster(participants, group: group, sfuIdentity: packet.sfuIdentity)
+#endif
         case .participantDemuxId:
             let participant: RTCGroupCall.Participant = try BinaryDecoder().decode(RTCGroupCall.Participant.self, from: plaintext)
             guard let group = groupCall(forSfuIdentity: packet.sfuIdentity) else {

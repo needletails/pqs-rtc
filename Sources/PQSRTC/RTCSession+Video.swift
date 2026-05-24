@@ -609,11 +609,26 @@ extension RTCSession {
         }
 #elseif os(Android)
         self.rtcClient.setVideoEnabled(isEnabled)
-        if connection.id.isGroupCall {
-            if isEnabled {
+        if !isEnabled {
+            stopAdaptiveVideoSend(connectionId: normalizedId)
+            return
+        }
+
+        let shouldStartConnectedVideoWork: Bool
+        if case .connected(_, let activeCall) = await callState.currentState {
+            let activeIds = [
+                activeCall.sharedCommunicationId.normalizedConnectionId,
+                activeCall.resolvedChannelWireId?.normalizedConnectionId ?? ""
+            ]
+            shouldStartConnectedVideoWork = activeIds.contains(normalizedId)
+        } else {
+            shouldStartConnectedVideoWork = false
+        }
+
+        if shouldStartConnectedVideoWork {
+            self.rtcClient.startLocalVideoCaptureIfNeeded()
+            if connection.id.isGroupCall {
                 await startAdaptiveVideoSendIfNeeded(connectionId: normalizedId)
-            } else {
-                stopAdaptiveVideoSend(connectionId: normalizedId)
             }
         }
 #endif

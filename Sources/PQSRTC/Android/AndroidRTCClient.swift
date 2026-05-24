@@ -491,6 +491,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// The current local video track wrapper, if created.
     private var localVideoTrack: RTCVideoTrack?
     private var videoCapturer: org.webrtc.Camera2Capturer?
+    private var localVideoCaptureStartInFlight = false
     private var surfaceTextureHelper: org.webrtc.SurfaceTextureHelper?
 
     // Screen capture fields (coexist alongside camera)
@@ -517,6 +518,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     // Keep per-participant receiver cryptors so we don't dispose previous ones.
     private var videoReceiverCryptorsByParticipantId: [String: org.webrtc.FrameCryptor] = [:]
     private var audioReceiverCryptorsByParticipantId: [String: org.webrtc.FrameCryptor] = [:]
+    private var videoReceiverKeysByParticipantId: [String: String] = [:]
+    private var audioReceiverKeysByParticipantId: [String: String] = [:]
+    private var videoReceiverTrackIdsByParticipantId: [String: String] = [:]
+    private var audioReceiverTrackIdsByParticipantId: [String: String] = [:]
 
     private var pendingSharedKey: Data?
     private var pendingSharedKeyIndex: Int32?
@@ -660,13 +665,14 @@ public final class AndroidRTCClient: @unchecked Sendable {
             return
         }
 
-        // These should match the Apple-side configuration as closely as possible.
+        // Match RTCSession.ensureFrameKeyProviderIfNeeded() (PBKDF2 = WebRTC default when Apple omits keyDerivationAlgorithm).
         // SKIP INSERT: val ratchetWindowSize = 0
         // SKIP INSERT: val sharedKeyMode = true
         // SKIP INSERT: val uncryptedMagicBytes: ByteArray? = "PQSRTCMagicBytes".encodeToByteArray()
         // SKIP INSERT: val failureTolerance = -1
         // SKIP INSERT: val keyRingSize = 16
         // SKIP INSERT: val discardFrameWhenCryptorNotReady = true
+        // SKIP INSERT: val keyDerivationAlgorithm = org.webrtc.FrameCryptorKeyDerivationAlgorithm.PBKDF2
 
         // SKIP INSERT: var keyProvider = this@AndroidRTCClient.keyProvider
         // SKIP INSERT: val modeMatches = (this@AndroidRTCClient.keyProviderIsSharedKeyMode == null) || (this@AndroidRTCClient.keyProviderIsSharedKeyMode == sharedKeyMode)
@@ -685,7 +691,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:         uncryptedMagicBytes,
         // SKIP INSERT:         failureTolerance,
         // SKIP INSERT:         keyRingSize,
-        // SKIP INSERT:         discardFrameWhenCryptorNotReady
+        // SKIP INSERT:         discardFrameWhenCryptorNotReady,
+        // SKIP INSERT:         keyDerivationAlgorithm
         // SKIP INSERT:     )
         // SKIP INSERT:     this@AndroidRTCClient.keyProvider = keyProvider
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
@@ -746,6 +753,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: val failureTolerance = -1
         // SKIP INSERT: val keyRingSize = 16
         // SKIP INSERT: val discardFrameWhenCryptorNotReady = true
+        // SKIP INSERT: val keyDerivationAlgorithm = org.webrtc.FrameCryptorKeyDerivationAlgorithm.PBKDF2
 
         // SKIP INSERT: var keyProvider = this@AndroidRTCClient.keyProvider
         // SKIP INSERT: val modeMatches = (this@AndroidRTCClient.keyProviderIsSharedKeyMode == null) || (this@AndroidRTCClient.keyProviderIsSharedKeyMode == sharedKeyModeK)
@@ -760,7 +768,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:         uncryptedMagicBytes,
         // SKIP INSERT:         failureTolerance,
         // SKIP INSERT:         keyRingSize,
-        // SKIP INSERT:         discardFrameWhenCryptorNotReady
+        // SKIP INSERT:         discardFrameWhenCryptorNotReady,
+        // SKIP INSERT:         keyDerivationAlgorithm
         // SKIP INSERT:     )
         // SKIP INSERT:     this@AndroidRTCClient.keyProvider = keyProvider
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
@@ -951,9 +960,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: }
 
         // Video sender encryptor
-        // SKIP INSERT: this@AndroidRTCClient.videoSenderCryptor?.dispose()
-        // SKIP INSERT: this@AndroidRTCClient.videoSenderCryptor = null
-        // SKIP INSERT: if (videoSender != null) {
+        // SKIP INSERT: if (this@AndroidRTCClient.videoSenderCryptor != null) {
+        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "Video sender cryptor already attached; keeping live cryptor")
+        // SKIP INSERT: } else if (videoSender != null) {
         // SKIP INSERT:     val cryptor = org.webrtc.FrameCryptorFactory.createFrameCryptorForRtpSender(
         // SKIP INSERT:         factory,
         // SKIP INSERT:         videoSender,
@@ -968,9 +977,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: }
 
         // Audio sender encryptor
-        // SKIP INSERT: this@AndroidRTCClient.audioSenderCryptor?.dispose()
-        // SKIP INSERT: this@AndroidRTCClient.audioSenderCryptor = null
-        // SKIP INSERT: if (audioSender != null) {
+        // SKIP INSERT: if (this@AndroidRTCClient.audioSenderCryptor != null) {
+        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "Audio sender cryptor already attached; keeping live cryptor")
+        // SKIP INSERT: } else if (audioSender != null) {
         // SKIP INSERT:     val cryptor = org.webrtc.FrameCryptorFactory.createFrameCryptorForRtpSender(
         // SKIP INSERT:         factory,
         // SKIP INSERT:         audioSender,
@@ -1107,9 +1116,22 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     })
         // SKIP INSERT: }
 
-        // Video receiver decryptor (keep one per participant)
-        // SKIP INSERT: if (videoReceiver != null) {
-        // SKIP INSERT:     this@AndroidRTCClient.videoReceiverCryptorsByParticipantId[participant]?.dispose()
+        // Video receiver decryptor (keep one per participant, but rebind when renegotiation swaps receivers).
+        // SKIP INSERT: val wantsVideoReceiver = trackKind == null || trackKind == "video"
+        // SKIP INSERT: if (wantsVideoReceiver && videoReceiver != null) {
+        // SKIP INSERT:     val currentReceiverKey = java.lang.System.identityHashCode(videoReceiver).toString()
+        // SKIP INSERT:     val currentTrackId = videoReceiver.track()?.id() ?: ""
+        // SKIP INSERT:     val existingCryptor = this@AndroidRTCClient.videoReceiverCryptorsByParticipantId[participant]
+        // SKIP INSERT:     val existingReceiverKey = this@AndroidRTCClient.videoReceiverKeysByParticipantId[participant]
+        // SKIP INSERT:     val existingTrackId = this@AndroidRTCClient.videoReceiverTrackIdsByParticipantId[participant]
+        // SKIP INSERT:     if (existingCryptor != null && existingReceiverKey == currentReceiverKey && existingTrackId == currentTrackId) {
+        // SKIP INSERT:         this@AndroidRTCClient.videoReceiverCryptor = existingCryptor
+        // SKIP INSERT:         android.util.Log.i("AndroidRTCClient", "Video receiver cryptor already attached for '$participant' receiverKey=$currentReceiverKey trackId=$currentTrackId; keeping live cryptor")
+        // SKIP INSERT:     } else {
+        // SKIP INSERT:         existingCryptor?.dispose()
+        // SKIP INSERT:         if (existingCryptor != null) {
+        // SKIP INSERT:             android.util.Log.i("AndroidRTCClient", "Rebinding video receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$currentReceiverKey newTrackId=$currentTrackId")
+        // SKIP INSERT:         }
         // SKIP INSERT:     val cryptor = org.webrtc.FrameCryptorFactory.createFrameCryptorForRtpReceiver(
         // SKIP INSERT:         factory,
         // SKIP INSERT:         videoReceiver,
@@ -1120,13 +1142,29 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     attachObserver("video-receiver", cryptor)
         // SKIP INSERT:     cryptor?.setEnabled(true)
         // SKIP INSERT:     this@AndroidRTCClient.videoReceiverCryptorsByParticipantId[participant] = cryptor
+        // SKIP INSERT:     this@AndroidRTCClient.videoReceiverKeysByParticipantId[participant] = currentReceiverKey
+        // SKIP INSERT:     this@AndroidRTCClient.videoReceiverTrackIdsByParticipantId[participant] = currentTrackId
         // SKIP INSERT:     this@AndroidRTCClient.videoReceiverCryptor = cryptor
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Video receiver cryptor attached")
+        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Video receiver cryptor attached receiverKey=$currentReceiverKey trackId=$currentTrackId")
+        // SKIP INSERT:     }
         // SKIP INSERT: }
 
-        // Audio receiver decryptor (keep one per participant)
-        // SKIP INSERT: if (audioReceiver != null) {
-        // SKIP INSERT:     this@AndroidRTCClient.audioReceiverCryptorsByParticipantId[participant]?.dispose()
+        // Audio receiver decryptor (keep one per participant, but rebind when renegotiation swaps receivers).
+        // SKIP INSERT: val wantsAudioReceiver = trackKind == null || trackKind == "audio"
+        // SKIP INSERT: if (wantsAudioReceiver && audioReceiver != null) {
+        // SKIP INSERT:     val currentReceiverKey = java.lang.System.identityHashCode(audioReceiver).toString()
+        // SKIP INSERT:     val currentTrackId = audioReceiver.track()?.id() ?: ""
+        // SKIP INSERT:     val existingCryptor = this@AndroidRTCClient.audioReceiverCryptorsByParticipantId[participant]
+        // SKIP INSERT:     val existingReceiverKey = this@AndroidRTCClient.audioReceiverKeysByParticipantId[participant]
+        // SKIP INSERT:     val existingTrackId = this@AndroidRTCClient.audioReceiverTrackIdsByParticipantId[participant]
+        // SKIP INSERT:     if (existingCryptor != null && existingReceiverKey == currentReceiverKey && existingTrackId == currentTrackId) {
+        // SKIP INSERT:         this@AndroidRTCClient.audioReceiverCryptor = existingCryptor
+        // SKIP INSERT:         android.util.Log.i("AndroidRTCClient", "Audio receiver cryptor already attached for '$participant' receiverKey=$currentReceiverKey trackId=$currentTrackId; keeping live cryptor")
+        // SKIP INSERT:     } else {
+        // SKIP INSERT:         existingCryptor?.dispose()
+        // SKIP INSERT:         if (existingCryptor != null) {
+        // SKIP INSERT:             android.util.Log.i("AndroidRTCClient", "Rebinding audio receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$currentReceiverKey newTrackId=$currentTrackId")
+        // SKIP INSERT:         }
         // SKIP INSERT:     val cryptor = org.webrtc.FrameCryptorFactory.createFrameCryptorForRtpReceiver(
         // SKIP INSERT:         factory,
         // SKIP INSERT:         audioReceiver,
@@ -1137,8 +1175,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     attachObserver("audio-receiver", cryptor)
         // SKIP INSERT:     cryptor?.setEnabled(true)
         // SKIP INSERT:     this@AndroidRTCClient.audioReceiverCryptorsByParticipantId[participant] = cryptor
+        // SKIP INSERT:     this@AndroidRTCClient.audioReceiverKeysByParticipantId[participant] = currentReceiverKey
+        // SKIP INSERT:     this@AndroidRTCClient.audioReceiverTrackIdsByParticipantId[participant] = currentTrackId
         // SKIP INSERT:     this@AndroidRTCClient.audioReceiverCryptor = cryptor
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Audio receiver cryptor attached")
+        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "✅ Audio receiver cryptor attached receiverKey=$currentReceiverKey trackId=$currentTrackId")
+        // SKIP INSERT:     }
         // SKIP INSERT: }
         // SKIP INSERT: }
         // SKIP INSERT: }
@@ -1192,7 +1233,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     private func ensureEglBase() throws {
         lock.lock()
         defer { lock.unlock() }
-        
+
         guard !isClosed else {
             throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
         }
@@ -1234,29 +1275,17 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       .setFieldTrials("WebRTC-H264HighProfile/Enabled/")
         // SKIP INSERT:       .createInitializationOptions()
         // SKIP INSERT:     try {
-        // SKIP INSERT:       // WebRTC native bootstrap is process-global; serialize and run it on main thread.
+        // SKIP INSERT:       // WebRTC native bootstrap is process-global; serialize it, but do not
+        // SKIP INSERT:       // bounce through the main thread. Blocking on a main-thread Handler here
+        // SKIP INSERT:       // can deadlock while Compose is presenting the call UI, leaving the RTC
+        // SKIP INSERT:       // actor stuck before offer creation and making end-call teardown ANR.
         // SKIP INSERT:       synchronized(AndroidRTCClient::class.java) {
         // SKIP INSERT:         val alreadyInitialized = java.lang.System.getProperty("pqsrtc.webrtc.initialized") == "1"
         // SKIP INSERT:         if (!alreadyInitialized) {
-        // SKIP INSERT:           val mainLooper = android.os.Looper.getMainLooper()
-        // SKIP INSERT:           if (android.os.Looper.myLooper() == mainLooper) {
-        // SKIP INSERT:             org.webrtc.PeerConnectionFactory.initialize(init)
-        // SKIP INSERT:           } else {
-        // SKIP INSERT:             val latch = java.util.concurrent.CountDownLatch(1)
-        // SKIP INSERT:             var initError: Throwable? = null
-        // SKIP INSERT:             android.os.Handler(mainLooper).post {
-        // SKIP INSERT:               try {
-        // SKIP INSERT:                 org.webrtc.PeerConnectionFactory.initialize(init)
-        // SKIP INSERT:               } catch (t: Throwable) {
-        // SKIP INSERT:                 initError = t
-        // SKIP INSERT:               } finally {
-        // SKIP INSERT:                 latch.countDown()
-        // SKIP INSERT:               }
-        // SKIP INSERT:             }
-        // SKIP INSERT:             latch.await(10, java.util.concurrent.TimeUnit.SECONDS)
-        // SKIP INSERT:             if (initError != null) throw initError as Throwable
-        // SKIP INSERT:           }
+        // SKIP INSERT:           android.util.Log.i("AndroidRTCClient", "Initializing PeerConnectionFactory on ${java.lang.Thread.currentThread().name}")
+        // SKIP INSERT:           org.webrtc.PeerConnectionFactory.initialize(init)
         // SKIP INSERT:           java.lang.System.setProperty("pqsrtc.webrtc.initialized", "1")
+        // SKIP INSERT:           android.util.Log.i("AndroidRTCClient", "PeerConnectionFactory process init complete")
         // SKIP INSERT:         }
         // SKIP INSERT:       }
         // SKIP INSERT:     } catch (e: java.lang.ClassNotFoundException) {
@@ -1273,17 +1302,20 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       throw IllegalStateException("Failed to initialize WebRTC: ${e.message}", e)
         // SKIP INSERT:     }
         // SKIP INSERT:     
+        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "Creating EGL base")
         // SKIP INSERT:     val egl = org.webrtc.EglBase.create() ?: throw IllegalStateException("Failed to create EGL base")
         // SKIP INSERT:     this@AndroidRTCClient.eglBase = egl
         // SKIP INSERT:
         // SKIP INSERT:     val enc = org.webrtc.DefaultVideoEncoderFactory(egl.eglBaseContext, true, true)
         // SKIP INSERT:     val dec = org.webrtc.DefaultVideoDecoderFactory(egl.eglBaseContext)
         // SKIP INSERT:     
+        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "Creating PeerConnectionFactory instance")
         // SKIP INSERT:     val fac = org.webrtc.PeerConnectionFactory.builder()
         // SKIP INSERT:         .setVideoEncoderFactory(enc)
         // SKIP INSERT:         .setVideoDecoderFactory(dec)
         // SKIP INSERT:         .createPeerConnectionFactory()
         // SKIP INSERT:     this@AndroidRTCClient.factory = fac
+        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "PeerConnectionFactory instance ready")
         // SKIP INSERT:   }
         // SKIP INSERT:   return this@AndroidRTCClient.factory ?: throw IllegalStateException("Factory not initialized")
         // SKIP INSERT: } catch (e: java.lang.Exception) {
@@ -1322,7 +1354,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   config.continualGatheringPolicy = org.webrtc.PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
         // SKIP INSERT:   val obs = RTCClientPeerObserver(this@AndroidRTCClient)
         // SKIP INSERT:   this@AndroidRTCClient.observer = obs
+        // SKIP INSERT:   android.util.Log.i("AndroidRTCClient", "Creating native PeerConnection iceServers=${servers.size} policy=${config.iceTransportsType}")
         // SKIP INSERT:   val pc = factory.createPeerConnection(config, obs)
+        // SKIP INSERT:   android.util.Log.i("AndroidRTCClient", "Native PeerConnection created=${pc != null}")
         // SKIP INSERT:   this@AndroidRTCClient.factory = factory
         // SKIP INSERT:   return pc
         // SKIP INSERT: } catch (e: java.lang.Exception) {
@@ -1652,8 +1686,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// For 1:1 calls — group calls should use ``getRemoteScreenVideoTrackById``.
     public func getRemoteScreenVideoTrack(peerConnection: RTCPeerConnection) -> RTCVideoTrack? {
         lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed else { return nil }
+        let isClosedCheck = isClosed
+        lock.unlock()
+        guard !isClosedCheck else { return nil }
 
         guard peerConnection.platformPeerConnection != nil else { return nil }
         // SKIP INSERT: val pc = peerConnection.platformPeerConnection ?: return null
@@ -1686,7 +1721,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     // These are Android equivalents of Apple `RTCRtpSender.parameters.encodings` tuning.
     // They are used by `RTCSession` for SFU/group calls so the sender doesn't overshoot uplink,
     // and can ramp up quality on good internet.
-    public func setVideoSenderEncodings(maxBitrateBps: Int, maxFramerate: Int) {
+    public func setVideoSenderEncodings(maxBitrateBps: Int, maxFramerate: Int, scaleResolutionDownBy: Double) {
         lock.lock()
         defer { lock.unlock() }
         guard !isClosed else { return }
@@ -1699,11 +1734,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: for (enc in encodings) {
         // SKIP INSERT:   enc.maxBitrateBps = maxBitrateBps
         // SKIP INSERT:   enc.maxFramerate = maxFramerate
+        // SKIP INSERT:   enc.scaleResolutionDownBy = scaleResolutionDownBy
         // SKIP INSERT: }
         // SKIP INSERT: videoSender.parameters = params
     }
 
     public func getAvailableOutgoingBitrateBps() async -> Double? {
+        var availableOutgoingBitrate: Double? = nil
         // SKIP INSERT: lock.lock()
         // SKIP INSERT: val closed = isClosed
         // SKIP INSERT: val pc = peerConnection?.platformPeerConnection
@@ -1735,7 +1772,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   }
         // SKIP INSERT:   latch.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
         // SKIP INSERT: }
-        return nil
+        // SKIP INSERT: availableOutgoingBitrate = best
+        return availableOutgoingBitrate
     }
     
     // MARK: - Public Video APIs (no org.webrtc exposure)
@@ -1754,7 +1792,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // callbacks and deadlock on this same lock.
         let platformPeerConnection: org.webrtc.PeerConnection
         let trackToReturn: RTCVideoTrack?
-        let shouldStartCapture: Bool
         do {
             lock.lock()
             guard !isClosed else {
@@ -1776,7 +1813,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
             
             platformPeerConnection = pc
             trackToReturn = localVideoTrack
-            shouldStartCapture = (videoCapturer == nil)
             lock.unlock()
         }
         
@@ -1794,22 +1830,47 @@ public final class AndroidRTCClient: @unchecked Sendable {
             _ = platformPeerConnection.addTrack(track.platformTrack, ids.toList())
         }
         
-        // Do not block peer-connection setup on camera startup. Create and attach the local
-        // track immediately so negotiation can continue, then start capture asynchronously.
-        if shouldStartCapture {
-            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Launching async local video capture startup")
-            Task.detached { [weak self] in
-                guard let self else { return }
-                do {
-                    try self.startLocalVideo(useFrontCamera: useFrontCamera)
-                    // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Local video capture started")
-                } catch {
-                    // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Failed to start local video asynchronously")
-                }
-            }
-        }
+        // Keep negotiation lightweight: create and attach the local track now, but defer camera
+        // capture until the PeerConnection is actually connected.
         
         return trackToReturn
+    }
+
+    /// Starts camera capture after signaling/ICE has reached a stable connected state.
+    ///
+    /// Creating a sender track is cheap and needed for SDP. Starting Camera2 is not: on Android it
+    /// competes with Firebase broadcast handling, EglRenderer, audio, and encrypted signaling during
+    /// the fragile `connecting` window.
+    public func startLocalVideoCaptureIfNeeded(fps: Int = 15, useFrontCamera: Bool = true) {
+        lock.lock()
+        guard !isClosed,
+              videoCapturer == nil,
+              !localVideoCaptureStartInFlight,
+              let localVideoTrack = localVideoTrack,
+              localVideoTrack._isEnabled else {
+            lock.unlock()
+            return
+        }
+        localVideoCaptureStartInFlight = true
+        lock.unlock()
+
+        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Launching deferred local video capture startup")
+        Task.detached { [weak self] in
+            guard let self else { return }
+            defer { self.markLocalVideoCaptureStartFinished() }
+            do {
+                try self.startLocalVideo(fps: fps, useFrontCamera: useFrontCamera)
+                // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Deferred local video capture started")
+            } catch {
+                // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Failed to start deferred local video capture")
+            }
+        }
+    }
+
+    private func markLocalVideoCaptureStartFinished() {
+        lock.lock()
+        localVideoCaptureStartInFlight = false
+        lock.unlock()
     }
     
     private struct Format: Hashable, Sendable {
@@ -1826,7 +1887,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///   - fps: Target capture framerate.
     ///   - useFrontCamera: Whether to prefer the front-facing camera.
     /// - Throws: `RTCClientErrors` if capture cannot be started.
-    private func startLocalVideo(fps: Int = 30, useFrontCamera: Bool = true) throws {
+    private func startLocalVideo(fps: Int = 15, useFrontCamera: Bool = true) throws {
         let existingVideoSource: RTCVideoSource
         let staleHelper: org.webrtc.SurfaceTextureHelper?
 
@@ -1917,15 +1978,21 @@ public final class AndroidRTCClient: @unchecked Sendable {
                 height: fmt.height))
         }
         
-        let available = Set(formats.map { ($0.width, $0.height) })
-        let candidates = formats.filter { available.contains(($0.height, $0.width)) }
+        // Start from a usable camera size and let WebRTC/adaptive sender encodings scale down when
+        // bandwidth or CPU is constrained. Requiring a rotated format pair can incorrectly pin some
+        // Android front cameras to 320x240 even when they support a much better landscape format.
+        let preferredMaxPixels = 1280 * 720
+        let preferredCandidates = formats.filter { $0.width * $0.height <= preferredMaxPixels }
+        let selectableCandidates = preferredCandidates.isEmpty ? formats : preferredCandidates
 
-        if let largestLandscape = candidates.filter({ $0.isLandscape }).max(by: { $0.width * $0.height < $1.width * $1.height }) {
-            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting camera capture: " + largestLandscape.width + "x" + largestLandscape.height + "@" + fps + "fps")
-            capturer.startCapture(Int32(largestLandscape.width), Int32(largestLandscape.height), Int32(fps))
-        } else if let largestPortrait = candidates.max(by: { $0.width * $0.height < $1.width * $1.height }) {
-            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting camera capture: " + largestPortrait.width + "x" + largestPortrait.height + "@" + fps + "fps")
-            capturer.startCapture(Int32(largestPortrait.width), Int32(largestPortrait.height), Int32(fps))
+        if let selectedLandscape = selectableCandidates
+            .filter({ $0.isLandscape })
+            .max(by: { $0.width * $0.height < $1.width * $1.height }) {
+            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting camera capture: " + selectedLandscape.width + "x" + selectedLandscape.height + "@" + fps + "fps")
+            capturer.startCapture(Int32(selectedLandscape.width), Int32(selectedLandscape.height), Int32(fps))
+        } else if let selectedPortrait = selectableCandidates.max(by: { $0.width * $0.height < $1.width * $1.height }) {
+            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting camera capture: " + selectedPortrait.width + "x" + selectedPortrait.height + "@" + fps + "fps")
+            capturer.startCapture(Int32(selectedPortrait.width), Int32(selectedPortrait.height), Int32(fps))
         } else {
             throw RTCClientErrors.peerConnectionError("No suitable video format found")
         }
@@ -1956,6 +2023,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
             capturer.stopCapture()
             videoCapturer = nil
         }
+        localVideoCaptureStartInFlight = false
         surfaceTextureHelper?.dispose()
         surfaceTextureHelper = nil
     }
@@ -2005,9 +2073,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// - Throws: `RTCClientErrors` if EGL cannot be created or the client is closed.
     public func initializeSurfaceRenderer(_ renderer: org.webrtc.SurfaceViewRenderer, mirror: Bool = false) throws {
         lock.lock()
-        defer { lock.unlock() }
+        let closed = isClosed
+        lock.unlock()
         
-        guard !isClosed else {
+        guard !closed else {
             throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
         }
         
@@ -2018,7 +2087,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
             throw RTCClientErrors.peerConnectionError("Failed to ensure EGL base: \(error.localizedDescription)")
         }
         
-        guard let eglBase = eglBase else {
+        lock.lock()
+        let currentEglBase = eglBase
+        lock.unlock()
+
+        guard let currentEglBase else {
             throw RTCClientErrors.peerConnectionError("EGL base is nil after ensureEglBase")
         }
 
@@ -2031,7 +2104,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     // No-op: safe to ignore if renderer wasn't initialized yet
         // SKIP INSERT: }
 
-        // SKIP INSERT: val egl = eglBase ?: throw IllegalStateException("EGL base not initialized")
+        // SKIP INSERT: val egl = currentEglBase
         // SKIP INSERT: renderer.init(
         // SKIP INSERT: egl.eglBaseContext,
         // SKIP INSERT: object : org.webrtc.RendererCommon.RendererEvents {
@@ -2050,7 +2123,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
 
         // SKIP INSERT: // Track renderer for centralized cleanup
+        lock.lock()
         // SKIP INSERT: activeSurfaceRenderers.insert(renderer)
+        lock.unlock()
 
         // SKIP INSERT: try {
         // SKIP INSERT:     if (renderer is CustomSurfaceViewRenderer) {
@@ -2085,11 +2160,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// - Parameter renderer: The renderer to release.
     public func safeReleaseRenderer(_ renderer: org.webrtc.SurfaceViewRenderer) {
         lock.lock()
-        defer { lock.unlock() }
+        let currentEglBase = eglBase
+        lock.unlock()
         
         // SKIP INSERT: try {
         // SKIP INSERT:     // Check if EGL context is still valid before releasing
-        // SKIP INSERT:     val egl = eglBase
+        // SKIP INSERT:     val egl = currentEglBase
         // SKIP INSERT:     if (egl != null && egl.eglBaseContext != null) {
         // SKIP INSERT:         renderer.release()
         // SKIP INSERT:     } else {
@@ -2106,9 +2182,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// For 1:1 calls only — group calls should use ``getRemoteVideoTrackById``.
     public func getRemoteVideoTrack(peerConnection: RTCPeerConnection) -> RTCVideoTrack? {
         lock.lock()
-        defer { lock.unlock() }
-        
-        guard !isClosed else { return nil }
+        let isClosedCheck = isClosed
+        lock.unlock()
+
+        guard !isClosedCheck else { return nil }
         
         guard peerConnection.platformPeerConnection != nil else { return nil }
         // SKIP INSERT: val pc = peerConnection.platformPeerConnection ?: return null
@@ -2126,9 +2203,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// transceiver, this method finds the exact track rather than returning the first one.
     public func getRemoteVideoTrackById(peerConnection: RTCPeerConnection, trackId: String) -> RTCVideoTrack? {
         lock.lock()
-        defer { lock.unlock() }
+        let isClosedCheck = isClosed
+        lock.unlock()
 
-        guard !isClosed else { return nil }
+        guard !isClosedCheck else { return nil }
         guard peerConnection.platformPeerConnection != nil else { return nil }
         // SKIP INSERT: val pc = peerConnection.platformPeerConnection ?: return null
         // SKIP INSERT: for (t in pc.getTransceivers()) {
@@ -2142,9 +2220,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Returns the remote screen video track matching a specific trackId.
     public func getRemoteScreenVideoTrackById(peerConnection: RTCPeerConnection, trackId: String) -> RTCVideoTrack? {
         lock.lock()
-        defer { lock.unlock() }
+        let isClosedCheck = isClosed
+        lock.unlock()
 
-        guard !isClosed else { return nil }
+        guard !isClosedCheck else { return nil }
         guard peerConnection.platformPeerConnection != nil else { return nil }
         // SKIP INSERT: val pc = peerConnection.platformPeerConnection ?: return null
         // SKIP INSERT: for (t in pc.getTransceivers()) {
@@ -2381,100 +2460,79 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///
     /// This method is idempotent; repeated calls are no-ops.
     public func close() {
+        let videoCapturerToStop: org.webrtc.Camera2Capturer?
+        let screenCapturerToStop: org.webrtc.VideoCapturer?
+        let surfaceTextureHelperToDispose: org.webrtc.SurfaceTextureHelper?
+        let screenSurfaceTextureHelperToDispose: org.webrtc.SurfaceTextureHelper?
+        let renderersToRelease: [org.webrtc.SurfaceViewRenderer]
+        let peerConnectionToClose: org.webrtc.PeerConnection?
+        let localVideoTrackToDispose: RTCVideoTrack?
+        let screenVideoTrackToDispose: RTCVideoTrack?
+        let localAudioTrackToDispose: RTCAudioTrack?
+        var videoSourceToDispose: RTCVideoSource?
+        var screenVideoSourceToDispose: RTCVideoSource?
+        var audioSourceToDispose: RTCAudioSource?
+        let eglBaseToRelease: org.webrtc.EglBase?
+        let factoryToDispose: org.webrtc.PeerConnectionFactory?
+        let videoSenderCryptorToDispose: org.webrtc.FrameCryptor?
+        let audioSenderCryptorToDispose: org.webrtc.FrameCryptor?
+        let screenSenderCryptorToDispose: org.webrtc.FrameCryptor?
+        let videoReceiverCryptorsToDispose: [org.webrtc.FrameCryptor]
+        let audioReceiverCryptorsToDispose: [org.webrtc.FrameCryptor]
+
         lock.lock()
-        defer { lock.unlock() }
-        
+
         // Prevent double cleanup
-        guard !isClosed else { return }
+        guard !isClosed else {
+            lock.unlock()
+            return
+        }
         isClosed = true
-        
+
+        videoCapturerToStop = videoCapturer
+        screenCapturerToStop = screenCapturer
+        surfaceTextureHelperToDispose = surfaceTextureHelper
+        screenSurfaceTextureHelperToDispose = screenSurfaceTextureHelper
+        renderersToRelease = Array(activeSurfaceRenderers)
+        peerConnectionToClose = peerConnection?.platformPeerConnection
+        localVideoTrackToDispose = localVideoTrack
+        screenVideoTrackToDispose = screenVideoTrack
+        localAudioTrackToDispose = localAudioTrack
+        videoSourceToDispose = videoSource
+        screenVideoSourceToDispose = screenVideoSource
+        audioSourceToDispose = audioSource
+        eglBaseToRelease = eglBase
+        factoryToDispose = factory
+        videoSenderCryptorToDispose = videoSenderCryptor
+        audioSenderCryptorToDispose = audioSenderCryptor
+        screenSenderCryptorToDispose = screenSenderCryptor
+        videoReceiverCryptorsToDispose = Array(videoReceiverCryptorsByParticipantId.values)
+        audioReceiverCryptorsToDispose = Array(audioReceiverCryptorsByParticipantId.values)
+
         // Clear delegate to prevent callbacks during cleanup
         delegate = nil
-        
-        // Stop and dispose camera capturer
-        if let capturer = videoCapturer {
-            capturer.stopCapture()
-            videoCapturer = nil
-        }
-        
-        // Stop and dispose screen capturer
-        // SKIP INSERT: (screenCapturer as? org.webrtc.ScreenCapturerAndroid)?.stopCapture()
-        // SKIP INSERT: (screenCapturer as? org.webrtc.ScreenCapturerAndroid)?.dispose()
-        screenCapturer = nil
 
-        // Dispose surface texture helpers
-        surfaceTextureHelper?.dispose()
-        surfaceTextureHelper = nil
-        screenSurfaceTextureHelper?.dispose()
-        screenSurfaceTextureHelper = nil
-        
-        // Detach video tracks from renderers first, then release renderers
-        // This ensures no video frames are being sent to renderers during cleanup
-        if let videoTrack = localVideoTrack {
-            for renderer in activeSurfaceRenderers {
-                videoTrack.platformTrack.removeSink(renderer)
-            }
-        }
-        
-        // Also detach any remote video tracks that might be attached
-        // Note: Remote tracks are typically managed by the session, but we ensure cleanup here
-        
-        // Release all active surface renderers to stop OpenGL rendering.
-        // Do not call `safeReleaseRenderer(_:)` here: it also takes `lock`, which would
-        // deadlock because `close()` already holds this same non-recursive lock.
-        // SKIP INSERT: for (renderer in activeSurfaceRenderers) {
-        // SKIP INSERT:     try {
-        // SKIP INSERT:         val egl = eglBase
-        // SKIP INSERT:         if (egl != null && egl.eglBaseContext != null) {
-        // SKIP INSERT:             renderer.release()
-        // SKIP INSERT:         }
-        // SKIP INSERT:     } catch (_: Throwable) {
-        // SKIP INSERT:         // Ignore teardown-time renderer release failures.
-        // SKIP INSERT:     }
-        // SKIP INSERT: }
         activeSurfaceRenderers.removeAll()
-        
+
         // Clear pending observers
         pendingOfferObserver = nil
         pendingAnswerObserver = nil
         pendingSetLocalObserver = nil
         pendingSetRemoteObserver = nil
         observer = nil
-        
-        // Close peer connection and release tracks/sources
-        // Use optional chaining to safely handle nil cases
-        if let pc = peerConnection?.platformPeerConnection {
-            pc.close()
-            pc.dispose()
-        }
-        
-        localVideoTrack?.dispose()
-        screenVideoTrack?.dispose()
-        localAudioTrack?.dispose()
-        videoSource?.dispose()
-        screenVideoSource?.dispose()
-        audioSource?.dispose()
-        eglBase?.release()
-        factory?.dispose()
-        
-        // Clean up E2EE resources (sender cryptors are unique; receiver cryptors are in ByParticipantId map, singular refs point into that map so do not dispose again)
-        videoSenderCryptor?.dispose()
-        audioSenderCryptor?.dispose()
-        screenSenderCryptor?.dispose()
 
-        for (_, cryptor) in videoReceiverCryptorsByParticipantId {
-            cryptor.dispose()
-        }
-        for (_, cryptor) in audioReceiverCryptorsByParticipantId {
-            cryptor.dispose()
-        }
         videoReceiverCryptorsByParticipantId.removeAll()
         audioReceiverCryptorsByParticipantId.removeAll()
+        videoReceiverKeysByParticipantId.removeAll()
+        audioReceiverKeysByParticipantId.removeAll()
+        videoReceiverTrackIdsByParticipantId.removeAll()
+        audioReceiverTrackIdsByParticipantId.removeAll()
 
         keyProvider = nil
         keyProviderIsSharedKeyMode = nil
         keyProviderReady = false
         pendingPerParticipantKeys.removeAll()
+        localVideoCaptureStartInFlight = false
         
         // Clear all references
         peerConnection = nil
@@ -2491,6 +2549,56 @@ public final class AndroidRTCClient: @unchecked Sendable {
         screenSenderCryptor = nil
         videoReceiverCryptor = nil
         audioReceiverCryptor = nil
+        lock.unlock()
+
+        // WebRTC and EGL teardown can synchronously call observers or block on GL/camera threads.
+        // Run it outside the state lock so Android end-call cannot deadlock or trap during cleanup.
+        if let videoTrack = localVideoTrackToDispose {
+            for renderer in renderersToRelease {
+                videoTrack.platformTrack.removeSink(renderer)
+            }
+        }
+
+        videoCapturerToStop?.stopCapture()
+        // SKIP INSERT: (screenCapturerToStop as? org.webrtc.ScreenCapturerAndroid)?.stopCapture()
+        // SKIP INSERT: (screenCapturerToStop as? org.webrtc.ScreenCapturerAndroid)?.dispose()
+
+        surfaceTextureHelperToDispose?.dispose()
+        screenSurfaceTextureHelperToDispose?.dispose()
+
+        // SKIP INSERT: for (renderer in renderersToRelease) {
+        // SKIP INSERT:     try {
+        // SKIP INSERT:         val egl = eglBaseToRelease
+        // SKIP INSERT:         if (egl != null && egl.eglBaseContext != null) {
+        // SKIP INSERT:             renderer.release()
+        // SKIP INSERT:         }
+        // SKIP INSERT:     } catch (_: Throwable) {
+        // SKIP INSERT:         // Ignore teardown-time renderer release failures.
+        // SKIP INSERT:     }
+        // SKIP INSERT: }
+
+        peerConnectionToClose?.close()
+        peerConnectionToClose?.dispose()
+
+        localVideoTrackToDispose?.dispose()
+        screenVideoTrackToDispose?.dispose()
+        localAudioTrackToDispose?.dispose()
+        videoSourceToDispose?.dispose()
+        screenVideoSourceToDispose?.dispose()
+        audioSourceToDispose?.dispose()
+        eglBaseToRelease?.release()
+        factoryToDispose?.dispose()
+
+        videoSenderCryptorToDispose?.dispose()
+        audioSenderCryptorToDispose?.dispose()
+        screenSenderCryptorToDispose?.dispose()
+
+        for cryptor in videoReceiverCryptorsToDispose {
+            cryptor.dispose()
+        }
+        for cryptor in audioReceiverCryptorsToDispose {
+            cryptor.dispose()
+        }
     }
 }
 

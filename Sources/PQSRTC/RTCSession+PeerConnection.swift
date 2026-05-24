@@ -43,6 +43,7 @@ extension RTCSession {
         let cfg = sfuVideoQualityProfile.adaptiveConfig
         let maxBitrateBps = cfg.startingBitrateBps
         let maxFramerate = cfg.startingFramerate
+        let scaleResolutionDownBy = RTCVideoQualityProfile.resolutionScaleDownBy(for: maxBitrateBps)
 
         var params = sender.parameters
         guard !params.encodings.isEmpty else { return }
@@ -56,8 +57,7 @@ extension RTCSession {
             if encoding.maxFramerate == nil {
                 encoding.maxFramerate = NSNumber(value: maxFramerate)
             }
-            // Optional knob if you still see freezes: uncomment to force downscale.
-            // encoding.scaleResolutionDownBy = NSNumber(value: 2.0)
+            encoding.scaleResolutionDownBy = NSNumber(value: scaleResolutionDownBy)
         }
         sender.parameters = params
     }

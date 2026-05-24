@@ -367,7 +367,7 @@ public actor RTCSession {
     //
     // Mirrors the Apple implementation but uses `org.webrtc.PeerConnection.getStats`.
     var adaptiveVideoSendTasksByConnectionId: [String: Task<Void, Never>] = [:]
-    var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int)] = [:]
+    var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double)] = [:]
 #endif
     
     // MARK: - Platform-specific RTC clients & encryption
@@ -405,7 +405,7 @@ public actor RTCSession {
     // - low bandwidth: keep bitrate/fps low to avoid freezes
     // - good bandwidth: raise bitrate/fps automatically for better quality
     var adaptiveVideoSendTasksByConnectionId: [String: Task<Void, Never>] = [:]
-    var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int)] = [:]
+    var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double)] = [:]
 #if os(iOS)
     var adaptiveVideoThermalStateByConnectionId: [String: String] = [:]
 #endif
@@ -445,6 +445,13 @@ public actor RTCSession {
     /// must not call ``createOffer`` again after `call_cipher` or WebRTC can stay in
     /// `have-local-offer` and reject inbound SFU renegotiation offers.
     var initialSfuGroupMediaOfferSentConnectionIds: Set<String> = []
+
+    /// Normalized connection ids currently inside SFU media bootstrap.
+    ///
+    /// Registration, answer, and retry paths can all discover that identities are ready at nearly
+    /// the same time. Without this guard, two tasks can both pass the "connection does not exist"
+    /// check and create duplicate Android PeerConnections/camera capture pipelines for one room.
+    var sfuGroupMediaBootstrapInFlightConnectionIds: Set<String> = []
 
     /// Normalized connection ids whose peer `call_cipher` has installed the receive frame key.
     ///
@@ -550,8 +557,23 @@ public actor RTCSession {
         }
     }
 
-    private func storeRemoteScreenTrackContinuation(_ id: UUID, continuation: AsyncStream<RemoteScreenTrackEvent>.Continuation) {
+    private func storeRemoteScreenTrackContinuation(_ id: UUID, continuation: AsyncStream<RemoteScreenTrackEvent>.Continuation) async {
         remoteScreenTrackContinuations[id] = continuation
+        for connection in await connectionManager.findAllConnections() {
+            let localKey = Self.conferenceParticipantIdentityKey(connection.localParticipantId)
+            for participantId in connection.remoteScreenTracksByParticipantId.keys {
+                let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+                guard !participantKey.isEmpty else { continue }
+                guard participantKey != localKey else { continue }
+                continuation.yield(
+                    RemoteScreenTrackEvent(
+                        connectionId: connection.id,
+                        participantId: participantId,
+                        isActive: true
+                    )
+                )
+            }
+        }
     }
 
     private func removeRemoteScreenTrackContinuation(_ id: UUID) {
@@ -593,8 +615,26 @@ public actor RTCSession {
         }
     }
 
-    private func storeRemoteParticipantTrackContinuation(_ id: UUID, continuation: AsyncStream<RemoteParticipantTrackEvent>.Continuation) {
+    private func storeRemoteParticipantTrackContinuation(_ id: UUID, continuation: AsyncStream<RemoteParticipantTrackEvent>.Continuation) async {
         remoteParticipantTrackContinuations[id] = continuation
+        for connection in await connectionManager.findAllConnections() {
+            let localKey = Self.conferenceParticipantIdentityKey(connection.localParticipantId)
+            for participantId in connection.remoteVideoTracksByParticipantId.keys {
+                let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                let participantKey = Self.conferenceParticipantIdentityKey(trimmed)
+                guard !participantKey.isEmpty else { continue }
+                guard UUID(uuidString: trimmed) == nil else { continue }
+                guard participantKey != localKey else { continue }
+                continuation.yield(
+                    RemoteParticipantTrackEvent(
+                        connectionId: connection.id,
+                        participantId: participantId,
+                        kind: "video",
+                        isActive: true
+                    )
+                )
+            }
+        }
     }
 
     private func removeRemoteParticipantTrackContinuation(_ id: UUID) {

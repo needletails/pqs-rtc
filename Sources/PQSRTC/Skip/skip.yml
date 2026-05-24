@@ -5,7 +5,7 @@ build:
   contents:
     - block: 'dependencies'
       contents:
-        - 'implementation("io.github.webrtc-sdk:android:137.7151.05")'
+        - 'implementation("io.github.webrtc-sdk:android:144.7559.05")'
         - 'implementation("androidx.compose.ui:ui")'
         - 'implementation("androidx.compose.foundation:foundation")'
 skip:

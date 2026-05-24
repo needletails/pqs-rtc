@@ -34,6 +34,9 @@ public protocol CallActionDelegate: AnyObject, Sendable {
     /// Mutes or unmutes the local camera/video track.
     func muteVideo() async
 
+    /// Sets the local camera/video muted state explicitly.
+    func setVideoMuted(_ muted: Bool) async
+
     /// Requests entering or exiting picture-in-picture.
     ///
     /// The default implementation is a no-op.
@@ -62,6 +65,10 @@ public extension CallActionDelegate {
 
     func setAudioMuted(_ muted: Bool) async {
         await muteAudio()
+    }
+
+    func setVideoMuted(_ muted: Bool) async {
+        await muteVideo()
     }
 
     func startScreenShare(target: ScreenShareTarget) async {}

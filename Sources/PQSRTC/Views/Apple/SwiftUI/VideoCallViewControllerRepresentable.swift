@@ -51,6 +51,10 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
         await viewController?.muteVideo()
     }
 
+    public func setVideoMuted(_ muted: Bool) async {
+        await viewController?.setVideoMuted(muted)
+    }
+
     public func showPictureInPicture(_ show: Bool) async {
         await viewController?.showPictureInPicture(show)
     }
@@ -211,6 +215,10 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
             videoMuted: initialLocalVideoMuted,
             audioMuted: initialLocalAudioMuted
         )
+        vc.updateConferenceRaisedHands(
+            conferenceRaisedHands,
+            topClearance: conferenceRaisedHandBadgeTopClearance
+        )
         
         if let controlsView {
             let hosting = UIHostingController(rootView: controlsView)
@@ -233,6 +241,10 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
             delegate = uiViewController
         }
         uiViewController.videoCallDelegate = context.coordinator
+        uiViewController.updateConferenceRaisedHands(
+            conferenceRaisedHands,
+            topClearance: conferenceRaisedHandBadgeTopClearance
+        )
     }
 
     public func makeCoordinator() -> Coordinator {
@@ -310,6 +322,10 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
 
     public func muteVideo() async {
         await viewController?.muteVideo()
+    }
+
+    public func setVideoMuted(_ muted: Bool) async {
+        await viewController?.setVideoMuted(muted)
     }
 
     public func showPictureInPicture(_ show: Bool) async {
@@ -467,6 +483,10 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
             videoMuted: initialLocalVideoMuted,
             audioMuted: initialLocalAudioMuted
         )
+        vc.updateConferenceRaisedHands(
+            conferenceRaisedHands,
+            topClearance: conferenceRaisedHandBadgeTopClearance
+        )
         
         if let controlsView {
             let hosting = NSHostingController(rootView: controlsView)
@@ -487,6 +507,10 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
             delegate = nsViewController
         }
         nsViewController.videoCallDelegate = context.coordinator
+        nsViewController.updateConferenceRaisedHands(
+            conferenceRaisedHands,
+            topClearance: conferenceRaisedHandBadgeTopClearance
+        )
     }
 
     public func makeCoordinator() -> Coordinator {

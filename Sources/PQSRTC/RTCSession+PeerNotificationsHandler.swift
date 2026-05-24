@@ -890,7 +890,7 @@ extension RTCSession {
             return false
         }
 
-        let sourceKey = exportFrameEncryptionKey(index: sourceIndex, for: source)
+        let sourceKey = await exportFrameEncryptionKey(index: sourceIndex, for: source)
         guard !sourceKey.isEmpty else { return false }
         await setFrameEncryptionKey(sourceKey, index: sourceIndex, for: target)
         logger.log(
@@ -1571,6 +1571,39 @@ extension RTCSession {
                 } else if enableEncryption {
                     self.logger.log(level: .debug, message: "Skipping addedStream sender cryptor attach until Android key provider is ready")
                 }
+
+                // SFU renegotiation can replace Android receiver objects without another
+                // `didAddReceiver` callback. Re-resolve the stable 1:1 owner, refresh the track
+                // map used by the call UI, and bind decryptors to the current receivers.
+                if Self.isTrueOneToOneSfuRoom(call: connection.call),
+                   let remoteTrackOwner = remoteTrackOwnerParticipantId(
+                    connection: connection,
+                    call: connection.call
+                   )?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !remoteTrackOwner.isEmpty {
+                    var updated = await connectionManager.findConnection(with: connection.id) ?? connection
+                    if let videoTrack = rtcClient.getRemoteVideoTrack(peerConnection: updated.peerConnection) {
+                        updated.remoteVideoTrack = videoTrack
+                        updated.remoteVideoTracksByParticipantId[remoteTrackOwner] = videoTrack
+                        await connectionManager.updateConnection(id: updated.id, with: updated)
+                        notifyRemoteParticipantTrackChanged(
+                            RemoteParticipantTrackEvent(
+                                connectionId: updated.id,
+                                participantId: remoteTrackOwner,
+                                kind: "video",
+                                isActive: true)
+                        )
+                    }
+                    if enableEncryption,
+                       oneToOneSfuReceiveKeyReadyConnectionIds.contains(teardownConnectionIdKey(updated.id)) {
+                        rtcClient.createReceiverEncryptedFrame(
+                            participant: remoteTrackOwner,
+                            connectionId: updated.id)
+                        logger.log(
+                            level: .info,
+                            message: "Android 1:1 SFU renegotiation: rebound current receiver FrameCryptors for participantId='\(remoteTrackOwner)' connId=\(updated.id)")
+                    }
+                }
 #elseif canImport(WebRTC)
 
                 for sender in connection.peerConnection.senders {
@@ -1588,6 +1621,7 @@ extension RTCSession {
                             let cfg = sfuVideoQualityProfile.adaptiveConfig
                             if encoding.maxBitrateBps == nil { encoding.maxBitrateBps = NSNumber(value: cfg.startingBitrateBps) }
                             if encoding.maxFramerate == nil { encoding.maxFramerate = NSNumber(value: cfg.startingFramerate) }
+                            encoding.scaleResolutionDownBy = NSNumber(value: RTCVideoQualityProfile.resolutionScaleDownBy(for: cfg.startingBitrateBps))
                         }
                     }
                     sender.parameters = params
@@ -1793,6 +1827,11 @@ extension RTCSession {
                 let participantId = remoteParticipantIdResolver?(streamIds, trackId, trackKind) ?? (streamIds.first ?? "")
 #if os(Android)
                     let isScreenTrack = RTCSession.isScreenShareId(trackId) || streamIds.contains(where: { RTCSession.isScreenShareId($0) })
+                    let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: connection.call)
+                    let oneToOneRemoteTrackOwner = isOneToOneSfuRoom
+                        ? remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        : nil
 
                     if trackKind == "video" {
                         var updated = connection
@@ -1814,9 +1853,15 @@ extension RTCSession {
                             let videoTrack = rtcClient.getRemoteVideoTrackById(peerConnection: connection.peerConnection, trackId: trackId)
                                 ?? rtcClient.getRemoteVideoTrack(peerConnection: connection.peerConnection)
                             if let videoTrack {
-                                let resolvedParticipant = participantId.isEmpty
-                                    ? (connection.remoteParticipantId.isEmpty ? connection.id : connection.remoteParticipantId)
-                                    : participantId
+                                let resolvedParticipant: String
+                                if let oneToOneRemoteTrackOwner,
+                                   !oneToOneRemoteTrackOwner.isEmpty {
+                                    resolvedParticipant = oneToOneRemoteTrackOwner
+                                } else {
+                                    resolvedParticipant = participantId.isEmpty
+                                        ? (connection.remoteParticipantId.isEmpty ? connection.id : connection.remoteParticipantId)
+                                        : participantId
+                                }
                                 updated.remoteVideoTrack = videoTrack
                                 if !resolvedParticipant.isEmpty {
                                     updated.remoteVideoTracksByParticipantId[resolvedParticipant] = videoTrack
@@ -1852,13 +1897,26 @@ extension RTCSession {
                     }
 
                     let receiverParticipantId: String
-                    if self.isGroupCallConnection(connection.id) {
+                    if let remoteTrackOwner = oneToOneRemoteTrackOwner,
+                       !remoteTrackOwner.isEmpty {
+                        receiverParticipantId = remoteTrackOwner
+                    } else if self.isGroupCallConnection(connection.id) {
                         receiverParticipantId = participantId.isEmpty ? connection.remoteParticipantId : participantId
                     } else {
                         receiverParticipantId = connection.remoteParticipantId
                     }
 
-                    if enableEncryption, !receiverParticipantId.isEmpty {
+                    let shouldDelayOneToOneSfuReceiverCryptorUntilReceiveKey =
+                        enableEncryption &&
+                        self.frameEncryptionKeyMode == .perParticipant &&
+                        isOneToOneSfuRoom &&
+                        !oneToOneSfuReceiveKeyReadyConnectionIds.contains(teardownConnectionIdKey(connection.id))
+
+                    if shouldDelayOneToOneSfuReceiverCryptorUntilReceiveKey {
+                        self.logger.log(
+                            level: .info,
+                            message: "Android 1:1 SFU receive-key guard: delaying \(trackKind) receiver FrameCryptor until receive key is installed participantId='\(receiverParticipantId)' connId=\(connection.id)")
+                    } else if enableEncryption, !receiverParticipantId.isEmpty {
                         rtcClient.createReceiverEncryptedFrame(
                             participant: receiverParticipantId,
                             connectionId: connection.id,
@@ -1895,7 +1953,7 @@ extension RTCSession {
                         if enableEncryption {
                             let resolved = receiverParticipantIdOverrideForE2EE(
                                 connection: connection,
-                                participantIdFromStreamIds: participantId
+                                participantIdFromStreamIds: resolvedScreenParticipant
                             )
                             let receiverParticipantId = resolved.override
                             if !shouldSkipGroupReceiverFrameCryptor(
@@ -2178,6 +2236,7 @@ extension RTCSession {
 #endif
 #if os(Android)
                     if connection.call.supportsVideo {
+                        rtcClient.startLocalVideoCaptureIfNeeded()
                         await startAdaptiveVideoSendIfNeeded(connectionId: connection.id)
                     }
 #endif
@@ -2246,6 +2305,12 @@ extension RTCSession {
                 if newState.state == .connected || newState.state == .completed {
                     cancelRelayFallbackTimer(connectionId: connection.id)
                     cancelDisconnectGraceTask()
+#if os(Android)
+                    if connection.call.supportsVideo {
+                        rtcClient.startLocalVideoCaptureIfNeeded()
+                        await startAdaptiveVideoSendIfNeeded(connectionId: connection.id)
+                    }
+#endif
                     let callDirection = await self.callState.callDirection
                         ?? self.inferredCallDirection(for: connection.call)
                     let current = await self.callState.currentState

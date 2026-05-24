@@ -198,6 +198,9 @@ public final class AndroidSampleCaptureView: @unchecked Sendable, Equatable {
     
     /// Pending track to attach when the surface becomes ready.
     private var pendingTrack: RTCVideoTrack?
+
+    /// Track currently supplying frames to the renderer, used when SFU renegotiation replaces it.
+    private var attachedTrack: RTCVideoTrack?
     
     /// Flag to track if the surface-ready callback has been set up.
     private var surfaceCallbackSetup = false
@@ -225,6 +228,7 @@ public final class AndroidSampleCaptureView: @unchecked Sendable, Equatable {
     /// Releases renderer resources safely, handling cases where the OpenGL context may be destroyed.
     public func release() {
         pendingTrack = nil
+        attachedTrack = nil
         // SKIP INSERT: try {
         // SKIP INSERT:     _surfaceViewRenderer.release()
         // SKIP INSERT: } catch (e: java.lang.Exception) {
@@ -289,6 +293,15 @@ public final class AndroidSampleCaptureView: @unchecked Sendable, Equatable {
     ///
     /// If the surface is not ready, the track is queued and attached when the surface becomes available.
     public func attach(_ track: RTCVideoTrack) {
+        let previousTrack = attachedTrack
+        attachedTrack = track
+        // SKIP INSERT: if (previousTrack != null && previousTrack.platformTrack != track.platformTrack) {
+        // SKIP INSERT:     try {
+        // SKIP INSERT:         previousTrack.platformTrack.removeSink(_surfaceViewRenderer)
+        // SKIP INSERT:     } catch (_: java.lang.IllegalStateException) {
+        // SKIP INSERT:         // Ignore a receiver that was disposed during renegotiation.
+        // SKIP INSERT:     }
+        // SKIP INSERT: }
         // SKIP INSERT: setupSurfaceCallback()
         // SKIP INSERT: if (isSurfaceReady()) {
         // SKIP INSERT:     try {
@@ -305,6 +318,9 @@ public final class AndroidSampleCaptureView: @unchecked Sendable, Equatable {
 
     /// Detaches a remote video track from this renderer.
     public func detach(_ track: RTCVideoTrack) {
+        if attachedTrack === track {
+            attachedTrack = nil
+        }
         // SKIP INSERT: try {
         // SKIP INSERT:     track.platformTrack.removeSink(_surfaceViewRenderer)
         // SKIP INSERT: } catch (e: java.lang.IllegalStateException) {

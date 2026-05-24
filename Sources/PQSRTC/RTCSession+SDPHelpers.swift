@@ -50,11 +50,91 @@ extension RTCSession {
     func modifySDP(
         sdp: String,
         hasVideo: Bool = false,
-        stripSsrcLines: Bool = false
+        stripSsrcLines: Bool = false,
+        vp8OnlyVideo: Bool = false
     ) async -> String {
-        let sdp = sdp
+        var sdp = sdp
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
+
+        func payloadType(in line: String, prefix: String) -> String? {
+            guard line.hasPrefix(prefix) else { return nil }
+            let rest = line.dropFirst(prefix.count)
+            return rest.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init)
+        }
+
+        func containsApt(_ line: String, payloadType: String) -> Bool {
+            let needle = "apt=\(payloadType)"
+            guard let range = line.range(of: needle) else { return false }
+            let before = range.lowerBound == line.startIndex ? nil : line[line.index(before: range.lowerBound)]
+            let after = range.upperBound == line.endIndex ? nil : line[range.upperBound]
+            let validBefore = before == nil || before == " " || before == "\t" || before == ";"
+            let validAfter = after == nil || after == " " || after == "\t" || after == ";" || after == "\r"
+            return validBefore && validAfter
+        }
+
+        func restrictVideoCodecsToVP8(_ sdp: String) -> String {
+            let lines = sdp.components(separatedBy: "\n")
+            var sections: [[String]] = []
+            var current: [String] = []
+
+            for line in lines {
+                if line.hasPrefix("m="), !current.isEmpty {
+                    sections.append(current)
+                    current = []
+                }
+                current.append(line)
+            }
+            if !current.isEmpty {
+                sections.append(current)
+            }
+
+            let rewritten = sections.flatMap { section -> [String] in
+                guard let first = section.first, first.hasPrefix("m=video") else { return section }
+
+                var vp8PayloadTypes = Set<String>()
+                for line in section {
+                    guard let pt = payloadType(in: line, prefix: "a=rtpmap:") else { continue }
+                    if line.range(of: "VP8/90000", options: .caseInsensitive) != nil {
+                        vp8PayloadTypes.insert(pt)
+                    }
+                }
+                guard !vp8PayloadTypes.isEmpty else { return section }
+
+                var keepPayloadTypes = vp8PayloadTypes
+                for line in section {
+                    guard let pt = payloadType(in: line, prefix: "a=fmtp:") else { continue }
+                    if vp8PayloadTypes.contains(where: { containsApt(line, payloadType: $0) }) {
+                        keepPayloadTypes.insert(pt)
+                    }
+                }
+
+                return section.compactMap { line in
+                    if line.hasPrefix("m=video") {
+                        let tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+                        guard tokens.count > 3 else { return line }
+                        let header = Array(tokens.prefix(3))
+                        let payloads = tokens.dropFirst(3).filter { keepPayloadTypes.contains($0) }
+                        guard !payloads.isEmpty else { return line }
+                        return (header + payloads).joined(separator: " ")
+                    }
+
+                    for prefix in ["a=rtpmap:", "a=rtcp-fb:", "a=fmtp:"] {
+                        if let pt = payloadType(in: line, prefix: prefix) {
+                            return keepPayloadTypes.contains(pt) ? line : nil
+                        }
+                    }
+                    return line
+                }
+            }
+
+            return rewritten.joined(separator: "\n")
+        }
+
+        if vp8OnlyVideo {
+            sdp = restrictVideoCodecsToVP8(sdp)
+        }
+
         // Helper function to replace receive/sendonly/inactive with sendrecv in a given line.
         func sendAndReceiveMedia(in line: String) -> (String, Bool) {
             var modifiedLine = line
@@ -375,7 +455,6 @@ extension RTCSession {
             // SKIP INSERT: android.util.Log.d("AndroidRTCClient", "Android: createOffer completed in SDPHandler")
             // SKIP INSERT: android.util.Log.d("AndroidRTCClient", "Android Offer SDP:\n" + description.sdp)
             
-            self.logger.log(level: .info, message: "Android Offer SDP:\n\(description.sdp)")
             self.logger.log(level: .info, message: "Android Offer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
             
             guard validateSDP(description.sdp) else {
@@ -406,7 +485,6 @@ extension RTCSession {
             
             let description = try await client.createAnswer(constraints: constraints)
             
-            self.logger.log(level: .info, message: "Android Answer SDP:\n\(description.sdp)")
             self.logger.log(level: .info, message: "Android Answer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
             
             guard validateSDP(description.sdp) else {

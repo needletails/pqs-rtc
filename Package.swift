@@ -1,5 +1,5 @@
 // swift-tools-version: 6.1
-// This is a Skip (https://skip.tools) package.
+
 import PackageDescription
 
 let package = Package(
@@ -16,7 +16,7 @@ let package = Package(
         .package(url: "https://source.skip.tools/skip.git", from: "1.6.32"),
         .package(url: "https://source.skip.tools/skip-fuse.git", from: "1.0.2"),
         .package(url: "https://source.skip.tools/skip-fuse-ui.git", from: "1.10.0"),
-        .package(url: "https://github.com/needletails/Specs.git", from: "137.7151.11"),
+        .package(url: "https://github.com/needletails/Specs.git", from: "144.7559.04"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.3.0"),
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.4"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),

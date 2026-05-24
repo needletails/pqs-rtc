@@ -135,9 +135,11 @@ extension RTCSession {
             stripSsrcLines: false)
         
 #if os(Android)
-        try await rtcClient.setRemoteDescription(RTCSessionDescription(
-            typeDescription: "OFFER",
-            sdp: modified))
+        try await setRemote(
+            sdp: RTCSessionDescription(
+                typeDescription: "OFFER",
+                sdp: modified),
+            call: call)
 #else
         try await setRemote(sdp:
                                 WebRTC.RTCSessionDescription(
@@ -186,9 +188,11 @@ extension RTCSession {
             hasVideo: call.supportsVideo,
             stripSsrcLines: false)
 #if os(Android)
-        try await rtcClient.setRemoteDescription(RTCSessionDescription(
-            typeDescription: "OFFER",
-            sdp: modified))
+        try await setRemote(
+            sdp: RTCSessionDescription(
+                typeDescription: "OFFER",
+                sdp: modified),
+            call: call)
 #else
         try await setRemote(sdp:
                                 WebRTC.RTCSessionDescription(type: sdp.type.rtcSdpType, sdp: modified),
@@ -213,9 +217,11 @@ extension RTCSession {
             stripSsrcLines: false)
         
 #if os(Android)
-        try await rtcClient.setRemoteDescription(RTCSessionDescription(
-            typeDescription: "ANSWER",
-            sdp: modified))
+        try await setRemote(
+            sdp: RTCSessionDescription(
+                typeDescription: "ANSWER",
+                sdp: modified),
+            call: call)
 #else
         try await setRemote(sdp:
                                 WebRTC.RTCSessionDescription(type: sdp.type.rtcSdpType, sdp: modified),
@@ -283,8 +289,8 @@ extension RTCSession {
             if !isOneToOneSfuRoom || !enableEncryption || oneToOneSfuReceiveKeyReadyConnectionIds.contains(normId) {
                 setHandshakeComplete(true)
             }
-            try await startSendingCandidates(call: call)
         }
+        try await startSendingCandidates(call: call)
     }
 
     static func shouldDeferOneToOneSfuHandshakeComplete(
@@ -391,12 +397,13 @@ extension RTCSession {
                 // Stripping them here can prevent RTP sender streams from activating
                 // on some WebRTC/SFU combinations (symptom: ICE+DTLS connected, but
                 // outbound audio/video packets remain flat at zero).
-                stripSsrcLines: false)
+                stripSsrcLines: false,
+                vp8OnlyVideo: connection.id.isGroupCall)
             
             description = RTCSessionDescription(typeDescription: description.typeDescription, sdp: modified)
             
-            logger.log(level: .info, message: "Android Modified Offer SDP:\n\(description.sdp)")
-            
+            logger.log(level: .info, message: "Android Modified Offer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
+
             logger.log(level: .info, message: "Generated SDP offer for call: \(call.sharedCommunicationId)")
             try await self.rtcClient.setLocalDescription(description)
             sdp = try SessionDescription(fromRTC: description)
@@ -412,7 +419,8 @@ extension RTCSession {
                 // Stripping them here can prevent RTP sender streams from activating
                 // on some WebRTC/SFU combinations (symptom: ICE+DTLS connected, but
                 // outbound audio/video packets remain flat at zero).
-                stripSsrcLines: false)
+                stripSsrcLines: false,
+                vp8OnlyVideo: connection.id.isGroupCall)
             
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             
@@ -504,11 +512,12 @@ extension RTCSession {
                 // Stripping them here can prevent RTP sender streams from activating
                 // on some WebRTC/SFU combinations (symptom: ICE+DTLS connected, but
                 // outbound audio/video packets remain flat at zero).
-                stripSsrcLines: false)
+                stripSsrcLines: false,
+                vp8OnlyVideo: connection.id.isGroupCall)
             description = RTCSessionDescription(typeDescription: description.typeDescription, sdp: modified)
             
-            logger.log(level: .info, message: "Android Modified Answer SDP:\n\(description.sdp)")
-            
+            logger.log(level: .info, message: "Android Modified Answer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
+
             logger.log(level: .info, message: "Generated SDP answer for call: \(call.sharedCommunicationId)")
             try await self.rtcClient.setLocalDescription(description)
             
@@ -524,7 +533,8 @@ extension RTCSession {
                 // Stripping them here can prevent RTP sender streams from activating
                 // on some WebRTC/SFU combinations (symptom: ICE+DTLS connected, but
                 // outbound audio/video packets remain flat at zero).
-                stripSsrcLines: false)
+                stripSsrcLines: false,
+                vp8OnlyVideo: connection.id.isGroupCall)
             
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             

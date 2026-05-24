@@ -14,6 +14,8 @@ import Foundation
 /// - `swift-sfu` does not transcode; selecting a higher profile allows higher quality on good uplink,
 ///   while the adaptive loop still backs off on bad uplink.
 public enum RTCVideoQualityProfile: Sendable, Equatable {
+    /// Lowest data use; favors continuity over detail on weak networks.
+    case low
     /// Balanced defaults suitable for most networks (good quality, robust on poor uplink).
     case standard
     /// Higher ceiling for consistently strong uplinks (e.g. Wi‑Fi).
@@ -41,6 +43,30 @@ extension RTCVideoQualityProfile {
 
     var adaptiveConfig: AdaptiveConfig {
         switch self {
+        case .low:
+#if os(iOS)
+            return AdaptiveConfig(
+                minBitrateBps: 120_000,
+                maxBitrateBps: 850_000,
+                startingBitrateBps: 350_000,
+                startingFramerate: 10,
+                headroomFactor: 0.55,
+                highFpsThresholdBps: 600_000,
+                lowFps: 7,
+                highFps: 12
+            )
+#else
+            return AdaptiveConfig(
+                minBitrateBps: 150_000,
+                maxBitrateBps: 1_000_000,
+                startingBitrateBps: 450_000,
+                startingFramerate: 10,
+                headroomFactor: 0.60,
+                highFpsThresholdBps: 700_000,
+                lowFps: 7,
+                highFps: 15
+            )
+#endif
         case .standard:
 #if os(iOS)
             return AdaptiveConfig(
@@ -118,6 +144,20 @@ extension RTCVideoQualityProfile {
             )
 #endif
         }
+    }
+
+    static func resolutionScaleDownBy(for targetBitrateBps: Int) -> Double {
+#if os(Android)
+        // Android hardware/WebRTC adaptation is already willing to reduce captured frames. Keep
+        // resolution stable longer so good networks do not quickly collapse to soft 360p video.
+        if targetBitrateBps < 250_000 { return 4.0 }
+        if targetBitrateBps < 500_000 { return 2.0 }
+        return 1.0
+#else
+        if targetBitrateBps < 350_000 { return 4.0 }
+        if targetBitrateBps < 900_000 { return 2.0 }
+        return 1.0
+#endif
     }
 }
 

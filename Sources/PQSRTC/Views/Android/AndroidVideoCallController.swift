@@ -60,7 +60,18 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var unassignedViews: [AndroidSampleCaptureView] = []
     /// Whether this is a group/conference call (multiple remote participants).
     private var isGroupCall: Bool {
-        currentCall?.sharedCommunicationId.isGroupCall ?? false
+        guard let currentCall else { return false }
+        return currentCall.sharedCommunicationId.isGroupCall && !isEphemeralOneToOneSfuRoom(currentCall)
+    }
+
+    /// 1:1 calls relayed through the SFU use a transient `#<uuid>` room. They still have a single
+    /// remote party, so Android should use the 1:1 renderer path rather than the group grid mapper.
+    private func isEphemeralOneToOneSfuRoom(_ call: Call) -> Bool {
+        guard call.recipients.count <= 1 else { return false }
+        let route = (call.channelWireId ?? call.sharedCommunicationId)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard route.hasPrefix("#") else { return false }
+        return UUID(uuidString: route.normalizedConnectionId) != nil
     }
 
     public init(session: RTCSession) {
@@ -82,6 +93,20 @@ public actor AndroidVideoCallController: CallActionDelegate {
         self.localView = local
         logger.log(level: .debug, message: "SET LOCAL VIEW")
         await syncWithCurrentState(reason: "setLocalView")
+    }
+
+    /// Installs all renderer views before syncing call state.
+    ///
+    /// Android `CallView` can appear while the session is already in `connecting`. Syncing after
+    /// only the remote view is set causes the local preview bootstrap to run without a local view.
+    public func setVideoViews(local: AndroidPreviewCaptureView, remotes: [AndroidSampleCaptureView]) async {
+        self.localView = local
+        self.remoteViews = remotes
+        self.remoteView = remotes.first
+        self.unassignedViews = remotes
+        self.participantViewAssignments.removeAll()
+        logger.log(level: .info, message: "AndroidVideoCallController installed video views local=true remoteCount=\(remotes.count)")
+        await syncWithCurrentState(reason: "setVideoViews")
     }
     
     public func setVideoCallDelegate(_ conformer: VideoCallDelegate?) async {
@@ -178,12 +203,12 @@ public actor AndroidVideoCallController: CallActionDelegate {
         case .held:
             break
         case .ended:
-            await tearDownCall()
+            markCallEndedLocally()
         case .failed(_, _, let errorMessage):
             await videoCallDelegate?.passErrorMessage(errorMessage)
-            await tearDownCall()
+            markCallEndedLocally()
         case .callAnsweredAuxDevice:
-            await tearDownCall()
+            markCallEndedLocally()
         }
     }
     
@@ -200,25 +225,34 @@ public actor AndroidVideoCallController: CallActionDelegate {
     }
     
     public func stop() async {
-        await tearDownCall()
+        markCallEndedLocally()
     }
     
     // MARK: - Actions
 
     public func endCall() async {
-        guard let call = self.currentCall else {
-            await tearDownCall()
-            await videoCallDelegate?.endedCall(true)
-            return
-        }
-        
-        if let transport = try? await session.requireTransport() {
-            try? await transport.didEnd(call: call, endState: CallStateMachine.EndState.userInitiated)
-        }
-        
-        await session.shutdown(with: call)
-        await tearDownCall()
+        let call = self.currentCall
+        let session = self.session
+
+        // Dismiss call UI before any WebRTC/camera work. Android renderer and camera
+        // teardown can block long enough to trip input ANRs when awaited from UI actions.
+        markCallEndedLocally()
         await videoCallDelegate?.endedCall(true)
+
+        Task.detached(priority: .userInitiated) {
+            guard let call else {
+                await session.shutdown(with: nil)
+                return
+            }
+
+            do {
+                let transport = try await session.requireTransport()
+                try await transport.didEnd(call: call, endState: CallStateMachine.EndState.userInitiated)
+            } catch {
+                // Continue with local shutdown even if the transport is already gone.
+            }
+            await session.shutdown(with: call)
+        }
     }
     
     public func muteAudio() async {
@@ -344,8 +378,12 @@ public actor AndroidVideoCallController: CallActionDelegate {
 
         if event.isActive {
             logger.log(level: .info, message: "Participant track added: participant=\(event.participantId)")
-            guard participantViewAssignments[event.participantId] == nil else {
-                logger.log(level: .debug, message: "Participant \(event.participantId) already has a view assignment")
+            if let assignedView = participantViewAssignments[event.participantId] {
+                await session.renderRemoteVideoForParticipant(
+                    to: assignedView,
+                    connectionId: connectionId,
+                    participantId: event.participantId)
+                logger.log(level: .info, message: "Reattached view to refreshed track for participant=\(event.participantId)")
                 return
             }
             guard !unassignedViews.isEmpty else {
@@ -464,6 +502,19 @@ public actor AndroidVideoCallController: CallActionDelegate {
     }
 
     // MARK: - Teardown
+
+    private func markCallEndedLocally() {
+        guard isRunning else { return }
+        isRunning = false
+        stopRemoteScreenTrackObservation()
+        stopParticipantTrackObservation()
+        stateStreamTask?.cancel()
+        stateStreamTask = nil
+        screenView = nil
+        activeRemoteScreenShareParticipantId = nil
+        hasActiveRemoteScreenShare = false
+        currentCall = nil
+    }
 
     private func tearDownCall() async {
         guard isRunning else { return }

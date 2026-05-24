@@ -1307,6 +1307,30 @@ extension RTCSession {
             return
         }
 
+#if os(Android)
+        // The Android answerer can create its SFU PeerConnection before the caller's
+        // call_cipher arrives. At that point only the provisional SFU identity exists;
+        // deriving an outbound frame key from it guarantees a later key replacement and
+        // leaves the remote decoder without a usable starting video frame. Wait until the
+        // caller's authoritative frame identity has been received. The offerer already
+        // carries the answerer's frame props in call_answered and proceeds immediately.
+        let hasRemoteFrameIdentityInCall = call.frameIdentityProps.map {
+            framePropsBelongToRemotePeer(
+                $0,
+                localParticipantId: connection.localParticipantId)
+        } ?? false
+        if !force,
+           Self.isTrueOneToOneSfuRoom(call: call),
+           !hasRemoteFrameIdentityInCall,
+           !oneToOneSfuReceiveKeyReadyConnectionIds.contains(teardownConnectionIdKey(connection.id)) {
+            logger.log(
+                level: .info,
+                message: "Android 1:1 SFU sender-key guard: deferring sender call_cipher until peer frame identity is received connId=\(connection.id)"
+            )
+            return
+        }
+#endif
+
         if !force, senderFrameKeyProvisionedConnectionIds.contains(normalizedConnectionId) {
             logger.log(
                 level: .debug,
@@ -1394,6 +1418,10 @@ extension RTCSession {
                     with: Int32(keyRingIndex),
                     ratchetSalt: ratchetSalt)
                 lastSharedFrameKeyIndex = keyRingIndex
+                logger.log(
+                    level: .info,
+                    message: "Derived+provisioned shared frame key (setMessageKey) index=\(keyRingIndex) ratchetIndex=\(ratchetIndex) fingerprint=\(frameEncryptionKeyFingerprint(messageKey)) connId=\(connection.id)"
+                )
             } else {
                 let senderParticipantId = Self.senderFrameKeyParticipantIdForSetMessageKey(
                     connectionLocalParticipantId: connection.localParticipantId)
@@ -1403,6 +1431,10 @@ extension RTCSession {
                     forParticipant: senderParticipantId,
                     ratchetSalt: ratchetSalt)
                 lastFrameKeyIndexByParticipantId[senderParticipantId] = keyRingIndex
+                logger.log(
+                    level: .info,
+                    message: "Derived+provisioned per-participant sender frame key (setMessageKey) index=\(keyRingIndex) ratchetIndex=\(ratchetIndex) fingerprint=\(frameEncryptionKeyFingerprint(messageKey)) connId=\(connection.id) local='\(senderParticipantId)'"
+                )
             }
             // Mirror Apple: attach sender FrameCryptors once the key is set (in case tracks were added before key derivation).
             try await createEncryptedFrame(connection: connection)
@@ -1506,6 +1538,10 @@ extension RTCSession {
                     with: Int32(keyRingIndex),
                     ratchetSalt: ratchetSalt)
                 lastSharedFrameKeyIndex = keyRingIndex
+                logger.log(
+                    level: .info,
+                    message: "Derived+provisioned shared frame key (setReceivingMessageKey) index=\(keyRingIndex) ratchetIndex=\(ratchetIndex) fingerprint=\(frameEncryptionKeyFingerprint(messageKey)) connId=\(connection.id)"
+                )
             } else {
                 // Provision ONLY the cipher sender's slot. See Apple branch for rationale.
                 rtcClient.setKey(
@@ -1514,6 +1550,10 @@ extension RTCSession {
                     forParticipant: remoteParticipantId,
                     ratchetSalt: ratchetSalt)
                 lastFrameKeyIndexByParticipantId[remoteParticipantId] = keyRingIndex
+                logger.log(
+                    level: .info,
+                    message: "Derived+provisioned per-participant receiver frame key (setReceivingMessageKey) index=\(keyRingIndex) ratchetIndex=\(ratchetIndex) fingerprint=\(frameEncryptionKeyFingerprint(messageKey)) connId=\(connection.id) remoteTrackOwner='\(remoteParticipantId)'"
+                )
             }
 
             // Attach receiver cryptors (Android needs explicit receiver attachment).

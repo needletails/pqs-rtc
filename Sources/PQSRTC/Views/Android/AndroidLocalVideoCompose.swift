@@ -29,6 +29,16 @@ import androidx.compose.ui.viewinterop.__
 import android.graphics.__
 import android.view.__
 
+// SKIP INSERT: private fun ntApplyRoundedOutline(view: android.view.View, radiusDp: Float) {
+// SKIP INSERT:     val radiusPx = radiusDp * view.resources.displayMetrics.density
+// SKIP INSERT:     view.clipToOutline = true
+// SKIP INSERT:     view.outlineProvider = object : android.view.ViewOutlineProvider() {
+// SKIP INSERT:         override fun getOutline(v: android.view.View, outline: android.graphics.Outline) {
+// SKIP INSERT:             outline.setRoundRect(0, 0, v.width, v.height, radiusPx)
+// SKIP INSERT:         }
+// SKIP INSERT:     }
+// SKIP INSERT: }
+
 // MARK: - Android Local Video Compose View
 /// Compose view that hosts the local preview renderer.
 ///
@@ -69,6 +79,8 @@ public struct AndroidLocalVideoCompose: ContentComposer {
                     client.initializeSurfaceRenderer(localCaptureView.surfaceViewRenderer, mirror: true)
                     // Match content to parent container by filling while preserving aspect
                     localCaptureView.surfaceViewRenderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                    // SKIP INSERT: localCaptureView.surfaceViewRenderer.setZOrderMediaOverlay(true)
+                    // SKIP INSERT: ntApplyRoundedOutline(localCaptureView.surfaceViewRenderer, 12f)
                     localCaptureView.surfaceViewRenderer
                 },
                 modifier: Modifier
@@ -106,12 +118,14 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
             }
         }
 
-        Box(modifier: context.modifier) {
+        Box(modifier: context.modifier.fillMaxSize()) {
             androidx.compose.ui.viewinterop.AndroidView(
                 factory: { ctx in
                     client.initializeSurfaceRenderer(renderer, mirror: false)
+                    renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
                     renderer
                 },
+                modifier: Modifier.fillMaxSize(),
                 update: { _ in }
             )
         }
@@ -230,9 +244,10 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                             androidx.compose.ui.viewinterop.AndroidView(
                                 factory: { _ in
                                     client.initializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
+                                    view.surfaceViewRenderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
                                     view.surfaceViewRenderer
                                 },
-                                modifier: Modifier.weight(Float(1.0)).fillMaxHeight(),
+                                modifier: Modifier.weight(Float(1.0)).fillMaxWidth().fillMaxHeight(),
                                 update: { _ in }
                             )
                         }
@@ -258,7 +273,9 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         switch itemCount {
         case 0:
             return (1, 1)
-        case 1...2:
+        case 1:
+            return (1, 1)
+        case 2:
             return (2, 1)
         case 3...4:
             return (2, 2)
@@ -666,8 +683,10 @@ public struct AndroidVideoCallView: View {
         }
 
         delegate = resources.controller
-        await resources.controller.setRemoteViews(remotes: resources.remoteCaptureViews)
-        await resources.controller.setLocalView(local: resources.localCaptureView)
+        await resources.controller.setVideoViews(
+            local: resources.localCaptureView,
+            remotes: resources.remoteCaptureViews
+        )
         await resources.controller.start()
     }
     
@@ -677,34 +696,15 @@ public struct AndroidVideoCallView: View {
         let screenWidth = size.width
         let screenHeight = size.height
         let isLandscape = screenWidth > screenHeight
-        let ar = getAspectRatio(width: screenWidth, height: screenHeight)
         let minSide = min(screenWidth, screenHeight)
         let isTablet = minSide >= 450
-        
-        var overlayWidth: CGFloat = 0
-        var overlayHeight: CGFloat = 0
-        if isLandscape {
-            if isTablet {
-                overlayWidth = screenWidth / 4.0
-                overlayHeight = (screenWidth / 4.0) / ar
-            } else { // phone
-                overlayWidth = screenWidth / 3.0
-                overlayHeight = (screenWidth / 3.0) / ar
-            }
-        } else { // portrait
-            if isTablet {
-                overlayWidth = screenHeight / 4.0
-                overlayHeight = (screenHeight / 4.0) * ar
-            } else { // phone
-                overlayWidth = screenHeight / 4.5
-                overlayHeight = (screenHeight / 5.5) * ar
-            }
-        }
+
+        let maxOverlayWidth: CGFloat = isTablet ? 240 : 180
+        let widthFraction: CGFloat = isTablet ? 0.28 : 0.34
+        let overlayWidth = min(maxOverlayWidth, minSide * widthFraction)
+        let overlayHeight = isLandscape ? overlayWidth * (9.0 / 16.0) : overlayWidth * (16.0 / 9.0)
+
         return CGSize(width: overlayWidth, height: overlayHeight)
-    }
-    
-    private func getAspectRatio(width: CGFloat, height: CGFloat) -> CGFloat {
-        return max(width, height) / min(width, height)
     }
 
     private func paginateRemotes(_ source: [AndroidSampleCaptureView], pageSize: Int) -> [[AndroidSampleCaptureView]] {

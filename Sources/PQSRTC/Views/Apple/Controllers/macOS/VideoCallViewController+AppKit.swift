@@ -93,6 +93,8 @@ public final class VideoCallViewController: NSViewController {
     private var participantTrackStreamTask: Task<Void, Never>?
     /// Whether a remote screen-share tile is currently visible in the collection view.
     private var hasActiveRemoteScreenShare = false
+    private var conferenceRaisedHands: [String: Bool] = [:]
+    private var conferenceRaisedHandBadgeTopClearance: CGFloat = 0
     /// If `true`, the host app provides its own controls overlay via ``setControlsView(_:)``.
     public var usesEmbeddedControls = false
     /// For SwiftUI call chrome: re-sync toggle state after ``muteVideo()`` / ``muteAudio()`` (avoids optimistic UI drift).
@@ -101,6 +103,15 @@ public final class VideoCallViewController: NSViewController {
     public func applyInitialLocalMuteDisplayState(videoMuted: Bool, audioMuted: Bool) {
         isMutingVideo = videoMuted
         isMutingAudio = audioMuted
+    }
+
+    public func updateConferenceRaisedHands(
+        _ raisedHands: [String: Bool],
+        topClearance: CGFloat = 0
+    ) {
+        conferenceRaisedHands = raisedHands
+        conferenceRaisedHandBadgeTopClearance = topClearance
+        applyConferenceRaisedHandBadges()
     }
     private weak var controlsView: NSView?
     
@@ -613,6 +624,14 @@ public final class VideoCallViewController: NSViewController {
         guard let renderer = localView.renderer as? PreviewViewRender else { return }
         await renderer.setShouldRender(isEnabled)
     }
+
+    private func applyCurrentLocalVideoMuteState(connectionId: String) async {
+        let videoEnabled = !isMutingVideo
+        await setLocalPreviewCapturing(isEnabled: videoEnabled)
+        await session.setVideoTrack(isEnabled: videoEnabled, connectionId: connectionId)
+        await blurView(isMutingVideo)
+        await videoCallDelegate?.localMuteDisplayDidChange(videoMuted: isMutingVideo, audioMuted: isMutingAudio)
+    }
     
     private var blurEffectView: NSVisualEffectView?
     /// Polls remote track + frame age so peer camera-off matches iOS (paused / camera-off chrome).
@@ -624,20 +643,18 @@ public final class VideoCallViewController: NSViewController {
     /// Used on macOS to obscure video when muted (and to match the call UI styling).
     func blurView(_ shouldBlur: Bool) async {
         if shouldBlur {
-            
+            guard let localView = detachedPreviewView ?? videoViews.views.first(where: { $0.videoView.contextName == "preview" })?.videoView else { return }
             if blurEffectView == nil {
                 blurEffectView = NSVisualEffectView()
                 blurEffectView?.material = .sidebar
                 blurEffectView?.blendingMode = .behindWindow
                 blurEffectView?.state = .active
-                blurEffectView?.frame = self.view.bounds
                 blurEffectView?.autoresizingMask = [.width, .height]
             }
-            
-            guard let remoteView = videoViews.views.first(where: { $0.videoView.contextName == "sample" })?.videoView else { return }
-            remoteView.addSubview(blurEffectView!)
-            guard let localView = detachedPreviewView ?? videoViews.views.first(where: { $0.videoView.contextName == "preview" })?.videoView else { return }
-            localView.addSubview(blurEffectView!)
+            guard let blurEffectView else { return }
+            blurEffectView.removeFromSuperview()
+            blurEffectView.frame = localView.bounds
+            localView.addSubview(blurEffectView)
         } else {
             blurEffectView?.removeFromSuperview()
             blurEffectView = nil
@@ -823,7 +840,7 @@ public final class VideoCallViewController: NSViewController {
         
         await session.bindLocalPreviewCaptureRenderer(previewRenderer, connectionId: connectionId)
         await self.session.renderLocalVideo(to: previewRenderer.rtcVideoRenderWrapper, connectionId: connectionId)
-        await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
+        await applyCurrentLocalVideoMuteState(connectionId: connectionId)
         await applyLocalVideoMirroringFromUserDefaults()
     }
 
@@ -853,7 +870,7 @@ public final class VideoCallViewController: NSViewController {
             await assignExistingParticipantTracks(connectionId: connectionId)
             await performQuery(removePreview: true)
             scheduleConfigureLocalPreviewIfNeeded(animated: false)
-            await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
+            await applyCurrentLocalVideoMuteState(connectionId: connectionId)
             return
         }
 
@@ -901,7 +918,7 @@ public final class VideoCallViewController: NSViewController {
         await self.session.renderRemoteVideo(
             to: remoteRenderer.rtcVideoRenderWrapper,
             with: connectionId)
-        await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
+        await applyCurrentLocalVideoMuteState(connectionId: connectionId)
         await applyMainRemoteTileInboundExpectation(connectionId: connectionId)
         startRemoteRendererRecoveryIfNeeded(renderer: remoteRenderer, connectionId: connectionId)
         startRemoteVideoTrackPolling()
@@ -1102,6 +1119,7 @@ public final class VideoCallViewController: NSViewController {
             connectionId: connectionId,
             participantId: participantId
         )
+        applyConferenceRaisedHandBadges()
         logger.log(level: .info, message: "Remote participant camera view created for participant=\(participantId)")
     }
 
@@ -1239,6 +1257,64 @@ public final class VideoCallViewController: NSViewController {
         label.anchors(top: badge.topAnchor, leading: icon.trailingAnchor, bottom: badge.bottomAnchor, trailing: badge.trailingAnchor, paddingTop: 4, paddingLeading: 4, paddingBottom: 4, paddingTrailing: 8)
     }
 
+    private func participantHasRaisedHand(_ participantId: String) -> Bool {
+        let participantKey = RTCSession.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return false }
+        return conferenceRaisedHands.contains { key, value in
+            value && RTCSession.conferenceParticipantIdentityKey(key) == participantKey
+        }
+    }
+
+    private func removeRaisedHandBadge(from view: NTMTKView) {
+        let badgeId = NSUserInterfaceItemIdentifier("raisedHandBadge")
+        view.subviews.first(where: { $0.identifier == badgeId })?.removeFromSuperview()
+    }
+
+    private func addRaisedHandBadge(to view: NTMTKView) {
+        let badgeId = NSUserInterfaceItemIdentifier("raisedHandBadge")
+        if view.subviews.contains(where: { $0.identifier == badgeId }) { return }
+
+        let badge = NSView()
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.92).cgColor
+        badge.layer?.cornerRadius = 14
+        badge.identifier = badgeId
+        badge.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: "hand.raised.fill", accessibilityDescription: "Raised hand")
+        icon.contentTintColor = .white
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        badge.addSubview(icon)
+
+        view.addSubview(badge)
+        let topPadding = max(8, min(22, conferenceRaisedHandBadgeTopClearance * 0.25))
+        NSLayoutConstraint.activate([
+            badge.topAnchor.constraint(equalTo: view.topAnchor, constant: topPadding),
+            badge.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            badge.widthAnchor.constraint(equalToConstant: 28),
+            badge.heightAnchor.constraint(equalToConstant: 28),
+            icon.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 15),
+            icon.heightAnchor.constraint(equalToConstant: 15)
+        ])
+    }
+
+    private func applyConferenceRaisedHandBadges() {
+        for model in videoViews.views {
+            guard isParticipantCameraModel(model) else {
+                removeRaisedHandBadge(from: model.videoView)
+                continue
+            }
+            if participantHasRaisedHand(model.participantId) {
+                addRaisedHandBadge(to: model.videoView)
+            } else {
+                removeRaisedHandBadge(from: model.videoView)
+            }
+        }
+    }
+
     private func stopRemoteRendererRecovery() {
         remoteRendererRecoveryTask?.cancel()
         remoteRendererRecoveryTask = nil
@@ -1319,7 +1395,7 @@ public final class VideoCallViewController: NSViewController {
                 )
                 await renderer.startStream()
                 await self.session.renderRemoteVideo(to: renderer.rtcVideoRenderWrapper, with: connectionId)
-                await self.session.setVideoTrack(isEnabled: true, connectionId: connectionId)
+                await self.session.setVideoTrack(isEnabled: !self.isMutingVideo, connectionId: connectionId)
                 await self.applyMainRemoteTileInboundExpectation(connectionId: connectionId)
             }
         }
@@ -1441,6 +1517,7 @@ public final class VideoCallViewController: NSViewController {
             controllerView.addConnectedLocalVideoView(view: localView)
             scheduleConfigureLocalPreviewIfNeeded(animated: false)
         }
+        applyConferenceRaisedHandBadges()
     }
     
     /// Clears all items from the current diffable snapshot.
@@ -1723,18 +1800,24 @@ extension VideoCallViewController: CallActionDelegate {
     
     /// Toggles the local video track and applies a blur overlay when video is muted.
     public func muteVideo() async {
+        await setVideoMuted(!isMutingVideo)
+    }
+
+    /// Sets the local video track to a specific muted/unmuted state.
+    public func setVideoMuted(_ muted: Bool) async {
         guard let callId = await resolvedMuteConnectionId() else {
             logger.log(level: .warning, message: "muteVideo: missing connection id")
             return
         }
         guard await activeCallAppearsToBeVideo() else { return }
-        
-        let shouldMute = !isMutingVideo
-        await setLocalPreviewCapturing(isEnabled: !shouldMute)
-        await session.setVideoTrack(isEnabled: !shouldMute, connectionId: callId)
-        isMutingVideo = shouldMute
-        await blurView(shouldMute)
-        await videoCallDelegate?.localMuteDisplayDidChange(videoMuted: isMutingVideo, audioMuted: isMutingAudio)
+
+        guard isMutingVideo != muted else {
+            await applyCurrentLocalVideoMuteState(connectionId: callId)
+            return
+        }
+
+        isMutingVideo = muted
+        await applyCurrentLocalVideoMuteState(connectionId: callId)
     }
 
     public func toggleSpeakerPhone() {
