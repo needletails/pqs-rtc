@@ -127,6 +127,36 @@ struct RTCSessionCryptoKeyResolutionTests {
         #expect(RTCSession.isTrueOneToOneSfuRoom(call: call) == true)
     }
 
+    @Test("duplicate devices in a 1:1 relay retain pairwise frame identity resolution")
+    func relayRoomWithDuplicateDevicesUsesPairwiseFrameIdentityResolution() throws {
+        let call = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: "#\(roomUUID)",
+            sender: try participant("local"),
+            recipients: [
+                try participant("echo", device: "d1"),
+                try participant("echo", device: "d2"),
+            ],
+            supportsVideo: true)
+
+        #expect(RTCSession.usesPairwiseFrameIdentityResolution(call: call) == true)
+    }
+
+    @Test("distinct peers do not use pairwise frame identity resolution")
+    func multipartyRoomDoesNotUsePairwiseFrameIdentityResolution() throws {
+        let call = try Call(
+            sharedCommunicationId: groupRoomUUID,
+            channelWireId: "#\(groupRoomUUID)",
+            sender: try participant("local"),
+            recipients: [
+                try participant("echo", device: "d1"),
+                try participant("bob", device: "d2"),
+            ],
+            supportsVideo: true)
+
+        #expect(RTCSession.usesPairwiseFrameIdentityResolution(call: call) == false)
+    }
+
     @Test("conf- prefixed rooms are not 1:1 SFU even with one recipient")
     func conferenceRoomIsNotOneToOne() throws {
         let confId = "conf-7f79fef9-f2cb-420f-bd57-2ce87e6d24aa"

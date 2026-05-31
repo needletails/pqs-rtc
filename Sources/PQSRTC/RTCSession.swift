@@ -522,6 +522,31 @@ public actor RTCSession {
 #if os(iOS) && !os(Android)
     var _iOSScreenCaptureSourceStorage: iOSScreenCaptureSource?
 #endif
+#if os(iOS) || os(macOS)
+    /// Identifies the capture source that currently owns the outgoing screen track.
+    /// Late termination callbacks from a stopped source must never stop a replacement share.
+    private var platformScreenCaptureGeneration: UInt64 = 0
+
+    func beginPlatformScreenCaptureGeneration() -> UInt64 {
+        platformScreenCaptureGeneration &+= 1
+        if platformScreenCaptureGeneration == 0 {
+            platformScreenCaptureGeneration = 1
+        }
+        return platformScreenCaptureGeneration
+    }
+
+    func isCurrentPlatformScreenCaptureGeneration(_ generation: UInt64) -> Bool {
+        generation != 0 && generation == platformScreenCaptureGeneration
+    }
+
+    func invalidatePlatformScreenCaptureGeneration(_ generation: UInt64? = nil) {
+        guard generation == nil || generation == platformScreenCaptureGeneration else { return }
+        platformScreenCaptureGeneration &+= 1
+        if platformScreenCaptureGeneration == 0 {
+            platformScreenCaptureGeneration = 1
+        }
+    }
+#endif
 #if os(Android)
     nonisolated internal let androidMediaProjectionPermission = AndroidMediaProjectionPermissionBox()
 
@@ -537,7 +562,43 @@ public actor RTCSession {
 
     // MARK: - Remote screen track notifications
 
+    private var localScreenShareStateContinuations: [UUID: AsyncStream<Bool>.Continuation] = [:]
     private var remoteScreenTrackContinuations: [UUID: AsyncStream<RemoteScreenTrackEvent>.Continuation] = [:]
+
+    /// Returns an async stream that yields local screen-share state transitions.
+    func localScreenShareStateStream() -> AsyncStream<Bool> {
+        let id = UUID()
+        return AsyncStream { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            Task { await self.storeLocalScreenShareStateContinuation(id, continuation: continuation) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                Task { await self.removeLocalScreenShareStateContinuation(id) }
+            }
+        }
+    }
+
+    private func storeLocalScreenShareStateContinuation(_ id: UUID, continuation: AsyncStream<Bool>.Continuation) async {
+        localScreenShareStateContinuations[id] = continuation
+        let connections = await connectionManager.findAllConnections()
+        let isSharing = connections.contains { connection in
+            connection.localScreenTrack != nil
+        }
+        continuation.yield(isSharing)
+    }
+
+    private func removeLocalScreenShareStateContinuation(_ id: UUID) {
+        localScreenShareStateContinuations.removeValue(forKey: id)
+    }
+
+    func notifyLocalScreenShareChanged(isSharing: Bool) {
+        for (_, continuation) in localScreenShareStateContinuations {
+            continuation.yield(isSharing)
+        }
+    }
 
     /// Returns an async stream that yields events whenever a remote participant starts or stops
     /// sharing their screen. View controllers subscribe to this stream to create/destroy screen
@@ -587,6 +648,10 @@ public actor RTCSession {
     }
 
     func finishAllRemoteScreenTrackStreams() {
+        for (_, continuation) in localScreenShareStateContinuations {
+            continuation.finish()
+        }
+        localScreenShareStateContinuations.removeAll()
         for (_, continuation) in remoteScreenTrackContinuations {
             continuation.finish()
         }

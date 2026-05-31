@@ -284,6 +284,9 @@ extension RTCSession {
             }
             connection.screenReceiverCryptorsByParticipantId.removeAll()
             connection.screenReceiverCryptorBindingsByParticipantId.removeAll()
+            if connection.localScreenTrack != nil {
+                notifyLocalScreenShareChanged(isSharing: false)
+            }
             for participantId in connection.remoteScreenTracksByParticipantId.keys {
                 notifyRemoteScreenTrackChanged(
                     RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)

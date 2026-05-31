@@ -62,7 +62,10 @@ public protocol RTCTransportEvents: Sendable {
     /// - `packet.sfuIdentity` identifies the SFU endpoint / room route
     /// - `call.sharedCommunicationId` identifies the local call instance
     /// - For channel-backed group calls, `call.channelWireId` / ``Call/resolvedChannelWireId`` is the
-    ///   canonical SFU room wire id; ephemeral `#<uuid>` 1:1 relay rooms intentionally omit it.
+    ///   canonical SFU room wire id.
+    /// - Ephemeral `#<uuid>` 1:1 relay rooms carry `call.channelWireId` as their explicit SFU
+    ///   route marker, while ``Call/resolvedChannelWireId`` deliberately remains `nil` so native
+    ///   1:1 ownership and peer-oriented frame-key handling are preserved.
     func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws
     
     // MARK: - 1:1 call signaling (encrypted via SwiftSFU)

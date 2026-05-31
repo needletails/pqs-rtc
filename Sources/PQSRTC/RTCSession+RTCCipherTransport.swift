@@ -106,6 +106,14 @@ extension RTCSession {
         return true
     }
 
+    /// True when media frame identity resolution still represents one remote peer.
+    ///
+    /// A relay payload can contain multiple devices for the same person; those entries must not
+    /// force the group-key or sender-as-remote branches used for genuine multi-party rooms.
+    internal static func usesPairwiseFrameIdentityResolution(call: Call) -> Bool {
+        call.recipients.count <= 1 || isTrueOneToOneSfuRoom(call: call)
+    }
+
     /// `groupCallNegotiation` sets `channelWireId` to the same room string as the RTC identity for Nudge 1:1-as-SFU relay.
     private static func isEphemeralSfuWireMatchesCommunication(call: Call) -> Bool {
         let commNorm = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
@@ -164,8 +172,9 @@ extension RTCSession {
     ) -> String? {
         // Fast path: single-recipient call where `recipient` is the room id — map to the peer's
         // secretName even if `groupCall(forSfuIdentity:)` is not registered yet (startup races).
-        if call.recipients.count == 1 {
-            let peer = call.recipients[0].secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if Self.usesPairwiseFrameIdentityResolution(call: call),
+           let peerParticipant = call.recipients.first {
+            let peer = peerParticipant.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
             if !peer.isEmpty {
                 let roomNorm = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
                 let remoteNorm = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
@@ -189,7 +198,7 @@ extension RTCSession {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        if call.recipients.count <= 1 {
+        if Self.usesPairwiseFrameIdentityResolution(call: call) {
             let remoteParticipantId = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
             let localParticipantId = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
             let roomNorm = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
@@ -333,7 +342,7 @@ extension RTCSession {
         // For multi-recipient/group payloads, preserve previous behavior to avoid
         // changing established routing semantics.
         let recipient: Call.Participant
-        if resolvedCall.recipients.count <= 1 {
+        if Self.usesPairwiseFrameIdentityResolution(call: resolvedCall) {
             guard let resolvedRecipient = resolvedCall.recipients.first else {
                 throw RTCErrors.invalidConfiguration("Received ciphertext without a resolved recipient in call")
             }
@@ -512,7 +521,7 @@ extension RTCSession {
         call: Call,
         storedRemoteProps: SessionIdentity.UnwrappedProps
     ) -> SessionIdentity.UnwrappedProps {
-        guard call.recipients.count <= 1 || Self.isTrueOneToOneSfuRoom(call: call) else {
+        guard Self.usesPairwiseFrameIdentityResolution(call: call) else {
             return storedRemoteProps
         }
         guard let callFrameProps = call.frameIdentityProps,

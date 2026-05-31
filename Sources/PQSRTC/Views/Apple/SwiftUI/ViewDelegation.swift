@@ -48,6 +48,9 @@ public protocol CallActionDelegate: AnyObject, Sendable {
     /// Starts screen sharing with the given target and capture preferences.
     func startScreenShare(target: ScreenShareTarget, options: ScreenShareOptions) async
 
+    /// Starts screen sharing and reports whether local sender setup succeeded.
+    func startScreenShareAndReport(target: ScreenShareTarget, options: ScreenShareOptions) async -> Bool
+
     /// Stops the active screen share.
     func stopScreenShare() async
 }
@@ -74,6 +77,10 @@ public extension CallActionDelegate {
     func startScreenShare(target: ScreenShareTarget) async {}
     func startScreenShare(target: ScreenShareTarget, options: ScreenShareOptions) async {
         await startScreenShare(target: target)
+    }
+    func startScreenShareAndReport(target: ScreenShareTarget, options: ScreenShareOptions) async -> Bool {
+        await startScreenShare(target: target, options: options)
+        return false
     }
     func stopScreenShare() async {}
 }

@@ -91,10 +91,11 @@ extension RTCSession {
 #endif
             case CallStateMachine.State.held(_, _):
                 break
-            case CallStateMachine.State.ended(_, _):
+            case CallStateMachine.State.ended(_, let currentCall):
 #if os(macOS)
                 await stopRingtone()
 #endif
+                await releaseLocalMediaResourcesForCallEnding(call: currentCall)
 #if os(iOS)
                 // Disable audio when the call has fully ended
                 setAudio(false)
@@ -103,6 +104,7 @@ extension RTCSession {
 #if os(macOS)
                 await stopRingtone()
 #endif
+                await releaseLocalMediaResourcesForCallEnding(call: currentCall)
 #if os(iOS)
                 // Also disable audio on failure to avoid leaving the session active
                 setAudio(false)
@@ -118,6 +120,7 @@ extension RTCSession {
 #if os(macOS)
                 await stopRingtone()
 #endif
+                await releaseLocalMediaResourcesForCallEnding(call: currentCall)
 #if os(iOS)
                 setAudio(false)
 #endif

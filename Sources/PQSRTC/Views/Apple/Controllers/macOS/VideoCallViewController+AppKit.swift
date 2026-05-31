@@ -87,12 +87,18 @@ public final class VideoCallViewController: NSViewController {
     /// Strong so SwiftUI `Coordinator` survives for mute/state callbacks; cleared in ``tearDownCall()``.
     public var videoCallDelegate: VideoCallDelegate?
     private let logger = NeedleTailLogger("[VideoCallViewController]")
+    /// Task observing local screen-share state changes from the session.
+    private var localScreenShareStateTask: Task<Void, Never>?
     /// Task observing remote screen track events from the session.
     private var screenTrackStreamTask: Task<Void, Never>?
     /// Task observing remote participant camera track events from the session.
     private var participantTrackStreamTask: Task<Void, Never>?
     /// Whether a remote screen-share tile is currently visible in the collection view.
     private var hasActiveRemoteScreenShare = false
+    /// Participant id for the local outgoing screen-share tile, when the host is sharing.
+    private var localScreenShareTileParticipantId: String?
+    /// Tracks the temporary expansion of an audio-call window while a share is visible.
+    private var hasExpandedVoiceCallForScreenShare = false
     private var conferenceRaisedHands: [String: Bool] = [:]
     private var conferenceRaisedHandBadgeTopClearance: CGFloat = 0
     /// If `true`, the host app provides its own controls overlay via ``setControlsView(_:)``.
@@ -331,8 +337,26 @@ public final class VideoCallViewController: NSViewController {
     public override func viewDidAppear() {
         super.viewDidAppear()
         installWindowCloseObserverIfNeeded()
+        startLocalScreenShareStateObservation()
         startRemoteScreenTrackObservation()
         startRemoteParticipantTrackObservation()
+    }
+
+    private func startLocalScreenShareStateObservation() {
+        localScreenShareStateTask?.cancel()
+        localScreenShareStateTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let stream = await self.session.localScreenShareStateStream()
+            for await isSharing in stream {
+                guard !Task.isCancelled else { return }
+                await self.videoCallDelegate?.screenShareDidChange(isSharing: isSharing)
+                if isSharing {
+                    await self.createLocalScreenView()
+                } else {
+                    await self.tearDownLocalScreenView()
+                }
+            }
+        }
     }
 
     private func startRemoteScreenTrackObservation() {
@@ -464,6 +488,25 @@ public final class VideoCallViewController: NSViewController {
         logLayoutProbe("applyVideoCallWindowLayout passSize=335x475 replaceRootSizing=min335x475 note=noDuplicateSelfEdgePins scrollViewAlreadyFillsBounds")
         controllerView.replaceCallRootSizingForVideoCall(minWidth: 335, minHeight: 475)
         upgradedToVideo = true
+    }
+
+    private func syncVoiceCallWindowForScreenShare(hasVisibleScreenShare: Bool) async {
+        guard isRunning,
+              let currentCall,
+              !currentCall.supportsVideo,
+              hasExpandedVoiceCallForScreenShare != hasVisibleScreenShare
+        else { return }
+
+        hasExpandedVoiceCallForScreenShare = hasVisibleScreenShare
+        if RTCSession.shouldPresentVoiceOnlyCallChrome(
+            callSupportsVideo: currentCall.supportsVideo,
+            hasVisibleScreenShare: hasVisibleScreenShare
+        ) {
+            upgradedToVideo = false
+            await applyVoiceCallWindowLayout()
+        } else {
+            await applyVideoCallWindowLayout()
+        }
     }
     
     private func waitForMountedVideoView(_ view: NTMTKView) async {
@@ -768,6 +811,7 @@ public final class VideoCallViewController: NSViewController {
         }
         // Prevent concurrent teardown from running more than once
         isRunning = false
+        await session.releaseLocalMediaResourcesForCallEnding(call: currentCall)
         removeWindowCloseObserver()
         
         if let currentCall {
@@ -782,6 +826,9 @@ public final class VideoCallViewController: NSViewController {
         }
         screenTrackStreamTask?.cancel()
         screenTrackStreamTask = nil
+        localScreenShareStateTask?.cancel()
+        localScreenShareStateTask = nil
+        await tearDownLocalScreenView()
         for model in videoViews.views where isScreenShareModel(model) {
             await tearDownScreenView(participantId: model.participantId)
         }
@@ -958,6 +1005,9 @@ public final class VideoCallViewController: NSViewController {
 
     private func shouldUseParticipantCameraTiles() -> Bool {
         guard let call = currentCall else { return false }
+        if RTCSession.isTrueOneToOneSfuRoom(call: call) {
+            return false
+        }
         let normalizedSharedId = call.sharedCommunicationId.normalizedConnectionId
         return call.conferencePassword != nil
             || call.resolvedChannelWireId != nil
@@ -1155,6 +1205,107 @@ public final class VideoCallViewController: NSViewController {
         stopAllParticipantRendererRecovery()
     }
 
+    private func createLocalScreenView() async {
+        guard let connectionId = await resolvedMuteConnectionId() else {
+            logger.log(level: .warning, message: "createLocalScreenView: missing active connection id")
+            return
+        }
+        let normalizedId = connectionId.normalizedConnectionId
+        guard let connection = await session.connectionManager.findConnection(with: normalizedId) else {
+            logger.log(level: .warning, message: "createLocalScreenView: connection not found for \(connectionId)")
+            return
+        }
+        guard connection.localScreenTrack != nil else {
+            logger.log(level: .warning, message: "createLocalScreenView: local screen track not ready for \(connectionId)")
+            return
+        }
+
+        let rawParticipantId = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let participantId = rawParticipantId.isEmpty ? "local" : rawParticipantId
+        localScreenShareTileParticipantId = participantId
+        let contextName = "screen_\(participantId)"
+        if screenShareModel(matching: participantId, allowSingleFallback: false) != nil {
+            return
+        }
+
+        let screenView: NTMTKView
+        do {
+            screenView = try NTMTKView(type: .sample, contextName: contextName)
+        } catch {
+            logger.log(level: .error, message: "Failed to create local screen share view: \(error)")
+            return
+        }
+
+        let model = VideoViewModel(videoView: screenView, participantId: participantId, connectionId: normalizedId)
+        videoViews.views.insert(model, at: 0)
+        hasActiveRemoteScreenShare = true
+        await performQuery(removePreview: previewDetachedToOverlay)
+        await waitForMountedVideoView(screenView)
+
+        await screenView.startRendering()
+        screenView.shouldRenderOnMetal = true
+        guard let screenRenderer = screenView.renderer as? SampleBufferViewRenderer else {
+            videoViews.removeView(model)
+            localScreenShareTileParticipantId = nil
+            hasActiveRemoteScreenShare = videoViews.views.contains(where: isScreenShareModel)
+            await performQuery(removePreview: previewDetachedToOverlay)
+            logger.log(level: .error, message: "Local screen share renderer unavailable, removing orphan tile")
+            return
+        }
+
+        let didAttach = await session.renderLocalScreenVideo(
+            to: screenRenderer.rtcVideoRenderWrapper,
+            connectionId: normalizedId
+        )
+        guard didAttach else {
+            await screenRenderer.setRemoteVideoInboundExpected(false)
+            await screenRenderer.shutdown()
+            screenView.shutdownMetalStream()
+            videoViews.removeView(model)
+            localScreenShareTileParticipantId = nil
+            hasActiveRemoteScreenShare = videoViews.views.contains(where: isScreenShareModel)
+            await performQuery(removePreview: previewDetachedToOverlay)
+            logger.log(level: .warning, message: "Local screen share tile removed because no local screen track was available")
+            return
+        }
+
+        await screenRenderer.setRemoteVideoInboundExpected(true)
+        addPresenterBadge(to: screenView)
+        logger.log(level: .info, message: "Local screen share view created for participant=\(participantId)")
+    }
+
+    private func tearDownLocalScreenView() async {
+        guard let participantId = localScreenShareTileParticipantId else {
+            hasActiveRemoteScreenShare = videoViews.views.contains(where: isScreenShareModel)
+            await performQuery(removePreview: previewDetachedToOverlay)
+            return
+        }
+        guard let model = screenShareModel(matching: participantId, allowSingleFallback: false) else {
+            localScreenShareTileParticipantId = nil
+            hasActiveRemoteScreenShare = videoViews.views.contains(where: isScreenShareModel)
+            await performQuery(removePreview: previewDetachedToOverlay)
+            return
+        }
+
+        let screenView = model.videoView
+        if let screenRenderer = screenView.renderer as? SampleBufferViewRenderer {
+            await screenRenderer.setRemoteVideoInboundExpected(false)
+            if !model.connectionId.isEmpty {
+                await session.removeLocalScreenVideoRenderer(
+                    screenRenderer.rtcVideoRenderWrapper,
+                    connectionId: model.connectionId
+                )
+            }
+            await screenRenderer.shutdown()
+        }
+        screenView.shutdownMetalStream()
+        videoViews.removeView(model)
+        localScreenShareTileParticipantId = nil
+        hasActiveRemoteScreenShare = videoViews.views.contains(where: isScreenShareModel)
+        await performQuery(removePreview: previewDetachedToOverlay)
+        logger.log(level: .info, message: "Local screen share view removed for participant=\(model.participantId)")
+    }
+
     /// Creates and renders a remote screen-share tile, promoting it to the dominant position.
     func createScreenView(connectionId: String, participantId: String) async {
         let contextName = "screen_\(participantId)"
@@ -1185,10 +1336,20 @@ public final class VideoCallViewController: NSViewController {
             logger.log(level: .error, message: "Screen share renderer unavailable, removing orphan tile for participant=\(participantId)")
             return
         }
-        await session.renderRemoteScreenVideo(
+        let didAttach = await session.renderRemoteScreenVideo(
             to: screenRenderer.rtcVideoRenderWrapper,
             connectionId: connectionId,
             participantId: participantId)
+        guard didAttach else {
+            await screenRenderer.setRemoteVideoInboundExpected(false)
+            await screenRenderer.shutdown()
+            screenView.shutdownMetalStream()
+            videoViews.removeView(model)
+            hasActiveRemoteScreenShare = videoViews.views.contains(where: isScreenShareModel)
+            await performQuery(removePreview: previewDetachedToOverlay)
+            logger.log(level: .warning, message: "Screen share tile removed because no screen track was available for participant=\(participantId)")
+            return
+        }
         await screenRenderer.setRemoteVideoInboundExpected(true)
         addPresenterBadge(to: screenView)
 
@@ -1495,6 +1656,7 @@ public final class VideoCallViewController: NSViewController {
         }
         let hasScreenShareInData = data.contains(where: isScreenShareModel)
         hasActiveRemoteScreenShare = hasScreenShareInData
+        await syncVoiceCallWindowForScreenShare(hasVisibleScreenShare: hasScreenShareInData)
         if hasScreenShareInData {
             data = screenShareFirst(data)
         }
@@ -1839,15 +2001,24 @@ extension VideoCallViewController: CallActionDelegate {
 
     /// Starts screen sharing with the given target and capture preferences.
     public func startScreenShare(target: ScreenShareTarget, options: ScreenShareOptions) async {
+        _ = await startScreenShareAndReport(target: target, options: options)
+    }
+
+    /// Starts screen sharing and reports whether the local sender setup succeeded.
+    public func startScreenShareAndReport(target: ScreenShareTarget, options: ScreenShareOptions) async -> Bool {
         guard let connectionId = await resolvedMuteConnectionId() else {
             logger.log(level: .warning, message: "startScreenShare: no active connection")
-            return
+            return false
         }
         do {
             try await session.addScreenTrackToStream(target: target, options: options, connectionId: connectionId)
             await videoCallDelegate?.screenShareDidChange(isSharing: true)
+            return true
         } catch {
             logger.log(level: .error, message: "startScreenShare failed: \(error)")
+            await videoCallDelegate?.passErrorMessage(error.localizedDescription)
+            await videoCallDelegate?.screenShareDidChange(isSharing: false)
+            return false
         }
     }
 

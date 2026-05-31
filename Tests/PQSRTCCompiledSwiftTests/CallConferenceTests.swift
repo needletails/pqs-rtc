@@ -179,6 +179,11 @@ struct CallConferenceTests {
         #expect(RTCSession.participantIdFromScreenShareId("screen_echo") == "echo")
     }
 
+    @Test("screen share system audio egress is explicit when unsupported")
+    func screenShareSystemAudioEgressIsExplicitWhenUnsupported() {
+        #expect(RTCSession.supportsScreenShareSystemAudioEgress == false)
+    }
+
     @Test("conference role updates preserve server timing and normalize participant keys")
     func conferenceRoleUpdatesPreserveTimingAndNormalizeKeys() async {
         let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)

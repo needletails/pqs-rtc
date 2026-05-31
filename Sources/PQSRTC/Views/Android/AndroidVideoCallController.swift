@@ -67,11 +67,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
     /// 1:1 calls relayed through the SFU use a transient `#<uuid>` room. They still have a single
     /// remote party, so Android should use the 1:1 renderer path rather than the group grid mapper.
     private func isEphemeralOneToOneSfuRoom(_ call: Call) -> Bool {
-        guard call.recipients.count <= 1 else { return false }
-        let route = (call.channelWireId ?? call.sharedCommunicationId)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard route.hasPrefix("#") else { return false }
-        return UUID(uuidString: route.normalizedConnectionId) != nil
+        RTCSession.isTrueOneToOneSfuRoom(call: call)
     }
 
     public init(session: RTCSession) {
@@ -241,10 +237,12 @@ public actor AndroidVideoCallController: CallActionDelegate {
 
         Task.detached(priority: .userInitiated) {
             guard let call else {
+                await session.releaseLocalMediaResourcesForCallEnding(call: nil)
                 await session.shutdown(with: nil)
                 return
             }
 
+            await session.releaseLocalMediaResourcesForCallEnding(call: call)
             do {
                 let transport = try await session.requireTransport()
                 try await transport.didEnd(call: call, endState: CallStateMachine.EndState.userInitiated)

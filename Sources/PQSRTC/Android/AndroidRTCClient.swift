@@ -471,7 +471,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     public func isFrameKeyProviderReady() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return !isClosed && keyProviderReady
+        return !isClosed && !frameCryptorUnavailable && keyProviderReady
     }
     
     // Retain SDP observers until their callbacks fire (avoid premature disposal)
@@ -508,6 +508,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
     private var keyProviderIsSharedKeyMode: Bool?
     /// Swift-only: true when keyProvider has been set (by Kotlin). Use this instead of reading keyProvider in Swift to avoid triggering JNI method resolution (setKey/setSharedKey) which crashes.
     private var keyProviderReady: Bool = false
+    /// Set after Android WebRTC reports that FrameCryptor natives are not linked in this build.
+    private var frameCryptorUnavailable: Bool = false
     private var videoSenderCryptor: org.webrtc.FrameCryptor?
     private var audioSenderCryptor: org.webrtc.FrameCryptor?
     private var screenSenderCryptor: org.webrtc.FrameCryptor?
@@ -664,6 +666,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
             lock.unlock()
             return
         }
+        if frameCryptorUnavailable {
+            // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "FrameCryptorKeyProvider unavailable; skipping shared-key provider creation")
+            lock.unlock()
+            return
+        }
 
         // Match RTCSession.ensureFrameKeyProviderIfNeeded() (PBKDF2 = WebRTC default when Apple omits keyDerivationAlgorithm).
         // SKIP INSERT: val ratchetWindowSize = 0
@@ -684,6 +691,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     val ratchetSaltSize = ratchetSalt.count
         // SKIP INSERT:     val ratchetSaltBytes = kotlin.UByteArray(ratchetSaltSize) { ratchetSalt.bytes[it] }
         // SKIP INSERT:     val ratchetSaltByteArray = kotlin.ByteArray(size = ratchetSaltBytes.size) { idx -> ratchetSaltBytes[idx].toByte() }
+        // SKIP INSERT:     try {
         // SKIP INSERT:     keyProvider = org.webrtc.FrameCryptorFactory.createFrameCryptorKeyProvider(
         // SKIP INSERT:         sharedKeyMode,
         // SKIP INSERT:         ratchetSaltByteArray,
@@ -698,6 +706,19 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderIsSharedKeyMode = sharedKeyMode
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyMode)")
+        // SKIP INSERT:     } catch (e: java.lang.UnsatisfiedLinkError) {
+        // SKIP INSERT:         this@AndroidRTCClient.keyProvider = null
+        // SKIP INSERT:         this@AndroidRTCClient.keyProviderReady = false
+        // SKIP INSERT:         this@AndroidRTCClient.frameCryptorUnavailable = true
+        // SKIP INSERT:         keyProvider = null
+        // SKIP INSERT:         android.util.Log.e("AndroidRTCClient", "FrameCryptor native API unavailable; media E2EE disabled for this Android WebRTC build", e)
+        // SKIP INSERT:     } catch (e: java.lang.LinkageError) {
+        // SKIP INSERT:         this@AndroidRTCClient.keyProvider = null
+        // SKIP INSERT:         this@AndroidRTCClient.keyProviderReady = false
+        // SKIP INSERT:         this@AndroidRTCClient.frameCryptorUnavailable = true
+        // SKIP INSERT:         keyProvider = null
+        // SKIP INSERT:         android.util.Log.e("AndroidRTCClient", "FrameCryptor native linkage failed; media E2EE disabled for this Android WebRTC build", e)
+        // SKIP INSERT:     }
         // SKIP INSERT: }
 
         // If we stashed a key earlier, apply it now that a provider exists. JNI requires main thread.
@@ -746,6 +767,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
         defer { lock.unlock() }
 
         guard !isClosed else { return }
+        guard !frameCryptorUnavailable else {
+            // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "FrameCryptorKeyProvider unavailable; skipping per-participant provider creation")
+            return
+        }
 
         // SKIP INSERT: val ratchetWindowSize = 0
         // SKIP INSERT: val sharedKeyModeK = false
@@ -761,6 +786,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     val ratchetSaltSize = ratchetSalt.count
         // SKIP INSERT:     val ratchetSaltBytes = kotlin.UByteArray(ratchetSaltSize) { ratchetSalt.bytes[it] }
         // SKIP INSERT:     val ratchetSaltByteArray = kotlin.ByteArray(size = ratchetSaltBytes.size) { idx -> ratchetSaltBytes[idx].toByte() }
+        // SKIP INSERT:     try {
         // SKIP INSERT:     keyProvider = org.webrtc.FrameCryptorFactory.createFrameCryptorKeyProvider(
         // SKIP INSERT:         sharedKeyModeK,
         // SKIP INSERT:         ratchetSaltByteArray,
@@ -775,6 +801,17 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderIsSharedKeyMode = sharedKeyModeK
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyModeK)")
+        // SKIP INSERT:     } catch (e: java.lang.UnsatisfiedLinkError) {
+        // SKIP INSERT:         this@AndroidRTCClient.keyProvider = null
+        // SKIP INSERT:         this@AndroidRTCClient.keyProviderReady = false
+        // SKIP INSERT:         this@AndroidRTCClient.frameCryptorUnavailable = true
+        // SKIP INSERT:         android.util.Log.e("AndroidRTCClient", "FrameCryptor native API unavailable; media E2EE disabled for this Android WebRTC build", e)
+        // SKIP INSERT:     } catch (e: java.lang.LinkageError) {
+        // SKIP INSERT:         this@AndroidRTCClient.keyProvider = null
+        // SKIP INSERT:         this@AndroidRTCClient.keyProviderReady = false
+        // SKIP INSERT:         this@AndroidRTCClient.frameCryptorUnavailable = true
+        // SKIP INSERT:         android.util.Log.e("AndroidRTCClient", "FrameCryptor native linkage failed; media E2EE disabled for this Android WebRTC build", e)
+        // SKIP INSERT:     }
         // SKIP INSERT: }
     }
 
@@ -917,6 +954,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
             // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Cannot create sender encrypted frame: AndroidRTCClient has been closed")
             return
         }
+        guard !frameCryptorUnavailable, keyProviderReady else { return }
 
         // SKIP INSERT: val mainLooper = android.os.Looper.getMainLooper()
         // SKIP INSERT: fun doCreateSenderCryptors() {
@@ -1009,6 +1047,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
             // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Cannot create screen sender encrypted frame: AndroidRTCClient has been closed")
             return
         }
+        guard !frameCryptorUnavailable, keyProviderReady else { return }
 
         // SKIP INSERT: val mainLooper = android.os.Looper.getMainLooper()
         // SKIP INSERT: fun doCreateScreenSenderCryptor() {
@@ -1076,6 +1115,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
             // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Cannot create receiver encrypted frame: AndroidRTCClient has been closed")
             return
         }
+        guard !frameCryptorUnavailable, keyProviderReady else { return }
 
         // SKIP INSERT: val mainLooper = android.os.Looper.getMainLooper()
         // SKIP INSERT: fun doCreateReceiverCryptors() {
@@ -1250,24 +1290,28 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///
     /// If initialization fails (missing native library, linkage issues, etc.), this method records that
     /// failure so future calls fail fast with a clearer error.
-    private func createFactory() throws -> org.webrtc.PeerConnectionFactory {
+    private func createFactory() -> org.webrtc.PeerConnectionFactory? {
         lock.lock()
         let failed = initializationFailed
         lock.unlock()
         
         guard !failed else {
-            throw RTCClientErrors.peerConnectionError("WebRTC initialization previously failed. Cannot create factory.")
+            return nil
         }
         
         // SKIP INSERT: try {
         // SKIP INSERT:   if (this@AndroidRTCClient.factory == null) {
         // SKIP INSERT:     // Check if initialization has already failed
         // SKIP INSERT:     if (this@AndroidRTCClient.initializationFailed) {
-        // SKIP INSERT:       throw IllegalStateException("WebRTC initialization previously failed. Cannot create factory.")
+        // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "WebRTC initialization previously failed. Cannot create factory.")
+        // SKIP INSERT:       return null
         // SKIP INSERT:     }
         // SKIP INSERT:     
         // SKIP INSERT:     val ctx = ProcessInfo.processInfo.androidContext
-        // SKIP INSERT:     val app = ctx?.applicationContext ?: throw IllegalStateException("Android context not available")
+        // SKIP INSERT:     val app = ctx?.applicationContext ?: run {
+        // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "Android context not available")
+        // SKIP INSERT:       return null
+        // SKIP INSERT:     }
         // SKIP INSERT:     
         // SKIP INSERT:     val init = org.webrtc.PeerConnectionFactory.InitializationOptions
         // SKIP INSERT:       .builder(app)
@@ -1291,19 +1335,23 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     } catch (e: java.lang.ClassNotFoundException) {
         // SKIP INSERT:       this@AndroidRTCClient.initializationFailed = true
         // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "WebRTC native library not found: ${e.message}", e)
-        // SKIP INSERT:       throw IllegalStateException("WebRTC native library missing. Check dependencies: ${e.message}", e)
+        // SKIP INSERT:       return null
         // SKIP INSERT:     } catch (e: java.lang.UnsatisfiedLinkError) {
         // SKIP INSERT:       this@AndroidRTCClient.initializationFailed = true
         // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "WebRTC native library link error: ${e.message}", e)
-        // SKIP INSERT:       throw IllegalStateException("WebRTC native library link failed: ${e.message}", e)
-        // SKIP INSERT:     } catch (e: java.lang.Exception) {
+        // SKIP INSERT:       return null
+        // SKIP INSERT:     } catch (e: Throwable) {
         // SKIP INSERT:       this@AndroidRTCClient.initializationFailed = true
         // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "Failed to initialize PeerConnectionFactory: ${e.javaClass.simpleName}: ${e.message}", e)
-        // SKIP INSERT:       throw IllegalStateException("Failed to initialize WebRTC: ${e.message}", e)
+        // SKIP INSERT:       return null
         // SKIP INSERT:     }
         // SKIP INSERT:     
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "Creating EGL base")
-        // SKIP INSERT:     val egl = org.webrtc.EglBase.create() ?: throw IllegalStateException("Failed to create EGL base")
+        // SKIP INSERT:     val egl = org.webrtc.EglBase.create() ?: run {
+        // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "Failed to create EGL base")
+        // SKIP INSERT:       this@AndroidRTCClient.initializationFailed = true
+        // SKIP INSERT:       return null
+        // SKIP INSERT:     }
         // SKIP INSERT:     this@AndroidRTCClient.eglBase = egl
         // SKIP INSERT:
         // SKIP INSERT:     val enc = org.webrtc.DefaultVideoEncoderFactory(egl.eglBaseContext, true, true)
@@ -1317,14 +1365,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     this@AndroidRTCClient.factory = fac
         // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "PeerConnectionFactory instance ready")
         // SKIP INSERT:   }
-        // SKIP INSERT:   return this@AndroidRTCClient.factory ?: throw IllegalStateException("Factory not initialized")
-        // SKIP INSERT: } catch (e: java.lang.Exception) {
+        // SKIP INSERT:   return this@AndroidRTCClient.factory
+        // SKIP INSERT: } catch (e: Throwable) {
         // SKIP INSERT:   // Mark as failed if not already marked
-        // SKIP INSERT:   if (!this@AndroidRTCClient.initializationFailed && e is IllegalStateException) {
-        // SKIP INSERT:     this@AndroidRTCClient.initializationFailed = true
-        // SKIP INSERT:   }
+        // SKIP INSERT:   this@AndroidRTCClient.initializationFailed = true
         // SKIP INSERT:   android.util.Log.e("AndroidRTCClient", "Fatal error creating factory: ${e.javaClass.simpleName}: ${e.message}", e)
-        // SKIP INSERT:   throw IllegalStateException("WebRTC initialization failed: ${e.message}", e)
+        // SKIP INSERT:   return null
         // SKIP INSERT: }
     }
     
@@ -1336,7 +1382,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         iceTransportPolicy: RTCIceTransportSelection = .all
     ) throws -> org.webrtc.PeerConnection? {
         // SKIP INSERT: try {
-        // SKIP INSERT:   val factory = createFactory()
+        // SKIP INSERT:   val factory = createFactory() ?: return null
         // SKIP INSERT:   val servers = kotlin.collections.mutableListOf<org.webrtc.PeerConnection.IceServer>()
         // SKIP INSERT:   for (url in iceServers) {
         // SKIP INSERT:     val builder = org.webrtc.PeerConnection.IceServer.builder(url)
@@ -1359,7 +1405,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   android.util.Log.i("AndroidRTCClient", "Native PeerConnection created=${pc != null}")
         // SKIP INSERT:   this@AndroidRTCClient.factory = factory
         // SKIP INSERT:   return pc
-        // SKIP INSERT: } catch (e: java.lang.Exception) {
+        // SKIP INSERT: } catch (e: Throwable) {
         // SKIP INSERT:   android.util.Log.e("AndroidRTCClient", "Error creating peer connection", e)
         // SKIP INSERT:   return null
         // SKIP INSERT: }

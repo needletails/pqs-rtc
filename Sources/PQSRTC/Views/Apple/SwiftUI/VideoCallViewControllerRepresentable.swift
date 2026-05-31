@@ -67,6 +67,10 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
         await viewController?.startScreenShare(target: target, options: options)
     }
 
+    public func startScreenShareAndReport(target: ScreenShareTarget, options: ScreenShareOptions) async -> Bool {
+        await viewController?.startScreenShareAndReport(target: target, options: options) ?? false
+    }
+
     public func stopScreenShare() async {
         await viewController?.stopScreenShare()
     }
@@ -338,6 +342,10 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
 
     public func startScreenShare(target: ScreenShareTarget, options: ScreenShareOptions) async {
         await viewController?.startScreenShare(target: target, options: options)
+    }
+
+    public func startScreenShareAndReport(target: ScreenShareTarget, options: ScreenShareOptions) async -> Bool {
+        await viewController?.startScreenShareAndReport(target: target, options: options) ?? false
     }
 
     public func stopScreenShare() async {

@@ -126,18 +126,27 @@ extension RTCSession {
     }
 
     /// Render a remote screen share track to an Android view.
-    func renderRemoteScreenVideo(to view: AndroidSampleCaptureView, connectionId: String, participantId: String) async {
+    @discardableResult
+    func renderRemoteScreenVideo(to view: AndroidSampleCaptureView, connectionId: String, participantId: String) async -> Bool {
         let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Rendering remote screen video for connection=\(connectionId) participant=\(participantId)")
         let manager = connectionManager as RTCConnectionManager
 
         guard var connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
             logger.log(level: .error, message: "renderRemoteScreenVideo: connection not found for \(connectionId)")
-            return
+            return false
         }
 
         // Prefer per-participant lookup, fall back to legacy single track
         var screenTrack = connection.remoteScreenTracksByParticipantId[participantId]
+        if screenTrack == nil {
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            if !participantKey.isEmpty {
+                screenTrack = connection.remoteScreenTracksByParticipantId.first {
+                    Self.conferenceParticipantIdentityKey($0.key) == participantKey
+                }?.value
+            }
+        }
         if screenTrack == nil {
             screenTrack = connection.remoteScreenTrack
                 ?? rtcClient.getRemoteScreenVideoTrack(peerConnection: connection.peerConnection)
@@ -150,8 +159,10 @@ extension RTCSession {
         if let screenTrack {
             view.attach(screenTrack)
             logger.log(level: .info, message: "Remote screen renderer attached for participant=\(participantId)")
+            return true
         } else {
             logger.log(level: .warning, message: "renderRemoteScreenVideo: screen track not available yet for participant=\(participantId)")
+            return false
         }
     }
 
@@ -160,7 +171,14 @@ extension RTCSession {
         let normalizedId = connectionId.normalizedConnectionId
         let manager = connectionManager as RTCConnectionManager
         guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
-        let screenTrack = connection.remoteScreenTracksByParticipantId[participantId] ?? connection.remoteScreenTrack
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        let screenTrack = connection.remoteScreenTracksByParticipantId[participantId]
+            ?? (!participantKey.isEmpty
+                ? connection.remoteScreenTracksByParticipantId.first {
+                    Self.conferenceParticipantIdentityKey($0.key) == participantKey
+                }?.value
+                : nil)
+            ?? connection.remoteScreenTrack
         if let screenTrack {
             view.detach(screenTrack)
         }
@@ -173,6 +191,33 @@ extension RTCSession {
         guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
         connection.localVideoTrack?.add(renderer)
     }
+
+    @discardableResult
+    func renderLocalScreenVideo(to renderer: RTCVideoRenderWrapper, connectionId: String) async -> Bool {
+        let normalizedId = connectionId.normalizedConnectionId
+        logger.log(level: .info, message: "Rendering local screen video for connection: \(connectionId)")
+        let manager = connectionManager as RTCConnectionManager
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
+            logger.log(level: .warning, message: "renderLocalScreenVideo: connection not found for \(connectionId)")
+            return false
+        }
+        guard let screenTrack = connection.localScreenTrack else {
+            logger.log(level: .warning, message: "renderLocalScreenVideo: local screen track not found for \(connectionId)")
+            return false
+        }
+        screenTrack.remove(renderer)
+        screenTrack.add(renderer)
+        logger.log(level: .info, message: "Local screen renderer attached trackId=\(screenTrack.trackId)")
+        return true
+    }
+
+    func removeLocalScreenVideoRenderer(_ renderer: RTCVideoRenderWrapper, connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        let manager = connectionManager as RTCConnectionManager
+        guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
+        connection.localScreenTrack?.remove(renderer)
+    }
+
     func renderRemoteVideo(to renderer: RTCVideoRenderWrapper, with connectionId: String) async {
         let normalizedId = connectionId.normalizedConnectionId
         if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled {
@@ -421,23 +466,26 @@ extension RTCSession {
     ///
     /// This mirrors ``renderRemoteVideo(to:with:)`` but targets the screen track stored in
     /// ``RTCConnection/remoteScreenTracksByParticipantId`` instead of the camera track.
-    func renderRemoteScreenVideo(to renderer: RTCVideoRenderWrapper, connectionId: String, participantId: String) async {
+    @discardableResult
+    func renderRemoteScreenVideo(to renderer: RTCVideoRenderWrapper, connectionId: String, participantId: String) async -> Bool {
         let normalizedId = connectionId.normalizedConnectionId
         logger.log(level: .info, message: "Rendering remote screen video for connection=\(connectionId) participant=\(participantId)")
         let manager = connectionManager as RTCConnectionManager
 
         guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
             logger.log(level: .error, message: "renderRemoteScreenVideo: connection not found for \(connectionId)")
-            return
+            return false
         }
 
-        guard let screenTrack = connection.remoteScreenTracksByParticipantId[participantId] else {
+        guard let binding = remoteScreenTrackBinding(in: connection, participantId: participantId) else {
             logger.log(level: .warning, message: "renderRemoteScreenVideo: screen track not found for participant=\(participantId)")
-            return
+            return false
         }
 
-        screenTrack.add(renderer)
-        logger.log(level: .info, message: "Remote screen renderer attached for participant=\(participantId) trackId=\(screenTrack.trackId)")
+        binding.track.remove(renderer)
+        binding.track.add(renderer)
+        logger.log(level: .info, message: "Remote screen renderer attached for participant=\(participantId) resolvedKey=\(binding.key) trackId=\(binding.track.trackId)")
+        return true
     }
 
     /// Removes a renderer previously bound via ``renderRemoteScreenVideo(to:connectionId:participantId:)``.
@@ -445,7 +493,26 @@ extension RTCSession {
         let normalizedId = connectionId.normalizedConnectionId
         let manager = connectionManager as RTCConnectionManager
         guard let connection: RTCConnection = await manager.findConnection(with: normalizedId) else { return }
-        connection.remoteScreenTracksByParticipantId[participantId]?.remove(renderer)
+        remoteScreenTrackBinding(in: connection, participantId: participantId)?.track.remove(renderer)
+    }
+
+    private func remoteScreenTrackBinding(
+        in connection: RTCConnection,
+        participantId: String
+    ) -> (key: String, track: WebRTC.RTCVideoTrack)? {
+        if let exact = connection.remoteScreenTracksByParticipantId[participantId] {
+            return (participantId, exact)
+        }
+
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        if !participantKey.isEmpty,
+           let normalized = connection.remoteScreenTracksByParticipantId.first(where: {
+               Self.conferenceParticipantIdentityKey($0.key) == participantKey
+           }) {
+            return (normalized.key, normalized.value)
+        }
+
+        return nil
     }
 
     /// Removes a renderer previously bound via ``renderRemoteVideoForParticipant(to:connectionId:participantId:)``.

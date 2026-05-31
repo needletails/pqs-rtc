@@ -51,11 +51,15 @@ extension RTCSession {
         sdp: String,
         hasVideo: Bool = false,
         stripSsrcLines: Bool = false,
-        vp8OnlyVideo: Bool = false
+        vp8OnlyVideo: Bool = false,
+        preserveVideoDirectionsForMids: Set<String> = []
     ) async -> String {
         var sdp = sdp
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
+        let preservedVideoDirectionMids = preserveVideoDirectionsForMids
+            .union(Self.screenShareVideoMids(in: sdp))
+            .union(Self.receiveOnlyVideoMidsWithoutLocalMedia(in: sdp))
 
         func payloadType(in line: String, prefix: String) -> String? {
             guard line.hasPrefix(prefix) else { return nil }
@@ -179,6 +183,7 @@ extension RTCSession {
         // Flags to indicate that we're in a media section and should modify direction attributes
         var inAudioSection = false
         var inVideoSection = false
+        var currentMediaMid: String?
         
         for line in lines {
             var line = line
@@ -213,12 +218,14 @@ extension RTCSession {
             if line.hasPrefix("m=audio") {
                 inVideoSection = false
                 inAudioSection = true
+                currentMediaMid = nil
                 modifiedLines.append(line)
                 continue
             }
             if line.hasPrefix("m=video") {
                 inAudioSection = false
                 inVideoSection = true
+                currentMediaMid = nil
                 modifiedLines.append(line)
                 continue
             }
@@ -227,6 +234,14 @@ extension RTCSession {
             if line.hasPrefix("v=") || line.hasPrefix("o=") || line.hasPrefix("s=") || line.hasPrefix("t=") {
                 inAudioSection = false
                 inVideoSection = false
+                currentMediaMid = nil
+                modifiedLines.append(line)
+                continue
+            }
+
+            if line.hasPrefix("a=mid:") {
+                currentMediaMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 modifiedLines.append(line)
                 continue
             }
@@ -248,7 +263,13 @@ extension RTCSession {
                 
                 // Only process lines that contain direction attributes
                 if line.contains("a=recvonly") || line.contains("a=sendonly") || line.contains("a=inactive") || line.contains("a=sendrecv") {
-                    if hasVideo {
+                    let shouldPreserveDirection = currentMediaMid.map {
+                        preservedVideoDirectionMids.contains($0)
+                    } ?? false
+                    if shouldPreserveDirection {
+                        modifiedLines.append(line)
+                        inVideoSection = false
+                    } else if hasVideo {
                         let (modifiedLine, didModify) = sendAndReceiveMedia(in: line)
                         modifiedLines.append(modifiedLine)
                         if didModify {
@@ -270,6 +291,112 @@ extension RTCSession {
         
         // Recombine the modified lines back into a single SDP string
         return modifiedLines.joined(separator: "\n") + "\n"
+    }
+
+    nonisolated static func screenShareVideoMids(in sdp: String) -> Set<String> {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var mids = Set<String>()
+        var currentIsVideo = false
+        var currentMid: String?
+        var currentHasScreenMsid = false
+
+        func flushCurrentSection() {
+            guard currentIsVideo, currentHasScreenMsid, let currentMid, !currentMid.isEmpty else { return }
+            mids.insert(currentMid)
+        }
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentIsVideo = line.hasPrefix("m=video")
+                currentMid = nil
+                currentHasScreenMsid = false
+                continue
+            }
+
+            guard currentIsVideo else { continue }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if Self.lineContainsScreenShareMsid(line) {
+                currentHasScreenMsid = true
+            }
+        }
+        flushCurrentSection()
+
+        return mids
+    }
+
+    nonisolated static func receiveOnlyVideoMidsWithoutLocalMedia(in sdp: String) -> Set<String> {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var mids = Set<String>()
+        var currentIsVideo = false
+        var currentMid: String?
+        var currentDirection: String?
+        var currentHasLocalMedia = false
+
+        func flushCurrentSection() {
+            guard currentIsVideo,
+                  currentDirection == "recvonly",
+                  !currentHasLocalMedia,
+                  let currentMid,
+                  !currentMid.isEmpty else { return }
+            mids.insert(currentMid)
+        }
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentIsVideo = line.hasPrefix("m=video")
+                currentMid = nil
+                currentDirection = nil
+                currentHasLocalMedia = false
+                continue
+            }
+
+            guard currentIsVideo else { continue }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if line == "a=sendrecv" || line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive" {
+                currentDirection = String(line.dropFirst("a=".count))
+            } else if line.hasPrefix("a=msid:") ||
+                        line.hasPrefix("a=ssrc:") ||
+                        line.hasPrefix("a=ssrc-group:") {
+                currentHasLocalMedia = true
+            }
+        }
+        flushCurrentSection()
+
+        return mids
+    }
+
+    private nonisolated static func lineContainsScreenShareMsid(_ line: String) -> Bool {
+        let remainder: String
+        if line.hasPrefix("a=msid:") {
+            remainder = String(line.dropFirst("a=msid:".count))
+        } else if let range = line.range(of: " msid:") {
+            remainder = String(line[range.upperBound...])
+        } else {
+            return false
+        }
+
+        return remainder
+            .split(whereSeparator: { $0 == " " || $0 == "\t" })
+            .contains { $0.hasPrefix(Self.screenTrackPrefix) }
     }
     
     /// Validates SDP format and content
@@ -517,6 +644,7 @@ extension RTCSession {
             try await client.setRemoteDescription(sdp)
             self.logger.log(level: .info, message: "Successfully set remote SDP\n \(sdp.sdp)")
             self.logger.log(level: .info, message: "Remote SDP summary after set connection=\(connection.id): \(RTCSdpDiagnostics.summary(sdp.sdp))")
+            await reconcileAndroidRemoteParticipantCameraTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
             
         } catch let error as SDPHandlerError {
             self.logger.log(level: .error, message: "Failed to set remote SDP: \(error.localizedDescription)")

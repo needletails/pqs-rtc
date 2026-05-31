@@ -19,6 +19,7 @@ import CoreGraphics
 import ScreenCaptureKit
 import WebRTC
 import CoreMedia
+import QuartzCore
 import NeedleTailLogger
 
 /// Captures a macOS display or window via ScreenCaptureKit and pushes frames
@@ -30,6 +31,9 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
     private weak var videoSource: RTCVideoSource?
     private let kNanosecondsPerSecond: Float64 = 1_000_000_000
     private lazy var capturer = RTCVideoCapturer()
+    private let screenSampleQueue = DispatchQueue(label: "com.needletails.pqsrtc.mac-screen-capture.video", qos: .userInteractive)
+    private let audioSampleQueue = DispatchQueue(label: "com.needletails.pqsrtc.mac-screen-capture.audio", qos: .userInitiated)
+    private var loggedUnsupportedAudioSample = false
     private let onUnexpectedStop: (@Sendable () -> Void)?
 
     init(onUnexpectedStop: (@Sendable () -> Void)? = nil) {
@@ -39,7 +43,7 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
 
     /// Enumerate available displays and windows.
     static func availableContent() async throws -> SCShareableContent {
-        try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
     }
 
     /// Begin capture for the given target and deliver frames to `videoSource`.
@@ -78,6 +82,9 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
             guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
                 throw RTCErrors.mediaError("Window \(windowID) not found")
             }
+            guard Self.isShareableApplicationWindow(window) else {
+                throw RTCErrors.mediaError("Window \(windowID) is not a shareable application window")
+            }
             filter = SCContentFilter(desktopIndependentWindow: window)
 
         default:
@@ -113,12 +120,25 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
             config.preservesAspectRatio = true
         }
         config.queueDepth = 4
+        if options.shareSystemAudio {
+            config.capturesAudio = true
+            config.excludesCurrentProcessAudio = true
+            config.sampleRate = 48_000
+            config.channelCount = 2
+        }
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: self)
-        try scStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+        try scStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: screenSampleQueue)
+        if options.shareSystemAudio {
+            try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSampleQueue)
+        }
         try await scStream.startCapture()
         self.stream = scStream
-        logger.log(level: .info, message: "Screen capture started output=\(config.width)x\(config.height) optimizeForVideo=\(options.optimizeForVideo)")
+        loggedUnsupportedAudioSample = false
+        logger.log(
+            level: .info,
+            message: "Screen capture started output=\(config.width)x\(config.height) optimizeForVideo=\(options.optimizeForVideo) shareSystemAudio=\(options.shareSystemAudio)"
+        )
     }
 
     /// Stop capturing and release the stream.
@@ -171,18 +191,73 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
         } ?? NSScreen.main
         return best?.backingScaleFactor ?? 1
     }
+
+    private static func isShareableApplicationWindow(_ window: SCWindow) -> Bool {
+        guard window.isOnScreen else { return false }
+        guard window.windowLayer == 0 else { return false }
+        guard let application = window.owningApplication else { return false }
+
+        let ownBundleID = Bundle.main.bundleIdentifier ?? ""
+        if !ownBundleID.isEmpty, application.bundleIdentifier == ownBundleID {
+            return false
+        }
+
+        let appName = application.applicationName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !appName.isEmpty else { return false }
+
+        let size = window.frame.size
+        return size.width >= 160 && size.height >= 120
+    }
 }
 
 extension MacScreenCaptureSource: SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen else { return }
+        switch type {
+        case .screen:
+            handleScreenSampleBuffer(sampleBuffer)
+        case .audio:
+            handleAudioSampleBuffer(sampleBuffer)
+        @unknown default:
+            return
+        }
+    }
+
+    private func handleScreenSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        guard sampleBuffer.isValid else { return }
+        guard sampleBufferContainsCompleteFrame(sampleBuffer) else { return }
         guard let videoSource else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        let timeStampNs = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * kNanosecondsPerSecond
+        let timestampSeconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        let timeStampNs = (timestampSeconds.isFinite ? timestampSeconds : CACurrentMediaTime()) * kNanosecondsPerSecond
         let rtcPixelBuffer = RTCCVPixelBuffer(pixelBuffer: pixelBuffer)
         let frame = RTCVideoFrame(buffer: rtcPixelBuffer, rotation: ._0, timeStampNs: Int64(timeStampNs))
         videoSource.capturer(capturer, didCapture: frame)
+    }
+
+    private func handleAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        guard sampleBuffer.isValid else { return }
+        if !loggedUnsupportedAudioSample {
+            loggedUnsupportedAudioSample = true
+            logger.log(
+                level: .warning,
+                message: "Captured ScreenCaptureKit system-audio samples, but this WebRTC build does not expose a push-audio source for RTP egress"
+            )
+        }
+    }
+
+    private func sampleBufferContainsCompleteFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer,
+            createIfNecessary: false
+        ) as? [[SCStreamFrameInfo: Any]],
+              let attachments = attachmentsArray.first,
+              let statusRawValue = attachments[SCStreamFrameInfo.status] as? Int,
+              let status = SCFrameStatus(rawValue: statusRawValue)
+        else {
+            return true
+        }
+        return status == .complete
     }
 }
 

@@ -211,10 +211,16 @@ extension RTCSession {
         sdp: SessionDescription
     ) async throws {
         let call = try resolveProperRecipient(call: call)
+#if !os(Android)
+        let preserveVideoDirectionsForMids = await localScreenShareVideoMids(for: call)
+#else
+        let preserveVideoDirectionsForMids: Set<String> = []
+#endif
         let modified = await modifySDP(
             sdp: sdp.sdp,
             hasVideo: call.supportsVideo,
-            stripSsrcLines: false)
+            stripSsrcLines: false,
+            preserveVideoDirectionsForMids: preserveVideoDirectionsForMids)
         
 #if os(Android)
         try await setRemote(
@@ -524,6 +530,8 @@ extension RTCSession {
             sdp = try SessionDescription(fromRTC: description)
 #elseif canImport(WebRTC)
             var description: WebRTC.RTCSessionDescription = try await generateSDPAnswer(for: connection, hasAudio: true, hasVideo: call.supportsVideo)
+            let preserveVideoDirectionsForMids = connection.peerConnection.remoteDescription
+                .map { Self.screenShareVideoMids(in: $0.sdp) } ?? []
             
             // Modify SDP for specific requirements
             let modified = await modifySDP(
@@ -534,7 +542,8 @@ extension RTCSession {
                 // on some WebRTC/SFU combinations (symptom: ICE+DTLS connected, but
                 // outbound audio/video packets remain flat at zero).
                 stripSsrcLines: false,
-                vp8OnlyVideo: connection.id.isGroupCall)
+                vp8OnlyVideo: connection.id.isGroupCall,
+                preserveVideoDirectionsForMids: preserveVideoDirectionsForMids)
             
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             
@@ -640,6 +649,15 @@ extension RTCSession {
 #endif
     
 #if !os(Android)
+    private func localScreenShareVideoMids(for call: Call) async -> Set<String> {
+        guard let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
+              let localSDP = connection.peerConnection.localDescription?.sdp
+        else {
+            return []
+        }
+        return Self.screenShareVideoMids(in: localSDP)
+    }
+
     func setRemote(
         sdp: WebRTC.RTCSessionDescription,
         call: Call
@@ -669,10 +687,17 @@ extension RTCSession {
             
             // Modify SDP for specific requirements
             var modifiedSdp = sdp
+            let preserveVideoDirectionsForMids: Set<String>
+            if sdp.type == .answer, let localSDP = connection.peerConnection.localDescription?.sdp {
+                preserveVideoDirectionsForMids = Self.screenShareVideoMids(in: localSDP)
+            } else {
+                preserveVideoDirectionsForMids = []
+            }
             let modified = await modifySDP(
                 sdp: sdp.sdp,
                 hasVideo: call.supportsVideo,
-                stripSsrcLines: false)
+                stripSsrcLines: false,
+                preserveVideoDirectionsForMids: preserveVideoDirectionsForMids)
             modifiedSdp = WebRTC.RTCSessionDescription(type: sdp.type, sdp: modified)
             
             // Set remote SDP using the new SDPHandler

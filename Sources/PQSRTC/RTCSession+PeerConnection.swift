@@ -64,6 +64,127 @@ extension RTCSession {
 
 #endif
 
+    /// Immediately releases local camera, microphone, and screen-capture resources for an ending call.
+    ///
+    /// This is intentionally separate from full signaling/peer-connection teardown so UI end actions
+    /// can reclaim device access before transport `didEnd` or remote cleanup finishes.
+    public func releaseLocalMediaResourcesForCallEnding(call: Call?) async {
+        shouldOffer = false
+
+#if os(iOS) || os(macOS)
+        for (_, renderer) in localPreviewCaptureRenderersByConnectionId {
+            await renderer.stopCaptureSession()
+            await renderer.setCapture(nil)
+        }
+#endif
+
+        let connectionIds = await localMediaReleaseConnectionIds(for: call)
+        for connectionId in connectionIds {
+            await releaseLocalMediaResourcesForCallEnding(connectionId: connectionId)
+        }
+
+#if os(iOS)
+        setAudio(false)
+        do {
+            try deactivateAudioSession(session: AVAudioSession.sharedInstance())
+        } catch {
+            logger.log(level: .warning, message: "⚠️ Failed to deactivate AVAudioSession while releasing local media: \(error.localizedDescription)")
+        }
+#elseif os(Android)
+        rtcClient.setAudioEnabled(false)
+        rtcClient.stopLocalVideo()
+        rtcClient.stopScreenCapture()
+#endif
+
+        logger.log(level: .info, message: "Released local media resources for ending call: \(call?.sharedCommunicationId ?? "<none>")")
+    }
+
+    private func localMediaReleaseConnectionIds(for call: Call?) async -> [String] {
+        var ids: [String] = []
+
+        func append(_ rawId: String?) {
+            let normalized = rawId?.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId ?? ""
+            guard !normalized.isEmpty, !ids.contains(normalized) else { return }
+            ids.append(normalized)
+        }
+
+        append(call?.sharedCommunicationId)
+        append(call?.resolvedChannelWireId)
+
+        if ids.isEmpty {
+            for connection in await connectionManager.findAllConnections() {
+                append(connection.id)
+            }
+        }
+
+        return ids
+    }
+
+    private func releaseLocalMediaResourcesForCallEnding(connectionId rawConnectionId: String) async {
+        let connectionId = rawConnectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !connectionId.isEmpty else { return }
+
+        guard var connection = await connectionManager.findConnection(with: connectionId) else {
+            logger.log(level: .debug, message: "No connection found while releasing local media for ending call: \(connectionId)")
+            return
+        }
+
+        stopAdaptiveVideoSend(connectionId: connectionId)
+
+#if os(Android)
+        rtcClient.setAudioEnabled(false)
+        rtcClient.stopLocalVideo()
+        rtcClient.stopScreenCapture()
+        let hadLocalScreenTrack = connection.localScreenTrack != nil
+        connection.localVideoTrack = nil
+        connection.localScreenTrack = nil
+        if hadLocalScreenTrack {
+            notifyLocalScreenShareChanged(isSharing: false)
+        }
+        await connectionManager.updateConnection(id: connectionId, with: connection)
+#elseif canImport(WebRTC)
+        if connection.localAudioTrack != nil {
+            await setTrackEnabled(WebRTC.RTCAudioTrack.self, isEnabled: false, with: connection)
+        }
+        if connection.localVideoTrack != nil {
+            await setTrackEnabled(WebRTC.RTCVideoTrack.self, isEnabled: false, with: connection)
+        }
+
+        for sender in connection.peerConnection.senders {
+            guard let kind = sender.track?.kind,
+                  kind == kRTCMediaStreamTrackKindAudio || kind == kRTCMediaStreamTrackKindVideo
+            else { continue }
+
+            var params = sender.parameters
+            if !params.encodings.isEmpty {
+                for encoding in params.encodings {
+                    encoding.isActive = false
+                }
+                sender.parameters = params
+            }
+
+            if !connection.peerConnection.removeTrack(sender) {
+                logger.log(level: .debug, message: "Unable to remove \(kind) sender while releasing local media for ending call: \(connectionId)")
+            }
+        }
+
+        if connection.localScreenTrack != nil, let captureSource = screenCaptureSourceForCurrentPlatform {
+            await stopPlatformScreenCapture(captureSource)
+        }
+        let hadLocalScreenTrack = connection.localScreenTrack != nil
+        connection.rtcVideoCaptureWrapper = nil
+        connection.screenCaptureWrapper = nil
+        connection.localVideoTrack = nil
+        connection.localAudioTrack = nil
+        connection.localScreenTrack = nil
+        if hadLocalScreenTrack {
+            notifyLocalScreenShareChanged(isSharing: false)
+        }
+
+        await connectionManager.updateConnection(id: connectionId, with: connection)
+#endif
+    }
+
     /// WebRTC SDP tokens like msid stream/track identifiers must not contain certain characters
     /// (notably `#`), or native SDP parsing can fail on the SFU side.
     ///
@@ -304,6 +425,8 @@ extension RTCSession {
     /// - Parameter call: The call to end. If `nil`, the session attempts to close any remaining
     ///   connections as a fallback.
     public func shutdown(with call: Call?) async {
+        await releaseLocalMediaResourcesForCallEnding(call: call)
+
         // Stop background consumers first so we don't process late callbacks
         // while tearing down peer connections.
         shouldOffer = false
@@ -785,8 +908,12 @@ extension RTCSession {
             if connection.localScreenTrack != nil, let captureSource = screenCaptureSourceForCurrentPlatform {
                 await stopPlatformScreenCapture(captureSource)
             }
+            let hadLocalScreenTrack = connection.localScreenTrack != nil
             connection.localScreenTrack = nil
             connection.screenCaptureWrapper = nil
+            if hadLocalScreenTrack {
+                notifyLocalScreenShareChanged(isSharing: false)
+            }
             for participantId in connection.remoteScreenTracksByParticipantId.keys {
                 notifyRemoteScreenTrackChanged(
                     RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
@@ -817,8 +944,12 @@ extension RTCSession {
             await setVideoTrack(isEnabled: false, connectionId: connectionId)
 
             // Stop local screen capture
+            let hadLocalScreenTrack = connection.localScreenTrack != nil
             rtcClient.stopScreenCapture()
             connection.localScreenTrack = nil
+            if hadLocalScreenTrack {
+                notifyLocalScreenShareChanged(isSharing: false)
+            }
 
             // Emit removal events for any active remote screen shares (per-participant and legacy single)
             for participantId in connection.remoteScreenTracksByParticipantId.keys {

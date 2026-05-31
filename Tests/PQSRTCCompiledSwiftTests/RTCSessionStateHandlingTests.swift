@@ -8,14 +8,28 @@ import NeedleTailLogger
 import WebRTC
 #endif
 
-@Suite(.serialized)
+    @Suite(.serialized)
 struct RTCSessionStateHandlingTests {
     actor TestTransportEvents: RTCTransportEvents {
         private(set) var didEndCalls: [(call: Call, endState: CallStateMachine.EndState)] = []
+        private(set) var didBeginStartCall = false
+        private let suspendStartCall: Bool
+        private var startCallContinuation: CheckedContinuation<Void, Never>?
+
+        init(suspendStartCall: Bool = false) {
+            self.suspendStartCall = suspendStartCall
+        }
 
         func sendCiphertext(recipient: String, connectionId: String, ciphertext: Data, call: Call) async throws {}
         func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws {}
-        func sendStartCall(_ call: Call) async throws {}
+        func sendStartCall(_ call: Call) async throws {
+            didBeginStartCall = true
+            if suspendStartCall {
+                await withCheckedContinuation { continuation in
+                    startCallContinuation = continuation
+                }
+            }
+        }
         func sendCallAnswered(_ call: Call) async throws {}
         func sendCallAnsweredAuxDevice(_ call: Call) async throws {}
         func sendOneToOneMessage(_ packet: RatchetMessagePacket, recipient: Call.Participant) async throws {}
@@ -24,6 +38,11 @@ struct RTCSessionStateHandlingTests {
 
         func didEnd(call: Call, endState: CallStateMachine.EndState) async throws {
             didEndCalls.append((call: call, endState: endState))
+        }
+
+        func releaseStartCall() {
+            startCallContinuation?.resume()
+            startCallContinuation = nil
         }
     }
 
@@ -122,6 +141,43 @@ struct RTCSessionStateHandlingTests {
 
         let stream = await session.appStateStream()
         #expect(stream != nil)
+    }
+
+    @Test("outbound start enters connecting before invite delivery completes")
+    func outboundStartConnectsBeforeInviteDeliveryCompletes() async throws {
+        let events = TestTransportEvents(suspendStartCall: true)
+        let session = await RTCSession(
+            iceServers: [],
+            username: "u",
+            password: "p",
+            delegate: events
+        )
+        defer { Task { await session.shutdown(with: nil) } }
+
+        let call = try makeCall(sharedId: "slow-outbound-start")
+        try await session.createStateStream(with: call)
+
+        let startTask = Task {
+            try await session.startCall(call)
+        }
+        for _ in 0..<100 {
+            if await events.didBeginStartCall {
+                break
+            }
+            await Task.yield()
+        }
+
+        let didBeginStartCall = await events.didBeginStartCall
+        let state = await session.callState.currentState
+        #expect(didBeginStartCall)
+        if case .connecting(.outbound(.voice), _) = state {
+            #expect(true)
+        } else {
+            Issue.record("Expected outbound call to be connecting while start_call transport is suspended")
+        }
+
+        await events.releaseStartCall()
+        _ = try await startTask.value
     }
 
     // MARK: - ICE disconnect grace period

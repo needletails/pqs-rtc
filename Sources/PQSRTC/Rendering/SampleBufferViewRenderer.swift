@@ -186,6 +186,42 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         self.rtcVideoRenderWrapper = RTCVideoRenderWrapper(id: rendersScreenShare ? "ScreenShareRenderer" : "SampleBufferViewRenderer")
         logger.log(level: .info, message: "SampleBufferViewRenderer initialized with bounds: \(bounds) rendersScreenShare=\(rendersScreenShare)")
     }
+
+    /// Fits source pixels inside a tile without cropping or stretching.
+    ///
+    /// Screen shares can switch between portrait and landscape while a fixed tile remains
+    /// mounted. Keep this calculation local to the receiver so an upstream scaler regression
+    /// cannot turn presentation content into a cropped or compressed image.
+    nonisolated static func aspectFitSize(sourceSize: CGSize, destinationSize: CGSize) -> CGSize {
+        guard sourceSize.width > 0,
+              sourceSize.height > 0,
+              destinationSize.width > 0,
+              destinationSize.height > 0
+        else {
+            return .zero
+        }
+
+        let scale = min(
+            destinationSize.width / sourceSize.width,
+            destinationSize.height / sourceSize.height
+        )
+        return CGSize(
+            width: sourceSize.width * scale,
+            height: sourceSize.height * scale
+        )
+    }
+
+    nonisolated private static func aspectFitScaleInfo(
+        sourceSize: CGSize,
+        destinationSize: CGSize
+    ) -> MetalProcessor.ScaledInfo {
+        let fitted = aspectFitSize(sourceSize: sourceSize, destinationSize: destinationSize)
+        return MetalProcessor.ScaledInfo(
+            size: fitted,
+            scaleX: fitted.width / max(sourceSize.width, 1),
+            scaleY: fitted.height / max(sourceSize.height, 1)
+        )
+    }
     
     deinit {
 #if DEBUG
@@ -717,12 +753,28 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             scaleMode = .aspectFitHorizontal
 #endif
             
-            let scaleInfo = await metalProcessor.createSize(
-                for: scaleMode,
-                originalSize: .init(width: pixelBuffer.width, height: pixelBuffer.height),
-                desiredSize: renderBounds,
-                aspectRatio: aspectRatio
+            let originalSize = CGSize(width: pixelBuffer.width, height: pixelBuffer.height)
+            let scaleInfo: MetalProcessor.ScaledInfo
+#if os(iOS)
+            if rendersScreenShare {
+                scaleInfo = Self.aspectFitScaleInfo(
+                    sourceSize: originalSize,
+                    destinationSize: renderBounds
+                )
+            } else {
+                scaleInfo = await metalProcessor.createSize(
+                    for: scaleMode,
+                    originalSize: originalSize,
+                    desiredSize: renderBounds,
+                    aspectRatio: aspectRatio
+                )
+            }
+#else
+            scaleInfo = Self.aspectFitScaleInfo(
+                sourceSize: originalSize,
+                destinationSize: renderBounds
             )
+#endif
             
             let info = try await metalProcessor.createMetalImage(
                 fromPixelBuffer: pixelBuffer,
@@ -961,12 +1013,28 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
 #else
             scaleMode = .aspectFitHorizontal
 #endif
-            let scaleInfo = await metalProcessor.createSize(
-                for: scaleMode,
-                originalSize: .init(width: CGFloat(buffer.width), height: CGFloat(buffer.height)),
-                desiredSize: renderBounds,
-                aspectRatio: aspectRatio
+            let originalSize = CGSize(width: CGFloat(buffer.width), height: CGFloat(buffer.height))
+            let scaleInfo: MetalProcessor.ScaledInfo
+#if os(iOS)
+            if rendersScreenShare {
+                scaleInfo = Self.aspectFitScaleInfo(
+                    sourceSize: originalSize,
+                    destinationSize: renderBounds
+                )
+            } else {
+                scaleInfo = await metalProcessor.createSize(
+                    for: scaleMode,
+                    originalSize: originalSize,
+                    desiredSize: renderBounds,
+                    aspectRatio: aspectRatio
+                )
+            }
+#else
+            scaleInfo = Self.aspectFitScaleInfo(
+                sourceSize: originalSize,
+                destinationSize: renderBounds
             )
+#endif
             if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogFirstRemoteMetalScale == false {
                 didLogFirstRemoteMetalScale = true
                 logger.log(

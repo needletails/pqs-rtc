@@ -68,6 +68,83 @@ struct RTCSessionSDPModifyTests {
     }
 
     @Test
+    func modifySDP_preservesScreenShareDirectionWhenHasVideoTrue() async {
+        let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
+
+        let inputLines = [
+            "v=0",
+            "o=- 0 0 IN IP4 127.0.0.1",
+            "s=-",
+            "t=0 0",
+            "m=video 9 UDP/TLS/RTP/SAVPF 100",
+            "a=mid:2",
+            "a=sendonly",
+            "a=msid:screen_nudge screen_nudge_#conf-room"
+        ]
+        let input = inputLines.joined(separator: "\n") + "\n"
+
+        let output = await session.modifySDP(sdp: input, hasVideo: true)
+
+        #expect(output.contains("a=sendonly"))
+        #expect(output.contains("a=sendrecv") == false)
+        #expect(RTCSession.screenShareVideoMids(in: input) == ["2"])
+
+        await session.shutdown(with: nil)
+    }
+
+    @Test
+    func modifySDP_preservesExplicitVideoMidDirectionWithoutScreenMsid() async {
+        let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
+
+        let inputLines = [
+            "v=0",
+            "o=- 0 0 IN IP4 127.0.0.1",
+            "s=-",
+            "t=0 0",
+            "m=video 9 UDP/TLS/RTP/SAVPF 100",
+            "a=mid:2",
+            "a=recvonly"
+        ]
+        let input = inputLines.joined(separator: "\n") + "\n"
+
+        let output = await session.modifySDP(
+            sdp: input,
+            hasVideo: true,
+            preserveVideoDirectionsForMids: ["2"]
+        )
+
+        #expect(output.contains("a=recvonly"))
+        #expect(output.contains("a=sendrecv") == false)
+
+        await session.shutdown(with: nil)
+    }
+
+    @Test
+    func modifySDP_preservesRecvOnlyVideoMidWithoutLocalMedia() async {
+        let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
+
+        let inputLines = [
+            "v=0",
+            "o=- 0 0 IN IP4 127.0.0.1",
+            "s=-",
+            "t=0 0",
+            "m=video 9 UDP/TLS/RTP/SAVPF 100",
+            "a=mid:2",
+            "a=recvonly",
+            "a=rtpmap:100 VP8/90000"
+        ]
+        let input = inputLines.joined(separator: "\n") + "\n"
+
+        let output = await session.modifySDP(sdp: input, hasVideo: true)
+
+        #expect(output.contains("a=recvonly"))
+        #expect(output.contains("a=sendrecv") == false)
+        #expect(RTCSession.receiveOnlyVideoMidsWithoutLocalMedia(in: input) == ["2"])
+
+        await session.shutdown(with: nil)
+    }
+
+    @Test
     func modifySDP_downgradesH264ProfileLevelId() async {
         let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
 

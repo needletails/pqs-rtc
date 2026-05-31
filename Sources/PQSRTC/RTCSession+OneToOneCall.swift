@@ -44,8 +44,22 @@ extension RTCSession {
     
     public func startCall(_ call: Call) async throws {
         shouldOffer = true
-        try await requireTransport().sendStartCall(call)
-        logger.log(level: .info, message: "Sent start_call message for \(call.sharedCommunicationId)")
+        let callDirection: CallStateMachine.CallDirection = .outbound(
+            call.supportsVideo ? .video : .voice
+        )
+
+        // The outgoing party has committed to the call at this point. Enter connecting before
+        // transport delivery so local preview and voice-call progress are immediate on slow links.
+        await setConnectingIfReady(call: call, callDirection: callDirection)
+
+        do {
+            try await requireTransport().sendStartCall(call)
+            logger.log(level: .info, message: "Sent start_call message for \(call.sharedCommunicationId)")
+        } catch {
+            shouldOffer = false
+            await callState.transition(to: .failed(callDirection, call, error.localizedDescription))
+            throw error
+        }
     }
     
     public func setupCallState(_ call: Call) async throws {
