@@ -96,6 +96,21 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     /// If this were weak, the renderer could be deallocated immediately after `startRendering()`,
     /// resulting in "track attached, but no frames rendered".
     var renderer: RendererDelegate?
+    @MainActor private(set) var prefersAspectFit = false
+    
+    /// Letterboxes camera video inside its tile instead of cropping. Used for participant thumbnails during screen share.
+    @MainActor
+    public func setPrefersAspectFit(_ enabled: Bool) {
+        guard type == .sample, !contextName.hasPrefix("screen_") else { return }
+        guard prefersAspectFit != enabled else { return }
+        prefersAspectFit = enabled
+        if let layer = captureView?.layer as? AVSampleBufferDisplayLayer {
+            layer.videoGravity = enabled ? .resizeAspect : .resizeAspectFill
+        }
+        if let sampleRenderer = renderer as? SampleBufferViewRenderer {
+            Task { await sampleRenderer.setPrefersAspectFit(enabled) }
+        }
+    }
     
     lazy var renderPipelineState: MTLRenderPipelineState? = {
         guard let mtlDevice = mtlDevice else {

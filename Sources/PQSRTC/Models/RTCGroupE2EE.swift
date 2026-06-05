@@ -21,6 +21,9 @@ import DoubleRatchetKit
 public enum PacketFlag: Codable, Sendable {
     // SFU/1:1 signaling
     case offer, answer, candidate, handshakeComplete
+    // SFU media-key readiness. The encrypted payload is a Call whose sender is the source
+    // participant this receiver is ready to decrypt.
+    case mediaReady
     // SFU group-call control (roster)
     case participants, participantDemuxId
 }

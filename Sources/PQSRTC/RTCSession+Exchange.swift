@@ -530,8 +530,10 @@ extension RTCSession {
             sdp = try SessionDescription(fromRTC: description)
 #elseif canImport(WebRTC)
             var description: WebRTC.RTCSessionDescription = try await generateSDPAnswer(for: connection, hasAudio: true, hasVideo: call.supportsVideo)
-            let preserveVideoDirectionsForMids = connection.peerConnection.remoteDescription
+            let remoteScreenShareVideoMids = connection.peerConnection.remoteDescription
                 .map { Self.screenShareVideoMids(in: $0.sdp) } ?? []
+            let activeRemoteScreenShareVideoMids = connection.peerConnection.remoteDescription
+                .map { Self.activeScreenShareVideoMids(in: $0.sdp) } ?? []
             
             // Modify SDP for specific requirements
             let modified = await modifySDP(
@@ -543,7 +545,8 @@ extension RTCSession {
                 // outbound audio/video packets remain flat at zero).
                 stripSsrcLines: false,
                 vp8OnlyVideo: connection.id.isGroupCall,
-                preserveVideoDirectionsForMids: preserveVideoDirectionsForMids)
+                preserveVideoDirectionsForMids: remoteScreenShareVideoMids,
+                forceReceiveOnlyVideoMids: activeRemoteScreenShareVideoMids)
             
             description = WebRTC.RTCSessionDescription(type: description.type, sdp: modified)
             

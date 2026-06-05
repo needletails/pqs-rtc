@@ -203,17 +203,23 @@ public struct AndroidRemoteGridCompose: ContentComposer {
     
     private let client: AndroidRTCClient
     private let remoteCaptureViews: [AndroidSampleCaptureView]
+    private let raisedHandFlags: [Bool]
+    private let prefersAspectFit: Bool
     private let cleanupOnDispose: Bool
     private let onDispose: () -> Void
     
     public init(
         client: AndroidRTCClient,
         remoteCaptureViews: [AndroidSampleCaptureView],
+        raisedHandFlags: [Bool] = [],
+        prefersAspectFit: Bool = false,
         cleanupOnDispose: Bool = true,
         onDispose: @escaping () -> Void
     ) {
         self.client = client
         self.remoteCaptureViews = remoteCaptureViews
+        self.raisedHandFlags = raisedHandFlags
+        self.prefersAspectFit = prefersAspectFit
         self.cleanupOnDispose = cleanupOnDispose
         self.onDispose = onDispose
     }
@@ -235,21 +241,43 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         Box(
             modifier: context.modifier.fillMaxSize()
         ) {
+            let paddedRaisedHandFlags = raisedHandFlags + Array(
+                repeating: false,
+                count: max(0, remoteCaptureViews.count - raisedHandFlags.count)
+            )
+            let flaggedViews = zip(remoteCaptureViews, paddedRaisedHandFlags).map { ($0.0, $0.1) }
             let grid = conferenceGridDimensions(for: remoteCaptureViews.count)
-            let rows = chunked(remoteCaptureViews, size: grid.columns)
+            let rows = chunked(flaggedViews, size: grid.columns)
             Column(modifier: Modifier.fillMaxSize()) {
                 for row in rows {
                     Row(modifier: Modifier.weight(Float(1.0)).fillMaxWidth()) {
-                        for view in row {
-                            androidx.compose.ui.viewinterop.AndroidView(
-                                factory: { _ in
-                                    client.initializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
-                                    view.surfaceViewRenderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-                                    view.surfaceViewRenderer
-                                },
-                                modifier: Modifier.weight(Float(1.0)).fillMaxWidth().fillMaxHeight(),
-                                update: { _ in }
-                            )
+                        for (view, showRaisedHand) in row {
+                            let scalingType = prefersAspectFit
+                                ? org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT
+                                : org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL
+                            Box(
+                                modifier: Modifier.weight(Float(1.0)).fillMaxWidth().fillMaxHeight()
+                            ) {
+                                androidx.compose.ui.viewinterop.AndroidView(
+                                    factory: { _ in
+                                        client.initializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
+                                        view.surfaceViewRenderer.setScalingType(scalingType)
+                                        view.surfaceViewRenderer
+                                    },
+                                    modifier: Modifier.fillMaxSize(),
+                                    update: { renderer in
+                                        renderer.setScalingType(scalingType)
+                                    }
+                                )
+                                if showRaisedHand {
+                                    androidx.compose.material3.Text(
+                                        text: "✋",
+                                        modifier: Modifier
+                                            .align(androidx.compose.ui.Alignment.TopEnd)
+                                            .padding(8.dp)
+                                    )
+                                }
+                            }
                         }
                         let missingColumns = max(0, grid.columns - row.count)
                         if missingColumns > 0 {
@@ -451,17 +479,23 @@ public struct AndroidRemoteVideoView: View {
 public struct AndroidRemoteGrid: View {
     private let client: AndroidRTCClient
     private let remoteCaptureViews: [AndroidSampleCaptureView]
+    private let raisedHandFlags: [Bool]
+    private let prefersAspectFit: Bool
     private let cleanupOnDispose: Bool
     private let onDispose: () -> Void
     
     public init(
         client: AndroidRTCClient,
         remoteCaptureViews: [AndroidSampleCaptureView],
+        raisedHandFlags: [Bool] = [],
+        prefersAspectFit: Bool = false,
         cleanupOnDispose: Bool = true,
         onDispose: @escaping () -> Void
     ) {
         self.client = client
         self.remoteCaptureViews = remoteCaptureViews
+        self.raisedHandFlags = raisedHandFlags
+        self.prefersAspectFit = prefersAspectFit
         self.cleanupOnDispose = cleanupOnDispose
         self.onDispose = onDispose
     }
@@ -471,6 +505,8 @@ public struct AndroidRemoteGrid: View {
             AndroidRemoteGridCompose(
                 client: client,
                 remoteCaptureViews: remoteCaptureViews,
+                raisedHandFlags: raisedHandFlags,
+                prefersAspectFit: prefersAspectFit,
                 cleanupOnDispose: cleanupOnDispose,
                 onDispose: onDispose
             )
@@ -513,9 +549,11 @@ public struct AndroidVideoCallView: View {
     
     private let remoteCount: Int
     private let session: RTCSession
+    private let conferenceRaisedHands: [String: Bool]
     @State var resourceKey: String
     @State var currentRemotePage: Int = 0
     @State var localViewSize: CGSize = .zero
+    @State var gridRaisedHandFlags: [Bool] = []
     @Binding var delegate: CallActionDelegate?
     @Binding var errorMessage: String
     @Binding var endedCall: Bool
@@ -535,10 +573,12 @@ public struct AndroidVideoCallView: View {
         height: Binding<CGFloat>,
         callState: Binding<CallStateMachine.State>,
         isScreenSharing: Binding<Bool> = .constant(false),
-        hasActiveRemoteScreenShare: Binding<Bool> = .constant(false)
+        hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
+        conferenceRaisedHands: [String: Bool] = [:]
     ) {
         self.session = session
         self.remoteCount = remoteCount
+        self.conferenceRaisedHands = conferenceRaisedHands
         self._delegate = delegate
         self._errorMessage = errorMessage
         self._endedCall = endedCall
@@ -549,6 +589,13 @@ public struct AndroidVideoCallView: View {
         self._hasActiveRemoteScreenShare = hasActiveRemoteScreenShare
         self._resourceKey = State(initialValue: UUID().uuidString)
     }
+
+    private var raisedHandsRefreshToken: String {
+        conferenceRaisedHands
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: "|")
+    }
     
     public var body: some View {
         let resources = AndroidVideoCallResourceStore.resources(
@@ -558,6 +605,11 @@ public struct AndroidVideoCallView: View {
         )
         let remotePageSize = hasActiveRemoteScreenShare ? 8 : 12
         let remotePages = paginateRemotes(resources.remoteCaptureViews, pageSize: remotePageSize)
+        let activeRemoteCount = resources.remoteCaptureViews.count
+        let screenShareHeightFraction: CGFloat = {
+            guard hasActiveRemoteScreenShare else { return 0 }
+            return activeRemoteCount <= 1 ? 0.64 : 0.68
+        }()
 
         ZStack {
             GeometryReader { geo in
@@ -568,8 +620,14 @@ public struct AndroidVideoCallView: View {
                             captureView: resources.screenCaptureView
                         )
                         .frame(maxWidth: .infinity)
-                        .frame(height: geo.size.height * 0.66)
+                        .frame(height: geo.size.height * screenShareHeightFraction)
                         .onAppear {
+                            Task { @MainActor in
+                                await resources.controller.setScreenView(resources.screenCaptureView)
+                            }
+                        }
+                        .onChange(of: hasActiveRemoteScreenShare) { _, isSharing in
+                            guard isSharing else { return }
                             Task { @MainActor in
                                 await resources.controller.setScreenView(resources.screenCaptureView)
                             }
@@ -583,6 +641,8 @@ public struct AndroidVideoCallView: View {
                                 AndroidRemoteGrid(
                                     client: session.rtcClient,
                                     remoteCaptureViews: remotes,
+                                    raisedHandFlags: raisedHandFlags(for: remotes, in: resources),
+                                    prefersAspectFit: hasActiveRemoteScreenShare,
                                     cleanupOnDispose: false,
                                     onDispose: {}
                                 )
@@ -606,6 +666,8 @@ public struct AndroidVideoCallView: View {
                         AndroidRemoteGrid(
                             client: session.rtcClient,
                             remoteCaptureViews: resources.remoteCaptureViews,
+                            raisedHandFlags: raisedHandFlags(for: resources.remoteCaptureViews, in: resources),
+                            prefersAspectFit: hasActiveRemoteScreenShare,
                             onDispose: {
                                 Task { @MainActor in
                                     await resources.controller.stop()
@@ -652,12 +714,50 @@ public struct AndroidVideoCallView: View {
                 await configureController(resources: resources)
             }
         }
+        .task(id: raisedHandsRefreshToken) {
+            await refreshGridRaisedHandFlags(resources: resources)
+        }
+        .task {
+            var lastAssignmentSignature = ""
+            while !Task.isCancelled {
+                let signature = await resources.controller.participantAssignmentSignature()
+                if signature != lastAssignmentSignature {
+                    lastAssignmentSignature = signature
+                    await refreshGridRaisedHandFlags(resources: resources)
+                }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
         .onDisappear {
             Task { @MainActor in
                 await resources.controller.stop()
                 AndroidVideoCallResourceStore.remove(for: resourceKey)
             }
         }
+    }
+
+    @MainActor
+    private func raisedHandFlags(
+        for views: [AndroidSampleCaptureView],
+        in resources: AndroidVideoCallResources
+    ) -> [Bool] {
+        guard !gridRaisedHandFlags.isEmpty, views.count == gridRaisedHandFlags.count else {
+            return Array(repeating: false, count: views.count)
+        }
+        let allViews = resources.remoteCaptureViews
+        return views.map { view in
+            guard let index = allViews.firstIndex(where: { $0 === view }),
+                  index < gridRaisedHandFlags.count else {
+                return false
+            }
+            return gridRaisedHandFlags[index]
+        }
+    }
+
+    @MainActor
+    private func refreshGridRaisedHandFlags(resources: AndroidVideoCallResources) async {
+        await resources.controller.updateConferenceRaisedHands(conferenceRaisedHands)
+        gridRaisedHandFlags = await resources.controller.raisedHandFlags(for: resources.remoteCaptureViews)
     }
 
     @MainActor
@@ -687,6 +787,7 @@ public struct AndroidVideoCallView: View {
             local: resources.localCaptureView,
             remotes: resources.remoteCaptureViews
         )
+        await refreshGridRaisedHandFlags(resources: resources)
         await resources.controller.start()
     }
     

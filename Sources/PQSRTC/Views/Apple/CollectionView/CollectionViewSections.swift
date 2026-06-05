@@ -677,7 +677,15 @@ public struct CollectionViewSections {
         if isWide {
             let columns = visibleCameraCount <= 2 ? 1 : 2
             let rows = Int(ceil(Double(visibleCameraCount) / Double(columns)))
-            let screenFraction: CGFloat = visibleCameraCount <= 2 ? 0.86 : 0.82
+            let screenFraction: CGFloat
+            switch visibleCameraCount {
+            case 1:
+                screenFraction = 0.74
+            case 2:
+                screenFraction = 0.82
+            default:
+                screenFraction = 0.82
+            }
             let screenSize: NSCollectionLayoutSize
             let cameraSize: NSCollectionLayoutSize
             if let g = groupAbsoluteExtent {
@@ -720,11 +728,11 @@ public struct CollectionViewSections {
             let screenFraction: CGFloat
             switch visibleCameraCount {
             case 1:
-                screenFraction = 0.88
+                screenFraction = 0.70
             case 2...4:
-                screenFraction = 0.84
+                screenFraction = 0.82
             default:
-                screenFraction = rows > 2 ? 0.76 : 0.80
+                screenFraction = rows > 2 ? 0.74 : 0.78
             }
             let cameraFraction = 1.0 - screenFraction
             let screenSize: NSCollectionLayoutSize

@@ -66,7 +66,7 @@ public final class VideoCallViewController: UICollectionViewController {
     ) {
         conferenceRaisedHands = raisedHands
         conferenceRaisedHandBadgeTopClearance = topClearance
-        applyConferenceRaisedHandBadges()
+        applyConferenceRaisedHandIndicators()
     }
     private weak var controlsView: UIView?
     private var duration: TimeInterval = 0
@@ -874,7 +874,8 @@ public final class VideoCallViewController: UICollectionViewController {
             connectionId: connectionId,
             participantId: participantId
         )
-        applyConferenceRaisedHandBadges()
+        applyConferenceCameraScaling()
+        applyConferenceRaisedHandIndicators()
         logger.log(level: .info, message: "Remote participant camera view created for participant=\(participantId)")
     }
 
@@ -913,7 +914,10 @@ public final class VideoCallViewController: UICollectionViewController {
     /// Creates and renders a remote screen-share tile, promoting it to the dominant position.
     func createScreenView(connectionId: String, participantId: String) async {
         let contextName = "screen_\(participantId)"
-        if screenShareModel(matching: participantId, allowSingleFallback: false) != nil { return }
+        if let existing = screenShareModel(matching: participantId, allowSingleFallback: false) {
+            await refreshScreenView(existing, connectionId: connectionId, participantId: participantId)
+            return
+        }
 
         let screenView: NTMTKView
         do {
@@ -956,6 +960,32 @@ public final class VideoCallViewController: UICollectionViewController {
 
         await videoCallDelegate?.remoteScreenShareDidChange(participantId: participantId, isSharing: true)
         logger.log(level: .info, message: "Remote screen share view created for participant=\(participantId)")
+    }
+
+    private func refreshScreenView(_ model: VideoViewModel, connectionId: String, participantId: String) async {
+        hasActiveRemoteScreenShare = true
+        let screenView = model.videoView
+        if screenView.renderer == nil {
+            await screenView.startRendering()
+        }
+        guard let screenRenderer = screenView.renderer as? SampleBufferViewRenderer else {
+            logger.log(level: .warning, message: "Screen share refresh skipped: renderer unavailable for participant=\(participantId)")
+            return
+        }
+        let didAttach = await session.renderRemoteScreenVideo(
+            to: screenRenderer.rtcVideoRenderWrapper,
+            connectionId: connectionId,
+            participantId: participantId)
+        guard didAttach else {
+            logger.log(level: .warning, message: "Screen share refresh could not attach track for participant=\(participantId)")
+            return
+        }
+        await screenRenderer.setRemoteVideoInboundExpected(true)
+        addPresenterBadge(to: screenView)
+        await performQuery(removePreview: true)
+        configureLocalPreviewIfNeeded()
+        await videoCallDelegate?.remoteScreenShareDidChange(participantId: participantId, isSharing: true)
+        logger.log(level: .info, message: "Remote screen share view refreshed for participant=\(participantId)")
     }
 
     /// Removes a remote screen-share tile and returns to normal layout.
@@ -1031,52 +1061,52 @@ public final class VideoCallViewController: UICollectionViewController {
         }
     }
 
-    private func removeRaisedHandBadge(from view: NTMTKView) {
+    private func removeRaisedHandIndicator(from view: NTMTKView) {
         view.viewWithTag(9002)?.removeFromSuperview()
     }
 
-    private func addRaisedHandBadge(to view: NTMTKView) {
-        let badgeTag = 9002
-        if view.viewWithTag(badgeTag) != nil { return }
+    private func addRaisedHandIndicator(to view: NTMTKView) {
+        let indicatorTag = 9002
+        if view.viewWithTag(indicatorTag) != nil { return }
 
-        let badge = UIView()
-        badge.tag = badgeTag
-        badge.translatesAutoresizingMaskIntoConstraints = false
-        badge.backgroundColor = UIColor.systemOrange.withAlphaComponent(0.92)
-        badge.layer.cornerRadius = 14
-        badge.clipsToBounds = true
+        let label = UILabel()
+        label.tag = indicatorTag
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.text = "✋"
+        label.font = UIFont.systemFont(ofSize: 24)
+        label.textAlignment = .center
+        label.backgroundColor = .clear
+        label.isAccessibilityElement = true
+        label.accessibilityLabel = "Raised hand"
 
-        let icon = UIImageView(image: UIImage(systemName: "hand.raised.fill"))
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.tintColor = .white
-        icon.contentMode = .scaleAspectFit
-        badge.addSubview(icon)
-
-        view.addSubview(badge)
+        view.addSubview(label)
         let topPadding = max(8, min(22, conferenceRaisedHandBadgeTopClearance * 0.25))
         NSLayoutConstraint.activate([
-            badge.topAnchor.constraint(equalTo: view.topAnchor, constant: topPadding),
-            badge.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
-            badge.widthAnchor.constraint(equalToConstant: 28),
-            badge.heightAnchor.constraint(equalToConstant: 28),
-            icon.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
-            icon.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 15),
-            icon.heightAnchor.constraint(equalToConstant: 15)
+            label.topAnchor.constraint(equalTo: view.topAnchor, constant: topPadding),
+            label.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            label.widthAnchor.constraint(equalToConstant: 30),
+            label.heightAnchor.constraint(equalToConstant: 30)
         ])
     }
 
-    private func applyConferenceRaisedHandBadges() {
+    private func applyConferenceRaisedHandIndicators() {
         for model in videoViews.views {
             guard isParticipantCameraModel(model) else {
-                removeRaisedHandBadge(from: model.videoView)
+                removeRaisedHandIndicator(from: model.videoView)
                 continue
             }
             if participantHasRaisedHand(model.participantId) {
-                addRaisedHandBadge(to: model.videoView)
+                addRaisedHandIndicator(to: model.videoView)
             } else {
-                removeRaisedHandBadge(from: model.videoView)
+                removeRaisedHandIndicator(from: model.videoView)
             }
+        }
+    }
+
+    private func applyConferenceCameraScaling() {
+        let useAspectFit = hasActiveRemoteScreenShare
+        for model in videoViews.views where isParticipantCameraModel(model) {
+            model.videoView.setPrefersAspectFit(useAspectFit)
         }
     }
 
@@ -1125,7 +1155,8 @@ public final class VideoCallViewController: UICollectionViewController {
             snapshot.appendItems(data, toSection: .initial)
             await dataSource?.apply(snapshot, animatingDifferences: false)
         }
-        applyConferenceRaisedHandBadges()
+        applyConferenceCameraScaling()
+        applyConferenceRaisedHandIndicators()
         updateConferencePageIndicator(totalItems: data.count)
     }
     

@@ -521,6 +521,8 @@ public actor RTCSession {
 #endif
 #if os(iOS) && !os(Android)
     var _iOSScreenCaptureSourceStorage: iOSScreenCaptureSource?
+    /// Connections waiting for ReplayKit broadcast start before advertising screen share to the SFU.
+    var pendingScreenShareRenegotiationConnectionIds: Set<String> = []
 #endif
 #if os(iOS) || os(macOS)
     /// Identifies the capture source that currently owns the outgoing screen track.

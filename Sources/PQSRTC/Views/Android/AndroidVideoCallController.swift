@@ -53,6 +53,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var screenView: AndroidSampleCaptureView?
     private(set) var hasActiveRemoteScreenShare = false
     private var activeRemoteScreenShareParticipantId: String?
+    private var conferenceRaisedHands: [String: Bool] = [:]
 
     /// Tracks which participant is currently rendered by which view.
     private var participantViewAssignments: [String: AndroidSampleCaptureView] = [:]
@@ -107,6 +108,37 @@ public actor AndroidVideoCallController: CallActionDelegate {
     
     public func setVideoCallDelegate(_ conformer: VideoCallDelegate?) async {
         self.videoCallDelegate = conformer
+    }
+
+    /// Updates conference raised-hand state used for per-tile overlays.
+    public func updateConferenceRaisedHands(_ raisedHands: [String: Bool]) {
+        conferenceRaisedHands = raisedHands
+    }
+
+    /// Returns raised-hand overlay flags aligned with the supplied remote renderer views.
+    public func raisedHandFlags(for views: [AndroidSampleCaptureView]) -> [Bool] {
+        views.map { view in
+            guard let participantId = participantViewAssignments.first(where: { $0.value === view })?.key else {
+                return false
+            }
+            return participantHasRaisedHand(participantId)
+        }
+    }
+
+    /// Stable signature of participant-to-view assignments for SwiftUI overlay refresh.
+    public func participantAssignmentSignature() -> String {
+        remoteViews.enumerated().map { index, view in
+            let participantId = participantViewAssignments.first(where: { $0.value === view })?.key ?? "-"
+            return "\(index):\(participantId)"
+        }.joined(separator: "|")
+    }
+
+    private func participantHasRaisedHand(_ participantId: String) -> Bool {
+        let participantKey = RTCSession.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return false }
+        return conferenceRaisedHands.contains { key, value in
+            value && RTCSession.conferenceParticipantIdentityKey(key) == participantKey
+        }
     }
     
     /// Starts consuming the session's call state and participant track streams.
@@ -343,7 +375,6 @@ public actor AndroidVideoCallController: CallActionDelegate {
             }
             if let view = screenView {
                 await session.removeRemoteScreenVideoRenderer(view, connectionId: event.connectionId, participantId: event.participantId)
-                screenView = nil
             }
             activeRemoteScreenShareParticipantId = nil
             hasActiveRemoteScreenShare = false
@@ -413,11 +444,13 @@ public actor AndroidVideoCallController: CallActionDelegate {
     /// Sets the view used to render a remote screen share and attaches it to the active screen track.
     public func setScreenView(_ view: AndroidSampleCaptureView) async {
         screenView = view
-        guard let connectionId = currentCall?.sharedCommunicationId else { return }
+        guard hasActiveRemoteScreenShare,
+              let participantId = activeRemoteScreenShareParticipantId,
+              let connectionId = currentCall?.sharedCommunicationId else { return }
         await session.renderRemoteScreenVideo(
             to: view,
             connectionId: connectionId,
-            participantId: activeRemoteScreenShareParticipantId ?? connectionId
+            participantId: participantId
         )
     }
 

@@ -52,7 +52,8 @@ extension RTCSession {
         hasVideo: Bool = false,
         stripSsrcLines: Bool = false,
         vp8OnlyVideo: Bool = false,
-        preserveVideoDirectionsForMids: Set<String> = []
+        preserveVideoDirectionsForMids: Set<String> = [],
+        forceReceiveOnlyVideoMids: Set<String> = []
     ) async -> String {
         var sdp = sdp
             .replacingOccurrences(of: "\r\n", with: "\n")
@@ -152,6 +153,26 @@ extension RTCSession {
             }
             if modifiedLine.contains("a=inactive") {
                 modifiedLine = modifiedLine.replacingOccurrences(of: "a=inactive", with: "a=sendrecv")
+                return (modifiedLine, true)
+            }
+            return (modifiedLine, false)
+        }
+
+        func receiveOnlyMedia(in line: String) -> (String, Bool) {
+            var modifiedLine = line
+            if modifiedLine.contains("a=sendrecv") {
+                modifiedLine = modifiedLine.replacingOccurrences(of: "a=sendrecv", with: "a=recvonly")
+                return (modifiedLine, true)
+            }
+            if modifiedLine.contains("a=sendonly") {
+                modifiedLine = modifiedLine.replacingOccurrences(of: "a=sendonly", with: "a=recvonly")
+                return (modifiedLine, true)
+            }
+            if modifiedLine.contains("a=inactive") {
+                modifiedLine = modifiedLine.replacingOccurrences(of: "a=inactive", with: "a=recvonly")
+                return (modifiedLine, true)
+            }
+            if modifiedLine.contains("a=recvonly") {
                 return (modifiedLine, true)
             }
             return (modifiedLine, false)
@@ -263,10 +284,19 @@ extension RTCSession {
                 
                 // Only process lines that contain direction attributes
                 if line.contains("a=recvonly") || line.contains("a=sendonly") || line.contains("a=inactive") || line.contains("a=sendrecv") {
+                    let shouldForceReceiveOnly = currentMediaMid.map {
+                        forceReceiveOnlyVideoMids.contains($0)
+                    } ?? false
                     let shouldPreserveDirection = currentMediaMid.map {
                         preservedVideoDirectionMids.contains($0)
                     } ?? false
-                    if shouldPreserveDirection {
+                    if shouldForceReceiveOnly {
+                        let (modifiedLine, didModify) = receiveOnlyMedia(in: line)
+                        modifiedLines.append(modifiedLine)
+                        if didModify {
+                            inVideoSection = false
+                        }
+                    } else if shouldPreserveDirection {
                         modifiedLines.append(line)
                         inVideoSection = false
                     } else if hasVideo {
@@ -324,6 +354,54 @@ extension RTCSession {
             if line.hasPrefix("a=mid:") {
                 currentMid = String(line.dropFirst("a=mid:".count))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if Self.lineContainsScreenShareMsid(line) {
+                currentHasScreenMsid = true
+            }
+        }
+        flushCurrentSection()
+
+        return mids
+    }
+
+    nonisolated static func activeScreenShareVideoMids(in sdp: String) -> Set<String> {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var mids = Set<String>()
+        var currentIsVideo = false
+        var currentMid: String?
+        var currentHasScreenMsid = false
+        var currentDirection: String?
+
+        func flushCurrentSection() {
+            guard currentIsVideo, currentHasScreenMsid, let currentMid, !currentMid.isEmpty else { return }
+            if currentDirection == "inactive" || currentDirection == "recvonly" {
+                return
+            }
+            mids.insert(currentMid)
+        }
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentIsVideo = line.hasPrefix("m=video")
+                currentMid = nil
+                currentHasScreenMsid = false
+                currentDirection = nil
+                continue
+            }
+
+            guard currentIsVideo else { continue }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if line == "a=sendrecv" || line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive" {
+                currentDirection = String(line.dropFirst("a=".count))
             }
             if Self.lineContainsScreenShareMsid(line) {
                 currentHasScreenMsid = true
@@ -396,7 +474,10 @@ extension RTCSession {
 
         return remainder
             .split(whereSeparator: { $0 == " " || $0 == "\t" })
-            .contains { $0.hasPrefix(Self.screenTrackPrefix) }
+            .contains {
+                $0.hasPrefix(Self.screenTrackPrefix)
+                    || $0.hasPrefix("streamId_\(Self.screenTrackPrefix)")
+            }
     }
     
     /// Validates SDP format and content
@@ -645,6 +726,7 @@ extension RTCSession {
             self.logger.log(level: .info, message: "Successfully set remote SDP\n \(sdp.sdp)")
             self.logger.log(level: .info, message: "Remote SDP summary after set connection=\(connection.id): \(RTCSdpDiagnostics.summary(sdp.sdp))")
             await reconcileAndroidRemoteParticipantCameraTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
+            await reconcileAndroidRemoteScreenTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
             
         } catch let error as SDPHandlerError {
             self.logger.log(level: .error, message: "Failed to set remote SDP: \(error.localizedDescription)")

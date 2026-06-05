@@ -142,6 +142,31 @@ struct RTCSessionCryptoKeyResolutionTests {
         #expect(RTCSession.usesPairwiseFrameIdentityResolution(call: call) == true)
     }
 
+    @Test("1:1 SFU ignores call_cipher from sibling device that is not the active media peer")
+    func oneToOneSfuRejectsSiblingDeviceCallCipher() throws {
+        let activeCall = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: "#\(roomUUID)",
+            sender: try participant("echo", device: "echo-active"),
+            recipients: [try participant("nudge", device: "nudge-active")],
+            supportsVideo: true)
+        let activePeerCipher = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: "#\(roomUUID)",
+            sender: try participant("nudge", device: "nudge-active"),
+            recipients: [try participant("echo", device: "echo-active")],
+            supportsVideo: true)
+        let siblingCipher = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: "#\(roomUUID)",
+            sender: try participant("nudge", device: "nudge-sibling"),
+            recipients: [try participant("echo", device: "echo-active")],
+            supportsVideo: true)
+
+        #expect(RTCSession.shouldProcessOneToOneSfuCallCipher(connectionCall: activeCall, inboundCall: activePeerCipher))
+        #expect(RTCSession.shouldProcessOneToOneSfuCallCipher(connectionCall: activeCall, inboundCall: siblingCipher) == false)
+    }
+
     @Test("distinct peers do not use pairwise frame identity resolution")
     func multipartyRoomDoesNotUsePairwiseFrameIdentityResolution() throws {
         let call = try Call(

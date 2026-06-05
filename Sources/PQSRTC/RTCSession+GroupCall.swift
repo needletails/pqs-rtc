@@ -24,6 +24,53 @@ extension RTCSession {
         groupCall(forSfuIdentity: roomId)
     }
 
+    /// Tells the SFU this client has installed the group sender key for a specific source.
+    ///
+    /// Group/conference E2EE uses one sender key per publishing participant. The SFU must not
+    /// forward source RTP to this receiver until the receiver confirms that source's key is
+    /// installed, otherwise encrypted media can arrive before a matching receiver FrameCryptor key.
+    public func sendSfuGroupMediaReady(
+        sourceParticipantId: String,
+        roomId: String,
+        call: Call
+    ) async throws {
+        let sourceId = sourceParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sourceId.isEmpty else { return }
+
+        let sourceParticipant = call.recipients.first {
+            $0.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(sourceId) == .orderedSame
+        } ?? (call.sender.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare(sourceId) == .orderedSame ? call.sender : nil)
+
+        var readinessCall = call
+        if let sourceParticipant {
+            readinessCall.sender = sourceParticipant
+        } else {
+            readinessCall.sender = try Call.Participant(
+                secretName: sourceId,
+                nickname: sourceId,
+                deviceId: ""
+            )
+        }
+        if let sessionParticipant {
+            readinessCall.recipients = [sessionParticipant]
+        }
+        readinessCall.metadata = nil
+
+        let plaintext = try BinaryEncoder().encode(readinessCall)
+        let writeTask = WriteTask(
+            data: plaintext,
+            roomId: roomId.normalizedConnectionId,
+            flag: .mediaReady,
+            call: readinessCall)
+        try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+        logger.log(
+            level: .info,
+            message: "Sent SFU group media readiness for source=\(sourceId) room=\(roomId)"
+        )
+    }
+
     private func mergeGroupCallForMediaBootstrap(
         stored: Call,
         update: Call,
@@ -625,6 +672,10 @@ extension RTCSession {
             logger.log(
                 level: .info,
                 message: "Applied inbound SFU post-cipher identity handshake for room=\(packet.sfuIdentity)")
+        case .mediaReady:
+            logger.log(
+                level: .debug,
+                message: "Ignoring inbound SFU mediaReady packet on client; media readiness is consumed by the SFU room=\(packet.sfuIdentity)")
         }
     }
 

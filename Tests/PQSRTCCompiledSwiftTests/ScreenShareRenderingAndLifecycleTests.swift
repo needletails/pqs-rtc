@@ -44,6 +44,25 @@ struct ScreenShareRenderingAndLifecycleTests {
         ))
     }
 
+    @Test("camera tiles prefer aspect fit while screen share is the dominant layout")
+    @MainActor
+    func cameraTilesPreferAspectFitDuringScreenShare() {
+        let view = NTMTKView(fallbackType: .sample, contextName: "camera_echo")
+        defer { view.shutdownMetalStream() }
+
+        #expect(view.prefersAspectFit == false)
+        view.setPrefersAspectFit(true)
+        #expect(view.prefersAspectFit == true)
+        view.setPrefersAspectFit(false)
+        #expect(view.prefersAspectFit == false)
+
+        // Screen-share renderers must not be toggled through the camera helper.
+        let screenView = NTMTKView(fallbackType: .sample, contextName: "screen_echo")
+        defer { screenView.shutdownMetalStream() }
+        screenView.setPrefersAspectFit(true)
+        #expect(screenView.prefersAspectFit == false)
+    }
+
     @Test("Late completion of an old screen capture cannot own a replacement capture")
     func staleScreenCaptureGenerationDoesNotMatchReplacement() async {
         let session = await RTCSession(

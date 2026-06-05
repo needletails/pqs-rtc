@@ -114,6 +114,41 @@ extension RTCSession {
         call.recipients.count <= 1 || isTrueOneToOneSfuRoom(call: call)
     }
 
+    /// True iff an inbound 1:1-SFU `call_cipher` belongs to the active media peer device.
+    ///
+    /// Nudge can fan out `call_cipher` packets from sibling devices that share the same
+    /// `secretName`. For true 1:1-SFU media, accepting a sibling device's frame identity can make
+    /// this client refresh its sender media ratchet against the wrong device, while the active
+    /// media peer keeps decrypting with the old slot. Group/conference rooms do not use this
+    /// pairwise `call_cipher` media-key path, so this guard only applies to true 1:1-SFU calls.
+    internal static func shouldProcessOneToOneSfuCallCipher(
+        connectionCall: Call,
+        inboundCall: Call
+    ) -> Bool {
+        guard isTrueOneToOneSfuRoom(call: connectionCall),
+              isTrueOneToOneSfuRoom(call: inboundCall) else {
+            return true
+        }
+
+        let inboundSecret = inboundCall.sender.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let inboundDevice = inboundCall.sender.deviceId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !inboundSecret.isEmpty, !inboundDevice.isEmpty else { return true }
+
+        let activeDevices = ([connectionCall.sender] + connectionCall.recipients)
+            .filter {
+                $0.secretName
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare(inboundSecret) == .orderedSame
+            }
+            .map { $0.deviceId.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !activeDevices.isEmpty else { return true }
+        return activeDevices.contains {
+            $0.caseInsensitiveCompare(inboundDevice) == .orderedSame
+        }
+    }
+
     /// `groupCallNegotiation` sets `channelWireId` to the same room string as the RTC identity for Nudge 1:1-as-SFU relay.
     private static func isEphemeralSfuWireMatchesCommunication(call: Call) -> Bool {
         let commNorm = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
@@ -416,7 +451,7 @@ extension RTCSession {
                         message: "Skipping post-cipher WebRTC createOffer (initialOfferSent=\(initialOfferSent) bootstrapInFlight=\(initialOfferBootstrapInFlight)); sending refreshed SFU identity payload (.handshakeComplete) for \(resolvedCall.sharedCommunicationId)"
                     )
                     do {
-                        var refreshed = try await buildPostCipherSfuGroupOfferPayloadPreservingLocalSdp(call: resolvedCall)
+                        let refreshed = try await buildPostCipherSfuGroupOfferPayloadPreservingLocalSdp(call: resolvedCall)
                         let payload = try BinaryEncoder().encode(refreshed)
                         let writeTask = WriteTask(
                             data: payload,
@@ -1914,6 +1949,17 @@ extension RTCSession {
 
         guard let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
             throw RTCErrors.connectionNotFound
+        }
+
+        guard Self.shouldProcessOneToOneSfuCallCipher(
+            connectionCall: connection.call,
+            inboundCall: call
+        ) else {
+            logger.log(
+                level: .info,
+                message: "Ignoring 1:1 SFU call_cipher from non-active peer device sender=\(call.sender.secretName) deviceId=\(call.sender.deviceId) connectionId=\(connection.id)"
+            )
+            return
         }
 
         let initialState = connection.cipherNegotiationState

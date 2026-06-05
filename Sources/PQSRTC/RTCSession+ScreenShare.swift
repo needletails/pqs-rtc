@@ -58,6 +58,200 @@ extension RTCSession {
         return fallback.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// One active screen-share participant advertised in remote SDP.
+    struct AdvertisedRemoteScreenShare: Equatable, Sendable {
+        let participantId: String
+        let trackId: String?
+    }
+
+    /// Parses active remote screen-share participants from SDP `m=video` sections.
+    ///
+    /// Skips `a=inactive` / `a=recvonly` sections. `resolveParticipantId` maps an msid stream or
+    /// track label to a stable participant id; return `nil` to ignore a label.
+    static func advertisedRemoteScreenShares(
+        in sdp: String,
+        localParticipantId: String,
+        resolveParticipantId: (String) -> String?
+    ) -> [AdvertisedRemoteScreenShare] {
+        var results: [AdvertisedRemoteScreenShare] = []
+        var seenParticipants = Set<String>()
+        var currentMediaKind: String?
+        var currentSectionLines: [String] = []
+        let local = localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        func isScreenShareLabel(_ rawLabel: String) -> Bool {
+            let trimmed = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.hasPrefix(screenTrackPrefix)
+                || trimmed.hasPrefix("streamId_\(screenTrackPrefix)")
+        }
+
+        func appendAdvertisement(streamLabel: String, trackId: String?) {
+            let candidates = [streamLabel, trackId].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty && isScreenShareLabel($0) }
+            guard !candidates.isEmpty else { return }
+
+            var participantId: String?
+            for candidate in candidates {
+                var label = candidate
+                if label.hasPrefix("streamId_") {
+                    label = String(label.dropFirst("streamId_".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if let resolved = resolveParticipantId(label) {
+                    participantId = resolved
+                    break
+                }
+                if let fromScreenId = participantIdFromScreenShareId(label) {
+                    participantId = fromScreenId.trimmingCharacters(in: .whitespacesAndNewlines)
+                    break
+                }
+            }
+            guard var id = participantId?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else { return }
+            guard UUID(uuidString: id) == nil else { return }
+            guard local.isEmpty || id.caseInsensitiveCompare(local) != .orderedSame else { return }
+            guard !seenParticipants.contains(id) else { return }
+            seenParticipants.insert(id)
+            results.append(AdvertisedRemoteScreenShare(participantId: id, trackId: trackId))
+        }
+
+        func flushCurrentSection() {
+            guard currentMediaKind == "video" else { return }
+            guard !currentSectionLines.contains(where: { $0 == "a=inactive" || $0 == "a=recvonly" }) else {
+                return
+            }
+
+            for line in currentSectionLines {
+                let remainder: String
+                if line.hasPrefix("a=msid:") {
+                    remainder = String(line.dropFirst("a=msid:".count))
+                } else if let range = line.range(of: " msid:") {
+                    remainder = String(line[range.upperBound...])
+                } else {
+                    continue
+                }
+
+                let parts = remainder
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    .map(String.init)
+                guard let streamLabel = parts.first else { continue }
+                let trackId = parts.count > 1 ? parts[1] : nil
+                appendAdvertisement(streamLabel: streamLabel, trackId: trackId)
+            }
+        }
+
+        for rawLine in sdp.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentSectionLines = [line]
+                if line.hasPrefix("m=video") {
+                    currentMediaKind = "video"
+                } else if line.hasPrefix("m=audio") {
+                    currentMediaKind = "audio"
+                } else {
+                    currentMediaKind = nil
+                }
+            } else {
+                currentSectionLines.append(line)
+            }
+        }
+        flushCurrentSection()
+
+        return results
+    }
+
+    /// Parses SFU relay offers that add a second active `m=video` section reusing the participant
+    /// stream label (for example `a=msid:nudge <uuid>`) without a `screen_` msid prefix.
+    static func advertisedRelayStyleRemoteScreenShares(
+        in sdp: String,
+        localParticipantId: String,
+        participantFromStreamLabel: (String) -> String?
+    ) -> [AdvertisedRemoteScreenShare] {
+        var results: [AdvertisedRemoteScreenShare] = []
+        var seenParticipants = Set<String>()
+        var cameraSectionsByParticipant = Set<String>()
+        var currentMediaKind: String?
+        var currentSectionLines: [String] = []
+        let local = localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        func isScreenShareLabel(_ rawLabel: String) -> Bool {
+            let trimmed = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.hasPrefix(screenTrackPrefix)
+                || trimmed.hasPrefix("streamId_\(screenTrackPrefix)")
+        }
+
+        func flushCurrentSection() {
+            guard currentMediaKind == "video" else { return }
+            guard !currentSectionLines.contains(where: { $0 == "a=inactive" || $0 == "a=recvonly" }) else {
+                return
+            }
+
+            var streamLabel: String?
+            var trackId: String?
+            for line in currentSectionLines {
+                let remainder: String
+                if line.hasPrefix("a=msid:") {
+                    remainder = String(line.dropFirst("a=msid:".count))
+                } else if let range = line.range(of: " msid:") {
+                    remainder = String(line[range.upperBound...])
+                } else {
+                    continue
+                }
+
+                let parts = remainder
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    .map(String.init)
+                streamLabel = parts.first ?? streamLabel
+                if parts.count > 1 {
+                    trackId = parts[1]
+                }
+            }
+
+            guard let stream = streamLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !stream.isEmpty else {
+                return
+            }
+            guard !isScreenShareLabel(stream) else { return }
+
+            guard let participant = participantFromStreamLabel(stream)?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !participant.isEmpty else {
+                return
+            }
+            guard UUID(uuidString: participant) == nil else { return }
+            guard local.isEmpty || participant.caseInsensitiveCompare(local) != .orderedSame else { return }
+
+            if cameraSectionsByParticipant.contains(participant) {
+                guard !seenParticipants.contains(participant) else { return }
+                seenParticipants.insert(participant)
+                results.append(AdvertisedRemoteScreenShare(participantId: participant, trackId: trackId))
+            } else {
+                cameraSectionsByParticipant.insert(participant)
+            }
+        }
+
+        for rawLine in sdp.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentSectionLines = [line]
+                if line.hasPrefix("m=video") {
+                    currentMediaKind = "video"
+                } else if line.hasPrefix("m=audio") {
+                    currentMediaKind = "audio"
+                } else {
+                    currentMediaKind = nil
+                }
+            } else {
+                currentSectionLines.append(line)
+            }
+        }
+        flushCurrentSection()
+
+        return results
+    }
+
     // MARK: - Public API
 
     /// Adds a screen share track to the peer connection as a second video sender.
@@ -162,21 +356,36 @@ extension RTCSession {
 
         await connectionManager.updateConnection(id: normalizedId, with: connection)
 #endif
-        do {
-            try await renegotiateScreenShareIfNeeded(
-                connectionId: normalizedId,
-                reason: "started"
-            )
-        } catch {
-            logger.log(
-                level: .warning,
-                message: "Screen share start failed during renegotiation for connection \(normalizedId); cleaning up local capture: \(error)"
-            )
-            await removeScreenTrackFromStream(connectionId: normalizedId)
-            throw error
+        let deferOfferUntilCaptureReady = Self.shouldDeferScreenShareRenegotiationUntilCaptureReady(target: target)
+#if os(iOS) && !os(Android)
+        if deferOfferUntilCaptureReady {
+            pendingScreenShareRenegotiationConnectionIds.insert(normalizedId)
+        }
+#endif
+        if !deferOfferUntilCaptureReady {
+            do {
+                try await renegotiateScreenShareIfNeeded(
+                    connectionId: normalizedId,
+                    reason: "started"
+                )
+            } catch {
+                logger.log(
+                    level: .warning,
+                    message: "Screen share start failed during renegotiation for connection \(normalizedId); cleaning up local capture: \(error)"
+                )
+                await removeScreenTrackFromStream(connectionId: normalizedId)
+                throw error
+            }
         }
         notifyLocalScreenShareChanged(isSharing: true)
         logger.log(level: .info, message: "Screen share track added for connection \(normalizedId)")
+    }
+
+    static func shouldDeferScreenShareRenegotiationUntilCaptureReady(target: ScreenShareTarget) -> Bool {
+        #if os(iOS)
+        if case .appScreen = target { return true }
+        #endif
+        return false
     }
 
     static func shouldEnforceScreenShareConferencePermissions(
@@ -205,6 +414,9 @@ extension RTCSession {
     /// Removes the screen share track and stops capture.
     public func removeScreenTrackFromStream(connectionId: String) async {
         let normalizedId = connectionId.normalizedConnectionId
+#if os(iOS) && !os(Android)
+        pendingScreenShareRenegotiationConnectionIds.remove(normalizedId)
+#endif
         guard var connection = await connectionManager.findConnection(with: normalizedId) else {
             if let captureSource = screenCaptureSourceForCurrentPlatform {
                 await stopPlatformScreenCapture(captureSource)
@@ -277,11 +489,19 @@ extension RTCSession {
         logger.log(level: .info, message: "Screen share track removed for connection \(normalizedId)")
     }
 
+    private func awaitClearScreenShareOfferInFlight(connectionId: String) async {
+        let offerKey = connectionId.normalizedConnectionId
+        for _ in 0..<25 where offerInFlightConnectionIds.contains(offerKey) {
+            try? await Task.sleep(nanoseconds: 40_000_000)
+        }
+    }
+
     private func renegotiateScreenShareIfNeeded(
         connectionId: String,
         reason: String
     ) async throws {
         let normalizedId = connectionId.normalizedConnectionId
+        await awaitClearScreenShareOfferInFlight(connectionId: normalizedId)
         guard var connection = await connectionManager.findConnection(with: normalizedId) else {
             logger.log(
                 level: .warning,
@@ -507,14 +727,21 @@ extension RTCSession {
         }
         let captureGeneration = beginPlatformScreenCaptureGeneration()
         let connectionId = connection.id
-        let captureSource = iOSScreenCaptureSource { [weak self] in
-            Task { [weak self] in
-                await self?.platformScreenCaptureDidFinishUnexpectedly(
-                    connectionId: connectionId,
-                    generation: captureGeneration
-                )
+        let captureSource = iOSScreenCaptureSource(
+            onBroadcastFinished: { [weak self] in
+                Task { [weak self] in
+                    await self?.platformScreenCaptureDidFinishUnexpectedly(
+                        connectionId: connectionId,
+                        generation: captureGeneration
+                    )
+                }
+            },
+            onBroadcastStarted: { [weak self] in
+                Task { [weak self] in
+                    await self?.screenCaptureDidBecomeReady(connectionId: connectionId)
+                }
             }
-        }
+        )
         _iOSScreenCaptureSourceStorage = captureSource
         do {
             try await captureSource.startCapture(options: options, videoSource: videoSource)
@@ -533,6 +760,25 @@ extension RTCSession {
 #endif
 
     // MARK: - Platform capture source helpers
+
+#if os(iOS) && !os(Android)
+    private func screenCaptureDidBecomeReady(connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard pendingScreenShareRenegotiationConnectionIds.remove(normalizedId) != nil else { return }
+        do {
+            try await renegotiateScreenShareIfNeeded(
+                connectionId: normalizedId,
+                reason: "capture-ready"
+            )
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "Screen share capture became ready but renegotiation failed for connection \(normalizedId); cleaning up local capture: \(error)"
+            )
+            await removeScreenTrackFromStream(connectionId: normalizedId)
+        }
+    }
+#endif
 
 #if os(iOS) || os(macOS)
     private func platformScreenCaptureDidFinishUnexpectedly(

@@ -97,6 +97,8 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     private let layerBox: SampleBufferDisplayLayerBox
     private let ciContext: CIContext
     private let rendersScreenShare: Bool
+    /// When true, camera tiles letterbox inside the tile instead of cropping (used during screen share).
+    private var prefersAspectFit = false
     @MainActor var bounds: CGRect
     private weak var delegate: BufferToMetalDelegate?
     
@@ -185,6 +187,14 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         self.logger = logger
         self.rtcVideoRenderWrapper = RTCVideoRenderWrapper(id: rendersScreenShare ? "ScreenShareRenderer" : "SampleBufferViewRenderer")
         logger.log(level: .info, message: "SampleBufferViewRenderer initialized with bounds: \(bounds) rendersScreenShare=\(rendersScreenShare)")
+    }
+
+    private var usesAspectFitRendering: Bool {
+        rendersScreenShare || prefersAspectFit
+    }
+
+    func setPrefersAspectFit(_ enabled: Bool) {
+        prefersAspectFit = enabled
     }
 
     /// Fits source pixels inside a tile without cropping or stretching.
@@ -747,8 +757,8 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             
             let scaleMode: ScaleMode
 #if os(iOS)
-            // Camera tiles fill the viewport; screen shares must fit so a desktop is never cropped on phones.
-            scaleMode = rendersScreenShare ? .aspectFitHorizontal : .aspectFill
+            // Camera tiles fill the viewport unless screen share is active; screen shares always fit.
+            scaleMode = usesAspectFitRendering ? .aspectFitHorizontal : .aspectFill
 #elseif os(macOS)
             scaleMode = .aspectFitHorizontal
 #endif
@@ -756,7 +766,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             let originalSize = CGSize(width: pixelBuffer.width, height: pixelBuffer.height)
             let scaleInfo: MetalProcessor.ScaledInfo
 #if os(iOS)
-            if rendersScreenShare {
+            if usesAspectFitRendering {
                 scaleInfo = Self.aspectFitScaleInfo(
                     sourceSize: originalSize,
                     destinationSize: renderBounds
@@ -1008,15 +1018,14 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             )
             let scaleMode: ScaleMode
 #if os(iOS)
-            // Camera tiles fill the viewport; screen shares must fit so a desktop is never cropped on phones.
-            scaleMode = rendersScreenShare ? .aspectFitHorizontal : .aspectFill
+            scaleMode = usesAspectFitRendering ? .aspectFitHorizontal : .aspectFill
 #else
             scaleMode = .aspectFitHorizontal
 #endif
             let originalSize = CGSize(width: CGFloat(buffer.width), height: CGFloat(buffer.height))
             let scaleInfo: MetalProcessor.ScaledInfo
 #if os(iOS)
-            if rendersScreenShare {
+            if usesAspectFitRendering {
                 scaleInfo = Self.aspectFitScaleInfo(
                     sourceSize: originalSize,
                     destinationSize: renderBounds

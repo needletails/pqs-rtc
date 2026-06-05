@@ -41,9 +41,14 @@ final class iOSScreenCaptureSource: @unchecked Sendable {
     private var isRunning = false
     private var loggedUnsupportedAudioPacket = false
     private let onBroadcastFinished: (@Sendable () -> Void)?
+    private let onBroadcastStarted: (@Sendable () -> Void)?
 
-    init(onBroadcastFinished: (@Sendable () -> Void)? = nil) {
+    init(
+        onBroadcastFinished: (@Sendable () -> Void)? = nil,
+        onBroadcastStarted: (@Sendable () -> Void)? = nil
+    ) {
         self.onBroadcastFinished = onBroadcastFinished
+        self.onBroadcastStarted = onBroadcastStarted
     }
 
     /// Starts the app-side receiver. The host app should launch `RPSystemBroadcastPickerView`
@@ -224,6 +229,7 @@ final class iOSScreenCaptureSource: @unchecked Sendable {
         switch packet.type {
         case .started:
             logger.log(level: .info, message: "ReplayKit broadcast started")
+            onBroadcastStarted?()
         case .videoFrame:
             handleVideoPacket(packet)
         case .paused:
