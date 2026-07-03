@@ -587,9 +587,29 @@ extension RTCSession {
             await rebindInboundRemoteVideoAfterSfuRenegotiationIfNeeded(call: call)
         }
         if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
-           isGroupCallConnection(connection.id),
-           connection.localScreenTrack != nil {
-            await ensureAppleOutboundScreenShareAfterSfuAnswer(connection: connection)
+           isGroupCallConnection(connection.id) {
+            if connection.localScreenTrack != nil {
+                await ensureAppleOutboundScreenShareAfterSfuAnswer(connection: connection)
+            }
+            // Applying the SFU answer to our local renegotiation offer (e.g. screen-share
+            // start/stop) can rotate the underlying RTPReceivers exactly like an SFU-authored
+            // offer does. The offer path runs a full post-negotiation reconcile
+            // (completeSfuRenegotiationOfferHandling); without the same pass here the camera
+            // tile renderers and receiver FrameCryptors stay bound to the pre-answer receiver
+            // wrappers — frames keep decoding but never reach the UI (host stall at share start).
+            if let remoteSdp = connection.peerConnection.remoteDescription?.sdp {
+                await ensureAppleInboundCameraReceiveAfterSfuRenegotiation(
+                    connection: connection,
+                    remoteSdp: remoteSdp
+                )
+                await ensureAppleInboundScreenReceiveAfterSfuRenegotiation(
+                    connection: connection,
+                    remoteSdp: remoteSdp
+                )
+            }
+            await reconcileAppleReceiverFrameCryptorsAfterSfuRenegotiation(connectionId: call.sharedCommunicationId)
+            await rebindGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(connectionId: call.sharedCommunicationId)
+            await rebindGroupRemoteParticipantScreenAfterSfuRenegotiationIfNeeded(connectionId: call.sharedCommunicationId)
         }
 #endif
 #endif

@@ -2639,6 +2639,21 @@ public final class AndroidRTCClient: @unchecked Sendable {
         guard let pc = peerConnection.platformPeerConnection else { return nil }
         return AndroidWebRTCTrackResolver.remoteScreenTrackById(peerConnection: pc, trackId: trackId)
     }
+
+    /// Returns the remote screen video track on a specific transceiver mid.
+    ///
+    /// Remote track ids are immutable, so the contract screen mid's receiver never carries a
+    /// `screen_` id nor the msid track token from a later renegotiation. Callers resolve the
+    /// screen mid from the remote SDP and look the receiver up by mid instead.
+    public func getRemoteScreenVideoTrackByMid(peerConnection: RTCPeerConnection, mid: String) -> RTCVideoTrack? {
+        lock.lock()
+        let isClosedCheck = isClosed
+        lock.unlock()
+
+        guard !isClosedCheck else { return nil }
+        guard let pc = peerConnection.platformPeerConnection else { return nil }
+        return AndroidWebRTCTrackResolver.remoteScreenTrackByMid(peerConnection: pc, mid: mid)
+    }
    
     /// Ensures an audio transceiver is present with `SEND_RECV` and attaches a local audio track.
     ///

@@ -3267,6 +3267,14 @@ extension RTCSession {
         guard !advertisedLabels.isEmpty else { return }
 
         var consumedTrackIds = Set(connection.remoteScreenTracksByParticipantId.values.map(\.trackId))
+        let mappedCameraTrackIds = Set(connection.remoteVideoTracksByParticipantId.values.map(\.trackId))
+        // Remote track ids are immutable: the contract screen mid's receiver keeps the id it was
+        // created with (a UUID minted while the mid was still recvonly), so neither the msid track
+        // token nor a `screen_` prefix ever matches it. The SDP is authoritative about which mids
+        // carry active screen media; resolve by mid when id lookups miss.
+        let advertisedScreenMids = Self.remoteActiveIncomingScreenShareVideoMids(in: remoteSdp)
+            .union(Self.sfuRelayIncomingScreenShareVideoMids(in: remoteSdp))
+        let peerConnection = connection.peerConnection
 
         for label in advertisedLabels {
             let participantId = label.participantId
@@ -3292,13 +3300,32 @@ extension RTCSession {
                 continue
             }
 
-            let screenTrack = label.trackId.flatMap {
-                rtcClient.getRemoteScreenVideoTrackById(peerConnection: connection.peerConnection, trackId: $0)
-            } ?? rtcClient.getRemoteScreenVideoTrack(peerConnection: connection.peerConnection)
+            var screenTrack: RTCVideoTrack?
+            if let trackId = label.trackId {
+                screenTrack = rtcClient.getRemoteScreenVideoTrackById(
+                    peerConnection: peerConnection,
+                    trackId: trackId
+                )
+            }
+            if screenTrack == nil {
+                for mid in advertisedScreenMids.sorted() {
+                    guard let byMid = rtcClient.getRemoteScreenVideoTrackByMid(
+                        peerConnection: peerConnection,
+                        mid: mid
+                    ) else { continue }
+                    guard !consumedTrackIds.contains(byMid.trackId),
+                          !mappedCameraTrackIds.contains(byMid.trackId) else { continue }
+                    screenTrack = byMid
+                    break
+                }
+            }
+            if screenTrack == nil {
+                screenTrack = rtcClient.getRemoteScreenVideoTrack(peerConnection: peerConnection)
+            }
             guard let screenTrack, !consumedTrackIds.contains(screenTrack.trackId) else {
                 logger.log(
                     level: .warning,
-                    message: "SFU SDP advertised Android screen msid for participant=\(participantId) but no live screen receiver exists connection=\(connection.id)"
+                    message: "SFU SDP advertised Android screen msid for participant=\(participantId) but no live screen receiver exists connection=\(connection.id) advertisedScreenMids=\(advertisedScreenMids.sorted())"
                 )
                 continue
             }

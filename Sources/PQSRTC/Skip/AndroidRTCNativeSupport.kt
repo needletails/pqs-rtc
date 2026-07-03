@@ -462,6 +462,15 @@ object AndroidRTCViewSupport {
         view.invalidateOutline()
     }
 
+    /// Removes a previously applied rounded outline. Renderers are pooled across Compose
+    /// remounts, so a renderer that used to carry the tile outline must be reset when the
+    /// outline moves to its aspect-fit host container.
+    fun clearRoundedOutline(view: View) {
+        view.clipToOutline = false
+        view.outlineProvider = ViewOutlineProvider.BACKGROUND
+        view.invalidateOutline()
+    }
+
     fun detachFromParent(view: View) {
         val parent = view.parent
         if (parent is ViewGroup) {
@@ -2873,6 +2882,16 @@ object AndroidWebRTCTrackResolver {
 
     fun remoteScreenTrackById(peerConnection: PeerConnection, trackId: String): RTCVideoTrack? {
         return chooseBestVideoTrack(peerConnection) { id -> id == trackId }?.let { RTCVideoTrack(it) }
+    }
+
+    /// Resolves the screen receiver by transceiver mid. Remote track ids are immutable: the
+    /// contract screen mid's receiver track keeps whatever id it was created with (usually a
+    /// UUID minted before the screen msid appeared), so id/prefix predicates can never match
+    /// it. The SDP tells us which mid carries `screen_<participant>` media; trust the mid.
+    fun remoteScreenTrackByMid(peerConnection: PeerConnection, mid: String): RTCVideoTrack? {
+        val wantedMid = mid.trim()
+        if (wantedMid.isEmpty()) return null
+        return chooseBestVideoTrack(peerConnection, mid = wantedMid) { _ -> true }?.let { RTCVideoTrack(it) }
     }
 
     fun firstRemoteScreenTrack(peerConnection: PeerConnection): RTCVideoTrack? {

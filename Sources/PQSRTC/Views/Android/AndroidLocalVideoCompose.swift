@@ -120,10 +120,13 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
                     _ = client.safelyInitializeSurfaceRenderer(renderer, mirror: false)
                     renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
                     captureView.rendererDidInitialize()
-                    AndroidRTCViewSupport.applyRoundedOutline(view: renderer, radiusDp: Float(12))
                     // Wrap-content host so the renderer measures to the sender's rotated frame
                     // aspect (letterbox) instead of Compose fillMaxSize forcing a center crop.
+                    // Round the container (the visible tile), not the renderer: rounding only the
+                    // letterboxed renderer leaves mixed rounded/squared corners on the tile.
                     let container = AndroidRTCViewSupport.aspectFitContainer(renderer: renderer)
+                    AndroidRTCViewSupport.clearRoundedOutline(view: renderer)
+                    AndroidRTCViewSupport.applyRoundedOutline(view: container, radiusDp: Float(12))
                     AndroidRTCViewSupport.detachFromParent(view: container)
                     container
                 },
@@ -290,14 +293,19 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                                         _ = client.safelyInitializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
                                         view.surfaceViewRenderer.setScalingType(scalingType)
                                         view.rendererDidInitialize()
-                                        AndroidRTCViewSupport.applyRoundedOutline(
-                                            view: view.surfaceViewRenderer,
-                                            radiusDp: Float(tileCornerRadiusDp)
-                                        )
                                         // Wrap-content host so each grid tile letterboxes to the
-                                        // sender's rotated frame aspect like Apple tiles.
+                                        // sender's rotated frame aspect like Apple tiles. Round the
+                                        // container (the visible tile), not the letterboxed renderer,
+                                        // so tile corners are uniform.
                                         let container = AndroidRTCViewSupport.aspectFitContainer(
                                             renderer: view.surfaceViewRenderer
+                                        )
+                                        AndroidRTCViewSupport.clearRoundedOutline(
+                                            view: view.surfaceViewRenderer
+                                        )
+                                        AndroidRTCViewSupport.applyRoundedOutline(
+                                            view: container,
+                                            radiusDp: Float(tileCornerRadiusDp)
                                         )
                                         AndroidRTCViewSupport.detachFromParent(view: container)
                                         container

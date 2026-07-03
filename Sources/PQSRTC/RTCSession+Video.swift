@@ -2071,6 +2071,22 @@ extension RTCSession {
         guard !activeRelayMids.isEmpty else { return }
         let contractMid = ScreenShareGroupCallContract.MediaMid.screen.rawValue
 
+        // Camera protection. In group calls the SFU's camera relay mids are also numerically
+        // greater than the contract screen mid, so the "escalated relay mid" heuristic below
+        // must never touch a mid the SFU is actively sending camera media on, nor a receiver
+        // already mapped as a participant camera. Without this, starting a screen share
+        // deactivated the viewer's camera mids (answered a=inactive), permanently starving
+        // all remote camera RTP (observed 2026-07-03: iPad answered inactive on mids 4/6 at
+        // share start; framesRx pinned at 0 for the rest of the call).
+        let remoteSdp = connection.peerConnection.remoteDescription?.sdp ?? ""
+        let screenMids = Self.activeScreenShareVideoMids(in: remoteSdp)
+            .union(Self.sfuRelayIncomingScreenShareVideoMids(in: remoteSdp))
+        let remoteSendingCameraMids = Self.remoteSendingVideoMids(in: remoteSdp)
+            .subtracting(screenMids)
+        let mappedCameraTrackIds = Set(
+            connection.remoteVideoTracksByParticipantId.values.map(\.trackId)
+        )
+
         for transceiver in connection.peerConnection.transceivers where transceiver.mediaType == .video {
             let mid = transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !mid.isEmpty, !activeRelayMids.contains(mid) else { continue }
@@ -2078,6 +2094,17 @@ extension RTCSession {
             let isLegacyScreenTrack = Self.isScreenShareId(track.trackId)
             let isEscalatedRelayMid = (Int(mid) ?? -1) > (Int(contractMid) ?? -1)
             guard isLegacyScreenTrack || isEscalatedRelayMid else { continue }
+            if !isLegacyScreenTrack {
+                guard !remoteSendingCameraMids.contains(mid),
+                      !mappedCameraTrackIds.contains(track.trackId)
+                else {
+                    logger.log(
+                        level: .info,
+                        message: "Keeping camera relay receiver during screen-share retire pass connection=\(connection.id) mid=\(mid) trackId=\(track.trackId)"
+                    )
+                    continue
+                }
+            }
 
             if track.isEnabled {
                 track.isEnabled = false
