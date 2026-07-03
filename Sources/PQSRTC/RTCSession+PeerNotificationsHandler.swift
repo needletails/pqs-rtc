@@ -630,6 +630,8 @@ extension RTCSession {
             return
         }
 
+        suppressUnboundAppleRemoteSfuAudioReceivers(connection)
+
         var updated = connection
         var consumedTrackIds = Set<String>()
         var didUpdate = false
@@ -653,13 +655,10 @@ extension RTCSession {
                    !advertisedIds.isEmpty,
                    advertisedIds.contains(preferredPair.track.trackId) {
                     existing.isEnabled = false
-                    preferredPair.track.isEnabled = true
-                    updated.remoteAudioTracksByParticipantId[participantId] = preferredPair.track
-                    activeTrack = preferredPair.track
-                    activeReceiver = preferredPair.receiver
-                    didUpdate = true
                     // Decrypt must follow the new leg: drop the cryptor bound to the superseded
-                    // receiver so the rebind below re-creates it on `activeReceiver`.
+                    // receiver so the rebind below re-creates it on `activeReceiver`. This must
+                    // happen BEFORE syncing playback — otherwise the stale binding releases the
+                    // new leg with no cryptor on its receiver and ciphertext hits the decoder.
                     if let staleCryptor = updated.audioReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
                         staleCryptor.enabled = false
                         staleCryptor.delegate = nil
@@ -668,12 +667,29 @@ extension RTCSession {
                         }
                     }
                     updated.audioReceiverCryptorBindingsByParticipantId.removeValue(forKey: participantId)
+                    updated.remoteAudioTracksByParticipantId[participantId] = preferredPair.track
+                    syncAppleRemoteSfuAudioTrackPlayback(
+                        connection: updated,
+                        participantId: participantId,
+                        track: preferredPair.track
+                    )
+                    activeTrack = preferredPair.track
+                    activeReceiver = preferredPair.receiver
+                    didUpdate = true
+                    // Persist the drop immediately: createEncryptedFrame below re-reads the stored
+                    // connection (and can defer during renegotiation), and the refresh after it
+                    // must not resurrect the stale binding/cryptor from the connection manager.
+                    await connectionManager.updateConnection(id: updated.id, with: updated)
                     logger.log(
                         level: .info,
                         message: "Upgraded SFU audio mapping participant=\(participantId) from trackId=\(existing.trackId) to advertised trackId=\(preferredPair.track.trackId) connection=\(updated.id)"
                     )
                 } else {
-                    existing.isEnabled = true
+                    syncAppleRemoteSfuAudioTrackPlayback(
+                        connection: updated,
+                        participantId: participantId,
+                        track: existing
+                    )
                     activeTrack = existing
                     activeReceiver = audioReceivers.first(where: { $0.track === existing })?.receiver
                 }
@@ -717,7 +733,11 @@ extension RTCSession {
                 prior.isEnabled = false
             }
 
-            pair.track.isEnabled = true
+            syncAppleRemoteSfuAudioTrackPlayback(
+                connection: updated,
+                participantId: participantId,
+                track: pair.track
+            )
             updated.remoteAudioTracksByParticipantId[participantId] = pair.track
             consumedTrackIds.insert(pair.track.trackId)
             didUpdate = true
@@ -762,6 +782,8 @@ extension RTCSession {
         ) {
             didUpdate = true
         }
+
+        releaseAllAppleRemoteSfuAudioTracksWithBoundCryptors(updated)
 
         if didUpdate {
             await connectionManager.updateConnection(id: updated.id, with: updated)
@@ -3102,7 +3124,7 @@ extension RTCSession {
                 continue
             }
 
-            audioTrack._isEnabled = true
+            audioTrack._isEnabled = false
             if let existing = connection.remoteAudioTracksByParticipantId[label.participantId] {
                 let existingTrackId = existing.trackIdIfAvailable
                 if existing === audioTrack, existingTrackId != nil {
@@ -3113,6 +3135,8 @@ extension RTCSession {
                             trackKind: "audio",
                             trackId: audioTrackId
                         )
+                    } else {
+                        audioTrack._isEnabled = true
                     }
                     continue
                 }
@@ -3869,7 +3893,11 @@ extension RTCSession {
 
         if let existingBinding = conn.audioReceiverCryptorBindingsByParticipantId[trimmed],
            conn.audioReceiverCryptorsByParticipantId[trimmed] != nil {
-            if existingBinding.trackId == match.track.trackId {
+            // trackId alone is not proof of a live bind: SFU renegotiation rotates the
+            // RTCRtpReceiver while trackId stays stable, leaving the cryptor on a dead receiver
+            // (audio then plays as ciphertext). Only skip when the receiver also matches.
+            if existingBinding.trackId == match.track.trackId,
+               existingBinding.receiverId == String(describing: ObjectIdentifier(match.receiver)) {
                 return
             }
         }
@@ -4183,8 +4211,12 @@ extension RTCSession {
                 }()
 
                 if let candidate = resolvedAudioCandidate {
-                    candidate.track.isEnabled = true
                     conn.remoteAudioTracksByParticipantId[provisioned] = candidate.track
+                    syncAppleRemoteSfuAudioTrackPlayback(
+                        connection: conn,
+                        participantId: provisioned,
+                        track: candidate.track
+                    )
                     await connectionManager.updateConnection(id: conn.id, with: conn)
 
                     if let mediaDelegate {
@@ -4939,6 +4971,15 @@ extension RTCSession {
                 // If your SFU uses a different mapping, configure `setRemoteParticipantIdResolver`.
                 let participantId = remoteParticipantIdResolver?(streamIds, trackId, trackKind) ?? (streamIds.first ?? "")
 #if os(Android)
+                    let androidRenegotiationNormId = connection.id.normalizedConnectionId
+                    if isGroupCallConnection(connection.id),
+                       sfuRenegotiationInFlightConnectionIds.contains(androidRenegotiationNormId) {
+                        logger.log(
+                            level: .info,
+                            message: "Deferring Android didAddReceiver until setRemoteSDP completes kind=\(trackKind) trackId=\(trackId) connection=\(connection.id)"
+                        )
+                        continue
+                    }
                     let isScreenTrack = RTCSession.isScreenShareId(trackId) || streamIds.contains(where: { RTCSession.isScreenShareId($0) })
                     let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: connection.call)
                     let oneToOneRemoteTrackOwner = isOneToOneSfuRoom
@@ -5488,6 +5529,13 @@ extension RTCSession {
                             }
                             updated.remoteAudioTracksByParticipantId[audioParticipantId] = audioTrack
                         }
+                        if !audioParticipantId.isEmpty {
+                            syncAppleRemoteSfuAudioTrackPlayback(
+                                connection: updated,
+                                participantId: audioParticipantId,
+                                track: audioTrack
+                            )
+                        }
                         let activeAudioTrackIds = Set(updated.remoteAudioTracksByParticipantId.values.map(\.trackId))
                         _ = disableSupersededAppleInboundAudioReceivers(
                             connection: &updated,
@@ -5815,6 +5863,9 @@ extension RTCSession {
                     if self.isGroupCallConnection(connection.id) {
                         // Group call: participantId must come from didAddReceiver/addStream mapping.
                         // Avoid binding receiver cryptors here to room-id / placeholder ids.
+                        if trackKind == "audio" {
+                            suppressUnboundAppleRemoteSfuAudioReceivers(connection)
+                        }
                         continue
                     } else if self.frameEncryptionKeyMode == .perParticipant {
                         // 1:1 call in perParticipant mode: use remoteParticipantId to match the key

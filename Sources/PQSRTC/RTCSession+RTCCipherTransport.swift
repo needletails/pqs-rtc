@@ -743,6 +743,143 @@ extension RTCSession {
         cryptor.enabled = true
     }
 
+#if canImport(WebRTC) && !os(Android)
+    /// Keeps SFU remote audio muted at the WebRTC track until FrameCryptor is bound. Without this,
+    /// encrypted RTP reaches the decoder during renegotiation and sounds like garbled noise.
+    func holdAppleRemoteSfuAudioTrackUntilCryptorBound(_ track: RTCAudioTrack) {
+        guard track.readyState != .ended else { return }
+        track.isEnabled = false
+    }
+
+    func releaseAppleRemoteSfuAudioTrackAfterCryptorBound(
+        connection: RTCConnection,
+        participantId: String,
+        trackId: String
+    ) {
+        let trimmedParticipantId = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let mappedKey = frameCryptorDictionaryKey(
+            in: connection.remoteAudioTracksByParticipantId,
+            matching: trimmedParticipantId
+        ),
+           let mapped = connection.remoteAudioTracksByParticipantId[mappedKey],
+           mapped.trackId == trackId,
+           mapped.readyState != .ended {
+            mapped.isEnabled = true
+            return
+        }
+        if let mapped = connection.remoteAudioTracksByParticipantId[participantId],
+           mapped.trackId == trackId,
+           mapped.readyState != .ended {
+            mapped.isEnabled = true
+            return
+        }
+        for transceiver in connection.peerConnection.transceivers where transceiver.mediaType == .audio {
+            guard transceiver.sender.track == nil,
+                  let track = transceiver.receiver.track as? RTCAudioTrack,
+                  track.trackId == trackId,
+                  track.readyState != .ended
+            else { continue }
+            track.isEnabled = true
+            return
+        }
+    }
+
+    /// A binding only guarantees decrypt when its cryptor still wraps the receiver that currently
+    /// carries the track. After SFU renegotiation WebRTC can rotate the `RTCRtpReceiver` while the
+    /// trackId stays stable; the old cryptor is then attached to a dead receiver and enabling the
+    /// track plays ciphertext (garbled audio).
+    private func appleAudioReceiverCryptorBindingTargetsLiveReceiver(
+        _ binding: RTCReceiverCryptorBinding,
+        connection: RTCConnection
+    ) -> Bool {
+        for transceiver in connection.peerConnection.transceivers where transceiver.mediaType == .audio {
+            guard transceiver.sender.track == nil,
+                  let track = transceiver.receiver.track as? RTCAudioTrack,
+                  track.trackId == binding.trackId,
+                  track.readyState != .ended
+            else { continue }
+            return String(describing: ObjectIdentifier(transceiver.receiver)) == binding.receiverId
+        }
+        return false
+    }
+
+    func appleRemoteSfuAudioReceiverCryptorIsBound(
+        connection: RTCConnection,
+        participantId: String,
+        trackId: String
+    ) -> Bool {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard let bindingKey = frameCryptorDictionaryKey(
+            in: connection.audioReceiverCryptorBindingsByParticipantId,
+            matching: trimmed
+        ),
+              let binding = connection.audioReceiverCryptorBindingsByParticipantId[bindingKey],
+              binding.trackId == trackId,
+              connection.audioReceiverCryptorsByParticipantId[bindingKey] != nil
+        else { return false }
+        return appleAudioReceiverCryptorBindingTargetsLiveReceiver(binding, connection: connection)
+    }
+
+    /// Holds remote SFU audio only while the receiver FrameCryptor is still unbound; re-enables
+    /// immediately when a cryptor is already installed (reconcile must not leave mapped legs muted).
+    func syncAppleRemoteSfuAudioTrackPlayback(
+        connection: RTCConnection,
+        participantId: String,
+        track: RTCAudioTrack
+    ) {
+        guard track.readyState != .ended else { return }
+        if appleRemoteSfuAudioReceiverCryptorIsBound(
+            connection: connection,
+            participantId: participantId,
+            trackId: track.trackId
+        ) {
+            releaseAppleRemoteSfuAudioTrackAfterCryptorBound(
+                connection: connection,
+                participantId: participantId,
+                trackId: track.trackId
+            )
+        } else {
+            holdAppleRemoteSfuAudioTrackUntilCryptorBound(track)
+        }
+    }
+
+    func releaseAllAppleRemoteSfuAudioTracksWithBoundCryptors(_ connection: RTCConnection) {
+        for (participantId, binding) in connection.audioReceiverCryptorBindingsByParticipantId {
+            guard connection.audioReceiverCryptorsByParticipantId[participantId] != nil,
+                  appleAudioReceiverCryptorBindingTargetsLiveReceiver(binding, connection: connection)
+            else { continue }
+            releaseAppleRemoteSfuAudioTrackAfterCryptorBound(
+                connection: connection,
+                participantId: participantId,
+                trackId: binding.trackId
+            )
+        }
+    }
+
+    func suppressUnboundAppleRemoteSfuAudioReceivers(_ connection: RTCConnection) {
+        guard isGroupCallConnection(connection.id) || Self.isTrueOneToOneSfuRoom(call: connection.call) else {
+            return
+        }
+        let cryptorBoundTrackIds = Set(
+            connection.audioReceiverCryptorBindingsByParticipantId
+                .filter { participantId, binding in
+                    connection.audioReceiverCryptorsByParticipantId[participantId] != nil
+                        && appleAudioReceiverCryptorBindingTargetsLiveReceiver(binding, connection: connection)
+                }
+                .values.map(\.trackId)
+        )
+        for transceiver in connection.peerConnection.transceivers where transceiver.mediaType == .audio {
+            guard transceiver.sender.track == nil,
+                  let track = transceiver.receiver.track as? RTCAudioTrack,
+                  track.readyState != .ended,
+                  !cryptorBoundTrackIds.contains(track.trackId)
+            else { continue }
+            holdAppleRemoteSfuAudioTrackUntilCryptorBound(track)
+        }
+    }
+#endif
+
     private func syncAppleFrameCryptorKeyIndex(
         participantId: String,
         index: Int,
@@ -1426,6 +1563,11 @@ extension RTCSession {
                 connectionId: connection.id)
             else { return }
             if prepareAudioReceiverCryptorSlot(connection: &connection, binding: binding) != nil {
+                releaseAppleRemoteSfuAudioTrackAfterCryptorBound(
+                    connection: connection,
+                    participantId: binding.participantId,
+                    trackId: binding.trackId
+                )
                 await connectionManager.updateConnection(id: connection.id, with: connection)
                 logger.log(
                     level: .info,
@@ -1449,6 +1591,11 @@ extension RTCSession {
             connection.audioFrameCryptor = audioCryptor
             connection.audioReceiverCryptorsByParticipantId[binding.participantId] = audioCryptor
             connection.audioReceiverCryptorBindingsByParticipantId[binding.participantId] = binding
+            releaseAppleRemoteSfuAudioTrackAfterCryptorBound(
+                connection: connection,
+                participantId: binding.participantId,
+                trackId: binding.trackId
+            )
             logger.log(
                 level: .info,
                 message: "Created receiver FrameCryptor kind=audio participantId=\(binding.participantId) connId=\(connection.id) trackId=\(binding.trackId) receiverId=\(binding.receiverId) keyIndex=\(appleFrameCryptorKeyIndex(for: binding.participantId))")

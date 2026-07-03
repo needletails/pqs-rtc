@@ -907,10 +907,12 @@ class AndroidFrameCryptorSupport {
             )
         ) {
             audioReceiverCryptor = existingCryptor
+            enableAndroidRemoteAudioReceiverTrack(receiver)
             Log.i("AndroidRTCClient", "Audio receiver cryptor already attached for '$participant' receiverKey=$receiverKey trackId=$trackId; keeping live cryptor")
             return
         }
 
+        holdAndroidRemoteAudioReceiverTrack(receiver)
         existingCryptor?.dispose()
         if (existingCryptor != null) {
             Log.i("AndroidRTCClient", "Rebinding audio receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$receiverKey newTrackId=$trackId")
@@ -930,7 +932,22 @@ class AndroidFrameCryptorSupport {
             audioReceiverKeysByParticipantId[participant] = receiverKey
             audioReceiverTrackIdsByParticipantId[participant] = trackId
             audioReceiverCryptor = cryptor
+            enableAndroidRemoteAudioReceiverTrack(receiver)
             Log.i("AndroidRTCClient", "✅ Audio receiver cryptor attached receiverKey=$receiverKey trackId=$trackId")
+        }
+    }
+
+    private fun holdAndroidRemoteAudioReceiverTrack(receiver: RtpReceiver) {
+        try {
+            receiver.track()?.takeIf { it.kind() == "audio" }?.setEnabled(false)
+        } catch (_: IllegalStateException) {
+        }
+    }
+
+    private fun enableAndroidRemoteAudioReceiverTrack(receiver: RtpReceiver) {
+        try {
+            receiver.track()?.takeIf { it.kind() == "audio" }?.setEnabled(true)
+        } catch (_: IllegalStateException) {
         }
     }
 

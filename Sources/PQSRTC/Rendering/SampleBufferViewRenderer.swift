@@ -721,6 +721,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             logger.log(level: .trace, message: "First remote I420 frame received (detailed wire log emitted separately)")
         }
         if !pauseMetalRendering {
+            #if os(iOS)
             if frame.rotation != ._0 {
                 let pixelBuffer = try makeNV12PixelBuffer(fromI420: buffer)
                 let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
@@ -730,7 +731,6 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 try await processFrameForMetal(pixelBuffer: displayBuffer)
                 return
             }
-            #if os(iOS)
             // Render iOS remote frames from source I420 planes directly for Metal.
             // This avoids an extra I420->NV12 interleave step and preserves source strides.
             if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogIOSRemoteI420MetalPath == false {
@@ -742,16 +742,26 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             }
             try await processI420FrameForMetal(buffer: buffer)
             #else
-            // Metal path supports I420 directly.
-            try await processI420FrameForMetal(buffer: buffer)
+            // macOS: bake WebRTC rotation metadata into upright NV12 pixels before Metal so
+            // group tiles aspect-fit landscape senders instead of showing quarter-turned video.
+            let pixelBuffer = try makeNV12PixelBuffer(fromI420: buffer)
+            let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
+                from: pixelBuffer,
+                rotation: frame.rotation
+            )
+            try await processFrameForMetal(pixelBuffer: displayBuffer)
             #endif
             return
         }
         
         // Sample-buffer path: convert I420 -> NV12 CVPixelBuffer -> CMSampleBuffer enqueue.
         let pixelBuffer = try makeNV12PixelBuffer(fromI420: buffer)
+        let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
+            from: pixelBuffer,
+            rotation: frame.rotation
+        )
         let time = normalizedPresentationTime(for: frame)
-        try await processPixelBufferForSampleBuffer(pixelBuffer: pixelBuffer, time: time)
+        try await processPixelBufferForSampleBuffer(pixelBuffer: displayBuffer, time: time)
     }
 
     // MARK: - Pixel buffer conversion (I420 -> NV12)

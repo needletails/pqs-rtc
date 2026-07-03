@@ -584,6 +584,30 @@ actor PreviewViewRender: RendererDelegate {
         hostBounds.width > 0 && hostBounds.height > 0 && hostBounds.width > hostBounds.height
     }
 
+    /// Window/scene bounds for capture rotation — not the local preview PiP tile, which stays
+    /// portrait-shaped on iPad group calls even when the full-screen call UI is landscape.
+    @MainActor
+    private static func videoCaptureLayoutBounds(fallbackHostBounds: CGRect) -> CGRect {
+        if let windowBounds = activeWindowBounds(), windowBounds.width > 0, windowBounds.height > 0 {
+            return windowBounds
+        }
+        return fallbackHostBounds
+    }
+
+    @MainActor
+    private static func activeWindowBounds() -> CGRect? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        guard let scene else { return nil }
+        if let keyWindow = scene.windows.first(where: { $0.isKeyWindow }) {
+            return keyWindow.bounds
+        }
+        if let visibleWindow = scene.windows.first(where: { !$0.isHidden && $0.alpha > 0 }) {
+            return visibleWindow.bounds
+        }
+        return nil
+    }
+
     @MainActor
     private static func interfaceOrientationIsLandscape() -> Bool {
         guard let orientation = activeInterfaceOrientation() else { return false }
@@ -597,8 +621,19 @@ actor PreviewViewRender: RendererDelegate {
         deviceOrientation: UIDeviceOrientation = UIDevice.current.orientation,
         hostBounds: CGRect = .zero
     ) -> VideoRotation {
-        let hostLandscape = hostBoundsIndicateLandscape(hostBounds)
+        let layoutBounds = videoCaptureLayoutBounds(fallbackHostBounds: hostBounds)
+        let hostLandscape = hostBoundsIndicateLandscape(layoutBounds)
         let interfaceLandscape = interfaceOrientationIsLandscape()
+
+        // Prefer interface + host layout before trusting device sensors. The chosen rotation is
+        // baked into the capture buffers via AVCaptureConnection.videoRotationAngle; WebRTC
+        // rotation metadata is handled separately in handleOrientation (always ._0 once baked).
+        let preferInterfaceLandscape = hostLandscape
+        if preferInterfaceLandscape, interfaceLandscape,
+           let interfaceOrientation = activeInterfaceOrientation(),
+           let rotation = videoRotation(forInterfaceOrientation: interfaceOrientation) {
+            return rotation
+        }
 
         if isConcreteDeviceOrientation(deviceOrientation) {
             let devicePortrait = deviceOrientation == .portrait || deviceOrientation == .portraitUpsideDown
@@ -667,6 +702,10 @@ actor PreviewViewRender: RendererDelegate {
             let angle = rotation.angle
             if connection.isVideoRotationAngleSupported(angle) {
                 connection.videoRotationAngle = angle
+                // The capture connection has physically rotated the buffer upright. Sending any
+                // non-zero WebRTC rotation on top double-rotates the frame on every receiver
+                // (landscape iPad → sideways pillarboxed tiles on macOS).
+                return ._0
             }
             return rotation.rtcRotation
         }
@@ -674,7 +713,8 @@ actor PreviewViewRender: RendererDelegate {
         let currentOrientation = UIDevice.current.orientation
         switch currentOrientation {
         case .faceUp:
-            let isLandscape = Self.interfaceOrientationIsLandscape() || Self.hostBoundsIndicateLandscape(bounds)
+            let layoutBounds = Self.videoCaptureLayoutBounds(fallbackHostBounds: bounds)
+            let isLandscape = Self.interfaceOrientationIsLandscape() || Self.hostBoundsIndicateLandscape(layoutBounds)
             let rotation: VideoRotation
             switch deviceOrientationState {
             case .wasLandscapeLeft:
@@ -683,20 +723,22 @@ actor PreviewViewRender: RendererDelegate {
                 rotation = isLandscape ? .faceUp(.wasLandscapeRight) : .faceUp(.none)
             case .none:
                 rotation = isLandscape
-                    ? Self.resolvedVideoRotation(hostBounds: bounds)
+                    ? Self.resolvedVideoRotation(hostBounds: layoutBounds)
                     : .faceUp(.none)
             }
             return setVideoRotation(for: connection, rotation: rotation)
 
         case .unknown:
-            let rotation = Self.resolvedVideoRotation(hostBounds: bounds)
+            let layoutBounds = Self.videoCaptureLayoutBounds(fallbackHostBounds: bounds)
+            let rotation = Self.resolvedVideoRotation(hostBounds: layoutBounds)
             updateDeviceOrientationState(for: rotation)
             return setVideoRotation(for: connection, rotation: rotation)
 
         default:
+            let layoutBounds = Self.videoCaptureLayoutBounds(fallbackHostBounds: bounds)
             let rotation = Self.resolvedVideoRotation(
                 deviceOrientation: currentOrientation,
-                hostBounds: bounds
+                hostBounds: layoutBounds
             )
             updateDeviceOrientationState(for: rotation)
             return setVideoRotation(for: connection, rotation: rotation)
@@ -752,7 +794,20 @@ actor PreviewViewRender: RendererDelegate {
 
                 if didLogFirstInjection == false {
                     didLogFirstInjection = true
-                    self.logger.log(level: .info, message: "✅ First camera frame injected into WebRTC")
+#if os(iOS)
+                    let layoutBounds = await MainActor.run {
+                        Self.videoCaptureLayoutBounds(fallbackHostBounds: self.bounds)
+                    }
+                    self.logger.log(
+                        level: .info,
+                        message: "✅ First camera frame injected into WebRTC rotation=\(rtcRotation.rawValue) layoutBounds=\(layoutBounds)"
+                    )
+#else
+                    self.logger.log(
+                        level: .info,
+                        message: "✅ First camera frame injected into WebRTC rotation=\(rtcRotation.rawValue)"
+                    )
+#endif
                 }
 
                 if PQSRTCDiagnostics.criticalBugLoggingEnabled, injectedFrameCount % 900 == 0 {

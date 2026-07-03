@@ -29,6 +29,9 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
     private let connectionId: String
     private weak var rtcClient: AndroidRTCClient?
     private var isShutdown = false
+    /// Latest `onAddStream` label for this connection; Android Unified Plan callbacks often
+    /// emit receiver track events with empty stream ids.
+    private var lastRemoteStreamLabel: String?
     
     public init(
         connectionId: String,
@@ -184,9 +187,8 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
             logger.log(level: .info, message: "Remote video track received from NeedleTailRTC")
             logger.log(level: .info, message: "Video track ID: \(track.trackId)")
             guard !connectionId.isEmpty else { return }
-            // Mirror the Apple Unified Plan callback (`didAddReceiver`) so the session can
-            // map this track to a participant and attach receiver cryptors.
-            continuation.yield(PeerConnectionNotifications.didAddReceiver(connectionId, "video", [], track.trackId))
+            let streamIds = lastRemoteStreamLabel.map { [$0] } ?? []
+            continuation.yield(PeerConnectionNotifications.didAddReceiver(connectionId, "video", streamIds, track.trackId))
         }
     }
     
@@ -196,9 +198,8 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
             guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Remote audio track received from NeedleTailRTC")
             guard !connectionId.isEmpty else { return }
-            // Mirror the Apple Unified Plan callback (`didAddReceiver`) so the session can
-            // map this track to a participant and attach receiver cryptors.
-            continuation.yield(PeerConnectionNotifications.didAddReceiver(connectionId, "audio", [], track.trackId))
+            let streamIds = lastRemoteStreamLabel.map { [$0] } ?? []
+            continuation.yield(PeerConnectionNotifications.didAddReceiver(connectionId, "audio", streamIds, track.trackId))
         }
     }
     
@@ -283,6 +284,7 @@ public final class AndroidPeerConnectionDelegate: @unchecked Sendable {
             guard let self else { return }
             guard !self.isShutdown else { return }
             logger.log(level: .info, message: "Stream added: \(streamId)")
+            lastRemoteStreamLabel = streamId
             guard !connectionId.isEmpty else { return }
             continuation.yield(PeerConnectionNotifications.addedStream(connectionId, streamId))
         }

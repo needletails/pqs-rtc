@@ -22,6 +22,7 @@ import SwiftUI
 
 #if os(iOS)
 import UIKit
+import NeedleTailLogger
 
 /// Forwards mute/end actions to the hosted ``VideoCallViewController``.
 ///
@@ -44,7 +45,14 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
     }
 
     public func setAudioMuted(_ muted: Bool) async {
-        await viewController?.setAudioMuted(muted)
+        guard let viewController else {
+            NeedleTailLogger("[VideoCallActionBridge]").log(
+                level: .warning,
+                message: "setAudioMuted(\(muted)) ignored; VideoCallViewController not bound"
+            )
+            return
+        }
+        await viewController.setAudioMuted(muted)
     }
 
     public func muteVideo() async {
@@ -323,7 +331,14 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
     }
 
     public func setAudioMuted(_ muted: Bool) async {
-        await viewController?.setAudioMuted(muted)
+        guard let viewController else {
+            NeedleTailLogger("[VideoCallActionBridge]").log(
+                level: .warning,
+                message: "setAudioMuted(\(muted)) ignored; VideoCallViewController not bound"
+            )
+            return
+        }
+        await viewController.setAudioMuted(muted)
     }
 
     public func muteVideo() async {

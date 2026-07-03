@@ -3200,15 +3200,15 @@ extension VideoCallViewController: CallActionDelegate {
             logger.log(level: .warning, message: "muteAudio: missing connection id")
             return
         }
-        guard isMutingAudio != muted else {
-            await videoCallDelegate?.localMuteDisplayDidChange(videoMuted: isMutingVideo, audioMuted: isMutingAudio)
-            return
-        }
+        let displayChanged = isMutingAudio != muted
         do {
-            // When muted, disable the local microphone track.
+            // Always reconcile the WebRTC track; display flags can match desired state while the
+            // underlying track stayed disabled after join or SFU renegotiation.
             try await session.setAudioTrack(isEnabled: !muted, connectionId: callId)
             isMutingAudio = muted
-            await videoCallDelegate?.localMuteDisplayDidChange(videoMuted: isMutingVideo, audioMuted: isMutingAudio)
+            if displayChanged {
+                await videoCallDelegate?.localMuteDisplayDidChange(videoMuted: isMutingVideo, audioMuted: isMutingAudio)
+            }
         } catch {
             logger.log(level: .error, message: "Failed to set audio track: \(error)")
         }
