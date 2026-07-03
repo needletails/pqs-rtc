@@ -3196,25 +3196,52 @@ extension RTCSession {
         }
 
         func existingScreenTrack(for participantId: String, in connection: RTCConnection) -> RTCVideoTrack? {
-            if let exact = connection.remoteScreenTracksByParticipantId[participantId] {
+            if let exact = connection.remoteScreenTracksByParticipantId[participantId],
+               exact.isLiveVideoTrack {
                 return exact
             }
             let participantKey = Self.conferenceParticipantIdentityKey(participantId)
             guard !participantKey.isEmpty else { return nil }
             return connection.remoteScreenTracksByParticipantId.first {
                 Self.conferenceParticipantIdentityKey($0.key) == participantKey
+                    && $0.value.isLiveVideoTrack
             }?.value
         }
 
         func androidHasLiveScreenReceiver(for participantId: String, in connection: RTCConnection) -> Bool {
             guard existingScreenTrack(for: participantId, in: connection) != nil else { return false }
-            let cameraTrackId = connection.remoteVideoTracksByParticipantId[participantId]?.trackId
+            let cameraTrackId = connection.remoteVideoTracksByParticipantId[participantId]?.trackIdIfAvailable
             guard let screenTrack = rtcClient.getRemoteScreenVideoTrack(peerConnection: connection.peerConnection) else {
                 return false
             }
-            if RTCSession.isScreenShareId(screenTrack.trackId) { return true }
-            guard let cameraTrackId else { return false }
-            return screenTrack.trackId != cameraTrackId
+            if let screenTrackId = screenTrack.trackIdIfAvailable,
+               RTCSession.isScreenShareId(screenTrackId) {
+                return true
+            }
+            guard let cameraTrackId,
+                  let screenTrackId = screenTrack.trackIdIfAvailable else { return false }
+            return screenTrackId != cameraTrackId
+        }
+
+        // SFU renegotiation can dispose the Java wrapper while the mapping lingers. Reading
+        // `.trackId` on a disposed wrapper traps (observed 2026-07-03 screen-share receive).
+        var didPruneDisposedScreenMappings = false
+        for (participantId, storedTrack) in Array(connection.remoteScreenTracksByParticipantId) {
+            guard storedTrack.isLiveVideoTrack else {
+                connection.remoteScreenTracksByParticipantId.removeValue(forKey: participantId)
+                if connection.remoteScreenTrack === storedTrack {
+                    connection.remoteScreenTrack = nil
+                }
+                didPruneDisposedScreenMappings = true
+                logger.log(
+                    level: .info,
+                    message: "Pruned disposed Android screen mapping before SDP reconcile participant=\(participantId) storedTrackId=\(storedTrack.trackIdIfAvailable ?? "<nil>") connection=\(connection.id)"
+                )
+                continue
+            }
+        }
+        if didPruneDisposedScreenMappings {
+            await connectionManager.updateConnection(id: connection.id, with: connection)
         }
 
         var removedScreenParticipants = Set<String>()
@@ -3266,8 +3293,12 @@ extension RTCSession {
 
         guard !advertisedLabels.isEmpty else { return }
 
-        var consumedTrackIds = Set(connection.remoteScreenTracksByParticipantId.values.map(\.trackId))
-        let mappedCameraTrackIds = Set(connection.remoteVideoTracksByParticipantId.values.map(\.trackId))
+        var consumedTrackIds = Set(
+            connection.remoteScreenTracksByParticipantId.values.compactMap(\.trackIdIfAvailable)
+        )
+        let mappedCameraTrackIds = Set(
+            connection.remoteVideoTracksByParticipantId.values.compactMap(\.trackIdIfAvailable)
+        )
         // Remote track ids are immutable: the contract screen mid's receiver keeps the id it was
         // created with (a UUID minted while the mid was still recvonly), so neither the msid track
         // token nor a `screen_` prefix ever matches it. The SDP is authoritative about which mids
@@ -3292,8 +3323,9 @@ extension RTCSession {
             ) {
                 continue
             }
-            if let existing = existingScreenTrack(for: participantId, in: connection) {
-                consumedTrackIds.insert(existing.trackId)
+            if let existing = existingScreenTrack(for: participantId, in: connection),
+               let existingTrackId = existing.trackIdIfAvailable {
+                consumedTrackIds.insert(existingTrackId)
                 notifyRemoteScreenTrackChanged(
                     RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: true)
                 )
@@ -3312,9 +3344,11 @@ extension RTCSession {
                     guard let byMid = rtcClient.getRemoteScreenVideoTrackByMid(
                         peerConnection: peerConnection,
                         mid: mid
-                    ) else { continue }
-                    guard !consumedTrackIds.contains(byMid.trackId),
-                          !mappedCameraTrackIds.contains(byMid.trackId) else { continue }
+                    ),
+                          let byMidTrackId = byMid.trackIdIfAvailable,
+                          byMid.isLiveVideoTrack else { continue }
+                    guard !consumedTrackIds.contains(byMidTrackId),
+                          !mappedCameraTrackIds.contains(byMidTrackId) else { continue }
                     screenTrack = byMid
                     break
                 }
@@ -3322,7 +3356,10 @@ extension RTCSession {
             if screenTrack == nil {
                 screenTrack = rtcClient.getRemoteScreenVideoTrack(peerConnection: peerConnection)
             }
-            guard let screenTrack, !consumedTrackIds.contains(screenTrack.trackId) else {
+            guard let screenTrack,
+                  screenTrack.isLiveVideoTrack,
+                  let screenTrackId = screenTrack.trackIdIfAvailable,
+                  !consumedTrackIds.contains(screenTrackId) else {
                 logger.log(
                     level: .warning,
                     message: "SFU SDP advertised Android screen msid for participant=\(participantId) but no live screen receiver exists connection=\(connection.id) advertisedScreenMids=\(advertisedScreenMids.sorted())"
@@ -3332,12 +3369,12 @@ extension RTCSession {
 
             connection.remoteScreenTrack = screenTrack
             connection.remoteScreenTracksByParticipantId[participantId] = screenTrack
-            consumedTrackIds.insert(screenTrack.trackId)
+            consumedTrackIds.insert(screenTrackId)
             await connectionManager.updateConnection(id: connection.id, with: connection)
 
             logger.log(
                 level: .info,
-                message: "Mapped Android SFU screen receiver to participant=\(participantId) trackId=\(screenTrack.trackId) connection=\(connection.id)"
+                message: "Mapped Android SFU screen receiver to participant=\(participantId) trackId=\(screenTrackId) connection=\(connection.id)"
             )
             notifyRemoteScreenTrackChanged(
                 RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: true)
@@ -3347,7 +3384,7 @@ extension RTCSession {
                     connectionId: connection.id,
                     participantId: participantId,
                     kind: "screen",
-                    trackId: screenTrack.trackId
+                    trackId: screenTrackId
                 )
             }
             if enableEncryption {
@@ -3355,7 +3392,7 @@ extension RTCSession {
                     participant: participantId,
                     connectionId: connection.id,
                     trackKind: "screen",
-                    trackId: screenTrack.trackId
+                    trackId: screenTrackId
                 )
             }
         }
