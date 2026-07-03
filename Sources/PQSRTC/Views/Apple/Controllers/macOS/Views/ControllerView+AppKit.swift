@@ -321,6 +321,34 @@ class ControllerView: NSView {
             }
         }
     }
+
+    /// Clears stored PiP overlay constraints when the preview leaves the overlay.
+    func clearPreviewOverlayConstraints(for view: NTMTKView) {
+        guard view === currentPreviewView || view.superview === localPreviewOverlay else { return }
+        NSLayoutConstraint.deactivate(previewOverlayConstraints)
+        previewOverlayConstraints = []
+        previewTopConstraint = nil
+        previewTrailingConstraint = nil
+        previewWidthConstraint = nil
+        previewHeightConstraint = nil
+        if currentPreviewView === view {
+            currentPreviewView = nil
+        }
+    }
+
+    /// Strips stale layout constraints before mounting a video tile into a collection cell.
+    ///
+    /// PiP width/height constraints (160×90) must not coexist with fill-to-cell edge pins.
+    func prepareVideoViewForCollectionCellLayout(_ videoView: NTMTKView, hostView: NSView) {
+        clearPreviewOverlayConstraints(for: videoView)
+        if let superview = videoView.superview, superview !== hostView {
+            deactivateConstraintsReferencing(videoView, in: superview)
+        }
+        deactivateConstraintsReferencing(videoView, in: hostView)
+        deactivateConstraints(for: videoView)
+        videoView.translatesAutoresizingMaskIntoConstraints = false
+        videoView.autoresizingMask = []
+    }
     
     /// Builds the “voice call” layout (avatar + labels).
     func createVoiceView() async {

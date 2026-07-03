@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import PQSRTC
 
@@ -142,6 +143,40 @@ struct RTCSessionCryptoKeyResolutionTests {
         #expect(RTCSession.usesPairwiseFrameIdentityResolution(call: call) == true)
     }
 
+    @Test("Android group camera reconcile avoids optional JNI receiver lookup helper")
+    func androidGroupCameraReconcileAvoidsOptionalJniReceiverLookupHelper() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let androidClientSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/PQSRTC/Android/AndroidRTCClient.swift"),
+            encoding: .utf8
+        )
+        let peerNotificationSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/PQSRTC/RTCSession+PeerNotificationsHandler.swift"),
+            encoding: .utf8
+        )
+
+        #expect(
+            !androidClientSource.contains("getRemoteVideoTrackByIdOrMid"),
+            "The optional trackId/mid Android helper regressed to a crash-prone JNI bridge."
+        )
+        #expect(
+            androidClientSource.contains("public func getRemoteVideoTrackByMid(peerConnection: RTCPeerConnection, mid: String) -> RTCVideoTrack?"),
+            "Android group camera recovery should use a non-optional MID-specific helper."
+        )
+        #expect(
+            !androidClientSource.contains("candidate.name == \"getMid\""),
+            "MID fallback should use the typed Kotlin property rather than reflective method lookup."
+        )
+        #expect(
+            peerNotificationSource.contains("rtcClient.getRemoteVideoTrackById(")
+                && peerNotificationSource.contains("rtcClient.getRemoteVideoTrackByMid("),
+            "Android group camera reconcile must try exact advertised track id first, then MID fallback for native id drift."
+        )
+    }
+
     @Test("1:1 SFU ignores call_cipher from sibling device that is not the active media peer")
     func oneToOneSfuRejectsSiblingDeviceCallCipher() throws {
         let activeCall = try Call(
@@ -165,6 +200,102 @@ struct RTCSessionCryptoKeyResolutionTests {
 
         #expect(RTCSession.shouldProcessOneToOneSfuCallCipher(connectionCall: activeCall, inboundCall: activePeerCipher))
         #expect(RTCSession.shouldProcessOneToOneSfuCallCipher(connectionCall: activeCall, inboundCall: siblingCipher) == false)
+    }
+
+    @Test("1:1 SFU ignores sibling device when stored connection call lacks channelWireId")
+    func oneToOneSfuRejectsSiblingWhenConnectionCallMissingWireId() throws {
+        let staleConnectionCall = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: nil,
+            sender: try participant("echo", device: "echo-active"),
+            recipients: [try participant("nudge", device: "nudge-active")],
+            supportsVideo: true)
+        let siblingCipher = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: "#\(roomUUID)",
+            sender: try participant("nudge", device: "nudge-sibling"),
+            recipients: [try participant("echo", device: "echo-active")],
+            supportsVideo: true)
+
+        #expect(RTCSession.shouldProcessOneToOneSfuCallCipher(
+            connectionCall: staleConnectionCall,
+            inboundCall: siblingCipher) == false)
+    }
+
+    @Test("likely 1:1 SFU classifies UUID rooms without channelWireId")
+    func likelyOneToOneSfuWithoutWireId() throws {
+        let call = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: nil,
+            sender: try participant("echo", device: "echo-active"),
+            recipients: [try participant("nudge", device: "nudge-active")],
+            supportsVideo: true)
+        #expect(RTCSession.isTrueOneToOneSfuRoom(call: call) == false)
+        #expect(RTCSession.isLikelyOneToOneSfuRoom(call: call) == true)
+    }
+
+    @Test("1:1 SFU ignores sibling device after resolveProperRecipient call shape")
+    func oneToOneSfuRejectsSiblingAfterRecipientResolution() throws {
+        let resolvedConnectionCall = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: "#\(roomUUID)",
+            sender: try participant("echo", device: "echo-active"),
+            recipients: [try participant("nudge", device: "nudge-active")],
+            supportsVideo: true)
+        let resolvedSiblingInbound = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: "#\(roomUUID)",
+            sender: try participant("echo", device: "echo-active"),
+            recipients: [try participant("nudge", device: "nudge-sibling")],
+            supportsVideo: true)
+
+        #expect(RTCSession.shouldProcessOneToOneSfuCallCipher(
+            connectionCall: resolvedConnectionCall,
+            inboundCall: resolvedSiblingInbound,
+            lockedRemoteDeviceId: "nudge-active",
+            cipherState: .complete,
+            localSecretName: "echo") == false)
+        #expect(RTCSession.shouldProcessOneToOneSfuCallCipher(
+            connectionCall: resolvedConnectionCall,
+            inboundCall: try Call(
+                sharedCommunicationId: roomUUID,
+                channelWireId: "#\(roomUUID)",
+                sender: try participant("echo", device: "echo-active"),
+                recipients: [try participant("nudge", device: "nudge-active")],
+                supportsVideo: true),
+            lockedRemoteDeviceId: "nudge-active",
+            cipherState: .complete,
+            localSecretName: "echo"))
+    }
+
+    @Test("locked remote device id rejects sibling call_cipher after first exchange")
+    func lockedRemoteDeviceRejectsSiblingCallCipher() throws {
+        let connectionCall = try Call(
+            sharedCommunicationId: roomUUID,
+            channelWireId: nil,
+            sender: try participant("echo", device: "echo-active"),
+            recipients: [try participant("nudge", device: "nudge-active")],
+            supportsVideo: true)
+        let siblingCipher = try Call(
+            sharedCommunicationId: roomUUID,
+            sender: try participant("nudge", device: "nudge-sibling"),
+            recipients: [try participant("echo", device: "echo-active")],
+            supportsVideo: true)
+
+        #expect(RTCSession.shouldProcessOneToOneSfuCallCipher(
+            connectionCall: connectionCall,
+            inboundCall: siblingCipher,
+            lockedRemoteDeviceId: "nudge-active",
+            cipherState: .complete) == false)
+        #expect(RTCSession.shouldProcessOneToOneSfuCallCipher(
+            connectionCall: connectionCall,
+            inboundCall: try Call(
+                sharedCommunicationId: roomUUID,
+                sender: try participant("nudge", device: "nudge-active"),
+                recipients: [try participant("echo", device: "echo-active")],
+                supportsVideo: true),
+            lockedRemoteDeviceId: "nudge-active",
+            cipherState: .complete))
     }
 
     @Test("distinct peers do not use pairwise frame identity resolution")
@@ -215,6 +346,58 @@ struct RTCSessionCryptoKeyResolutionTests {
         #expect(shouldDelay == false)
     }
 
+    @Test("group receiver cryptor binding skips room and placeholder participant ids")
+    func groupReceiverCryptorBindingSkipsUnstableParticipantIds() {
+        let roomId = "493b6051-39f0-493d-aace-7683f2bfa9e2"
+        let channelId = "broken_\(roomId)"
+
+        #expect(RTCSession.shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
+            enableEncryption: true,
+            isGroupCallConnection: true,
+            frameEncryptionKeyMode: .perParticipant,
+            participantIdOverride: "",
+            connectionId: roomId,
+            remoteParticipantId: channelId,
+            localParticipantId: "frank"
+        ))
+        #expect(RTCSession.shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
+            enableEncryption: true,
+            isGroupCallConnection: true,
+            frameEncryptionKeyMode: .perParticipant,
+            participantIdOverride: channelId,
+            connectionId: roomId,
+            remoteParticipantId: channelId,
+            localParticipantId: "frank"
+        ))
+        #expect(RTCSession.shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
+            enableEncryption: true,
+            isGroupCallConnection: true,
+            frameEncryptionKeyMode: .perParticipant,
+            participantIdOverride: "0dd54da6-6ef4-4002-bd3f-5cda1d4fcfa1",
+            connectionId: roomId,
+            remoteParticipantId: channelId,
+            localParticipantId: "frank"
+        ))
+        #expect(!RTCSession.shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
+            enableEncryption: true,
+            isGroupCallConnection: true,
+            frameEncryptionKeyMode: .perParticipant,
+            participantIdOverride: "audio_echo_\(roomId)",
+            connectionId: roomId,
+            remoteParticipantId: channelId,
+            localParticipantId: "frank"
+        ))
+        #expect(!RTCSession.shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
+            enableEncryption: true,
+            isGroupCallConnection: true,
+            frameEncryptionKeyMode: .perParticipant,
+            participantIdOverride: "echo",
+            connectionId: roomId,
+            remoteParticipantId: channelId,
+            localParticipantId: "frank"
+        ))
+    }
+
     @Test("SFU msid stream label echo_ maps to frame key id echo in 1:1 SFU")
     func sfuUnderscoreStreamLabelMapsToSecretName() {
         let resolved = RTCSession.normalizedReceiverFrameKeyParticipantIdForSfuUnderscoreStreamLabel(
@@ -262,6 +445,56 @@ struct RTCSessionCryptoKeyResolutionTests {
             localParticipantSecretName: "echo"
         )
         #expect(resolved == "nudge")
+    }
+
+    @Test("conference SFU media labels normalize to publisher participant ids")
+    func conferenceSfuMediaLabelsNormalizeToPublisherParticipantIds() {
+        let roomId = "493b6051-39f0-493d-aace-7683f2bfa9e2"
+
+        #expect(RTCSession.normalizedRemoteParticipantIdFromSfuMediaLabel(
+            "video_echo_\(roomId)",
+            connectionId: roomId,
+            localParticipantId: "frank"
+        ) == "echo")
+
+        #expect(RTCSession.normalizedRemoteParticipantIdFromSfuMediaLabel(
+            "audio_echo_\(roomId)",
+            connectionId: "#\(roomId)",
+            localParticipantId: "frank"
+        ) == "echo")
+
+        #expect(RTCSession.normalizedRemoteParticipantIdFromSfuMediaLabel(
+            "streamId_video_echo_\(roomId)",
+            connectionId: roomId,
+            localParticipantId: "frank"
+        ) == "echo")
+    }
+
+    @Test("conference participant identity strips SFU media prefixes")
+    func conferenceParticipantIdentityStripsSfuMediaPrefixes() {
+        let roomId = "493b6051-39f0-493d-aace-7683f2bfa9e2"
+        #expect(RTCSession.conferenceParticipantIdentityKey("video_echo_\(roomId)") == "echo")
+        #expect(RTCSession.conferenceParticipantIdentityKey("audio_echo_\(roomId)") == "echo")
+    }
+
+    @Test("SFU media label normalizer rejects self, UUID, and screen ids")
+    func sfuMediaLabelNormalizerRejectsInvalidOwners() {
+        let roomId = "493b6051-39f0-493d-aace-7683f2bfa9e2"
+        #expect(RTCSession.normalizedRemoteParticipantIdFromSfuMediaLabel(
+            "video_frank_\(roomId)",
+            connectionId: roomId,
+            localParticipantId: "frank"
+        ) == nil)
+        #expect(RTCSession.normalizedRemoteParticipantIdFromSfuMediaLabel(
+            "video_41769cb0-8ab0-4407-87d8-1f4c1c8e10b6_\(roomId)",
+            connectionId: roomId,
+            localParticipantId: "frank"
+        ) == nil)
+        #expect(RTCSession.normalizedRemoteParticipantIdFromSfuMediaLabel(
+            "screen_echo",
+            connectionId: roomId,
+            localParticipantId: "frank"
+        ) == nil)
     }
 
     @Test("stable stream id without trailing underscore returns nil from underscore normalizer")
@@ -376,6 +609,249 @@ struct RTCSessionCryptoKeyResolutionTests {
             frameEncryptionEnabled: true,
             receiveKeyReady: false) == false)
     }
+
+    @Test("1:1 SFU remote renderer attach waits for receive key when FrameCryptor is enabled")
+    func oneToOneSfuRemoteRendererAttachWaitsForReceiveKey() throws {
+        #expect(RTCSession.shouldDeferOneToOneSfuRemoteRendererAttach(
+            isOneToOneSfuRoom: true,
+            frameEncryptionEnabled: true,
+            receiveKeyReady: false) == true)
+        #expect(RTCSession.shouldDeferOneToOneSfuRemoteRendererAttach(
+            isOneToOneSfuRoom: true,
+            frameEncryptionEnabled: true,
+            receiveKeyReady: true) == false)
+        #expect(RTCSession.shouldDeferOneToOneSfuRemoteRendererAttach(
+            isOneToOneSfuRoom: false,
+            frameEncryptionEnabled: true,
+            receiveKeyReady: false) == false)
+    }
+
+#if canImport(WebRTC)
+    @Test("receiver cryptor reuse requires stable track and receiver identity")
+    func receiverCryptorReuseRequiresStableTrackAndReceiverIdentity() {
+        #expect(RTCSession.shouldReuseReceiverFrameCryptorBinding(
+            existingTrackId: "497824b0-0532-4498-89cf-8a3a89b4bff3",
+            newTrackId: "497824b0-0532-4498-89cf-8a3a89b4bff3",
+            existingReceiverId: "ObjectIdentifier(0x1)",
+            newReceiverId: "ObjectIdentifier(0x1)"
+        ))
+        #expect(RTCSession.shouldReuseReceiverFrameCryptorBinding(
+            existingTrackId: "497824b0-0532-4498-89cf-8a3a89b4bff3",
+            newTrackId: "497824b0-0532-4498-89cf-8a3a89b4bff3",
+            existingReceiverId: "ObjectIdentifier(0x1)",
+            newReceiverId: "ObjectIdentifier(0x2)"
+        ) == false)
+        #expect(RTCSession.shouldReuseReceiverFrameCryptorBinding(
+            existingTrackId: "497824b0-0532-4498-89cf-8a3a89b4bff3",
+            newTrackId: "ea2d8bab-df45-4cdd-b978-71b3ae1d1107",
+            existingReceiverId: "ObjectIdentifier(0x1)",
+            newReceiverId: "ObjectIdentifier(0x2)"
+        ) == false)
+    }
+
+    @Test("renderer recovery skips advancing ingress and attempts true decode stalls")
+    func inboundRemoteVideoRendererRecoveryPolicy() {
+        let advancing = RTCSession.InboundVideoFlowCheck(
+            state: .advancingIngress,
+            likelyCause: "test",
+            audioPacketsReceived: 1,
+            packetsReceived: 1,
+            framesReceived: 1,
+            framesDecoded: 1,
+            deltaAudioPacketsReceived: 1,
+            deltaPacketsReceived: 1,
+            deltaFramesReceived: 1,
+            deltaFramesDecoded: 0,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: advancing,
+            callbackAgeMs: 4_000,
+            hasAnyCallbacks: true) == false)
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: advancing,
+            callbackAgeMs: 12_000,
+            hasAnyCallbacks: true) == false)
+
+        let decodeStalledWithCallbacks = RTCSession.InboundVideoFlowCheck(
+            state: .decodeStalled,
+            likelyCause: "inbound_video_advancing_but_decode_stalled",
+            audioPacketsReceived: 10,
+            packetsReceived: 90,
+            framesReceived: 75,
+            framesDecoded: 75,
+            deltaAudioPacketsReceived: 5,
+            deltaPacketsReceived: 8,
+            deltaFramesReceived: 0,
+            deltaFramesDecoded: 0,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: decodeStalledWithCallbacks,
+            callbackAgeMs: 2_000,
+            hasAnyCallbacks: true) == false)
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: decodeStalledWithCallbacks,
+            callbackAgeMs: 4_000,
+            hasAnyCallbacks: true))
+
+        let decodeStalledNoCallbacks = RTCSession.InboundVideoFlowCheck(
+            state: .decodeStalled,
+            likelyCause: "inbound_video_advancing_but_decode_stalled",
+            audioPacketsReceived: 3,
+            packetsReceived: 9,
+            framesReceived: 0,
+            framesDecoded: 0,
+            deltaAudioPacketsReceived: 3,
+            deltaPacketsReceived: 9,
+            deltaFramesReceived: 0,
+            deltaFramesDecoded: 0,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: decodeStalledNoCallbacks,
+            callbackAgeMs: -1,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 12_000))
+
+        let stalled = RTCSession.InboundVideoFlowCheck(
+            state: .stalledIngress,
+            likelyCause: "test",
+            audioPacketsReceived: 10,
+            packetsReceived: 10,
+            framesReceived: 10,
+            framesDecoded: 10,
+            deltaAudioPacketsReceived: 0,
+            deltaPacketsReceived: 0,
+            deltaFramesReceived: 0,
+            deltaFramesDecoded: 0,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: stalled,
+            callbackAgeMs: 3_000,
+            hasAnyCallbacks: true) == false)
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: stalled,
+            callbackAgeMs: 12_000,
+            hasAnyCallbacks: true))
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: nil,
+            callbackAgeMs: 12_000,
+            hasAnyCallbacks: true))
+    }
+
+    @Test("screen renderer recovery uses per-mid flow and recovers sooner on decode stall")
+    func inboundRemoteScreenRendererRecoveryPolicy() {
+        let screenDecodeStalled = RTCSession.InboundVideoFlowCheck(
+            state: .decodeStalled,
+            likelyCause: "inbound_screen_video_advancing_but_decode_stalled",
+            audioPacketsReceived: 1,
+            packetsReceived: 8,
+            framesReceived: 0,
+            framesDecoded: 0,
+            deltaAudioPacketsReceived: 1,
+            deltaPacketsReceived: 8,
+            deltaFramesReceived: 0,
+            deltaFramesDecoded: 0,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+        let aggregateAdvancing = RTCSession.InboundVideoFlowCheck(
+            state: .advancingIngress,
+            likelyCause: "inbound_video_advancing",
+            audioPacketsReceived: 1,
+            packetsReceived: 40,
+            framesReceived: 10,
+            framesDecoded: 10,
+            deltaAudioPacketsReceived: 1,
+            deltaPacketsReceived: 20,
+            deltaFramesReceived: 5,
+            deltaFramesDecoded: 5,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+
+        #expect(RTCSession.shouldAttemptInboundRemoteScreenRendererRecovery(
+            screenFlow: screenDecodeStalled,
+            aggregateFlow: aggregateAdvancing,
+            callbackAgeMs: 4_000,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 4_000))
+        #expect(RTCSession.shouldAttemptInboundRemoteScreenRendererRecovery(
+            screenFlow: screenDecodeStalled,
+            aggregateFlow: aggregateAdvancing,
+            callbackAgeMs: -1,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 6_000))
+
+        let transportUnstable = RTCSession.InboundVideoFlowCheck(
+            state: .noTraffic,
+            likelyCause: "transport_or_ice_instability",
+            audioPacketsReceived: 2,
+            packetsReceived: 0,
+            framesReceived: 0,
+            framesDecoded: 0,
+            deltaAudioPacketsReceived: 2,
+            deltaPacketsReceived: 0,
+            deltaFramesReceived: 0,
+            deltaFramesDecoded: 0,
+            dtlsState: "closed",
+            selectedPairState: "failed")
+        #expect(RTCSession.shouldAttemptInboundRemoteScreenRendererRecovery(
+            screenFlow: transportUnstable,
+            aggregateFlow: nil,
+            callbackAgeMs: -1,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 4_000))
+
+        let screenNoTraffic = RTCSession.InboundVideoFlowCheck(
+            state: .noTraffic,
+            likelyCause: "audio_advancing_screen_video_flat_remote_sender_or_sfu_screen_forward_stopped",
+            audioPacketsReceived: 40,
+            packetsReceived: 0,
+            framesReceived: 0,
+            framesDecoded: 0,
+            deltaAudioPacketsReceived: 5,
+            deltaPacketsReceived: 0,
+            deltaFramesReceived: 0,
+            deltaFramesDecoded: 0,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+        #expect(RTCSession.shouldAttemptInboundRemoteScreenRendererRecovery(
+            screenFlow: screenNoTraffic,
+            aggregateFlow: aggregateAdvancing,
+            callbackAgeMs: -1,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 6_000))
+        #expect(RTCSession.shouldAttemptInboundRemoteScreenRendererRecovery(
+            screenFlow: screenNoTraffic,
+            aggregateFlow: aggregateAdvancing,
+            callbackAgeMs: -1,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 3_000))
+    }
+
+    @Test("transport-only camera stalls do not trigger renderer rebind recovery")
+    func cameraRendererRecoverySkipsTransportOnlyNoTraffic() {
+        let transportUnstable = RTCSession.InboundVideoFlowCheck(
+            state: .noTraffic,
+            likelyCause: "transport_or_ice_instability",
+            audioPacketsReceived: 100,
+            packetsReceived: 0,
+            framesReceived: 0,
+            framesDecoded: 0,
+            deltaAudioPacketsReceived: 0,
+            deltaPacketsReceived: 0,
+            deltaFramesReceived: 0,
+            deltaFramesDecoded: 0,
+            dtlsState: "closed",
+            selectedPairState: "failed")
+
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: transportUnstable,
+            callbackAgeMs: 230_000,
+            hasAnyCallbacks: true) == false)
+    }
+#endif
 
     @Test("handleAnswer fans out .handshakeComplete WriteTask for SFU group rooms")
     func handshakeCompleteFanoutForSfuGroup() throws {

@@ -13,7 +13,7 @@ import Observation
 
 /// SwiftUI-friendly wrapper for observing coarse network quality changes.
 ///
-/// This uses the "NeedleTailKit EventObserver" pattern:
+/// This uses the "NudgeKit EventObserver" pattern:
 /// - **one observable property** (`latest`)
 /// - **one setter** (`setLatest`) that installs `withObservationTracking` and yields to a lazily-created stream
 @MainActor
@@ -40,7 +40,7 @@ public final class RTCNetworkQualityEventObserver {
     // `deinit` is nonisolated; cancellation is thread-safe.
     private var task: Task<Void, Never>?
 
-    // MARK: - Observation-backed stream (NeedleTailKit-style)
+    // MARK: - Observation-backed stream (NudgeKit-style)
     public private(set) var latestStream: AsyncStream<RTCNetworkQualityUpdate>?
     private var latestContinuation: AsyncStream<RTCNetworkQualityUpdate>.Continuation?
 
@@ -67,7 +67,7 @@ public final class RTCNetworkQualityEventObserver {
 
     /// Sets the latest update and yields it over `latestStream`.
     ///
-    /// This matches the NeedleTailKit pattern:
+    /// This matches the NudgeKit pattern:
     /// - lazily create stream
     /// - install `withObservationTracking { self.latest } onChange { yield(latest) }`
     /// - then update `latest`

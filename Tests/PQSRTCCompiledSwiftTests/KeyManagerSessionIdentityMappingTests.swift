@@ -1,11 +1,34 @@
 import DoubleRatchetKit
 import Foundation
+import Crypto
 import Testing
 
 @testable import PQSRTC
 
 @Suite(.serialized)
 struct KeyManagerSessionIdentityMappingTests {
+    private func serverCompositeSfuSessionId(
+        roomId: String,
+        deviceId: UUID,
+        sessionContext: String?
+    ) -> UUID {
+        let normalizedContext = sessionContext?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let base = "\(roomId.normalizedUUIDConnectionId.lowercased())|\(deviceId.uuidString)"
+        let input = normalizedContext?.isEmpty == false
+            ? "\(base)|\(normalizedContext!)"
+            : base
+        let digest = SHA256.hash(data: Data(input.utf8))
+        let bytes = Array(digest)
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+    }
+
     @Test
     func recipientIdentityUsesConnectionIdAsSessionIdentityId_whenConnectionIdIsUUIDString() async throws {
         let keyManager = KeyManager()
@@ -59,6 +82,47 @@ struct KeyManagerSessionIdentityMappingTests {
         #expect(fetchedByRoute?.sessionIdentity.id == expectedSessionId)
         #expect(fetchedByNormalized?.sessionIdentity.id == expectedSessionId)
         #expect(fetchedBySessionId?.connectionId == connectionId)
+    }
+
+    @Test
+    func sfuRecipientIdentityMatchesServerCompositeSessionId_andKeepsRoomLookupAliases() async throws {
+        let keyManager = KeyManager()
+        let roomId = "493B6051-39F0-493D-AACE-7683F2BFA9E2"
+        let channelWireId = "#broken_493b6051-39f0-493d-aace-7683f2bfa9e2"
+        let deviceId = try #require(UUID(uuidString: "2D4087FD-0E8A-4D96-B558-33142F345AD2"))
+        let sessionContext = "A6CDC6A2-4C89-4649-B593-77CED9458EEF"
+        let expectedSessionId = serverCompositeSfuSessionId(
+            roomId: roomId,
+            deviceId: deviceId,
+            sessionContext: sessionContext
+        )
+        #expect(expectedSessionId == UUID(uuidString: "DDDB1A3D-B680-26B0-C2AD-BD0001E55020"))
+
+        let local = try await keyManager.generateSenderIdentity(connectionId: UUID().uuidString, secretName: "sfu")
+        let recipientProps = await local.sessionIdentity.props(symmetricKey: local.symmetricKey)
+        #expect(recipientProps != nil)
+        guard let recipientProps else { return }
+
+        let recipientIdentity = try await keyManager.createSFUSignalingRecipientIdentity(
+            roomId: roomId,
+            deviceId: deviceId,
+            sessionContext: sessionContext,
+            props: recipientProps,
+            aliases: [roomId, channelWireId]
+        )
+
+        #expect(recipientIdentity.connectionId == "\(roomId.normalizedUUIDConnectionId.lowercased())|\(deviceId.uuidString)")
+        #expect(recipientIdentity.sessionIdentity.id == expectedSessionId)
+
+        let fetchedByRoom = await keyManager.fetchConnectionIdentityByConnectionId(roomId)
+        let fetchedByChannel = await keyManager.fetchConnectionIdentityByConnectionId(channelWireId)
+        let fetchedByComposite = await keyManager.fetchConnectionIdentityByConnectionId(recipientIdentity.connectionId)
+        let fetchedBySessionId = await keyManager.fetchConnectionIdentity(expectedSessionId)
+
+        #expect(fetchedByRoom?.sessionIdentity.id == expectedSessionId)
+        #expect(fetchedByChannel?.sessionIdentity.id == expectedSessionId)
+        #expect(fetchedByComposite?.sessionIdentity.id == expectedSessionId)
+        #expect(fetchedBySessionId?.sessionIdentity.id == expectedSessionId)
     }
 
     @Test

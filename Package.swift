@@ -16,13 +16,13 @@ let package = Package(
         .package(url: "https://source.skip.tools/skip.git", from: "1.6.32"),
         .package(url: "https://source.skip.tools/skip-fuse.git", from: "1.0.2"),
         .package(url: "https://source.skip.tools/skip-fuse-ui.git", from: "1.10.0"),
-        .package(url: "https://github.com/needletails/Specs.git", from: "144.7559.04"),
+        .package(url: "https://github.com/needletails/Specs.git", from: "144.7559.10"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.3.0"),
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.5"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5"),
         .package(path: "../needletail-media-kit"),
-        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "2.0.3"),
+        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "3.0.0"),
     ],
     targets: [
         .target(

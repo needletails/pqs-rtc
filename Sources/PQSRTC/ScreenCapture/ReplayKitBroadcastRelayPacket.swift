@@ -20,8 +20,11 @@ enum ReplayKitBroadcastRelayPacketType: UInt8, Sendable {
 struct ReplayKitBroadcastRelayPacket: Sendable, Equatable {
     static let magic = Data([0x4E, 0x54, 0x52, 0x50]) // "NTRP"
     static let headerLength = 28
+    static let maxPayloadLength = 16 * 1024 * 1024
+    static let defaultOrientationRawValue: UInt8 = 1
 
     let type: ReplayKitBroadcastRelayPacketType
+    let orientationRawValue: UInt8
     let timestampNs: Int64
     let width: UInt32
     let height: UInt32
@@ -29,12 +32,14 @@ struct ReplayKitBroadcastRelayPacket: Sendable, Equatable {
 
     init(
         type: ReplayKitBroadcastRelayPacketType,
+        orientationRawValue: UInt8 = Self.defaultOrientationRawValue,
         timestampNs: Int64,
         width: UInt32 = 0,
         height: UInt32 = 0,
         payload: Data = Data()
     ) {
         self.type = type
+        self.orientationRawValue = orientationRawValue == 0 ? Self.defaultOrientationRawValue : orientationRawValue
         self.timestampNs = timestampNs
         self.width = width
         self.height = height
@@ -45,7 +50,8 @@ struct ReplayKitBroadcastRelayPacket: Sendable, Equatable {
         var packet = Data()
         packet.append(Self.magic)
         packet.append(type.rawValue)
-        packet.append(contentsOf: [0, 0, 0])
+        packet.append(orientationRawValue)
+        packet.append(contentsOf: [0, 0])
         packet.appendLittleEndianUInt64(UInt64(bitPattern: timestampNs))
         packet.appendLittleEndianUInt32(width)
         packet.appendLittleEndianUInt32(height)
@@ -70,11 +76,15 @@ struct ReplayKitBroadcastRelayPacket: Sendable, Equatable {
             throw ReplayKitBroadcastRelayPacketError.unknownPacketType(data[4])
         }
         let payloadLength = Int(data.littleEndianUInt32(at: 24))
+        guard payloadLength <= maxPayloadLength else {
+            throw ReplayKitBroadcastRelayPacketError.payloadTooLarge(payloadLength)
+        }
         guard data.count == headerLength + payloadLength else {
             throw ReplayKitBroadcastRelayPacketError.invalidPayloadLength(expected: payloadLength, actual: max(0, data.count - headerLength))
         }
         return ReplayKitBroadcastRelayPacket(
             type: type,
+            orientationRawValue: data[5] == 0 ? defaultOrientationRawValue : data[5],
             timestampNs: Int64(bitPattern: data.littleEndianUInt64(at: 8)),
             width: data.littleEndianUInt32(at: 16),
             height: data.littleEndianUInt32(at: 20),
@@ -88,6 +98,7 @@ enum ReplayKitBroadcastRelayPacketError: Error, Equatable {
     case invalidMagic
     case unknownPacketType(UInt8)
     case invalidPayloadLength(expected: Int, actual: Int)
+    case payloadTooLarge(Int)
 }
 
 private extension Data {

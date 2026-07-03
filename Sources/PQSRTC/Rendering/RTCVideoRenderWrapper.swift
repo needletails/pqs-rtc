@@ -17,6 +17,8 @@
 
 #if !os(Android)
 @preconcurrency import WebRTC
+import CoreFoundation
+import CoreVideo
 import NeedleTailLogger
 
 final class RTCVideoRenderWrapper: NSObject, RTCVideoRenderer, @unchecked Sendable {
@@ -54,10 +56,20 @@ final class RTCVideoRenderWrapper: NSObject, RTCVideoRenderer, @unchecked Sendab
     /// That showed up as severe image corruption on the receive path (e.g. **green tint**, blocky
     /// **macroblocking**, wrong colors) because chroma/luma no longer matched a coherent frame.
     ///
-    /// **Mitigation:** normalize to I420 and **`memcpy` each plane** into an `RTCMutableI420Buffer` on
-    /// the WebRTC callback thread *before* yielding to async consumers.
+    /// **Mitigation:** copy on the WebRTC callback thread *before* yielding to async consumers.
+    /// NV12/CVPixelBuffer frames are plane-copied (cheaper than I420 conversion + triple-memcpy).
     private func makeRenderSafeFrameCopy(_ frame: RTCVideoFrame?) -> RTCVideoFrame? {
         guard let frame else { return nil }
+
+        if let cvBuffer = frame.buffer as? RTCCVPixelBuffer,
+           let copied = copyPixelBuffer(cvBuffer.pixelBuffer) {
+            return RTCVideoFrame(
+                buffer: RTCCVPixelBuffer(pixelBuffer: copied),
+                rotation: frame.rotation,
+                timeStampNs: frame.timeStampNs
+            )
+        }
+
         let i420Buffer = frame.buffer.toI420()
 
         let copiedBuffer = RTCMutableI420Buffer(
@@ -83,6 +95,55 @@ final class RTCVideoRenderWrapper: NSObject, RTCVideoRenderer, @unchecked Sendab
             rotation: frame.rotation,
             timeStampNs: frame.timeStampNs
         )
+    }
+
+    private func copyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(source)
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ]
+
+        var destination: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            pixelFormat,
+            attributes as CFDictionary,
+            &destination
+        )
+        guard status == kCVReturnSuccess, let destination else { return nil }
+
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(destination, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+            CVPixelBufferUnlockBaseAddress(destination, [])
+        }
+
+        if CVPixelBufferIsPlanar(source) {
+            let planeCount = CVPixelBufferGetPlaneCount(source)
+            for plane in 0..<planeCount {
+                guard let src = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                      let dst = CVPixelBufferGetBaseAddressOfPlane(destination, plane) else {
+                    continue
+                }
+                let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+                let planeHeight = CVPixelBufferGetHeightOfPlane(source, plane)
+                memcpy(dst, src, rowBytes * planeHeight)
+            }
+        } else if let src = CVPixelBufferGetBaseAddress(source),
+                  let dst = CVPixelBufferGetBaseAddress(destination) {
+            let rowBytes = CVPixelBufferGetBytesPerRow(source)
+            memcpy(dst, src, rowBytes * height)
+        }
+
+        return destination
     }
 }
 #endif

@@ -471,7 +471,7 @@ public struct Call: Sendable, Codable, Equatable {
     /// Unlike the primary initializer, this initializer **allows empty `recipients`** so an SFU room
     /// can be joined before any remote participants are known.
     ///
-    /// - Important: For 1:1 calls, prefer the primary initializer which enforces `recipients` is non-empty.
+    /// - Important: For 1:1 calls, prefer the primary initializer and pass the intended recipient.
     public init(
         groupSharedCommunicationId: String,
         sender: Participant,
@@ -572,10 +572,46 @@ public struct Call: Sendable, Codable, Equatable {
         if UUID(uuidString: stem) != nil { return nil }
         return candidate
     }
-}
 
-extension SessionIdentity.UnwrappedProps: @retroactive Equatable {
-    public static func == (lhs: DoubleRatchetKit.SessionIdentity.UnwrappedProps, rhs: DoubleRatchetKit.SessionIdentity.UnwrappedProps) -> Bool {
-        lhs.deviceId == rhs.deviceId
+    public static func == (lhs: Call, rhs: Call) -> Bool {
+        lhs.id == rhs.id &&
+        lhs.sharedMessageId == rhs.sharedMessageId &&
+        lhs.sharedCommunicationId == rhs.sharedCommunicationId &&
+        lhs.channelWireId == rhs.channelWireId &&
+        lhs.channelDisplayName == rhs.channelDisplayName &&
+        lhs.sender == rhs.sender &&
+        lhs.recipients == rhs.recipients &&
+        lhs.createdAt == rhs.createdAt &&
+        lhs.updatedAt == rhs.updatedAt &&
+        lhs.endedAt == rhs.endedAt &&
+        lhs.supportsVideo == rhs.supportsVideo &&
+        lhs.unanswered == rhs.unanswered &&
+        lhs.rejected == rhs.rejected &&
+        lhs.failed == rhs.failed &&
+        lhs.isActive == rhs.isActive &&
+        identityPropsEqual(lhs.frameIdentityProps, rhs.frameIdentityProps) &&
+        identityPropsEqual(lhs.signalingIdentityProps, rhs.signalingIdentityProps) &&
+        lhs.metadata == rhs.metadata &&
+        lhs.conferencePassword == rhs.conferencePassword
+    }
+
+    private static func identityPropsEqual(
+        _ lhs: SessionIdentity.UnwrappedProps?,
+        _ rhs: SessionIdentity.UnwrappedProps?
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (lhs?, rhs?):
+            return encodedIdentityProps(lhs) == encodedIdentityProps(rhs)
+        default:
+            return false
+        }
+    }
+
+    private static func encodedIdentityProps(_ props: SessionIdentity.UnwrappedProps) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(props)
     }
 }

@@ -271,11 +271,23 @@ actor TaskProcessor {
             logger.log(level: .error, message: "❌ JOB RATCHET ERROR: \(error) - job will be retried: \(job.id)")
             return .paused
         } catch {
+            if isWriterNotReadyError(error) {
+                logger.log(level: .debug, message: "Job paused - transport writer not ready, will retry: \(job.id)")
+                return .paused
+            }
             removeJob(id: job.id)
             logger.log(level: .error, message: "Job error: \(error)")
             // Keep the job in cache for now (retry semantics are handled elsewhere / future improvements).
             return .failed
         }
+    }
+
+    private func isWriterNotReadyError(_ error: Error) -> Bool {
+        if let description = (error as? LocalizedError)?.errorDescription,
+           description.localizedCaseInsensitiveContains("writer not set") {
+            return true
+        }
+        return String(describing: error).localizedCaseInsensitiveContains("writernotset")
     }
 
     // MARK: - Job Processing Outcomes
@@ -346,7 +358,7 @@ actor TaskProcessor {
         logger.log(level: .info, message: "Encrypted Message", metadata: ["roomId":"\(outboundTask.roomId)", "flag":"\(outboundTask.flag)"])
         
         let encrypted = RatchetMessagePacket(
-            sfuIdentity: outboundTask.roomId.ensureIRCChannel,
+            sfuIdentity: outboundTask.roomId,
             header: message.header,
             ratchetMessage: message,
             flag: outboundTask.flag)

@@ -67,14 +67,22 @@ struct RTCSessionValidationAndShutdownTests {
 
         #expect(await session.keyManager.oneTimeKeyCount() > 0)
         #expect(await session.keyManager.sessionIdentityCount() > 0)
-        #expect((try await session.keyManager.fetchCallKeyBundle()) != nil)
+        let bundle = try await session.keyManager.fetchCallKeyBundle()
+        #expect(bundle.connectionId == local.connectionId)
         #expect(await session.keyManager.fetchCiphertext(connectionId: "conn-pending") != nil)
 
         await session.shutdown(with: nil)
 
         #expect(await session.keyManager.oneTimeKeyCount() == 0)
         #expect(await session.keyManager.sessionIdentityCount() == 0)
-        #expect((try await session.keyManager.fetchCallKeyBundle()) == nil)
+        do {
+            _ = try await session.keyManager.fetchCallKeyBundle()
+            Issue.record("Expected fetchCallKeyBundle() to throw after shutdown")
+        } catch is RTCErrors {
+            // Expected: shutdown clears the local call key bundle.
+        } catch {
+            Issue.record("Unexpected error after shutdown: \(error)")
+        }
         #expect(await session.keyManager.fetchCiphertext(connectionId: "conn-pending") == nil)
     }
 }

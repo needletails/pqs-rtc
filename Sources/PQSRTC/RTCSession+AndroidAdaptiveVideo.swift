@@ -13,7 +13,6 @@ extension RTCSession {
         let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
         guard !normalizedId.isEmpty else { return }
 
-        // Idempotent: only one loop per connection.
         if let existing = adaptiveVideoSendTasksByConnectionId[normalizedId], !existing.isCancelled {
             return
         }
@@ -32,58 +31,70 @@ extension RTCSession {
                 guard current.id.isGroupCall else { break }
                 if !current.call.supportsVideo { break }
 
-                let cfg = await self.sfuVideoQualityProfile.adaptiveConfig
+                let isOneToOneSfu = Self.isTrueOneToOneSfuRoom(call: current.call)
+                let cfg = await self.sfuAdaptiveConfig(for: current.call)
 
-                // Query available outgoing bitrate via Android WebRTC stats.
                 let available = await self.rtcClient.getAvailableOutgoingBitrateBps()
-                guard let available, available > 0 else {
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
-                    continue
-                }
-
-                let rawTarget = Int(available * cfg.headroomFactor)
-                let targetBps = max(cfg.minBitrateBps, min(cfg.maxBitrateBps, rawTarget))
-                let targetFps: Int = (targetBps >= cfg.highFpsThresholdBps) ? cfg.highFps : cfg.lowFps
-                let targetScale = RTCVideoQualityProfile.resolutionScaleDownBy(for: targetBps)
-
-                let last = await self.adaptiveVideoLastAppliedByConnectionId[normalizedId]
-                let lastBps = last?.bitrateBps ?? 0
-                let lastFps = last?.framerate ?? 0
-                let lastScale = last?.scaleResolutionDownBy ?? 0
-                let deltaOk: Bool
-                if lastBps == 0 {
-                    deltaOk = true
+                let targets: AdaptiveVideoTargets
+                if let available, available > 0 {
+                    targets = RTCAdaptiveVideoTargets.compute(
+                        cfg: cfg,
+                        isOneToOneSfu: isOneToOneSfu,
+                        reportedAvailableOutgoingBps: available,
+                        currentRttSeconds: nil
+                    )
                 } else {
-                    let ratio = Double(abs(targetBps - lastBps)) / Double(max(1, lastBps))
-                    deltaOk = ratio >= 0.15 || targetFps != lastFps || abs(targetScale - lastScale) >= 0.25
+                    targets = RTCAdaptiveVideoTargets.conservativeStartupTargets(
+                        cfg: cfg,
+                        isOneToOneSfu: isOneToOneSfu
+                    )
                 }
+
+                let lastApplied = await self.adaptiveVideoLastAppliedByConnectionId[normalizedId]
+                let deltaOk = RTCAdaptiveVideoTargets.shouldApply(targets, lastApplied: lastApplied)
 
                 if deltaOk {
-                    self.rtcClient.setVideoSenderEncodings(maxBitrateBps: targetBps, maxFramerate: targetFps, scaleResolutionDownBy: targetScale)
-                    await self.setAdaptiveVideoLastApplied(connectionId: normalizedId, bitrateBps: targetBps, framerate: targetFps, scaleResolutionDownBy: targetScale)
-                    self.logger.log(level: .info, message: "Adaptive video send applied (Android, connId=\(normalizedId)): maxBitrateBps=\(targetBps) maxFramerate=\(targetFps) scaleResolutionDownBy=\(targetScale) (availableOutgoingBitrate=\(Int(available)))")
+                    self.rtcClient.setVideoSenderEncodings(
+                        maxBitrateBps: targets.maxBitrateBps,
+                        maxFramerate: targets.maxFramerate,
+                        scaleResolutionDownBy: targets.scaleResolutionDownBy
+                    )
+                    await self.setAdaptiveVideoLastApplied(
+                        connectionId: normalizedId,
+                        bitrateBps: targets.maxBitrateBps,
+                        framerate: targets.maxFramerate,
+                        scaleResolutionDownBy: targets.scaleResolutionDownBy
+                    )
+                    self.logger.log(
+                        level: .debug,
+                        message: "Adaptive video send applied (Android, connId=\(normalizedId) oneToOne=\(isOneToOneSfu)): maxBitrateBps=\(targets.maxBitrateBps) maxFramerate=\(targets.maxFramerate) scaleResolutionDownBy=\(targets.scaleResolutionDownBy) reportedAvailableBps=\(available.map { String(Int($0)) } ?? "nil")"
+                    )
                 }
 
                 let quality: RTCNetworkQuality
-                if available < 150_000 {
-                    quality = .veryPoor
-                } else if available < 300_000 {
-                    quality = .poor
-                } else if available < 700_000 {
-                    quality = .fair
-                } else if available < 1_500_000 {
-                    quality = .good
+                if let available {
+                    if available < 150_000 {
+                        quality = .veryPoor
+                    } else if available < 300_000 {
+                        quality = .poor
+                    } else if available < 700_000 {
+                        quality = .fair
+                    } else if available < 1_500_000 {
+                        quality = .good
+                    } else {
+                        quality = .excellent
+                    }
                 } else {
-                    quality = .excellent
+                    quality = .poor
                 }
 
                 await self.emitNetworkQualityUpdateIfNeeded(
                     connectionId: normalizedId,
                     quality: quality,
-                    availableOutgoingBitrateBps: Int(available),
+                    availableOutgoingBitrateBps: available.map { Int($0) },
                     rttMs: nil,
-                    appliedVideoMaxBitrateBps: targetBps,
-                    appliedVideoMaxFramerate: targetFps,
+                    appliedVideoMaxBitrateBps: targets.maxBitrateBps,
+                    appliedVideoMaxFramerate: targets.maxFramerate,
                     nowUptimeNs: DispatchTime.now().uptimeNanoseconds
                 )
 
@@ -107,4 +118,3 @@ extension RTCSession {
     }
 }
 #endif
-

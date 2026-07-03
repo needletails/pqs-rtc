@@ -37,6 +37,111 @@ extension RTCSession {
         return UUID(uuidString: resolved) != nil
     }
 
+    internal static func shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
+        enableEncryption: Bool,
+        isGroupCallConnection: Bool,
+        frameEncryptionKeyMode: RTCFrameEncryptionKeyMode,
+        participantIdOverride: String?,
+        connectionId: String,
+        remoteParticipantId: String,
+        localParticipantId: String?
+    ) -> Bool {
+        guard enableEncryption else { return false }
+        guard isGroupCallConnection else { return false }
+        guard frameEncryptionKeyMode == .perParticipant else { return false }
+
+        let raw = participantIdOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !raw.isEmpty else { return true }
+
+        let normalizedFromMediaLabel = normalizedRemoteParticipantIdFromSfuMediaLabel(
+            raw,
+            connectionId: connectionId,
+            localParticipantId: localParticipantId
+        )
+        let effective = (normalizedFromMediaLabel ?? raw)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !effective.isEmpty else { return true }
+
+        if normalizedFromMediaLabel == nil {
+            let lowercasedRaw = raw.lowercased()
+            if lowercasedRaw.hasPrefix("audio_")
+                || lowercasedRaw.hasPrefix("video_")
+                || lowercasedRaw.hasPrefix("streamid_") {
+                return true
+            }
+        }
+
+        if UUID(uuidString: effective) != nil {
+            return true
+        }
+
+        let local = localParticipantId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !local.isEmpty, effective.caseInsensitiveCompare(local) == .orderedSame {
+            return true
+        }
+
+        let participantKey = effective.normalizedConnectionId.lowercased()
+        let connectionKey = connectionId.normalizedConnectionId.lowercased()
+        let remoteKey = remoteParticipantId.normalizedConnectionId.lowercased()
+        return participantKey == connectionKey || (!remoteKey.isEmpty && participantKey == remoteKey)
+    }
+
+    internal static func normalizedRemoteParticipantIdFromSfuMediaLabel(
+        _ rawLabel: String,
+        connectionId: String,
+        localParticipantId: String?
+    ) -> String? {
+        var id = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return nil }
+        guard !RTCSession.isScreenShareId(id) else { return nil }
+
+        if id.hasPrefix("streamId_") {
+            id = String(id.dropFirst("streamId_".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if id.hasPrefix("video_") {
+            id = String(id.dropFirst("video_".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if id.hasPrefix("audio_") {
+            id = String(id.dropFirst("audio_".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let trimmedConnectionId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let connectionSuffixes = [
+            "_\(trimmedConnectionId)",
+            "_\(trimmedConnectionId.normalizedConnectionId)",
+            "_\(trimmedConnectionId.ensureIRCChannel)"
+        ]
+        for suffix in connectionSuffixes where !suffix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && id.hasSuffix(suffix) {
+            id = String(id.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if id.hasSuffix("_") {
+            id = String(id.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard !id.isEmpty else { return nil }
+        guard UUID(uuidString: id) == nil else { return nil }
+        guard !RTCSession.isScreenShareId(id) else { return nil }
+        guard !Self.isGenericWebRTCStreamLabel(id) else { return nil }
+
+        let local = localParticipantId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !local.isEmpty, id.caseInsensitiveCompare(local) == .orderedSame {
+            return nil
+        }
+
+        return id
+    }
+
+    private static func isGenericWebRTCStreamLabel(_ value: String) -> Bool {
+        let label = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return label == "stream"
+            || label == "default"
+            || label == "audio"
+            || label == "video"
+            || label == "remote"
+            || label == "local"
+    }
+
     /// WebRTC/msid recv stream labels often use `secretName_` while receive keys use `secretName`.
     ///
     /// - **1:1 SFU:** Normalize only when the stripped label matches the resolved remote peer
@@ -87,7 +192,7 @@ extension RTCSession {
     }
 
     /// Whether `connectionId` belongs to the active SFU group/conference peer connection.
-    private func isGroupCallConnection(_ connectionId: String) -> Bool {
+    func isGroupCallConnection(_ connectionId: String) -> Bool {
         let norm = connectionId.normalizedConnectionId
         if groupCalls[norm] != nil { return true }
         if groupCalls[connectionId] != nil { return true }
@@ -137,6 +242,9 @@ extension RTCSession {
         guard !streamId.isEmpty else {
             return (nil, false, false)
         }
+        guard !Self.isGenericWebRTCStreamLabel(streamId) else {
+            return (nil, false, false)
+        }
 
         // Safe fallback for 1:1 SFU rooms where SFU stream ids are random UUIDs.
         // Conference channels use `conf-<uuid>` room ids and often have empty recipients; do not
@@ -150,6 +258,47 @@ extension RTCSession {
             if !effectiveRemote.isEmpty,
                streamId.caseInsensitiveCompare(effectiveRemote) != .orderedSame {
                 return (effectiveRemote, true, true)
+            }
+        }
+
+        // Conference SFU relay screen legs often publish UUID stream labels (no `screen_<participant>`
+        // prefix). Frame keys are provisioned under stable participant ids such as `echo`.
+        #if canImport(WebRTC) && !os(Android)
+        if isGroup,
+           !isOneToOneSfuRoom,
+           streamLooksLikeUuid {
+            let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            let loneRemoteParticipantIds = connection.remoteVideoTracksByParticipantId.keys.compactMap { key -> String? in
+                let candidate = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !candidate.isEmpty, candidate.caseInsensitiveCompare(local) != .orderedSame else { return nil }
+                return candidate
+            }
+            if loneRemoteParticipantIds.count == 1, let relay = loneRemoteParticipantIds.first {
+                return (relay, true, true)
+            }
+            if let owner = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !owner.isEmpty {
+                return (owner, true, true)
+            }
+        }
+        #endif
+
+        if isGroup,
+           let normalized = Self.normalizedRemoteParticipantIdFromSfuMediaLabel(
+            streamId,
+            connectionId: connection.id,
+            localParticipantId: connection.localParticipantId
+           ) {
+            if isOneToOneSfuRoom {
+                let effectiveRemote = (remoteTrackOwnerParticipantId(connection: connection, call: connection.call) ?? remoteId)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if effectiveRemote.isEmpty
+                    || normalized.caseInsensitiveCompare(effectiveRemote) == .orderedSame {
+                    return (normalized, true, false)
+                }
+            } else {
+                return (normalized, true, false)
             }
         }
 
@@ -176,15 +325,15 @@ extension RTCSession {
         connection: RTCConnection,
         participantIdOverride: String?
     ) -> Bool {
-        guard enableEncryption else { return false }
-        guard isGroupCallConnection(connection.id) else { return false }
-        guard frameEncryptionKeyMode == .perParticipant else { return false }
-        let trimmedOverride = participantIdOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let remote = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effective = trimmedOverride.isEmpty ? remote : trimmedOverride
-        guard !effective.isEmpty else { return false }
-        let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
-        return effective.caseInsensitiveCompare(local) == .orderedSame
+        Self.shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
+            enableEncryption: enableEncryption,
+            isGroupCallConnection: isGroupCallConnection(connection.id),
+            frameEncryptionKeyMode: frameEncryptionKeyMode,
+            participantIdOverride: participantIdOverride,
+            connectionId: connection.id,
+            remoteParticipantId: connection.remoteParticipantId,
+            localParticipantId: connection.localParticipantId
+        )
     }
 
     /// Whether a camera receiver should be surfaced to multi-participant UI as an actual remote tile.
@@ -192,12 +341,23 @@ extension RTCSession {
     /// Apple Unified Plan can emit a receiver/track for the initial SFU answer even when the SFU has no
     /// remote source to forward yet. In those answers the recv stream label is UUID-shaped and the SDP
     /// carries no remote SSRC/msid, so rendering it creates a black "remote participant" tile forever.
-    private func shouldSurfaceRemoteParticipantCameraTrack(
+    func shouldSurfaceRemoteParticipantCameraTrack(
         connection: RTCConnection,
         participantId: String
     ) -> Bool {
         let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        if Self.isTrueOneToOneSfuRoom(call: connection.call) {
+            let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !local.isEmpty, trimmed.caseInsensitiveCompare(local) == .orderedSame {
+                logger.log(
+                    level: .info,
+                    message: "Ignoring self-labeled 1:1 SFU camera receiver participantId=\(trimmed) connection=\(connection.id)"
+                )
+                return false
+            }
+            return true
+        }
         guard isGroupCallConnection(connection.id) else { return true }
         if UUID(uuidString: trimmed) != nil {
             logger.log(
@@ -242,6 +402,19 @@ extension RTCSession {
         )
     }
 
+    private func oneToOneSfuRemoteScreenParticipantId(
+        in connection: RTCConnection
+    ) -> String? {
+        guard Self.isTrueOneToOneSfuRoom(call: connection.call) else { return nil }
+        let owner = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let owner, !owner.isEmpty {
+            return owner
+        }
+        let remote = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return remote.isEmpty ? nil : remote
+    }
+
     #if canImport(WebRTC) && !os(Android)
     /// WebRTC fires `didAddReceiver` only once for the SFU recv transceiver. The first answer can
     /// contain only a UUID-like placeholder stream id, then a later SFU renegotiation updates the
@@ -253,20 +426,22 @@ extension RTCSession {
         connectionId: String
     ) async {
         guard var connection = await connectionManager.findConnection(with: connectionId) else { return }
-        guard isGroupCallConnection(connection.id) else { return }
+        guard isAppleSfuMediaConnection(connection) else { return }
 
-        let participantIds = stableRemoteCameraParticipantIds(in: remoteSdp, connection: connection)
+        let cameraLabels = appleStableRemoteCameraTrackLabels(in: remoteSdp, connection: connection)
+        let participantIds = cameraLabels.map(\.participantId)
         guard !participantIds.isEmpty else { return }
 
         connection = clearUuidAliasedReceiverCryptors(on: connection, keepingParticipantId: nil)
 
-        let cameraReceivers: [(receiver: RTCRtpReceiver, track: RTCVideoTrack)] = connection.peerConnection.transceivers.compactMap { transceiver in
+        let cameraReceivers: [(receiver: RTCRtpReceiver, track: RTCVideoTrack, mid: String)] = connection.peerConnection.transceivers.compactMap { transceiver in
             guard transceiver.mediaType == .video,
                   let track = transceiver.receiver.track as? RTCVideoTrack,
                   !RTCSession.isScreenShareId(track.trackId),
+                  !isAppleDedicatedScreenShareTransceiver(transceiver, connection: connection),
                   track.readyState != .ended
             else { return nil }
-            return (transceiver.receiver, track)
+            return (transceiver.receiver, track, transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         guard !cameraReceivers.isEmpty else {
             logger.log(
@@ -280,16 +455,73 @@ extension RTCSession {
         var consumedTrackIds = Set<String>()
         var didUpdate = false
 
-        for participantId in participantIds {
+        for label in cameraLabels {
+            let participantId = label.participantId
             guard shouldSurfaceRemoteParticipantCameraTrack(connection: updated, participantId: participantId) else { continue }
 
             if let existing = updated.remoteVideoTracksByParticipantId[participantId],
                existing.readyState != .ended {
                 consumedTrackIds.insert(existing.trackId)
+                let advertisedTrackId = label.trackId?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let advertisedMid = label.mid?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let livePair = cameraReceivers.first(where: { pair in
+                    guard pair.track.trackId == existing.trackId || pair.track === existing else { return false }
+                    if let advertisedTrackId, !advertisedTrackId.isEmpty {
+                        return pair.track.trackId == advertisedTrackId
+                    }
+                    if let advertisedMid, !advertisedMid.isEmpty {
+                        return pair.mid == advertisedMid
+                    }
+                    return pair.track.trackId == existing.trackId
+                }), livePair.track !== existing {
+                    let remoteSdp = updated.peerConnection.remoteDescription?.sdp ?? ""
+                    let advertisedOwners = Self.advertisedRemoteCameraOwnersByTrackId(in: remoteSdp)
+                    let allowOwnershipTransfer = advertisedOwners[livePair.track.trackId]
+                        .map {
+                            Self.conferenceParticipantIdentityKey($0) == Self.conferenceParticipantIdentityKey(participantId)
+                        } ?? true
+                    if Self.claimRemoteCameraTrack(
+                        livePair.track,
+                        participantId: participantId,
+                        in: &updated,
+                        allowReplacingExistingStableOwner: allowOwnershipTransfer
+                    ) {
+                        didUpdate = true
+                    }
+                }
+                if enableEncryption,
+                   updated.videoReceiverCryptorsByParticipantId[participantId] == nil,
+                   let pair = cameraReceivers.first(where: { $0.track === existing }) {
+                    do {
+                        try await createEncryptedFrame(
+                            connection: updated,
+                            kind: .videoReceiver(pair.receiver),
+                            participantIdOverride: participantId
+                        )
+                    } catch {
+                        logger.log(
+                            level: .error,
+                            message: "Failed to rebind video receiver FrameCryptor for SFU participant=\(participantId): \(error)"
+                        )
+                    }
+                    if let refreshed = await connectionManager.findConnection(with: updated.id) {
+                        updated = refreshed
+                    }
+                }
                 continue
             }
 
+            let advertisedTrackId = label.trackId?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let advertisedMid = label.mid?.trimmingCharacters(in: .whitespacesAndNewlines)
             guard let pair = cameraReceivers.first(where: { pair in
+                guard !consumedTrackIds.contains(pair.track.trackId) else { return false }
+                guard let advertisedTrackId, !advertisedTrackId.isEmpty else { return false }
+                return pair.track.trackId == advertisedTrackId
+            }) ?? cameraReceivers.first(where: { pair in
+                guard !consumedTrackIds.contains(pair.track.trackId) else { return false }
+                guard let advertisedMid, !advertisedMid.isEmpty else { return false }
+                return pair.mid == advertisedMid
+            }) ?? cameraReceivers.first(where: { pair in
                 guard !consumedTrackIds.contains(pair.track.trackId) else { return false }
                 return !updated.remoteVideoTracksByParticipantId.values.contains(where: { $0 === pair.track })
             }) ?? cameraReceivers.first(where: { !consumedTrackIds.contains($0.track.trackId) }) else {
@@ -300,8 +532,24 @@ extension RTCSession {
                 continue
             }
 
+            guard Self.claimRemoteCameraTrack(
+                pair.track,
+                participantId: participantId,
+                in: &updated,
+                allowReplacingExistingStableOwner: {
+                    let remoteSdp = updated.peerConnection.remoteDescription?.sdp ?? ""
+                    let advertisedOwners = Self.advertisedRemoteCameraOwnersByTrackId(in: remoteSdp)
+                    guard let owner = advertisedOwners[pair.track.trackId] else { return false }
+                    return Self.conferenceParticipantIdentityKey(owner) == Self.conferenceParticipantIdentityKey(participantId)
+                }()
+            ) else {
+                logger.log(
+                    level: .warning,
+                    message: "Rejected duplicate SFU camera receiver claim participant=\(participantId) trackId=\(pair.track.trackId) connection=\(updated.id)"
+                )
+                continue
+            }
             updated.remoteVideoTrack = pair.track
-            updated.remoteVideoTracksByParticipantId[participantId] = pair.track
             consumedTrackIds.insert(pair.track.trackId)
             didUpdate = true
             await connectionManager.updateConnection(id: updated.id, with: updated)
@@ -357,7 +605,7 @@ extension RTCSession {
         connectionId: String
     ) async {
         guard var connection = await connectionManager.findConnection(with: connectionId) else { return }
-        guard isGroupCallConnection(connection.id) else { return }
+        guard isAppleSfuMediaConnection(connection) else { return }
 
         let participantIds = stableRemoteAudioParticipantIds(in: remoteSdp, connection: connection)
         guard !participantIds.isEmpty else { return }
@@ -366,6 +614,9 @@ extension RTCSession {
 
         let audioReceivers: [(receiver: RTCRtpReceiver, track: RTCAudioTrack)] = connection.peerConnection.transceivers.compactMap { transceiver in
             guard transceiver.mediaType == .audio,
+                  // The local publish m-line's receiver is not a remote leg; binding a remote
+                  // participant (and their frame key) to it garbles that participant's audio.
+                  transceiver.sender.track == nil,
                   let track = transceiver.receiver.track as? RTCAudioTrack,
                   track.readyState != .ended
             else { return nil }
@@ -386,8 +637,66 @@ extension RTCSession {
         for participantId in participantIds {
             if let existing = updated.remoteAudioTracksByParticipantId[participantId],
                existing.readyState != .ended {
-                existing.isEnabled = true
-                consumedTrackIds.insert(existing.trackId)
+                let advertisedIds = advertisedSfuRemoteMediaTrackIds(
+                    mediaKind: "audio",
+                    participantId: participantId,
+                    connection: updated
+                )
+                let preferredPair = audioReceivers.first(where: { pair in
+                    pair.track.readyState != .ended
+                        && pair.track !== existing
+                        && (advertisedIds.isEmpty || advertisedIds.contains(pair.track.trackId))
+                })
+                let activeTrack: RTCAudioTrack
+                let activeReceiver: RTCRtpReceiver?
+                if let preferredPair,
+                   !advertisedIds.isEmpty,
+                   advertisedIds.contains(preferredPair.track.trackId) {
+                    existing.isEnabled = false
+                    preferredPair.track.isEnabled = true
+                    updated.remoteAudioTracksByParticipantId[participantId] = preferredPair.track
+                    activeTrack = preferredPair.track
+                    activeReceiver = preferredPair.receiver
+                    didUpdate = true
+                    // Decrypt must follow the new leg: drop the cryptor bound to the superseded
+                    // receiver so the rebind below re-creates it on `activeReceiver`.
+                    if let staleCryptor = updated.audioReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
+                        staleCryptor.enabled = false
+                        staleCryptor.delegate = nil
+                        if updated.audioFrameCryptor === staleCryptor {
+                            updated.audioFrameCryptor = nil
+                        }
+                    }
+                    updated.audioReceiverCryptorBindingsByParticipantId.removeValue(forKey: participantId)
+                    logger.log(
+                        level: .info,
+                        message: "Upgraded SFU audio mapping participant=\(participantId) from trackId=\(existing.trackId) to advertised trackId=\(preferredPair.track.trackId) connection=\(updated.id)"
+                    )
+                } else {
+                    existing.isEnabled = true
+                    activeTrack = existing
+                    activeReceiver = audioReceivers.first(where: { $0.track === existing })?.receiver
+                }
+                consumedTrackIds.insert(activeTrack.trackId)
+                if enableEncryption,
+                   updated.audioReceiverCryptorsByParticipantId[participantId] == nil,
+                   let activeReceiver {
+                    do {
+                        try await createEncryptedFrame(
+                            connection: updated,
+                            kind: .audioReceiver(activeReceiver),
+                            participantIdOverride: participantId
+                        )
+                    } catch {
+                        logger.log(
+                            level: .error,
+                            message: "Failed to rebind audio receiver FrameCryptor for SFU participant=\(participantId): \(error)"
+                        )
+                    }
+                    if let refreshed = await connectionManager.findConnection(with: updated.id) {
+                        updated = refreshed
+                    }
+                }
                 continue
             }
 
@@ -400,6 +709,12 @@ extension RTCSession {
                     message: "No unmapped audio receiver available for SFU participant=\(participantId) connection=\(updated.id)"
                 )
                 continue
+            }
+
+            if let prior = updated.remoteAudioTracksByParticipantId[participantId],
+               prior !== pair.track,
+               prior.readyState != .ended {
+                prior.isEnabled = false
             }
 
             pair.track.isEnabled = true
@@ -441,27 +756,512 @@ extension RTCSession {
             }
         }
 
+        if disableSupersededAppleInboundAudioReceivers(
+            connection: &updated,
+            keepingActiveTrackIds: consumedTrackIds
+        ) {
+            didUpdate = true
+        }
+
         if didUpdate {
             await connectionManager.updateConnection(id: updated.id, with: updated)
         }
     }
 
+    #if canImport(WebRTC) && !os(Android)
+    /// Disables stale SFU audio receivers after renegotiation (e.g. group → 1:1 upgrade leaves both
+    /// anonymous UUID legs and `audio_echo_*` direct legs enabled, which garbles playback).
+    @discardableResult
+    private func disableSupersededAppleInboundAudioReceivers(
+        connection: inout RTCConnection,
+        keepingActiveTrackIds activeTrackIds: Set<String>
+    ) -> Bool {
+        guard isAppleSfuMediaConnection(connection) else { return false }
+        guard !activeTrackIds.isEmpty else { return false }
+
+        var didUpdate = false
+        for transceiver in connection.peerConnection.transceivers where transceiver.mediaType == .audio {
+            guard let track = transceiver.receiver.track as? RTCAudioTrack,
+                  track.readyState != .ended,
+                  track.isEnabled,
+                  !activeTrackIds.contains(track.trackId)
+            else { continue }
+
+            let retireInOneToOne = Self.isTrueOneToOneSfuRoom(call: connection.call)
+            let isAnonymousLeg = UUID(uuidString: track.trackId) != nil
+            guard retireInOneToOne || isAnonymousLeg else { continue }
+
+            track.isEnabled = false
+            didUpdate = true
+
+            for (participantId, mappedTrack) in connection.remoteAudioTracksByParticipantId where mappedTrack === track {
+                connection.remoteAudioTracksByParticipantId.removeValue(forKey: participantId)
+                if let cryptor = connection.audioReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
+                    cryptor.enabled = false
+                    cryptor.delegate = nil
+                    if connection.audioFrameCryptor === cryptor {
+                        connection.audioFrameCryptor = nil
+                    }
+                }
+                connection.audioReceiverCryptorBindingsByParticipantId.removeValue(forKey: participantId)
+            }
+
+            logger.log(
+                level: .info,
+                message: "Disabled superseded SFU audio receiver trackId=\(track.trackId) connection=\(connection.id) activeLegs=\(activeTrackIds.sorted())"
+            )
+        }
+        return didUpdate
+    }
+    #endif
+
     /// WebRTC may not emit `didRemoveStream` when the SFU removes only the screen-share sender
     /// during renegotiation, and it may not emit a second `didAddReceiver` when the same recv
     /// transceiver is reused for a subsequent share. Reconcile stored screen tracks against the
     /// current remote SDP so tiles disappear when sharing stops and reappear when sharing resumes.
+    #if canImport(WebRTC) && !os(Android)
+    private func appleTransceiver(
+        for receiver: RTCRtpReceiver,
+        in peerConnection: RTCPeerConnection
+    ) -> RTCRtpTransceiver? {
+        let receiverObjectId = ObjectIdentifier(receiver)
+        if let matched = peerConnection.transceivers.first(where: { ObjectIdentifier($0.receiver) == receiverObjectId }) {
+            return matched
+        }
+        guard let trackId = receiver.track?.trackId else { return nil }
+        return peerConnection.transceivers.first { $0.receiver.track?.trackId == trackId }
+    }
+
+    private func appleTransceiver(
+        containingVideoTrackId trackId: String,
+        in peerConnection: RTCPeerConnection
+    ) -> RTCRtpTransceiver? {
+        peerConnection.transceivers.first {
+            $0.mediaType == .video && $0.receiver.track?.trackId == trackId
+        }
+    }
+
+    private func appleVideoTransceivers(in peerConnection: RTCPeerConnection) -> [RTCRtpTransceiver] {
+        peerConnection.transceivers.filter { $0.mediaType == .video }
+    }
+
+    /// SFU viewers use additional `m=video` transceivers for screen-share slots. In 1:1 SFU rooms
+    /// the second transceiver is typically the screen leg; in conference calls each remote
+    /// participant has their own camera transceiver and must not be classified as screen by index alone.
+    private func allowsAppleSlotBasedScreenShareInference(connection: RTCConnection) -> Bool {
+        Self.isTrueOneToOneSfuRoom(call: connection.call)
+    }
+
+    private func appleDedicatedScreenShareTransceivers(
+        in peerConnection: RTCPeerConnection,
+        connection: RTCConnection
+    ) -> [RTCRtpTransceiver] {
+        let videoTransceivers = appleVideoTransceivers(in: peerConnection)
+        guard !videoTransceivers.isEmpty else { return [] }
+        let cameraTrackIds = Set(connection.remoteVideoTracksByParticipantId.values.map(\.trackId))
+
+        let explicitScreenTransceivers = videoTransceivers.filter { transceiver in
+            RTCSession.isAppleTransceiverReceivingRemoteMedia(transceiver)
+                && (
+                    RTCSession.isScreenShareId(transceiver.receiver.track?.trackId ?? "")
+                        || transceiver.sender.streamIds.contains(where: RTCSession.isScreenShareId)
+                )
+        }
+        if !explicitScreenTransceivers.isEmpty {
+            if let remoteSdp = connection.peerConnection.remoteDescription?.sdp,
+               !remoteSdp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let relayMids = activeIncomingScreenShareVideoMids(in: remoteSdp, connection: connection)
+                if !relayMids.isEmpty {
+                    if let contractRelay = Self.contractScreenRelayTransceiver(
+                        among: explicitScreenTransceivers,
+                        relayMids: relayMids
+                    ) {
+                        return [contractRelay]
+                    }
+                    let relayReceivers = videoTransceivers.filter { transceiver in
+                        guard RTCSession.isAppleTransceiverReceivingRemoteMedia(transceiver) else { return false }
+                        let mid = transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard relayMids.contains(mid) else { return false }
+                        guard let track = transceiver.receiver.track as? RTCVideoTrack,
+                              track.readyState != .ended
+                        else { return false }
+                        if Self.isSfuCameraMediaId(track.trackId) { return false }
+                        if cameraTrackIds.contains(track.trackId) { return false }
+                        if connection.remoteVideoTracksByParticipantId.values.contains(where: { $0 === track }) {
+                            return false
+                        }
+                        return true
+                    }
+                    if let contractRelay = Self.contractScreenRelayTransceiver(
+                        among: relayReceivers,
+                        relayMids: relayMids
+                    ) {
+                        return [contractRelay]
+                    }
+                }
+            }
+            if let last = explicitScreenTransceivers.last {
+                return [last]
+            }
+        }
+
+        let relayScreenTransceivers = videoTransceivers.filter { transceiver in
+            guard RTCSession.isAppleTransceiverReceivingRemoteMedia(transceiver) else { return false }
+            guard let track = transceiver.receiver.track as? RTCVideoTrack,
+                  track.readyState != .ended
+            else { return false }
+            if Self.isSfuCameraMediaId(track.trackId) { return false }
+            if cameraTrackIds.contains(track.trackId) { return false }
+            if connection.remoteVideoTracksByParticipantId.values.contains(where: { $0 === track }) {
+                return false
+            }
+            return true
+        }
+        if isGroupCallConnection(connection.id), !Self.isTrueOneToOneSfuRoom(call: connection.call) {
+            guard let remoteSdp = connection.peerConnection.remoteDescription?.sdp,
+                  !remoteSdp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return [] }
+            let relayMids = activeIncomingScreenShareVideoMids(in: remoteSdp, connection: connection)
+            guard !relayMids.isEmpty else { return [] }
+            let relayReceivers = relayScreenTransceivers.filter { transceiver in
+                let mid = transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines)
+                return !mid.isEmpty && relayMids.contains(mid)
+            }
+            if let contractRelay = Self.contractScreenRelayTransceiver(
+                among: relayReceivers,
+                relayMids: relayMids
+            ) {
+                return [contractRelay]
+            }
+            return Array(relayReceivers.suffix(1))
+        }
+        if let relayScreenTransceiver = relayScreenTransceivers.last {
+            return [relayScreenTransceiver]
+        }
+
+        guard allowsAppleSlotBasedScreenShareInference(connection: connection),
+              videoTransceivers.count == 2
+        else { return [] }
+        return [videoTransceivers[1]]
+    }
+
+    private func isAppleDedicatedScreenShareTransceiver(
+        _ transceiver: RTCRtpTransceiver,
+        connection: RTCConnection
+    ) -> Bool {
+        if RTCSession.isScreenShareId(transceiver.receiver.track?.trackId ?? "")
+            || transceiver.sender.streamIds.contains(where: RTCSession.isScreenShareId) {
+            return true
+        }
+        if let track = transceiver.receiver.track,
+           connection.remoteVideoTracksByParticipantId.values.contains(where: { $0 === track }) {
+            return false
+        }
+        return appleDedicatedScreenShareTransceivers(in: connection.peerConnection, connection: connection)
+            .contains { $0 === transceiver }
+    }
+
+    private func liveScreenReceiverCandidates(
+        in connection: RTCConnection,
+        excludingTrackIds: Set<String> = []
+    ) -> [(receiver: RTCRtpReceiver, track: RTCVideoTrack)] {
+        appleDedicatedScreenShareTransceivers(in: connection.peerConnection, connection: connection).compactMap { transceiver in
+            guard let track = transceiver.receiver.track as? RTCVideoTrack,
+                  track.readyState != .ended,
+                  !excludingTrackIds.contains(track.trackId)
+            else { return nil }
+            return (transceiver.receiver, track)
+        }
+    }
+
+    private static func contractScreenRelayTransceiver(
+        among transceivers: [RTCRtpTransceiver],
+        relayMids: Set<String>
+    ) -> RTCRtpTransceiver? {
+        let contractMid = ScreenShareGroupCallContract.MediaMid.screen.rawValue
+        guard relayMids.contains(contractMid) else { return nil }
+        return transceivers.first {
+            $0.mid.trimmingCharacters(in: .whitespacesAndNewlines) == contractMid
+        }
+    }
+
+    /// Live screen receiver on an SFU relay `m=video` mid for a known remote sharer.
+    private func relayScreenReceiverPair(
+        for participantId: String,
+        connection: RTCConnection,
+        remoteSdp: String,
+        excludingTrackIds: Set<String> = []
+    ) -> (receiver: RTCRtpReceiver, track: RTCVideoTrack)? {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return nil }
+        let cameraTrackIds = Set(connection.remoteVideoTracksByParticipantId.compactMap { key, track -> String? in
+            guard Self.conferenceParticipantIdentityKey(key) == participantKey else { return nil }
+            return track.trackId
+        })
+        let relayMids = activeIncomingScreenShareVideoMids(in: remoteSdp, connection: connection)
+        guard !relayMids.isEmpty else { return nil }
+        let contractMid = ScreenShareGroupCallContract.MediaMid.screen.rawValue
+        let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: connection.call)
+
+        let preferredTransceiver = connection.peerConnection.transceivers.first { transceiver in
+            guard transceiver.mediaType == .video else { return false }
+            let mid = transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard mid == contractMid, relayMids.contains(contractMid) else { return false }
+            guard let track = transceiver.receiver.track as? RTCVideoTrack,
+                  track.readyState != .ended,
+                  !excludingTrackIds.contains(track.trackId),
+                  !cameraTrackIds.contains(track.trackId),
+                  (Self.isScreenShareId(track.trackId) || isOneToOneSfuRoom)
+            else { return false }
+            return true
+        }
+        guard let transceiver = preferredTransceiver,
+              let track = transceiver.receiver.track as? RTCVideoTrack
+        else { return nil }
+        return (transceiver.receiver, track)
+    }
+
+    private func reclaimWronglyMappedCameraAsScreen(
+        participantId: String,
+        connection: RTCConnection
+    ) -> (receiver: RTCRtpReceiver, track: RTCVideoTrack)? {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return nil }
+        guard let cameraTrack = connection.remoteVideoTracksByParticipantId.first(where: {
+            Self.conferenceParticipantIdentityKey($0.key) == participantKey
+        })?.value,
+              cameraTrack.readyState != .ended
+        else { return nil }
+        guard let transceiver = connection.peerConnection.transceivers.first(where: {
+            $0.receiver.track === cameraTrack || $0.receiver.track?.trackId == cameraTrack.trackId
+        }),
+              isAppleDedicatedScreenShareTransceiver(transceiver, connection: connection)
+        else { return nil }
+        return (transceiver.receiver, cameraTrack)
+    }
+
+    private func clearRemoteCameraMapping(
+        for participantId: String,
+        on connection: inout RTCConnection,
+        track: RTCVideoTrack
+    ) {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        for key in connection.remoteVideoTracksByParticipantId.keys
+        where Self.conferenceParticipantIdentityKey(key) == participantKey
+            && (
+                connection.remoteVideoTracksByParticipantId[key] === track
+                    || connection.remoteVideoTracksByParticipantId[key]?.trackId == track.trackId
+            ) {
+            connection.remoteVideoTracksByParticipantId.removeValue(forKey: key)
+        }
+        if connection.remoteVideoTrack === track || connection.remoteVideoTrack?.trackId == track.trackId {
+            connection.remoteVideoTrack = nil
+        }
+    }
+
+    private func isAppleSfuMediaConnection(_ connection: RTCConnection) -> Bool {
+        isGroupCallConnection(connection.id) || Self.isTrueOneToOneSfuRoom(call: connection.call)
+    }
+
+    private func shouldTreatAppleVideoTrackAsRemoteScreenShare(
+        trackId: String,
+        streamIds: [String],
+        transceiver: RTCRtpTransceiver,
+        connection: RTCConnection
+    ) -> Bool {
+        if RTCSession.isScreenShareId(trackId) || streamIds.contains(where: RTCSession.isScreenShareId) {
+            return true
+        }
+        if isGroupCallConnection(connection.id),
+           !Self.isTrueOneToOneSfuRoom(call: connection.call) {
+            // Multiparty SFU camera receivers can temporarily land on the reserved screen
+            // transceiver during renegotiation. Only explicit `screen_*` identity should
+            // create screen-share UI in group calls.
+            return false
+        }
+        guard isAppleSfuMediaConnection(connection),
+              isAppleDedicatedScreenShareTransceiver(transceiver, connection: connection)
+        else { return false }
+        return true
+    }
+
+    private func resolvedAppleRelayScreenShareParticipantId(
+        streamIds: [String],
+        trackId: String,
+        connection: RTCConnection
+    ) -> String? {
+        if let mapped = normalizedKnownRemoteScreenParticipantId(trackId, connection: connection) {
+            return mapped
+        }
+        let streamParticipant = streamIds.first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !streamParticipant.isEmpty,
+           UUID(uuidString: streamParticipant) == nil,
+           let normalized = normalizedRemoteParticipantIdFromSfuStreamLabel(streamParticipant, connection: connection) {
+            return normalized
+        }
+        if let owner = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !owner.isEmpty {
+            return owner
+        }
+        return ambiguousRelayScreenParticipantId(in: connection)
+    }
+
+    /// Remote screen sharers advertised in the current SFU remote SDP, including relay-style
+    /// `m=video` legs that never produced a `remoteScreenTracksByParticipantId` mapping.
+    func sdpAdvertisedActiveRemoteScreenShareParticipantIds(connection: RTCConnection) -> [String] {
+        #if canImport(WebRTC)
+        guard let remoteSdp = connection.peerConnection.remoteDescription?.sdp,
+              !remoteSdp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return [] }
+        return stableRemoteScreenTrackLabels(in: remoteSdp, connection: connection).map(\.participantId)
+        #else
+        return []
+        #endif
+    }
+
+    /// Retries SDP reconcile when screen-share was advertised before a live receiver existed.
+    func reconcileDeferredAppleRemoteScreenTracksIfNeeded(connectionId: String) async {
+        #if canImport(WebRTC)
+        guard let connection = await connectionManager.findConnection(with: connectionId),
+              isAppleSfuMediaConnection(connection),
+              let remoteSdp = connection.peerConnection.remoteDescription?.sdp,
+              !remoteSdp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
+
+        let advertised = stableRemoteScreenTrackLabels(in: remoteSdp, connection: connection)
+        let hasUnmappedAdvertisement = advertised.contains { label in
+            let participantKey = Self.conferenceParticipantIdentityKey(label.participantId)
+            guard !participantKey.isEmpty else { return false }
+            return !connection.remoteScreenTracksByParticipantId.contains { participantId, track in
+                Self.conferenceParticipantIdentityKey(participantId) == participantKey
+                    && track.readyState != .ended
+            }
+        }
+        guard hasUnmappedAdvertisement, !liveScreenReceiverCandidates(in: connection).isEmpty else { return }
+
+        await reconcileAppleRemoteScreenTracksAfterSetRemoteSDP(remoteSdp, connectionId: connectionId)
+        #endif
+    }
+    #endif
+
+    private func mappedScreenReceiverMidIsActiveInSdp(
+        participantId: String,
+        connection: RTCConnection,
+        remoteSdp: String
+    ) -> Bool {
+        guard let track = connection.remoteScreenTracksByParticipantId[participantId]
+            ?? connection.remoteScreenTracksByParticipantId.first(where: {
+                Self.conferenceParticipantIdentityKey($0.key)
+                    == Self.conferenceParticipantIdentityKey(participantId)
+            })?.value,
+              track.readyState != .ended
+        else { return false }
+
+        let activeRelayMids = activeIncomingScreenShareVideoMids(in: remoteSdp, connection: connection)
+        guard !activeRelayMids.isEmpty else { return false }
+
+        for transceiver in connection.peerConnection.transceivers where transceiver.mediaType == .video {
+            guard transceiver.receiver.track === track else { continue }
+            let mid = transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines)
+            return activeRelayMids.contains(mid)
+        }
+        return false
+    }
+    #endif
+
+    private func activeIncomingScreenShareVideoMids(
+        in remoteSdp: String,
+        connection: RTCConnection
+    ) -> Set<String> {
+        var mids = Self.remoteActiveIncomingScreenShareVideoMids(in: remoteSdp)
+            .union(Self.sfuRelayIncomingScreenShareVideoMids(in: remoteSdp))
+        if Self.isTrueOneToOneSfuRoom(call: connection.call) {
+            mids.formUnion(Self.oneToOneSfuIncomingScreenShareVideoMids(in: remoteSdp))
+        }
+        return mids
+    }
+
+    private func ambiguousRelayScreenParticipantId(in connection: RTCConnection) -> String? {
+        let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remoteParticipantIds = connection.remoteVideoTracksByParticipantId.keys.compactMap { key -> String? in
+            let candidate = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !candidate.isEmpty, candidate.caseInsensitiveCompare(local) != .orderedSame else { return nil }
+            return candidate
+        }
+        guard remoteParticipantIds.count == 1 else { return nil }
+        return remoteParticipantIds[0]
+    }
+
+    #if canImport(WebRTC) && !os(Android)
     func reconcileAppleRemoteScreenTracksAfterSetRemoteSDP(
         _ remoteSdp: String,
         connectionId: String
     ) async {
         guard var connection = await connectionManager.findConnection(with: connectionId) else { return }
-        guard isGroupCallConnection(connection.id) else { return }
+        guard isAppleSfuMediaConnection(connection) else { return }
 
         let advertisedLabels = stableRemoteScreenTrackLabels(in: remoteSdp, connection: connection)
         let advertisedParticipantList = advertisedLabels.map(\.participantId)
         let advertisedParticipants = Set(advertisedParticipantList)
         let explicitlyInactiveParticipants = Set(inactiveRemoteScreenParticipantIds(in: remoteSdp, connection: connection))
         let advertisedCameraParticipants = Set(stableRemoteCameraParticipantIds(in: remoteSdp, connection: connection))
+
+        var didUpdate = false
+        for uuidKey in connection.remoteScreenTracksByParticipantId.keys where !Self.isPlausibleConferenceScreenShareParticipantId(uuidKey) {
+            connection.remoteScreenTracksByParticipantId.removeValue(forKey: uuidKey)
+            connection.screenReceiverCryptorsByParticipantId.removeValue(forKey: uuidKey)
+            connection.screenReceiverCryptorBindingsByParticipantId.removeValue(forKey: uuidKey)
+            didUpdate = true
+            logger.log(
+                level: .info,
+                message: "Removed UUID-alias remote screen-share mapping during SDP reconcile participant=\(uuidKey) connection=\(connection.id)"
+            )
+        }
+
+        for participantId in Array(connection.remoteScreenTracksByParticipantId.keys) {
+            guard let track = connection.remoteScreenTracksByParticipantId[participantId],
+                  Self.isSfuCameraMediaId(track.trackId)
+            else { continue }
+
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            let staleScreenKeys = connection.remoteScreenTracksByParticipantId.keys.filter { key in
+                Self.conferenceParticipantIdentityKey(key) == participantKey
+                    || connection.remoteScreenTracksByParticipantId[key]?.trackId == track.trackId
+            }
+            for staleKey in staleScreenKeys {
+                connection.remoteScreenTracksByParticipantId.removeValue(forKey: staleKey)
+                if let cryptor = connection.screenReceiverCryptorsByParticipantId.removeValue(forKey: staleKey) {
+                    cryptor.enabled = false
+                    cryptor.delegate = nil
+                }
+                connection.screenReceiverCryptorBindingsByParticipantId.removeValue(forKey: staleKey)
+            }
+            let reclaimedCameraTrack = !participantKey.isEmpty
+                && !connection.remoteVideoTracksByParticipantId.keys.contains(where: {
+                    Self.conferenceParticipantIdentityKey($0) == participantKey
+                })
+                && Self.claimRemoteCameraTrack(track, participantId: participantId, in: &connection)
+            didUpdate = true
+            logger.log(
+                level: .info,
+                message: "Reclaimed SFU camera-labelled track from remote screen-share mapping participant=\(participantId) trackId=\(track.trackId) connection=\(connection.id)"
+            )
+            notifyRemoteScreenTrackChanged(
+                RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
+            )
+            if reclaimedCameraTrack {
+                notifyRemoteParticipantTrackChanged(
+                    RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: true)
+                )
+            } else {
+                logger.log(
+                    level: .warning,
+                    message: "Rejected duplicate SFU camera reclaim from screen mapping participant=\(participantId) trackId=\(track.trackId) connection=\(connection.id)"
+                )
+            }
+        }
 
         func isStillAdvertised(_ participantId: String) -> Bool {
             let participantKey = Self.conferenceParticipantIdentityKey(participantId)
@@ -490,39 +1290,146 @@ extension RTCSession {
             }?.value
         }
 
+        func hasKnownRemoteCamera(_ participantId: String, in connection: RTCConnection) -> Bool {
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            if connection.remoteVideoTracksByParticipantId.keys.contains(where: {
+                Self.conferenceParticipantIdentityKey($0) == participantKey
+            }) {
+                return true
+            }
+            return hasAdvertisedCamera(participantId)
+        }
+
         func hasLiveScreenReceiver(for participantId: String, in connection: RTCConnection) -> Bool {
-            let cameraTrackId = connection.remoteVideoTracksByParticipantId[participantId]?.trackId
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            let cameraTrackIds = Set(connection.remoteVideoTracksByParticipantId.compactMap { key, track -> String? in
+                guard Self.conferenceParticipantIdentityKey(key) == participantKey else { return nil }
+                return track.trackId
+            })
+            let relayMids = activeIncomingScreenShareVideoMids(in: remoteSdp, connection: connection)
+
             return connection.peerConnection.transceivers.contains { transceiver in
                 guard transceiver.mediaType == .video,
                       let track = transceiver.receiver.track as? RTCVideoTrack,
                       track.readyState != .ended
                 else { return false }
-                if RTCSession.isScreenShareId(track.trackId) { return true }
-                guard let cameraTrackId else { return false }
-                return track.trackId != cameraTrackId
+                if cameraTrackIds.contains(track.trackId) { return false }
+
+                let mid = transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !relayMids.isEmpty, mid.isEmpty || !relayMids.contains(mid) {
+                    return false
+                }
+                if !mid.isEmpty,
+                   relayMids.contains(mid),
+                   isStillAdvertised(participantId) {
+                    return true
+                }
+
+                guard shouldTreatAppleVideoTrackAsRemoteScreenShare(
+                    trackId: track.trackId,
+                    streamIds: [],
+                    transceiver: transceiver,
+                    connection: connection
+                ) else { return false }
+
+                if let mappedId = normalizedKnownRemoteScreenParticipantId(track.trackId, connection: connection) {
+                    return Self.conferenceParticipantIdentityKey(mappedId) == participantKey
+                }
+                if let relayId = resolvedAppleRelayScreenShareParticipantId(
+                    streamIds: [],
+                    trackId: track.trackId,
+                    connection: connection
+                ) {
+                    return Self.conferenceParticipantIdentityKey(relayId) == participantKey
+                }
+                if let existing = existingScreenTrack(for: participantId, in: connection) {
+                    return existing.trackId == track.trackId
+                }
+                return false
             }
         }
 
-        var didUpdate = false
-        for participantId in Array(connection.remoteScreenTracksByParticipantId.keys) where !isStillAdvertised(participantId) {
-            if !isExplicitlyInactive(participantId),
-               !hasAdvertisedCamera(participantId),
+        var removedScreenParticipants = Set<String>()
+        for participantId in Array(connection.remoteScreenTracksByParticipantId.keys) {
+            let forceRemoveAfterStopRequest = await shouldForceRemoveRemoteScreenShareAfterStopRequest(
+                participantId: participantId,
+                in: connection,
+                remoteSdp: remoteSdp,
+                connectionId: connectionId
+            )
+            let shouldReconcileRemoval = !isStillAdvertised(participantId)
+                || isExplicitlyInactive(participantId)
+                || forceRemoveAfterStopRequest
+            guard shouldReconcileRemoval else { continue }
+
+            let stopForwarded = isRemoteScreenShareStopForwardedInSdp(
+                participantId: participantId,
+                remoteSdp: remoteSdp,
+                connection: connection
+            )
+            if !forceRemoveAfterStopRequest,
+               !isExplicitlyInactive(participantId),
+               !stopForwarded,
                hasLiveScreenReceiver(for: participantId, in: connection) {
+                let mappingMidActive = mappedScreenReceiverMidIsActiveInSdp(
+                    participantId: participantId,
+                    connection: connection,
+                    remoteSdp: remoteSdp
+                )
+                let placeholderOnlySdp = Self.isSfuRecvonlyPlaceholderOnlyRemoteSdp(remoteSdp)
+                let hasExplicitScreenTrack = existingScreenTrack(for: participantId, in: connection)
+                    .map { RTCSession.isScreenShareId($0.trackId) } ?? false
+                let shouldKeep = isStillAdvertised(participantId)
+                    || mappingMidActive
+                    || (placeholderOnlySdp && hasExplicitScreenTrack)
+                if shouldKeep {
+                    logger.log(
+                        level: .info,
+                        message: "Keeping live remote screen-share receiver during SDP reconcile participant=\(participantId) connection=\(connection.id)"
+                    )
+                    if placeholderOnlySdp && hasExplicitScreenTrack {
+                        notifyRemoteScreenTrackChanged(
+                            RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: true)
+                        )
+                    }
+                    continue
+                }
+            }
+            if forceRemoveAfterStopRequest {
                 logger.log(
                     level: .info,
-                    message: "Keeping live remote screen-share receiver during SDP reconcile participant=\(participantId) connection=\(connection.id)"
+                    message: "Clearing remote screen-share mapping after preempt stop for participant=\(participantId) connection=\(connection.id)"
                 )
-                notifyRemoteScreenTrackChanged(
-                    RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: true)
+            }
+            removedScreenParticipants.insert(participantId)
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            let staleScreenKeys = connection.remoteScreenTracksByParticipantId.keys.filter {
+                Self.conferenceParticipantIdentityKey($0) == participantKey
+            }
+            let removedTrackIds = Set(staleScreenKeys.compactMap {
+                connection.remoteScreenTracksByParticipantId[$0]?.trackId
+            })
+            let keysToRemove = connection.remoteScreenTracksByParticipantId.keys.filter { key in
+                staleScreenKeys.contains(key)
+                    || removedTrackIds.contains(connection.remoteScreenTracksByParticipantId[key]?.trackId ?? "")
+            }
+            for staleKey in keysToRemove {
+                connection.remoteScreenTracksByParticipantId.removeValue(forKey: staleKey)
+                if let cryptor = connection.screenReceiverCryptorsByParticipantId.removeValue(forKey: staleKey) {
+                    cryptor.enabled = false
+                    cryptor.delegate = nil
+                }
+                connection.screenReceiverCryptorBindingsByParticipantId.removeValue(forKey: staleKey)
+            }
+            let suppressedKey = Self.conferenceParticipantIdentityKey(participantId)
+            if !suppressedKey.isEmpty {
+                connection.suppressedRemoteScreenShareParticipantIds.insert(suppressedKey)
+                connection.remoteScreenShareStopRequestedParticipantKeys.remove(suppressedKey)
+                clearRemoteScreenIngressFlatObservation(
+                    connectionId: connection.id,
+                    participantKey: suppressedKey
                 )
-                continue
             }
-            connection.remoteScreenTracksByParticipantId.removeValue(forKey: participantId)
-            if let cryptor = connection.screenReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
-                cryptor.enabled = false
-                cryptor.delegate = nil
-            }
-            connection.screenReceiverCryptorBindingsByParticipantId.removeValue(forKey: participantId)
             didUpdate = true
             logger.log(
                 level: .info,
@@ -537,40 +1444,77 @@ extension RTCSession {
             await connectionManager.updateConnection(id: connection.id, with: connection)
         }
 
-        guard !advertisedParticipantList.isEmpty else { return }
-
-        let explicitScreenReceivers: [(receiver: RTCRtpReceiver, track: RTCVideoTrack)] = connection.peerConnection.transceivers.compactMap { transceiver in
-            guard transceiver.mediaType == .video,
-                  let track = transceiver.receiver.track as? RTCVideoTrack,
-                  RTCSession.isScreenShareId(track.trackId),
-                  track.readyState != .ended
-            else { return nil }
-            return (transceiver.receiver, track)
-        }
-
-        let allVideoReceivers: [(receiver: RTCRtpReceiver, track: RTCVideoTrack)] = connection.peerConnection.transceivers.compactMap { transceiver in
-            guard transceiver.mediaType == .video,
-                  let track = transceiver.receiver.track as? RTCVideoTrack,
-                  track.readyState != .ended
-            else { return nil }
-            return (transceiver.receiver, track)
-        }
+        if !advertisedParticipantList.isEmpty {
+        let explicitScreenReceivers = liveScreenReceiverCandidates(in: connection)
 
         var updated = connection
         var consumedTrackIds = Set(updated.remoteScreenTracksByParticipantId.values.map(\.trackId))
 
         for label in advertisedLabels {
             let participantId = label.participantId
+            let advertisedParticipantKey = Self.conferenceParticipantIdentityKey(participantId)
+            if !advertisedParticipantKey.isEmpty,
+               removedScreenParticipants.contains(where: {
+                   Self.conferenceParticipantIdentityKey($0) == advertisedParticipantKey
+               }) {
+                continue
+            }
+            if shouldSkipRemoteScreenShareMapping(
+                participantId: participantId,
+                connection: updated,
+                remoteSdp: remoteSdp
+            ) {
+                continue
+            }
             if let existing = existingScreenTrack(for: participantId, in: updated) {
-                consumedTrackIds.insert(existing.trackId)
-                notifyRemoteScreenTrackChanged(
-                    RemoteScreenTrackEvent(connectionId: updated.id, participantId: participantId, isActive: true)
+                let reclaimedPair = reclaimWronglyMappedCameraAsScreen(participantId: participantId, connection: updated)
+                let slotPair = liveScreenReceiverCandidates(in: updated, excludingTrackIds: consumedTrackIds).first
+                let relayPair = relayScreenReceiverPair(
+                    for: participantId,
+                    connection: updated,
+                    remoteSdp: remoteSdp,
+                    excludingTrackIds: consumedTrackIds
                 )
+                if let livePair = relayPair ?? slotPair ?? reclaimedPair,
+                   livePair.track.trackId != existing.trackId {
+                    updated.remoteScreenTracksByParticipantId[participantId] = livePair.track
+                    consumedTrackIds.insert(livePair.track.trackId)
+                    didUpdate = true
+                    await connectionManager.updateConnection(id: updated.id, with: updated)
+                    logger.log(
+                        level: .info,
+                        message: "Rebound SFU relay screen receiver during SDP reconcile participant=\(participantId) oldTrackId=\(existing.trackId) newTrackId=\(livePair.track.trackId) connection=\(updated.id)"
+                    )
+                    notifyRemoteScreenTrackChanged(
+                        RemoteScreenTrackEvent(connectionId: updated.id, participantId: participantId, isActive: true)
+                    )
+                    if enableEncryption {
+                        do {
+                            try await createEncryptedFrame(
+                                connection: updated,
+                                kind: .screenReceiver(livePair.receiver),
+                                participantIdOverride: participantId
+                            )
+                        } catch {
+                            logger.log(
+                                level: .error,
+                                message: "Failed to rebind screen receiver FrameCryptor during relay reconcile participant=\(participantId): \(error)"
+                            )
+                        }
+                        if let refreshed = await connectionManager.findConnection(with: updated.id) {
+                            updated = refreshed
+                        }
+                    }
+                } else {
+                    consumedTrackIds.insert(existing.trackId)
+                }
+                let mappedKey = Self.conferenceParticipantIdentityKey(participantId)
+                if !mappedKey.isEmpty, updated.suppressedRemoteScreenShareParticipantIds.remove(mappedKey) != nil {
+                    didUpdate = true
+                }
                 continue
             }
 
-            let cameraTrackIds = Set(updated.remoteVideoTracksByParticipantId.values.map(\.trackId))
-            let mappedScreenTrackIds = Set(updated.remoteScreenTracksByParticipantId.values.map(\.trackId))
             let trackIdMatch: (receiver: RTCRtpReceiver, track: RTCVideoTrack)? = {
                 guard let trackId = label.trackId?.trimmingCharacters(in: .whitespacesAndNewlines), !trackId.isEmpty else {
                     return nil
@@ -583,13 +1527,20 @@ extension RTCSession {
                     return (receiver, track)
                 }.first
             }()
+            let reclaimedPair = reclaimWronglyMappedCameraAsScreen(participantId: participantId, connection: updated)
+            let relayPair = relayScreenReceiverPair(
+                for: participantId,
+                connection: updated,
+                remoteSdp: remoteSdp,
+                excludingTrackIds: consumedTrackIds
+            )
+            let slotPair = liveScreenReceiverCandidates(in: updated, excludingTrackIds: consumedTrackIds).first
             guard let pair = trackIdMatch
+                ?? relayPair
+                ?? slotPair
                 ?? explicitScreenReceivers.first(where: { !consumedTrackIds.contains($0.track.trackId) })
-                ?? allVideoReceivers.first(where: { candidate in
-                    !consumedTrackIds.contains(candidate.track.trackId)
-                        && !cameraTrackIds.contains(candidate.track.trackId)
-                        && !mappedScreenTrackIds.contains(candidate.track.trackId)
-                }) else {
+                ?? reclaimedPair
+            else {
                 logger.log(
                     level: .warning,
                     message: "SFU SDP advertised screen msid for participant=\(participantId) but no live screen receiver exists connection=\(updated.id)"
@@ -597,8 +1548,20 @@ extension RTCSession {
                 continue
             }
 
+            if let reclaimedPair, pair.track === reclaimedPair.track || pair.track.trackId == reclaimedPair.track.trackId {
+                clearRemoteCameraMapping(for: participantId, on: &updated, track: reclaimedPair.track)
+                logger.log(
+                    level: .info,
+                    message: "Reclaimed camera-mapped screen-slot receiver for participant=\(participantId) trackId=\(pair.track.trackId) connection=\(updated.id)"
+                )
+            }
+
             updated.remoteScreenTracksByParticipantId[participantId] = pair.track
             consumedTrackIds.insert(pair.track.trackId)
+            let mappedKey = Self.conferenceParticipantIdentityKey(participantId)
+            if !mappedKey.isEmpty {
+                updated.suppressedRemoteScreenShareParticipantIds.remove(mappedKey)
+            }
             didUpdate = true
             await connectionManager.updateConnection(id: updated.id, with: updated)
 
@@ -642,7 +1605,165 @@ extension RTCSession {
         if didUpdate {
             await connectionManager.updateConnection(id: updated.id, with: updated)
         }
+        }
+
+        if let latest = await connectionManager.findConnection(with: connectionId) {
+            await discoverUnmappedLiveAppleScreenReceivers(
+                connection: latest,
+                remoteSdp: remoteSdp,
+                removedScreenParticipants: removedScreenParticipants,
+                explicitlyInactiveParticipants: explicitlyInactiveParticipants,
+                activelyAdvertisedParticipantKeys: Set(
+                    advertisedParticipantList.map { Self.conferenceParticipantIdentityKey($0) }.filter { !$0.isEmpty }
+                )
+            )
+        }
     }
+
+    /// Surfaces remote screen shares when SFU SDP uses recvonly/inactive placeholders without `screen_`
+    /// msids. WebRTC often reuses the recv transceiver and does not emit another `didAddReceiver`.
+    private func discoverUnmappedLiveAppleScreenReceivers(
+        connection: RTCConnection,
+        remoteSdp: String,
+        removedScreenParticipants: Set<String>,
+        explicitlyInactiveParticipants: Set<String>,
+        activelyAdvertisedParticipantKeys: Set<String> = []
+    ) async {
+        var updated = connection
+        var didUpdate = false
+
+        func participantKey(_ participantId: String) -> String {
+            Self.conferenceParticipantIdentityKey(participantId)
+        }
+
+        func isMappedParticipant(_ participantId: String) -> Bool {
+            let key = participantKey(participantId)
+            return updated.remoteScreenTracksByParticipantId.keys.contains { participantKey($0) == key }
+        }
+
+        func wasRemovedThisReconcile(_ participantId: String) -> Bool {
+            let key = participantKey(participantId)
+            return removedScreenParticipants.contains { participantKey($0) == key }
+        }
+
+        func isExplicitlyInactiveParticipant(_ participantId: String) -> Bool {
+            let key = participantKey(participantId)
+            return explicitlyInactiveParticipants.contains { participantKey($0) == key }
+        }
+
+        func shouldSkipDiscovery(for participantId: String) -> Bool {
+            if wasRemovedThisReconcile(participantId) || isExplicitlyInactiveParticipant(participantId) {
+                return true
+            }
+            if shouldSkipRemoteScreenShareMapping(
+                participantId: participantId,
+                connection: updated,
+                remoteSdp: remoteSdp
+            ) {
+                return true
+            }
+            let key = participantKey(participantId)
+            if !key.isEmpty, updated.suppressedRemoteScreenShareParticipantIds.contains(key) {
+                guard activelyAdvertisedParticipantKeys.contains(key) else { return true }
+                updated.suppressedRemoteScreenShareParticipantIds.remove(key)
+                didUpdate = true
+            }
+            let local = updated.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !local.isEmpty && participantId.caseInsensitiveCompare(local) == .orderedSame
+        }
+
+        func transceiverHasActiveLocalScreenSender(_ transceiver: RTCRtpTransceiver) -> Bool {
+            guard let track = transceiver.sender.track as? RTCVideoTrack else { return false }
+            return track.readyState != .ended && RTCSession.isScreenShareId(track.trackId)
+        }
+
+        func mappedTrackIds() -> Set<String> {
+            Set(updated.remoteScreenTracksByParticipantId.values.map(\.trackId))
+        }
+
+        var consumedTrackIds = mappedTrackIds()
+
+        for transceiver in updated.peerConnection.transceivers {
+            guard transceiver.mediaType == .video,
+                  let track = transceiver.receiver.track as? RTCVideoTrack,
+                  track.readyState != .ended,
+                  !consumedTrackIds.contains(track.trackId),
+                  shouldTreatAppleVideoTrackAsRemoteScreenShare(
+                      trackId: track.trackId,
+                      streamIds: [],
+                      transceiver: transceiver,
+                      connection: updated
+                  )
+            else { continue }
+
+            guard let participantId = resolvedAppleRelayScreenShareParticipantId(
+                streamIds: [],
+                trackId: track.trackId,
+                connection: updated
+            ) ?? normalizedKnownRemoteScreenParticipantId(track.trackId, connection: updated),
+                  !shouldSkipDiscovery(for: participantId),
+                  !isMappedParticipant(participantId),
+                  !transceiverHasActiveLocalScreenSender(transceiver)
+            else { continue }
+
+            if isGroupCallConnection(updated.id) {
+                let participantIdentityKey = participantKey(participantId)
+                let activeRelayMids = activeIncomingScreenShareVideoMids(in: remoteSdp, connection: updated)
+                guard !activeRelayMids.isEmpty else { continue }
+                let transceiverMid = transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines)
+                let onRelayMid = !transceiverMid.isEmpty && activeRelayMids.contains(transceiverMid)
+                let advertisedOnActiveRelay = activelyAdvertisedParticipantKeys.contains(participantIdentityKey)
+                    && onRelayMid
+                guard onRelayMid || advertisedOnActiveRelay else { continue }
+            }
+
+            consumedTrackIds.insert(track.trackId)
+            updated.remoteScreenTracksByParticipantId[participantId] = track
+            let mappedKey = participantKey(participantId)
+            if !mappedKey.isEmpty {
+                updated.suppressedRemoteScreenShareParticipantIds.remove(mappedKey)
+            }
+            didUpdate = true
+            await connectionManager.updateConnection(id: updated.id, with: updated)
+            logger.log(
+                level: .info,
+                message: "Discovered unmapped live screen-share receiver participant=\(participantId) trackId=\(track.trackId) connection=\(updated.id)"
+            )
+            notifyRemoteScreenTrackChanged(
+                RemoteScreenTrackEvent(connectionId: updated.id, participantId: participantId, isActive: true)
+            )
+            if let mediaDelegate {
+                await mediaDelegate.didAddRemoteTrack(
+                    connectionId: updated.id,
+                    participantId: participantId,
+                    kind: "screen",
+                    trackId: track.trackId
+                )
+            }
+            if enableEncryption {
+                do {
+                    try await createEncryptedFrame(
+                        connection: updated,
+                        kind: .screenReceiver(transceiver.receiver),
+                        participantIdOverride: participantId
+                    )
+                } catch {
+                    logger.log(
+                        level: .error,
+                        message: "Failed to bind discovered screen receiver FrameCryptor for participant=\(participantId): \(error)"
+                    )
+                }
+            }
+            if let refreshed = await connectionManager.findConnection(with: updated.id) {
+                updated = refreshed
+            }
+        }
+
+        if didUpdate {
+            await connectionManager.updateConnection(id: updated.id, with: updated)
+        }
+    }
+    #endif
 
     private func stableRemoteCameraParticipantIds(
         in sdp: String,
@@ -683,6 +1804,130 @@ extension RTCSession {
 
         return participantIds
     }
+
+#if canImport(WebRTC) && !os(Android)
+    private func appleStableRemoteCameraTrackLabels(
+        in sdp: String,
+        connection: RTCConnection
+    ) -> [(participantId: String, trackId: String?, mid: String?)] {
+        var labels: [(participantId: String, trackId: String?, mid: String?)] = []
+        var seen = Set<String>()
+        var currentMediaKind: String?
+        var currentMid: String?
+        var currentSectionLines: [String] = []
+
+        func appendLabel(from remainder: String) {
+            let parts = remainder
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .map(String.init)
+            guard let streamLabel = parts.first else { return }
+            let participantId = normalizedRemoteParticipantIdFromSfuStreamLabel(streamLabel, connection: connection)
+                ?? (parts.count > 1
+                    ? normalizedRemoteParticipantIdFromSfuStreamLabel(parts[1], connection: connection)
+                    : nil)
+            guard let participantId else { return }
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            guard !participantKey.isEmpty, seen.insert(participantKey).inserted else { return }
+            labels.append((participantId: participantId, trackId: parts.dropFirst().first, mid: currentMid))
+        }
+
+        func flushCurrentSection() {
+            guard currentMediaKind == "video" else { return }
+            guard !currentSectionLines.contains(where: { $0 == "a=inactive" || $0 == "a=recvonly" }) else {
+                return
+            }
+            for line in currentSectionLines {
+                if line.hasPrefix("a=msid:") {
+                    appendLabel(from: String(line.dropFirst("a=msid:".count)))
+                } else if let range = line.range(of: " msid:") {
+                    appendLabel(from: String(line[range.upperBound...]))
+                }
+            }
+        }
+
+        for rawLine in sdp.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentSectionLines = [line]
+                currentMediaKind = line.hasPrefix("m=video") ? "video" : nil
+                currentMid = nil
+            } else {
+                if line.hasPrefix("a=mid:") {
+                    currentMid = String(line.dropFirst("a=mid:".count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                currentSectionLines.append(line)
+            }
+        }
+        flushCurrentSection()
+
+        return labels
+    }
+
+    private func appleStableRemoteAudioTrackLabels(
+        in sdp: String,
+        connection: RTCConnection
+    ) -> [(participantId: String, trackId: String?, mid: String?)] {
+        var labels: [(participantId: String, trackId: String?, mid: String?)] = []
+        var seen = Set<String>()
+        var currentMediaKind: String?
+        var currentMid: String?
+        var currentSectionLines: [String] = []
+
+        func appendLabel(from remainder: String) {
+            let parts = remainder
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .map(String.init)
+            guard let streamLabel = parts.first else { return }
+            let participantId = normalizedRemoteParticipantIdFromSfuStreamLabel(streamLabel, connection: connection)
+                ?? (parts.count > 1
+                    ? normalizedRemoteParticipantIdFromSfuStreamLabel(parts[1], connection: connection)
+                    : nil)
+            guard let participantId else { return }
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            guard !participantKey.isEmpty, seen.insert(participantKey).inserted else { return }
+            labels.append((participantId: participantId, trackId: parts.dropFirst().first, mid: currentMid))
+        }
+
+        func flushCurrentSection() {
+            guard currentMediaKind == "audio" else { return }
+            guard !currentSectionLines.contains(where: { $0 == "a=inactive" || $0 == "a=recvonly" }) else {
+                return
+            }
+            for line in currentSectionLines {
+                if line.hasPrefix("a=msid:") {
+                    appendLabel(from: String(line.dropFirst("a=msid:".count)))
+                } else if let range = line.range(of: " msid:") {
+                    appendLabel(from: String(line[range.upperBound...]))
+                }
+            }
+        }
+
+        for rawLine in sdp.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentSectionLines = [line]
+                currentMediaKind = line.hasPrefix("m=audio") ? "audio" : nil
+                currentMid = nil
+            } else {
+                if line.hasPrefix("a=mid:") {
+                    currentMid = String(line.dropFirst("a=mid:".count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                currentSectionLines.append(line)
+            }
+        }
+        flushCurrentSection()
+
+        return labels
+    }
+#endif
 
     private func stableRemoteAudioParticipantIds(
         in sdp: String,
@@ -753,7 +1998,162 @@ extension RTCSession {
         for share in relayStyleScreenShareAdvertisements(in: sdp, connection: connection) {
             append(share.participantId, trackId: share.trackId)
         }
+        if labels.isEmpty,
+           connection.localScreenTrack == nil,
+           connection.remoteScreenShareStopRequestedParticipantKeys.isEmpty,
+           !Self.oneToOneSfuIncomingScreenShareVideoMids(in: sdp).isEmpty,
+           let participantId = oneToOneSfuRemoteScreenParticipantId(in: connection),
+           Self.isPlausibleConferenceScreenShareParticipantId(participantId) {
+            append(participantId, trackId: nil)
+        }
+        if labels.isEmpty,
+           connection.localScreenTrack == nil,
+           connection.remoteScreenShareStopRequestedParticipantKeys.isEmpty,
+           !activeIncomingScreenShareVideoMids(in: sdp, connection: connection).isEmpty,
+           let relayParticipant = ambiguousRelayScreenParticipantId(in: connection),
+           Self.isPlausibleConferenceScreenShareParticipantId(relayParticipant) {
+            let relayKey = Self.conferenceParticipantIdentityKey(relayParticipant)
+            if !connection.remoteScreenShareStopRequestedParticipantKeys.contains(relayKey) {
+#if os(Android)
+                let hasLiveScreenReceiver = rtcClient.getRemoteScreenVideoTrack(peerConnection: connection.peerConnection) != nil
+#elseif canImport(WebRTC)
+                let hasLiveScreenReceiver = !liveScreenReceiverCandidates(in: connection).isEmpty
+#else
+                let hasLiveScreenReceiver = false
+#endif
+                if hasLiveScreenReceiver {
+                    append(relayParticipant, trackId: nil)
+                }
+            }
+        }
         return labels
+    }
+
+    func isRemoteScreenShareExplicitlyAdvertisedInSDP(
+        participantId: String,
+        remoteSdp: String,
+        connection: RTCConnection
+    ) -> Bool {
+        remoteScreenShareExplicitlyAdvertised(
+            participantId: participantId,
+            in: remoteSdp,
+            connection: connection
+        )
+    }
+
+    func isRemoteScreenShareExplicitlyStoppedInSDP(
+        participantId: String,
+        remoteSdp: String,
+        connection: RTCConnection,
+        screenIngressCeased: Bool = false
+    ) -> Bool {
+        ScreenShareGroupCallSDPPolicy.shouldTreatRemoteSharerAsStoppedAfterPreempt(
+            participantId: participantId,
+            stopWasRequested: true,
+            explicitInactiveParticipantIds: inactiveRemoteScreenParticipantIds(
+                in: remoteSdp,
+                connection: connection
+            ),
+            screenIngressCeased: screenIngressCeased
+        )
+    }
+
+    private func remoteScreenShareExplicitlyAdvertised(
+        participantId: String,
+        in sdp: String,
+        connection: RTCConnection
+    ) -> Bool {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return false }
+        let explicit = screenParticipantIds(in: sdp, connection: connection)
+        if explicit.contains(where: { Self.conferenceParticipantIdentityKey($0) == participantKey }) {
+            return true
+        }
+        return relayStyleScreenShareAdvertisements(in: sdp, connection: connection).contains {
+            Self.conferenceParticipantIdentityKey($0.participantId) == participantKey
+        }
+    }
+
+    private func shouldForceRemoveRemoteScreenShareAfterStopRequest(
+        participantId: String,
+        in connection: RTCConnection,
+        remoteSdp: String,
+        connectionId: String
+    ) async -> Bool {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty,
+              connection.remoteScreenShareStopRequestedParticipantKeys.contains(participantKey)
+        else { return false }
+
+        let ingressCeased = await remoteScreenIngressCeasedIndicatingStop(
+            connectionId: connectionId,
+            participantKey: participantKey
+        )
+        let explicitScreenAdvertisement = screenParticipantIds(in: remoteSdp, connection: connection).contains {
+            Self.conferenceParticipantIdentityKey($0) == participantKey
+        }
+        let flatObservationKey = remoteScreenIngressFlatObservationKey(
+            connectionId: connectionId,
+            participantKey: participantKey
+        )
+#if canImport(WebRTC)
+        let sustainedFlatObservation = remoteScreenIngressFlatSinceByKey[flatObservationKey].map {
+            Date().timeIntervalSince($0) >= ScreenShareGroupCallContract.preemptWaitIngressCeasedMinimumFlatSeconds
+        } ?? false
+#else
+        let sustainedFlatObservation = false
+#endif
+        let effectiveIngressCeased = ingressCeased || (!explicitScreenAdvertisement && sustainedFlatObservation)
+        return isRemoteScreenShareExplicitlyStoppedInSDP(
+            participantId: participantId,
+            remoteSdp: remoteSdp,
+            connection: connection,
+            screenIngressCeased: effectiveIngressCeased
+        )
+    }
+
+    private func shouldSkipRemoteScreenShareMapping(
+        participantId: String,
+        connection: RTCConnection,
+        remoteSdp: String
+    ) -> Bool {
+        if connection.localScreenTrack != nil {
+            return true
+        }
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return false }
+        if connection.remoteScreenShareStopRequestedParticipantKeys.contains(participantKey) {
+            return true
+        }
+        if connection.suppressedRemoteScreenShareParticipantIds.contains(participantKey) {
+            return !remoteScreenShareExplicitlyAdvertised(
+                participantId: participantId,
+                in: remoteSdp,
+                connection: connection
+            )
+        }
+        return false
+    }
+
+    /// True when the remote SDP still forwards camera for `participantId` but no longer forwards
+    /// active screen-share media (SFU stop-forward often uses `recvonly` on mid=2 without `screen_` msid).
+    private func isRemoteScreenShareStopForwardedInSdp(
+        participantId: String,
+        remoteSdp: String,
+        connection: RTCConnection
+    ) -> Bool {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return false }
+
+        let hasActiveCamera = stableRemoteCameraParticipantIds(in: remoteSdp, connection: connection)
+            .contains { Self.conferenceParticipantIdentityKey($0) == participantKey }
+        guard hasActiveCamera else { return false }
+
+        let stillAdvertised = stableRemoteScreenTrackLabels(in: remoteSdp, connection: connection)
+            .contains { Self.conferenceParticipantIdentityKey($0.participantId) == participantKey }
+        guard !stillAdvertised else { return false }
+
+        return activeIncomingScreenShareVideoMids(in: remoteSdp, connection: connection).isEmpty
     }
 
     private func inactiveRemoteScreenParticipantIds(
@@ -791,6 +2191,17 @@ extension RTCSession {
             }
         }
         flushCurrentSection()
+
+        for participantId in stableRemoteCameraParticipantIds(in: sdp, connection: connection) where !seen.contains(participantId) {
+            if isRemoteScreenShareStopForwardedInSdp(
+                participantId: participantId,
+                remoteSdp: sdp,
+                connection: connection
+            ) {
+                seen.insert(participantId)
+                participantIds.append(participantId)
+            }
+        }
 
         return participantIds
     }
@@ -886,14 +2297,24 @@ extension RTCSession {
             if line.hasPrefix("a=msid:") {
                 let remainder = String(line.dropFirst("a=msid:".count))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if let streamLabel = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).first {
-                    appendStreamLabel(String(streamLabel))
+                let parts = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+                if let streamLabel = parts.first {
+                    let before = ids.count
+                    appendStreamLabel(streamLabel)
+                    if ids.count == before, parts.count > 1 {
+                        appendStreamLabel(parts[1])
+                    }
                 }
             } else if let range = line.range(of: " msid:") {
                 let remainder = String(line[range.upperBound...])
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if let streamLabel = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).first {
-                    appendStreamLabel(String(streamLabel))
+                let parts = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+                if let streamLabel = parts.first {
+                    let before = ids.count
+                    appendStreamLabel(streamLabel)
+                    if ids.count == before, parts.count > 1 {
+                        appendStreamLabel(parts[1])
+                    }
                 }
             }
         }
@@ -923,14 +2344,24 @@ extension RTCSession {
             if line.hasPrefix("a=msid:") {
                 let remainder = String(line.dropFirst("a=msid:".count))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if let streamLabel = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).first {
-                    appendStreamLabel(String(streamLabel))
+                let parts = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+                if let streamLabel = parts.first {
+                    let before = ids.count
+                    appendStreamLabel(streamLabel)
+                    if ids.count == before, parts.count > 1 {
+                        appendStreamLabel(parts[1])
+                    }
                 }
             } else if let range = line.range(of: " msid:") {
                 let remainder = String(line[range.upperBound...])
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if let streamLabel = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).first {
-                    appendStreamLabel(String(streamLabel))
+                let parts = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+                if let streamLabel = parts.first {
+                    let before = ids.count
+                    appendStreamLabel(streamLabel)
+                    if ids.count == before, parts.count > 1 {
+                        appendStreamLabel(parts[1])
+                    }
                 }
             }
         }
@@ -962,21 +2393,26 @@ extension RTCSession {
             ids.append(participantId)
         }
 
+        func appendScreenLabels(from remainder: String) {
+            let parts = remainder
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .map(String.init)
+            guard let streamLabel = parts.first else { return }
+            let before = ids.count
+            appendScreenLabel(streamLabel)
+            if ids.count == before, parts.count > 1 {
+                appendScreenLabel(parts[1])
+            }
+        }
+
         for line in lines {
             if line.hasPrefix("a=msid:") {
                 let remainder = String(line.dropFirst("a=msid:".count))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                let parts = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-                for part in parts {
-                    appendScreenLabel(part)
-                }
+                appendScreenLabels(from: remainder)
             } else if let range = line.range(of: " msid:") {
                 let remainder = String(line[range.upperBound...])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                let parts = remainder.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-                for part in parts {
-                    appendScreenLabel(part)
-                }
+                appendScreenLabels(from: remainder)
             }
         }
 
@@ -987,28 +2423,62 @@ extension RTCSession {
         _ rawLabel: String,
         connection: RTCConnection
     ) -> String? {
-        var id = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty else { return nil }
-        guard !RTCSession.isScreenShareId(id) else { return nil }
-
-        if id.hasPrefix("streamId_") {
-            id = String(id.dropFirst("streamId_".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if id.hasSuffix("_") {
-            id = String(id.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        guard !id.isEmpty else { return nil }
-        guard UUID(uuidString: id) == nil else { return nil }
-        guard !RTCSession.isScreenShareId(id) else { return nil }
-
-        let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !local.isEmpty, id.caseInsensitiveCompare(local) == .orderedSame {
-            return nil
-        }
-
-        return id
+        Self.normalizedRemoteParticipantIdFromSfuMediaLabel(
+            rawLabel,
+            connectionId: connection.id,
+            localParticipantId: connection.localParticipantId
+        )
     }
+
+    #if canImport(WebRTC) && !os(Android)
+    private func appleSfuReceiverTrackMatchesProvisionedParticipant(
+        receiver: RTCRtpReceiver,
+        track: RTCVideoTrack,
+        provisioned: String,
+        connection: RTCConnection
+    ) -> Bool {
+        _ = receiver
+        let provisionedKey = Self.conferenceParticipantIdentityKey(provisioned)
+        guard !provisionedKey.isEmpty else { return false }
+
+        guard let remoteSdp = connection.peerConnection.remoteDescription?.sdp else { return false }
+
+        let owners = Self.advertisedRemoteCameraOwnersByTrackId(in: remoteSdp)
+        if let owner = owners[track.trackId],
+           Self.conferenceParticipantIdentityKey(owner) == provisionedKey {
+            return true
+        }
+
+        let advertised = advertisedSfuRemoteMediaTrackIds(
+            mediaKind: "video",
+            participantId: provisioned,
+            connection: connection
+        )
+        if !advertised.isEmpty {
+            return advertised.contains(track.trackId)
+        }
+
+        let cameraLabels = appleStableRemoteCameraTrackLabels(in: remoteSdp, connection: connection)
+        if let label = cameraLabels.first(where: {
+            $0.trackId?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) == track.trackId
+        }) {
+            return Self.conferenceParticipantIdentityKey(label.participantId) == provisionedKey
+        }
+
+        let trackId = track.trackId
+        guard let transceiver = connection.peerConnection.transceivers.first(where: {
+            $0.receiver.track?.trackId == trackId
+        }) else {
+            return false
+        }
+        let mid = transceiver.mid.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        guard !mid.isEmpty else { return false }
+        return cameraLabels.contains {
+            Self.conferenceParticipantIdentityKey($0.participantId) == provisionedKey
+                && $0.mid?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) == mid
+        }
+    }
+    #endif
 
     private func normalizedRemoteScreenParticipantIdFromSfuLabel(
         _ rawLabel: String,
@@ -1058,6 +2528,7 @@ extension RTCSession {
         return id
     }
 
+    #if canImport(WebRTC) && !os(Android)
     private func resolvedAppleRemoteScreenParticipantId(
         streamIds: [String],
         trackId: String,
@@ -1075,7 +2546,24 @@ extension RTCSession {
             trackId: trackId,
             fallback: fallback
         )
-        return normalizedKnownRemoteScreenParticipantId(resolved, connection: connection) ?? resolved
+        if Self.isTrueOneToOneSfuRoom(call: connection.call),
+           UUID(uuidString: resolved.trimmingCharacters(in: .whitespacesAndNewlines)) != nil,
+           let owner = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !owner.isEmpty {
+            return owner
+        }
+        if let known = normalizedKnownRemoteScreenParticipantId(resolved, connection: connection) {
+            return known
+        }
+        if let relay = resolvedAppleRelayScreenShareParticipantId(
+            streamIds: streamIds,
+            trackId: trackId,
+            connection: connection
+        ) {
+            return relay
+        }
+        return ""
     }
     #endif
 
@@ -1084,36 +2572,21 @@ extension RTCSession {
         _ rawLabel: String,
         connection: RTCConnection
     ) -> String? {
-        var id = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty else { return nil }
-        guard !RTCSession.isScreenShareId(id) else { return nil }
-
-        if id.hasPrefix("streamId_") {
-            id = String(id.dropFirst("streamId_".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if id.hasSuffix("_") {
-            id = String(id.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        guard !id.isEmpty else { return nil }
-        guard UUID(uuidString: id) == nil else { return nil }
-        guard !RTCSession.isScreenShareId(id) else { return nil }
-
-        let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !local.isEmpty, id.caseInsensitiveCompare(local) == .orderedSame {
-            return nil
-        }
-
-        return id
+        Self.normalizedRemoteParticipantIdFromSfuMediaLabel(
+            rawLabel,
+            connectionId: connection.id,
+            localParticipantId: connection.localParticipantId
+        )
     }
 
     private func stableRemoteCameraTrackLabels(
         in sdp: String,
         connection: RTCConnection
-    ) -> [(participantId: String, trackId: String?)] {
-        var labels: [(participantId: String, trackId: String?)] = []
+    ) -> [(participantId: String, trackId: String?, mid: String?)] {
+        var labels: [(participantId: String, trackId: String?, mid: String?)] = []
         var seen = Set<String>()
         var currentMediaKind: String?
+        var currentMid: String?
         var currentSectionLines: [String] = []
 
         func flushCurrentSection() {
@@ -1136,13 +2609,16 @@ extension RTCSession {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .split(whereSeparator: { $0 == " " || $0 == "\t" })
                     .map(String.init)
-                guard let streamLabel = parts.first,
-                      let participantId = androidNormalizedRemoteParticipantIdFromSfuStreamLabel(streamLabel, connection: connection)
-                else {
+                guard let streamLabel = parts.first else {
                     continue
                 }
+                let participantId = androidNormalizedRemoteParticipantIdFromSfuStreamLabel(streamLabel, connection: connection)
+                    ?? (parts.count > 1
+                        ? androidNormalizedRemoteParticipantIdFromSfuStreamLabel(parts[1], connection: connection)
+                        : nil)
+                guard let participantId else { continue }
                 guard seen.insert(participantId.lowercased()).inserted else { continue }
-                labels.append((participantId: participantId, trackId: parts.dropFirst().first))
+                labels.append((participantId: participantId, trackId: parts.dropFirst().first, mid: currentMid))
             }
         }
 
@@ -1153,13 +2629,283 @@ extension RTCSession {
                 flushCurrentSection()
                 currentSectionLines = [line]
                 currentMediaKind = line.hasPrefix("m=video") ? "video" : nil
+                currentMid = nil
             } else {
+                if line.hasPrefix("a=mid:") {
+                    currentMid = String(line.dropFirst("a=mid:".count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
                 currentSectionLines.append(line)
             }
         }
         flushCurrentSection()
 
         return labels
+    }
+
+    private func stableRemoteAudioTrackLabels(
+        in sdp: String,
+        connection: RTCConnection
+    ) -> [(participantId: String, trackId: String?, mid: String?)] {
+        var labels: [(participantId: String, trackId: String?, mid: String?)] = []
+        var seen = Set<String>()
+        var currentMediaKind: String?
+        var currentMid: String?
+        var currentSectionLines: [String] = []
+
+        func flushCurrentSection() {
+            guard currentMediaKind == "audio" else { return }
+            guard !currentSectionLines.contains(where: { $0 == "a=inactive" || $0 == "a=recvonly" }) else {
+                return
+            }
+
+            for line in currentSectionLines {
+                let remainder: String
+                if line.hasPrefix("a=msid:") {
+                    remainder = String(line.dropFirst("a=msid:".count))
+                } else if let range = line.range(of: " msid:") {
+                    remainder = String(line[range.upperBound...])
+                } else {
+                    continue
+                }
+
+                let parts = remainder
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    .map(String.init)
+                guard let streamLabel = parts.first else {
+                    continue
+                }
+                let participantId = androidNormalizedRemoteParticipantIdFromSfuStreamLabel(streamLabel, connection: connection)
+                    ?? (parts.count > 1
+                        ? androidNormalizedRemoteParticipantIdFromSfuStreamLabel(parts[1], connection: connection)
+                        : nil)
+                guard let participantId else { continue }
+                let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+                guard !participantKey.isEmpty, seen.insert(participantKey).inserted else { continue }
+                labels.append((participantId: participantId, trackId: parts.dropFirst().first, mid: currentMid))
+            }
+        }
+
+        for rawLine in sdp.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentSectionLines = [line]
+                currentMediaKind = line.hasPrefix("m=audio") ? "audio" : nil
+                currentMid = nil
+            } else {
+                if line.hasPrefix("a=mid:") {
+                    currentMid = String(line.dropFirst("a=mid:".count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                currentSectionLines.append(line)
+            }
+        }
+        flushCurrentSection()
+
+        return labels
+    }
+
+    func androidResolvedRemoteCameraTrackId(
+        participantId: String,
+        in connection: RTCConnection
+    ) -> String? {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        if let exact = connection.androidRemoteCameraResolvedTrackIdsByParticipantId[participantId] {
+            return exact
+        }
+        return connection.androidRemoteCameraResolvedTrackIdsByParticipantId.first { key, _ in
+            Self.conferenceParticipantIdentityKey(key) == participantKey
+        }?.value
+    }
+
+    func androidResolvedRemoteCameraMid(
+        participantId: String,
+        in connection: RTCConnection
+    ) -> String? {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        if let exact = connection.androidRemoteCameraResolvedMidsByParticipantId[participantId] {
+            return exact
+        }
+        return connection.androidRemoteCameraResolvedMidsByParticipantId.first { key, _ in
+            Self.conferenceParticipantIdentityKey(key) == participantKey
+        }?.value
+    }
+
+    func androidRemoteVideoTracksShareNativeSource(_ lhs: RTCVideoTrack, _ rhs: RTCVideoTrack) -> Bool {
+        AndroidRemoteVideoTrackAttachPolicy.tracksShareEffectiveNativeSource(
+            lhsTrackId: lhs.trackIdIfAvailable,
+            rhsTrackId: rhs.trackIdIfAvailable,
+            lhsIsLive: lhs.isLiveVideoTrack,
+            rhsIsLive: rhs.isLiveVideoTrack,
+            platformTracksIdentical: lhs.platformTrack === rhs.platformTrack
+        )
+    }
+
+    func androidResolveLiveRemoteCameraTrackFromAdvertisedMedia(
+        advertisedTrackId: String?,
+        advertisedMid: String?,
+        connection: RTCConnection
+    ) -> RTCVideoTrack? {
+        if let advertisedMid = advertisedMid?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !advertisedMid.isEmpty,
+           let midTrack = rtcClient.getRemoteVideoTrackByMid(
+            peerConnection: connection.peerConnection,
+            mid: advertisedMid
+           ),
+           midTrack.isLiveVideoTrack {
+            return midTrack
+        }
+        if let advertisedTrackId = advertisedTrackId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !advertisedTrackId.isEmpty {
+            let exactTrack = rtcClient.getRemoteVideoTrackById(
+                peerConnection: connection.peerConnection,
+                trackId: advertisedTrackId
+            )
+            if let exactTrack,
+               exactTrack.trackIdIfAvailable != nil,
+               exactTrack.isLiveVideoTrack {
+                return exactTrack
+            }
+            return nil
+        }
+        return nil
+    }
+
+    func androidResolveLiveRemoteCameraTrack(
+        participantId: String,
+        connection: inout RTCConnection,
+        remoteSdp: String? = nil,
+        preferFreshFromPeerConnection: Bool = false
+    ) -> RTCVideoTrack? {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        guard !participantKey.isEmpty else { return nil }
+
+        if let remoteSdp = remoteSdp?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !remoteSdp.isEmpty {
+            let labels = stableRemoteCameraTrackLabels(in: remoteSdp, connection: connection)
+            if let label = labels.first(where: { Self.conferenceParticipantIdentityKey($0.participantId) == participantKey }),
+               let liveTrack = androidResolveLiveRemoteCameraTrackFromAdvertisedMedia(
+                advertisedTrackId: label.trackId,
+                advertisedMid: label.mid,
+                connection: connection
+               ),
+               liveTrack.isLiveVideoTrack {
+                let resolvedTrackId = liveTrack.trackIdIfAvailable ?? label.trackId
+                if let resolvedTrackId, !resolvedTrackId.isEmpty {
+                    rememberAndroidResolvedRemoteCameraMedia(
+                        participantId: label.participantId,
+                        trackId: resolvedTrackId,
+                        mid: label.mid,
+                        in: &connection
+                    )
+                }
+                return liveTrack
+            }
+        }
+
+        if let storedTrackId = androidResolvedRemoteCameraTrackId(participantId: participantId, in: connection),
+           let exactTrack = rtcClient.getRemoteVideoTrackById(
+            peerConnection: connection.peerConnection,
+            trackId: storedTrackId
+           ),
+           exactTrack.isLiveVideoTrack {
+            return exactTrack
+        }
+
+        if let storedMid = androidResolvedRemoteCameraMid(participantId: participantId, in: connection),
+           let midTrack = rtcClient.getRemoteVideoTrackByMid(
+            peerConnection: connection.peerConnection,
+            mid: storedMid
+           ),
+           midTrack.isLiveVideoTrack {
+            return midTrack
+        }
+
+        return nil
+    }
+
+    func rememberAndroidResolvedRemoteCameraMedia(
+        participantId: String,
+        trackId: String,
+        mid: String?,
+        in connection: inout RTCConnection
+    ) {
+        connection.androidRemoteCameraResolvedTrackIdsByParticipantId[participantId] = trackId
+        if let mid = mid?.trimmingCharacters(in: .whitespacesAndNewlines), !mid.isEmpty {
+            connection.androidRemoteCameraResolvedMidsByParticipantId[participantId] = mid
+        }
+    }
+
+    func clearAndroidResolvedRemoteCameraMedia(
+        participantId: String,
+        in connection: inout RTCConnection
+    ) {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        for key in connection.androidRemoteCameraResolvedTrackIdsByParticipantId.keys
+        where key == participantId || Self.conferenceParticipantIdentityKey(key) == participantKey {
+            connection.androidRemoteCameraResolvedTrackIdsByParticipantId.removeValue(forKey: key)
+        }
+        for key in connection.androidRemoteCameraResolvedMidsByParticipantId.keys
+        where key == participantId || Self.conferenceParticipantIdentityKey(key) == participantKey {
+            connection.androidRemoteCameraResolvedMidsByParticipantId.removeValue(forKey: key)
+        }
+    }
+
+    func installAndroidGroupReceiverVideoCryptorIfReady(
+        participantId: String,
+        connection: RTCConnection,
+        trackId: String
+    ) {
+        guard enableEncryption else { return }
+        let normId = connection.id.normalizedConnectionId
+        guard !sfuRenegotiationInFlightConnectionIds.contains(normId) else { return }
+        rtcClient.createReceiverEncryptedFrame(
+            participant: participantId,
+            connectionId: connection.id,
+            trackKind: "video",
+            trackId: trackId
+        )
+    }
+
+    func reconcileAndroidReceiverFrameCryptorsAfterSfuRenegotiation(connectionId: String) async {
+        guard enableEncryption else { return }
+        guard let connection = await connectionManager.findConnection(with: connectionId) else { return }
+        guard isGroupCallConnection(connection.id) else { return }
+
+        for (participantId, track) in connection.remoteVideoTracksByParticipantId {
+            let trackId = track.trackIdIfAvailable
+                ?? androidResolvedRemoteCameraTrackId(participantId: participantId, in: connection)
+            guard let trackId, !trackId.isEmpty else { continue }
+            rtcClient.createReceiverEncryptedFrame(
+                participant: participantId,
+                connectionId: connection.id,
+                trackKind: "video",
+                trackId: trackId
+            )
+        }
+
+        for (participantId, track) in connection.remoteAudioTracksByParticipantId {
+            guard let trackId = track.trackIdIfAvailable, !trackId.isEmpty else { continue }
+            rtcClient.createReceiverEncryptedFrame(
+                participant: participantId,
+                connectionId: connection.id,
+                trackKind: "audio",
+                trackId: trackId
+            )
+        }
+
+        for (participantId, track) in connection.remoteScreenTracksByParticipantId {
+            guard let trackId = track.trackIdIfAvailable, !trackId.isEmpty else { continue }
+            rtcClient.createReceiverEncryptedFrame(
+                participant: participantId,
+                connectionId: connection.id,
+                trackKind: "screen",
+                trackId: trackId
+            )
+        }
     }
 
     func reconcileAndroidRemoteParticipantCameraTracksAfterSetRemoteSDP(
@@ -1176,20 +2922,64 @@ extension RTCSession {
             guard shouldSurfaceRemoteParticipantCameraTrack(connection: connection, participantId: label.participantId) else {
                 continue
             }
-            if let existing = connection.remoteVideoTracksByParticipantId[label.participantId],
-               label.trackId == nil || existing.trackId == label.trackId {
-                continue
+            let videoTrack: RTCVideoTrack?
+            let resolutionSource: String
+            let advertisedTrackId = label.trackId?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let advertisedMid = label.mid?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if advertisedTrackId != nil || advertisedMid != nil {
+                videoTrack = androidResolveLiveRemoteCameraTrackFromAdvertisedMedia(
+                    advertisedTrackId: advertisedTrackId,
+                    advertisedMid: advertisedMid,
+                    connection: connection
+                )
+                if videoTrack?.trackIdIfAvailable != nil,
+                   advertisedTrackId != nil,
+                   !advertisedTrackId!.isEmpty {
+                    resolutionSource = "trackId"
+                } else if videoTrack != nil, advertisedMid != nil, !advertisedMid!.isEmpty {
+                    resolutionSource = advertisedTrackId?.isEmpty == false ? "midAfterTrackIdMiss" : "mid"
+                } else {
+                    resolutionSource = "unresolved"
+                }
+            } else {
+                videoTrack = nil
+                resolutionSource = "unresolved"
             }
-
-            let videoTrack = label.trackId.flatMap {
-                rtcClient.getRemoteVideoTrackById(peerConnection: connection.peerConnection, trackId: $0)
-            } ?? rtcClient.getRemoteVideoTrack(peerConnection: connection.peerConnection)
-            guard let videoTrack else {
+            logger.log(
+                level: videoTrack?.trackIdIfAvailable == nil ? .warning : .info,
+                message: "Android SFU camera label resolution participant=\(label.participantId) advertisedTrackId=\(advertisedTrackId ?? "<nil>") advertisedMid=\(advertisedMid ?? "<nil>") resolution=\(resolutionSource) resolvedTrackId=\(videoTrack?.trackIdIfAvailable ?? "<nil>") connection=\(connection.id)"
+            )
+            guard let videoTrack,
+                  let videoTrackId = videoTrack.trackIdIfAvailable else {
                 logger.log(
                     level: .warning,
                     message: "SFU SDP advertised Android camera msid for participant=\(label.participantId) but no live video receiver exists for connection=\(connection.id)"
                 )
                 continue
+            }
+
+            if let existing = connection.remoteVideoTracksByParticipantId[label.participantId] {
+                let existingTrackId = existing.trackIdIfAvailable
+                if existing.platformTrack === videoTrack.platformTrack, existingTrackId != nil {
+                    rememberAndroidResolvedRemoteCameraMedia(
+                        participantId: label.participantId,
+                        trackId: videoTrackId,
+                        mid: advertisedMid,
+                        in: &connection
+                    )
+                    installAndroidGroupReceiverVideoCryptorIfReady(
+                        participantId: label.participantId,
+                        connection: connection,
+                        trackId: videoTrackId
+                    )
+                    continue
+                }
+                if existingTrackId == videoTrackId {
+                    logger.log(
+                        level: .info,
+                        message: "Replacing stale Android SFU camera wrapper participant=\(label.participantId) trackId=\(videoTrackId) connection=\(connection.id)"
+                    )
+                }
             }
 
             let placeholderParticipants = connection.remoteVideoTracksByParticipantId.compactMap { participantId, existingTrack -> String? in
@@ -1198,7 +2988,9 @@ extension RTCSession {
                 let isPlaceholder = UUID(uuidString: participantId.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
                     || participantKey == connection.id.normalizedConnectionId.lowercased()
                     || participantKey == connection.remoteParticipantId.normalizedConnectionId.lowercased()
-                guard isPlaceholder, existingTrack.trackId == videoTrack.trackId else { return nil }
+                guard isPlaceholder else { return nil }
+                guard let existingTrackId = existingTrack.trackIdIfAvailable else { return participantId }
+                guard existingTrackId == videoTrackId else { return nil }
                 return participantId
             }
 
@@ -1213,13 +3005,33 @@ extension RTCSession {
                 )
             }
 
-            connection.remoteVideoTrack = videoTrack
-            connection.remoteVideoTracksByParticipantId[label.participantId] = videoTrack
+            let claimSucceeded = Self.claimRemoteCameraTrack(
+                videoTrack,
+                participantId: label.participantId,
+                in: &connection
+            )
+            guard claimSucceeded else {
+                await connectionManager.updateConnection(id: connection.id, with: connection)
+                logger.log(
+                    level: .warning,
+                    message: "Rejected duplicate Android SFU camera receiver claim participant=\(label.participantId) trackId=\(videoTrackId) connection=\(connection.id)"
+                )
+                continue
+            }
+            rememberAndroidResolvedRemoteCameraMedia(
+                participantId: label.participantId,
+                trackId: videoTrackId,
+                mid: advertisedMid,
+                in: &connection
+            )
+            if connection.remoteVideoTracksByParticipantId.count == 1 {
+                connection.remoteVideoTrack = videoTrack
+            }
             await connectionManager.updateConnection(id: connection.id, with: connection)
 
             logger.log(
                 level: .info,
-                message: "Mapped Android SFU camera receiver to participant=\(label.participantId) trackId=\(videoTrack.trackId) connection=\(connection.id)"
+                message: "Mapped Android SFU camera receiver to participant=\(label.participantId) trackId=\(videoTrackId) connection=\(connection.id)"
             )
             notifyRemoteParticipantTrackChanged(
                 RemoteParticipantTrackEvent(connectionId: connection.id, participantId: label.participantId, kind: "video", isActive: true)
@@ -1229,17 +3041,112 @@ extension RTCSession {
                     connectionId: connection.id,
                     participantId: label.participantId,
                     kind: "video",
-                    trackId: videoTrack.trackId
+                    trackId: videoTrackId
+                )
+            }
+            if enableEncryption {
+                installAndroidGroupReceiverVideoCryptorIfReady(
+                    participantId: label.participantId,
+                    connection: connection,
+                    trackId: videoTrackId
+                )
+            }
+        }
+    }
+
+    func reconcileAndroidRemoteParticipantAudioTracksAfterSetRemoteSDP(
+        _ remoteSdp: String,
+        connectionId: String
+    ) async {
+        guard var connection = await connectionManager.findConnection(with: connectionId) else { return }
+        guard isGroupCallConnection(connection.id) else { return }
+
+        let labels = stableRemoteAudioTrackLabels(in: remoteSdp, connection: connection)
+        guard !labels.isEmpty else { return }
+
+        for label in labels {
+            let audioTrack: RTCAudioTrack?
+            if let advertisedTrackId = label.trackId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !advertisedTrackId.isEmpty {
+                let exactTrack = rtcClient.getRemoteAudioTrackById(
+                    peerConnection: connection.peerConnection,
+                    trackId: advertisedTrackId
+                )
+                if let exactTrack, exactTrack.trackIdIfAvailable != nil {
+                    audioTrack = exactTrack
+                } else if let advertisedMid = label.mid?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !advertisedMid.isEmpty {
+                    audioTrack = rtcClient.getRemoteAudioTrackByMid(
+                        peerConnection: connection.peerConnection,
+                        mid: advertisedMid
+                    )
+                } else {
+                    audioTrack = nil
+                }
+            } else if let advertisedMid = label.mid?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !advertisedMid.isEmpty {
+                audioTrack = rtcClient.getRemoteAudioTrackByMid(
+                    peerConnection: connection.peerConnection,
+                    mid: advertisedMid
+                )
+            } else {
+                audioTrack = nil
+            }
+
+            guard let audioTrack,
+                  let audioTrackId = audioTrack.trackIdIfAvailable else {
+                logger.log(
+                    level: .warning,
+                    message: "SFU SDP advertised Android audio msid for participant=\(label.participantId) but no live audio receiver exists for connection=\(connection.id)"
+                )
+                continue
+            }
+
+            audioTrack._isEnabled = true
+            if let existing = connection.remoteAudioTracksByParticipantId[label.participantId] {
+                let existingTrackId = existing.trackIdIfAvailable
+                if existing === audioTrack, existingTrackId != nil {
+                    if enableEncryption {
+                        rtcClient.createReceiverEncryptedFrame(
+                            participant: label.participantId,
+                            connectionId: connection.id,
+                            trackKind: "audio",
+                            trackId: audioTrackId
+                        )
+                    }
+                    continue
+                }
+                if existingTrackId == audioTrackId {
+                    logger.log(
+                        level: .info,
+                        message: "Replacing stale Android SFU audio wrapper participant=\(label.participantId) trackId=\(audioTrackId) connection=\(connection.id)"
+                    )
+                }
+            }
+
+            connection.remoteAudioTracksByParticipantId[label.participantId] = audioTrack
+            await connectionManager.updateConnection(id: connection.id, with: connection)
+
+            if let mediaDelegate {
+                await mediaDelegate.didAddRemoteTrack(
+                    connectionId: connection.id,
+                    participantId: label.participantId,
+                    kind: "audio",
+                    trackId: audioTrackId
                 )
             }
             if enableEncryption {
                 rtcClient.createReceiverEncryptedFrame(
                     participant: label.participantId,
                     connectionId: connection.id,
-                    trackKind: "video",
-                    trackId: videoTrack.trackId
+                    trackKind: "audio",
+                    trackId: audioTrackId
                 )
             }
+            logger.log(
+                level: .info,
+                message: "Mapped Android SFU audio receiver to participant=\(label.participantId) trackId=\(audioTrackId) connection=\(connection.id)"
+            )
         }
     }
 
@@ -1252,10 +3159,16 @@ extension RTCSession {
 
         let advertisedLabels = androidStableRemoteScreenTrackLabels(in: remoteSdp, connection: connection)
         let advertisedParticipants = Set(advertisedLabels.map(\.participantId))
+        let explicitlyInactiveParticipants = Set(inactiveRemoteScreenParticipantIds(in: remoteSdp, connection: connection))
 
         func isStillAdvertised(_ participantId: String) -> Bool {
             let participantKey = Self.conferenceParticipantIdentityKey(participantId)
             return advertisedParticipants.contains { Self.conferenceParticipantIdentityKey($0) == participantKey }
+        }
+
+        func isExplicitlyInactive(_ participantId: String) -> Bool {
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            return explicitlyInactiveParticipants.contains { Self.conferenceParticipantIdentityKey($0) == participantKey }
         }
 
         func existingScreenTrack(for participantId: String, in connection: RTCConnection) -> RTCVideoTrack? {
@@ -1280,19 +3193,43 @@ extension RTCSession {
             return screenTrack.trackId != cameraTrackId
         }
 
-        for participantId in Array(connection.remoteScreenTracksByParticipantId.keys) where !isStillAdvertised(participantId) {
-            if androidHasLiveScreenReceiver(for: participantId, in: connection) {
+        var removedScreenParticipants = Set<String>()
+        for participantId in Array(connection.remoteScreenTracksByParticipantId.keys) {
+            let shouldReconcileRemoval = !isStillAdvertised(participantId) || isExplicitlyInactive(participantId)
+            guard shouldReconcileRemoval else { continue }
+
+            let stopForwarded = isRemoteScreenShareStopForwardedInSdp(
+                participantId: participantId,
+                remoteSdp: remoteSdp,
+                connection: connection
+            )
+            if !isExplicitlyInactive(participantId),
+               !stopForwarded,
+               androidHasLiveScreenReceiver(for: participantId, in: connection) {
                 logger.log(
                     level: .info,
                     message: "Keeping live Android remote screen-share receiver during SDP reconcile participant=\(participantId) connection=\(connection.id)"
                 )
-                notifyRemoteScreenTrackChanged(
-                    RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: true)
-                )
                 continue
             }
-            connection.remoteScreenTracksByParticipantId.removeValue(forKey: participantId)
+
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            let staleScreenKeys = connection.remoteScreenTracksByParticipantId.keys.filter {
+                Self.conferenceParticipantIdentityKey($0) == participantKey
+            }
+            for staleKey in staleScreenKeys {
+                connection.remoteScreenTracksByParticipantId.removeValue(forKey: staleKey)
+            }
             connection.remoteScreenTrack = nil
+            if !participantKey.isEmpty {
+                connection.suppressedRemoteScreenShareParticipantIds.insert(participantKey)
+                connection.remoteScreenShareStopRequestedParticipantKeys.remove(participantKey)
+                clearRemoteScreenIngressFlatObservation(
+                    connectionId: connection.id,
+                    participantKey: participantKey
+                )
+            }
+            removedScreenParticipants.insert(participantId)
             await connectionManager.updateConnection(id: connection.id, with: connection)
             logger.log(
                 level: .info,
@@ -1309,6 +3246,20 @@ extension RTCSession {
 
         for label in advertisedLabels {
             let participantId = label.participantId
+            let advertisedParticipantKey = Self.conferenceParticipantIdentityKey(participantId)
+            if !advertisedParticipantKey.isEmpty,
+               removedScreenParticipants.contains(where: {
+                   Self.conferenceParticipantIdentityKey($0) == advertisedParticipantKey
+               }) {
+                continue
+            }
+            if shouldSkipRemoteScreenShareMapping(
+                participantId: participantId,
+                connection: connection,
+                remoteSdp: remoteSdp
+            ) {
+                continue
+            }
             if let existing = existingScreenTrack(for: participantId, in: connection) {
                 consumedTrackIds.insert(existing.trackId)
                 notifyRemoteScreenTrackChanged(
@@ -1352,7 +3303,7 @@ extension RTCSession {
                 rtcClient.createReceiverEncryptedFrame(
                     participant: participantId,
                     connectionId: connection.id,
-                    trackKind: "video",
+                    trackKind: "screen",
                     trackId: screenTrack.trackId
                 )
             }
@@ -1404,6 +3355,14 @@ extension RTCSession {
         )
         for share in relayStyleShares {
             append(share.participantId, trackId: share.trackId)
+        }
+        if labels.isEmpty,
+           connection.localScreenTrack == nil,
+           connection.remoteScreenShareStopRequestedParticipantKeys.isEmpty,
+           !Self.oneToOneSfuIncomingScreenShareVideoMids(in: sdp).isEmpty,
+           let participantId = oneToOneSfuRemoteScreenParticipantId(in: connection),
+           Self.isPlausibleConferenceScreenShareParticipantId(participantId) {
+            append(participantId, trackId: nil)
         }
 
         return labels
@@ -1458,6 +3417,7 @@ extension RTCSession {
 
         dropUuidEntries(&updated.videoReceiverCryptorsByParticipantId)
         dropUuidEntries(&updated.audioReceiverCryptorsByParticipantId)
+        dropUuidEntries(&updated.screenReceiverCryptorsByParticipantId)
 
         // The legacy "single" receiver-cryptor slots can also hold a UUID-bound cryptor that
         // shares the underlying RTPReceiver. Replacing the slot without disabling first would
@@ -1469,6 +3429,13 @@ extension RTCSession {
         if audioSlotIsUuidAlias, let existingAudio = updated.audioFrameCryptor {
             existingAudio.enabled = false
             updated.audioFrameCryptor = nil
+        }
+        updated.screenReceiverCryptorBindingsByParticipantId = updated.screenReceiverCryptorBindingsByParticipantId.filter { key, _ in
+            guard UUID(uuidString: key.trimmingCharacters(in: .whitespacesAndNewlines)) != nil else { return true }
+            if let stableNorm, key.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(stableNorm) == .orderedSame {
+                return true
+            }
+            return false
         }
         return updated
     }
@@ -1535,6 +3502,410 @@ extension RTCSession {
         return true
     }
 
+    /// Remote track owner id for 1:1 SFU renderer/track resolution — maps room-routed
+    /// `remoteParticipantId` to the peer's secretName (same rules as frame-key provisioning).
+    func oneToOneSfuRemoteTrackOwnerId(connection: RTCConnection) -> String {
+        if let owner = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !owner.isEmpty {
+            return owner
+        }
+        return connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+#if canImport(WebRTC) && !os(Android)
+    /// Rebinds receiver FrameCryptors to live RTP receivers after SFU renegotiation completes.
+    ///
+    /// Receiver cryptors are often created during `setRemoteDescription` (inside reconcile) before
+    /// the answering side applies its local description. WebRTC can swap the active `RTCRtpReceiver`
+    /// when the answer is applied, leaving decrypt on a stale receiver while RTP keeps flowing.
+    func reconcileAppleReceiverFrameCryptorsAfterSfuRenegotiation(connectionId: String) async {
+        guard enableEncryption else { return }
+        guard frameEncryptionKeyMode == .perParticipant else { return }
+        guard let connection = await connectionManager.findConnection(with: connectionId) else { return }
+        guard isGroupCallConnection(connection.id) else { return }
+
+        let localParticipantId = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remoteParticipantIds = lastFrameKeyIndexByParticipantId.keys.filter { participantId in
+            let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return false }
+            guard UUID(uuidString: trimmed) == nil else { return false }
+            return trimmed.caseInsensitiveCompare(localParticipantId) != .orderedSame
+        }
+        guard !remoteParticipantIds.isEmpty else { return }
+
+        for participantId in remoteParticipantIds {
+            guard appleGroupParticipantReceiverCryptorsNeedRebind(
+                connection: connection,
+                participantId: participantId
+            ) else {
+                continue
+            }
+            do {
+                try await appleReattachReceiverFrameCryptorsAfterFrameKeyInstall(
+                    connection: connection,
+                    provisionedRemoteTrackOwnerId: participantId)
+                logger.log(
+                    level: .info,
+                    message: "Rebound SFU receiver FrameCryptors after renegotiation participantId='\(participantId)' connection=\(connectionId)")
+            } catch {
+                logger.log(
+                    level: .warning,
+                    message: "Failed to rebind SFU receiver FrameCryptors after renegotiation participantId='\(participantId)' connection=\(connectionId): \(error)")
+            }
+        }
+    }
+
+    private func advertisedSfuRemoteMediaTrackIds(
+        mediaKind: String,
+        participantId: String,
+        connection: RTCConnection
+    ) -> Set<String> {
+        guard let sdp = connection.peerConnection.remoteDescription?.sdp else { return [] }
+
+        var result: Set<String> = []
+        var currentMediaKind: String?
+        var currentSectionLines: [String] = []
+
+        func flushCurrentSection() {
+            guard currentMediaKind == mediaKind else { return }
+            guard !currentSectionLines.contains(where: { $0 == "a=inactive" || $0 == "a=recvonly" }) else {
+                return
+            }
+
+            for entry in Self.sfuSdpMsidEntries(inSectionLines: currentSectionLines) {
+                guard let owner = normalizedRemoteParticipantIdFromSfuStreamLabel(entry.streamLabel, connection: connection),
+                      owner.caseInsensitiveCompare(participantId) == .orderedSame,
+                      let trackId = entry.trackId
+                else {
+                    continue
+                }
+                result.insert(trackId)
+            }
+        }
+
+        for rawLine in sdp.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentSectionLines = [line]
+                if line.hasPrefix("m=audio") {
+                    currentMediaKind = "audio"
+                } else if line.hasPrefix("m=video") {
+                    currentMediaKind = "video"
+                } else {
+                    currentMediaKind = nil
+                }
+            } else {
+                currentSectionLines.append(line)
+            }
+        }
+        flushCurrentSection()
+
+        return result
+    }
+
+    /// Resolves the live inbound remote camera track for a 1:1 SFU room using the same SDP/map
+    /// rules as receiver FrameCryptor binding — never the first video transceiver placeholder.
+    ///
+    /// The participant id must be the actual remote track owner (peer secretName), not
+    /// `connection.remoteParticipantId`: in 1:1 SFU rooms that property is the **room id**
+    /// (signaling routing), while the SDP advertises msid owners like `echo`/`nudge`. Matching
+    /// against the room id makes the owner lookup miss and callers fall back to the positional
+    /// resolver, which returns the placeholder receive half of our own send m-line.
+    func resolveOneToOneSfuInboundRemoteCameraVideoTrack(
+        connection: RTCConnection
+    ) -> RTCVideoTrack? {
+        let remotePid = oneToOneSfuRemoteTrackOwnerId(connection: connection)
+        guard !remotePid.isEmpty else { return nil }
+        return appleResolveLiveVideoReceiver(for: remotePid, connection: connection)?.track
+    }
+
+    private func appleResolveLiveVideoReceiver(
+        for participantId: String,
+        connection: RTCConnection
+    ) -> (receiver: RTCRtpReceiver, track: RTCVideoTrack)? {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let advertised = advertisedSfuRemoteMediaTrackIds(
+            mediaKind: "video",
+            participantId: trimmed,
+            connection: connection
+        )
+
+        let participantKey = Self.conferenceParticipantIdentityKey(trimmed)
+        let mappedTrack = connection.remoteVideoTracksByParticipantId[trimmed]
+            ?? connection.remoteVideoTracksByParticipantId.first(where: {
+                Self.conferenceParticipantIdentityKey($0.key) == participantKey
+            })?.value
+
+        // Trust the participant map only while it agrees with what the SDP advertises for this
+        // participant. A stale map entry (e.g. the placeholder receive track of our own send
+        // m-line in 1:1 SFU) would otherwise mask the receiver that actually carries their RTP.
+        if let mappedTrack,
+           advertised.isEmpty || advertised.contains(mappedTrack.trackId),
+           let receiver = connection.peerConnection.receivers.first(where: {
+               guard let track = $0.track as? RTCVideoTrack,
+                     track.readyState != .ended,
+                     !RTCSession.isScreenShareId(track.trackId)
+               else { return false }
+               return track === mappedTrack || track.trackId == mappedTrack.trackId
+           }),
+           let track = receiver.track as? RTCVideoTrack {
+            return (receiver, track)
+        }
+
+        guard !advertised.isEmpty else { return nil }
+
+        let matches: [(receiver: RTCRtpReceiver, track: RTCVideoTrack)] = connection.peerConnection.receivers.compactMap { receiver in
+            guard let track = receiver.track as? RTCVideoTrack,
+                  track.readyState != .ended,
+                  !RTCSession.isScreenShareId(track.trackId),
+                  advertised.contains(track.trackId)
+            else {
+                return nil
+            }
+            return (receiver, track)
+        }
+        if matches.count == 1, let match = matches.first { return match }
+        if matches.count > 1 {
+            let namedPrefix = "video_\(participantKey)".lowercased()
+            if let named = matches.first(where: { $0.track.trackId.lowercased().hasPrefix(namedPrefix) }) {
+                return named
+            }
+        }
+        return nil
+    }
+
+    private func appleResolveLiveAudioReceiver(
+        for participantId: String,
+        connection: RTCConnection
+    ) -> (receiver: RTCRtpReceiver, track: RTCAudioTrack)? {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let advertised = advertisedSfuRemoteMediaTrackIds(
+            mediaKind: "audio",
+            participantId: trimmed,
+            connection: connection
+        )
+
+        // See appleResolveLiveVideoReceiver: only trust the map while it matches advertised ids.
+        if let mappedTrack = connection.remoteAudioTracksByParticipantId[trimmed],
+           advertised.isEmpty || advertised.contains(mappedTrack.trackId),
+           let receiver = connection.peerConnection.receivers.first(where: {
+               guard let track = $0.track as? RTCAudioTrack,
+                     track.readyState != .ended
+               else { return false }
+               return track === mappedTrack || track.trackId == mappedTrack.trackId
+           }),
+           let track = receiver.track as? RTCAudioTrack {
+            return (receiver, track)
+        }
+
+        guard !advertised.isEmpty else { return nil }
+
+        let matches: [(receiver: RTCRtpReceiver, track: RTCAudioTrack)] = connection.peerConnection.receivers.compactMap { receiver in
+            guard let track = receiver.track as? RTCAudioTrack,
+                  track.readyState != .ended,
+                  advertised.contains(track.trackId)
+            else {
+                return nil
+            }
+            return (receiver, track)
+        }
+        guard matches.count == 1, let match = matches.first else { return nil }
+        return match
+    }
+
+    private func appleResolveLiveScreenReceiver(
+        for participantId: String,
+        connection: RTCConnection
+    ) -> (receiver: RTCRtpReceiver, track: RTCVideoTrack)? {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        func receiver(matching liveTrack: RTCVideoTrack) -> RTCRtpReceiver? {
+            connection.peerConnection.receivers.first {
+                guard let track = $0.track as? RTCVideoTrack,
+                      track.readyState != .ended
+                else { return false }
+                return track === liveTrack || track.trackId == liveTrack.trackId
+            }
+        }
+
+        let mappedTrack = connection.remoteScreenTracksByParticipantId[trimmed]
+            ?? connection.remoteScreenTracksByParticipantId.first {
+                Self.conferenceParticipantIdentityKey($0.key) == Self.conferenceParticipantIdentityKey(trimmed)
+            }?.value
+
+        let remoteSdp = connection.peerConnection.remoteDescription?.sdp ?? ""
+        var activeScreenMids = Self.remoteActiveIncomingScreenShareVideoMids(in: remoteSdp)
+            .union(Self.sfuRelayIncomingScreenShareVideoMids(in: remoteSdp))
+        if Self.isTrueOneToOneSfuRoom(call: connection.call) {
+            activeScreenMids.formUnion(Self.oneToOneSfuIncomingScreenShareVideoMids(in: remoteSdp))
+        }
+
+        if let mappedTrack,
+           let liveTrack = Self.resolveLiveGroupParticipantScreenTrack(
+            storedTrackId: mappedTrack.trackId,
+            participantId: trimmed,
+            in: connection.peerConnection,
+            cameraTrackIds: Set(connection.remoteVideoTracksByParticipantId.values.map(\.trackId)),
+            activeIncomingScreenMids: activeScreenMids
+           ),
+           let liveReceiver = receiver(matching: liveTrack) {
+            return (liveReceiver, liveTrack)
+        }
+
+        if let mappedTrack,
+           mappedTrack.readyState != .ended,
+           let mappedReceiver = receiver(matching: mappedTrack) {
+            return (mappedReceiver, mappedTrack)
+        }
+
+        let advertisedTrackIds = Set(
+            stableRemoteScreenTrackLabels(in: remoteSdp, connection: connection)
+                .filter {
+                    Self.conferenceParticipantIdentityKey($0.participantId)
+                        == Self.conferenceParticipantIdentityKey(trimmed)
+                }
+                .compactMap { $0.trackId?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+        guard !advertisedTrackIds.isEmpty else { return nil }
+        let matches: [(receiver: RTCRtpReceiver, track: RTCVideoTrack)] = connection.peerConnection.receivers.compactMap { candidate in
+            guard let track = candidate.track as? RTCVideoTrack,
+                  track.readyState != .ended,
+                  advertisedTrackIds.contains(track.trackId)
+            else { return nil }
+            return (candidate, track)
+        }
+        guard matches.count == 1, let match = matches.first else { return nil }
+        return match
+    }
+
+    private func appleGroupParticipantReceiverCryptorsNeedRebind(
+        connection: RTCConnection,
+        participantId: String
+    ) -> Bool {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        if let audioBinding = connection.audioReceiverCryptorBindingsByParticipantId[trimmed],
+           connection.audioReceiverCryptorsByParticipantId[trimmed] != nil,
+           let audioMatch = appleResolveLiveAudioReceiver(for: trimmed, connection: connection) {
+            let liveReceiverId = String(describing: ObjectIdentifier(audioMatch.receiver))
+            if audioBinding.trackId != audioMatch.track.trackId || audioBinding.receiverId != liveReceiverId {
+                return true
+            }
+        } else if connection.remoteAudioTracksByParticipantId[trimmed] != nil
+            || !advertisedSfuRemoteMediaTrackIds(mediaKind: "audio", participantId: trimmed, connection: connection).isEmpty {
+            return true
+        }
+
+        if connection.remoteVideoTracksByParticipantId[trimmed] != nil {
+            if let videoBinding = connection.videoReceiverCryptorBindingsByParticipantId[trimmed],
+               connection.videoReceiverCryptorsByParticipantId[trimmed] != nil,
+               let videoMatch = appleResolveLiveVideoReceiver(for: trimmed, connection: connection) {
+                let liveReceiverId = String(describing: ObjectIdentifier(videoMatch.receiver))
+                if videoBinding.trackId != videoMatch.track.trackId || videoBinding.receiverId != liveReceiverId {
+                    return true
+                }
+            } else {
+                return true
+            }
+        }
+
+        let mappedScreenTrack = connection.remoteScreenTracksByParticipantId[trimmed]
+            ?? connection.remoteScreenTracksByParticipantId.first {
+                Self.conferenceParticipantIdentityKey($0.key) == Self.conferenceParticipantIdentityKey(trimmed)
+            }?.value
+        if mappedScreenTrack != nil {
+            if let screenBinding = connection.screenReceiverCryptorBindingsByParticipantId[trimmed],
+               connection.screenReceiverCryptorsByParticipantId[trimmed] != nil,
+               let screenMatch = appleResolveLiveScreenReceiver(for: trimmed, connection: connection) {
+                let receiverId = String(describing: ObjectIdentifier(screenMatch.receiver))
+                if screenBinding.trackId != screenMatch.track.trackId || screenBinding.receiverId != receiverId {
+                    return true
+                }
+            } else {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func appleBindGroupAudioReceiverCryptorFromAdvertisedMsidIfNeeded(
+        conn: inout RTCConnection,
+        participantId: String
+    ) async throws {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard Self.usesApplicationInjectedGroupFrameKeys(call: conn.call),
+              isGroupCallConnection(conn.id),
+              !Self.isTrueOneToOneSfuRoom(call: conn.call),
+              frameEncryptionKeyMode == .perParticipant else {
+            return
+        }
+
+        guard let match = appleResolveLiveAudioReceiver(for: trimmed, connection: conn) else {
+            let advertisedCount = advertisedSfuRemoteMediaTrackIds(
+                mediaKind: "audio",
+                participantId: trimmed,
+                connection: conn
+            ).count
+            if advertisedCount > 1 {
+                logger.log(
+                    level: .warning,
+                    message: "Skipped SFU audio receiver FrameCryptor bind for participant=\(trimmed): SDP advertised \(advertisedCount) audio tracks but no unique live receiver connection=\(conn.id)"
+                )
+            }
+            return
+        }
+
+        if let existingBinding = conn.audioReceiverCryptorBindingsByParticipantId[trimmed],
+           conn.audioReceiverCryptorsByParticipantId[trimmed] != nil {
+            if existingBinding.trackId == match.track.trackId {
+                return
+            }
+        }
+
+        conn.remoteAudioTracksByParticipantId[trimmed] = match.track
+        await connectionManager.updateConnection(id: conn.id, with: conn)
+
+        if let mediaDelegate {
+            await mediaDelegate.didAddRemoteTrack(
+                connectionId: conn.id,
+                participantId: trimmed,
+                kind: "audio",
+                trackId: match.track.trackId
+            )
+        }
+
+        if !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: trimmed),
+           !shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+            connection: conn,
+            participantIdOverride: trimmed) {
+            try await createEncryptedFrame(
+                connection: conn,
+                kind: .audioReceiver(match.receiver),
+                participantIdOverride: trimmed
+            )
+            if let latest = await connectionManager.findConnection(with: conn.id) {
+                conn = latest
+            }
+            logger.log(
+                level: .info,
+                message: "Bound SFU audio receiver FrameCryptor from advertised msid participant=\(trimmed) trackId=\(match.track.trackId) connection=\(conn.id)"
+            )
+        }
+    }
+#endif
+
 #if canImport(WebRTC)
     /// Re-binds Apple WebRTC receiver `RTCFrameCryptor`s after a frame key is installed.
     ///
@@ -1559,7 +3930,6 @@ extension RTCSession {
             conn = clearUuidAliasedReceiverCryptors(on: conn, keepingParticipantId: provisioned)
         } else {
             appleDropUuidAliasedReceiverCryptorMapEntries(&conn, keepingParticipantId: provisioned)
-            appleDisableAppleReceiverFrameCryptorsForParticipant(&conn, provisionedParticipantId: provisioned)
         }
         await connectionManager.updateConnection(id: conn.id, with: conn)
 
@@ -1590,6 +3960,7 @@ extension RTCSession {
         }
         dropUuidEntries(&conn.videoReceiverCryptorsByParticipantId)
         dropUuidEntries(&conn.audioReceiverCryptorsByParticipantId)
+        dropUuidEntries(&conn.screenReceiverCryptorsByParticipantId)
         conn.videoReceiverCryptorBindingsByParticipantId = conn.videoReceiverCryptorBindingsByParticipantId.filter { key, _ in
             guard UUID(uuidString: key.trimmingCharacters(in: .whitespacesAndNewlines)) != nil else { return true }
             if let stableNorm, key.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(stableNorm) == .orderedSame {
@@ -1604,34 +3975,13 @@ extension RTCSession {
             }
             return false
         }
-    }
-
-    private func appleDisableAppleReceiverFrameCryptorsForParticipant(
-        _ conn: inout RTCConnection,
-        provisionedParticipantId: String
-    ) {
-        let p = provisionedParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let c = conn.videoReceiverCryptorsByParticipantId.removeValue(forKey: p) {
-            c.enabled = false
-            c.delegate = nil
-            if conn.videoFrameCryptor === c {
-                conn.videoFrameCryptor = nil
+        conn.screenReceiverCryptorBindingsByParticipantId = conn.screenReceiverCryptorBindingsByParticipantId.filter { key, _ in
+            guard UUID(uuidString: key.trimmingCharacters(in: .whitespacesAndNewlines)) != nil else { return true }
+            if let stableNorm, key.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(stableNorm) == .orderedSame {
+                return true
             }
+            return false
         }
-        conn.videoReceiverCryptorBindingsByParticipantId.removeValue(forKey: p)
-        if let c = conn.audioReceiverCryptorsByParticipantId.removeValue(forKey: p) {
-            c.enabled = false
-            c.delegate = nil
-            if conn.audioFrameCryptor === c {
-                conn.audioFrameCryptor = nil
-            }
-        }
-        conn.audioReceiverCryptorBindingsByParticipantId.removeValue(forKey: p)
-        if let c = conn.screenReceiverCryptorsByParticipantId.removeValue(forKey: p) {
-            c.enabled = false
-            c.delegate = nil
-        }
-        conn.screenReceiverCryptorBindingsByParticipantId.removeValue(forKey: p)
     }
 
     private func appleRebindAppleReceiverCryptorsFromTrackMaps(
@@ -1650,67 +4000,6 @@ extension RTCSession {
             if let latest = await connectionManager.findConnection(with: conn.id) {
                 conn = latest
             }
-        }
-
-        func advertisedAudioTrackIds(for participantId: String) -> Set<String> {
-            guard let sdp = conn.peerConnection.remoteDescription?.sdp else { return [] }
-
-            var result: Set<String> = []
-            var currentMediaKind: String?
-            var currentSectionLines: [String] = []
-
-            func flushCurrentSection() {
-                guard currentMediaKind == "audio" else { return }
-                guard !currentSectionLines.contains(where: { $0 == "a=inactive" || $0 == "a=recvonly" }) else {
-                    return
-                }
-
-                for line in currentSectionLines {
-                    let remainder: String
-                    if line.hasPrefix("a=msid:") {
-                        remainder = String(line.dropFirst("a=msid:".count))
-                    } else if let range = line.range(of: " msid:") {
-                        remainder = String(line[range.upperBound...])
-                    } else {
-                        continue
-                    }
-
-                    let parts = remainder
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                        .split(whereSeparator: { $0 == " " || $0 == "\t" })
-                        .map(String.init)
-                    guard let streamLabel = parts.first,
-                          let owner = normalizedRemoteParticipantIdFromSfuStreamLabel(streamLabel, connection: conn),
-                          owner.caseInsensitiveCompare(participantId) == .orderedSame
-                    else {
-                        continue
-                    }
-                    if parts.count > 1 {
-                        result.insert(parts[1])
-                    }
-                }
-            }
-
-            for rawLine in sdp.components(separatedBy: .newlines) {
-                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !line.isEmpty else { continue }
-                if line.hasPrefix("m=") {
-                    flushCurrentSection()
-                    currentSectionLines = [line]
-                    if line.hasPrefix("m=audio") {
-                        currentMediaKind = "audio"
-                    } else if line.hasPrefix("m=video") {
-                        currentMediaKind = "video"
-                    } else {
-                        currentMediaKind = nil
-                    }
-                } else {
-                    currentSectionLines.append(line)
-                }
-            }
-            flushCurrentSection()
-
-            return result
         }
 
         func isMappedToStableParticipant(_ track: RTCMediaStreamTrack) -> Bool {
@@ -1734,22 +4023,87 @@ extension RTCSession {
                 return
             }
 
+            await refreshConn()
+
             if conn.videoReceiverCryptorsByParticipantId[provisioned] == nil,
                conn.remoteVideoTracksByParticipantId[provisioned] == nil {
-                let videoCandidates: [(receiver: RTCRtpReceiver, track: RTCVideoTrack)] = conn.peerConnection.receivers.compactMap { receiver in
-                    guard let track = receiver.track as? RTCVideoTrack,
+                let advertisedVideoIds = advertisedSfuRemoteMediaTrackIds(
+                    mediaKind: "video",
+                    participantId: provisioned,
+                    connection: conn
+                )
+                let sdpVideoTrackIds: Set<String>
+                if let remoteSdp = conn.peerConnection.remoteDescription?.sdp {
+                    sdpVideoTrackIds = Set(
+                        appleStableRemoteCameraTrackLabels(in: remoteSdp, connection: conn)
+                            .filter { $0.participantId.caseInsensitiveCompare(provisioned) == .orderedSame }
+                            .compactMap { $0.trackId?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                    )
+                } else {
+                    sdpVideoTrackIds = []
+                }
+                let videoCandidates: [(receiver: RTCRtpReceiver, track: RTCVideoTrack)] = conn.peerConnection.transceivers.compactMap { transceiver in
+                    guard transceiver.mediaType == .video,
+                          let track = transceiver.receiver.track as? RTCVideoTrack,
                           track.readyState != .ended,
                           !RTCSession.isScreenShareId(track.trackId),
+                          !isAppleDedicatedScreenShareTransceiver(transceiver, connection: conn),
                           !isMappedToStableParticipant(track)
                     else {
                         return nil
                     }
-                    return (receiver, track)
+                    if !advertisedVideoIds.isEmpty, !advertisedVideoIds.contains(track.trackId) {
+                        return nil
+                    }
+                    return (transceiver.receiver, track)
                 }
 
-                if videoCandidates.count == 1, let candidate = videoCandidates.first {
+                let resolvedVideoCandidate: (receiver: RTCRtpReceiver, track: RTCVideoTrack)? = {
+                    func candidateMatchesProvisioned(_ candidate: (receiver: RTCRtpReceiver, track: RTCVideoTrack)) -> Bool {
+                        if !advertisedVideoIds.isEmpty {
+                            return advertisedVideoIds.contains(candidate.track.trackId)
+                        }
+                        if !sdpVideoTrackIds.isEmpty {
+                            return sdpVideoTrackIds.contains(candidate.track.trackId)
+                        }
+                        return appleSfuReceiverTrackMatchesProvisionedParticipant(
+                            receiver: candidate.receiver,
+                            track: candidate.track,
+                            provisioned: provisioned,
+                            connection: conn
+                        )
+                    }
+
+                    let matching = videoCandidates.filter { candidateMatchesProvisioned($0) }
+                    return GroupSfuVideoAttachPolicy.resolvedUnresolvedSfuReceiverCandidate(
+                        candidates: videoCandidates,
+                        matchingCandidates: matching,
+                        advertisedTrackIds: advertisedVideoIds,
+                        sdpTrackIds: sdpVideoTrackIds,
+                        trackId: { $0.track.trackId }
+                    )
+                }()
+
+                if let candidate = resolvedVideoCandidate {
+                    guard Self.claimRemoteCameraTrack(
+                        candidate.track,
+                        participantId: provisioned,
+                        in: &conn,
+                        allowReplacingExistingStableOwner: appleSfuReceiverTrackMatchesProvisionedParticipant(
+                            receiver: candidate.receiver,
+                            track: candidate.track,
+                            provisioned: provisioned,
+                            connection: conn
+                        )
+                    ) else {
+                        logger.log(
+                            level: .warning,
+                            message: "Rejected unresolved SFU video receiver fallback for participant=\(provisioned): track \(candidate.track.trackId) already has a stable owner"
+                        )
+                        return
+                    }
                     conn.remoteVideoTrack = candidate.track
-                    conn.remoteVideoTracksByParticipantId[provisioned] = candidate.track
                     await connectionManager.updateConnection(id: conn.id, with: conn)
 
                     notifyRemoteParticipantTrackChanged(
@@ -1774,9 +4128,9 @@ extension RTCSession {
                         await refreshConn()
                         logger.log(
                             level: .info,
-                            message: "Mapped single unresolved SFU video receiver to provisioned participant=\(provisioned) trackId=\(candidate.track.trackId) connection=\(conn.id)")
+                            message: "Mapped unresolved SFU video receiver to provisioned participant=\(provisioned) trackId=\(candidate.track.trackId) connection=\(conn.id)")
                     }
-                } else if videoCandidates.count > 1 {
+                } else if !videoCandidates.isEmpty {
                     logger.log(
                         level: .warning,
                         message: "Skipped unresolved SFU video receiver fallback for participant=\(provisioned): \(videoCandidates.count) possible receivers")
@@ -1785,17 +4139,50 @@ extension RTCSession {
 
             if conn.audioReceiverCryptorsByParticipantId[provisioned] == nil,
                conn.remoteAudioTracksByParticipantId[provisioned] == nil {
-                let audioCandidates: [(receiver: RTCRtpReceiver, track: RTCAudioTrack)] = conn.peerConnection.receivers.compactMap { receiver in
-                    guard let track = receiver.track as? RTCAudioTrack,
+                let advertisedAudioIds = advertisedSfuRemoteMediaTrackIds(
+                    mediaKind: "audio",
+                    participantId: provisioned,
+                    connection: conn
+                )
+                let sdpAudioTrackIds: Set<String>
+                if let remoteSdp = conn.peerConnection.remoteDescription?.sdp {
+                    sdpAudioTrackIds = Set(
+                        appleStableRemoteAudioTrackLabels(in: remoteSdp, connection: conn)
+                            .filter { $0.participantId.caseInsensitiveCompare(provisioned) == .orderedSame }
+                            .compactMap { $0.trackId?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                    )
+                } else {
+                    sdpAudioTrackIds = []
+                }
+                let audioCandidates: [(receiver: RTCRtpReceiver, track: RTCAudioTrack)] = conn.peerConnection.transceivers.compactMap { transceiver in
+                    guard transceiver.mediaType == .audio,
+                          // Never map a remote participant onto the local publish m-line's
+                          // receiver: it has no FrameCryptor and plays ciphertext (garbled).
+                          transceiver.sender.track == nil,
+                          let track = transceiver.receiver.track as? RTCAudioTrack,
                           track.readyState != .ended,
                           !isMappedToStableParticipant(track)
                     else {
                         return nil
                     }
-                    return (receiver, track)
+                    if !advertisedAudioIds.isEmpty, !advertisedAudioIds.contains(track.trackId) {
+                        return nil
+                    }
+                    return (transceiver.receiver, track)
                 }
 
-                if audioCandidates.count == 1, let candidate = audioCandidates.first {
+                let resolvedAudioCandidate: (receiver: RTCRtpReceiver, track: RTCAudioTrack)? = {
+                    return GroupSfuVideoAttachPolicy.resolvedUnresolvedSfuReceiverCandidate(
+                        candidates: audioCandidates,
+                        matchingCandidates: [],
+                        advertisedTrackIds: advertisedAudioIds,
+                        sdpTrackIds: sdpAudioTrackIds,
+                        trackId: { $0.track.trackId }
+                    )
+                }()
+
+                if let candidate = resolvedAudioCandidate {
                     candidate.track.isEnabled = true
                     conn.remoteAudioTracksByParticipantId[provisioned] = candidate.track
                     await connectionManager.updateConnection(id: conn.id, with: conn)
@@ -1819,9 +4206,9 @@ extension RTCSession {
                         await refreshConn()
                         logger.log(
                             level: .info,
-                            message: "Mapped single unresolved SFU audio receiver to provisioned participant=\(provisioned) trackId=\(candidate.track.trackId) connection=\(conn.id)")
+                            message: "Mapped unresolved SFU audio receiver to provisioned participant=\(provisioned) trackId=\(candidate.track.trackId) connection=\(conn.id)")
                     }
-                } else if audioCandidates.count > 1 {
+                } else if !audioCandidates.isEmpty {
                     logger.log(
                         level: .warning,
                         message: "Skipped unresolved SFU audio receiver fallback for participant=\(provisioned): \(audioCandidates.count) possible receivers")
@@ -1859,6 +4246,24 @@ extension RTCSession {
                 )
                 let receiverPid = resolved.override
                 guard matchesProvisioned(effectiveReceiverId: receiverPid) else { continue }
+
+                // 1:1 SFU: a stale map entry can still point at the placeholder receive track of
+                // our own send m-line after renegotiation. Binding the cryptor there would strand
+                // the peer's advertised receiver undecrypted; appleEnsureOneToOneSfuReceiverCryptors
+                // (below) binds the advertised receiver instead.
+                if Self.isTrueOneToOneSfuRoom(call: conn.call) {
+                    let advertised = advertisedSfuRemoteMediaTrackIds(
+                        mediaKind: "video",
+                        participantId: receiverPid ?? streamPid,
+                        connection: conn
+                    )
+                    if !advertised.isEmpty, !advertised.contains(videoTrack.trackId) {
+                        logger.log(
+                            level: .info,
+                            message: "Skipping stale 1:1 SFU mapped video track for receiver cryptor rebind participantId=\(receiverPid ?? streamPid) trackId=\(videoTrack.trackId); SDP advertises a different remote-owned track connId=\(conn.id)")
+                        continue
+                    }
+                }
 
                 if !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: receiverPid),
                    !shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
@@ -1944,90 +4349,11 @@ extension RTCSession {
             }
         }
 
-        for (streamPid, audioTrack) in conn.remoteAudioTracksByParticipantId {
-            guard let receiver = conn.peerConnection.receivers.first(where: { $0.track?.trackId == audioTrack.trackId })
-            else { continue }
-            let resolved = receiverParticipantIdOverrideForE2EE(
-                connection: conn,
-                participantIdFromStreamIds: streamPid
-            )
-            let receiverPid = resolved.override
-            guard matchesProvisioned(effectiveReceiverId: receiverPid) else { continue }
-
-            if !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: receiverPid),
-               !shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
-                connection: conn,
-                participantIdOverride: receiverPid) {
-                try await createEncryptedFrame(
-                    connection: conn,
-                    kind: .audioReceiver(receiver),
-                    participantIdOverride: receiverPid)
-                await refreshConn()
-            } else if shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
-                connection: conn,
-                participantIdOverride: receiverPid) {
-                let aliasProvisioned = await tryProvisionUuidAliasFrameKeyIfPossible(
-                    for: receiverPid ?? "",
-                    connection: conn
-                )
-                if aliasProvisioned {
-                    try await createEncryptedFrame(
-                        connection: conn,
-                        kind: .audioReceiver(receiver),
-                        participantIdOverride: receiverPid)
-                    await refreshConn()
-                }
-            }
-        }
-
-        if Self.usesApplicationInjectedGroupFrameKeys(call: conn.call),
-           frameEncryptionKeyMode == .perParticipant,
-           !provisioned.isEmpty,
-           conn.audioReceiverCryptorsByParticipantId[provisioned] == nil {
-            let advertisedTrackIds = advertisedAudioTrackIds(for: provisioned)
-            if !advertisedTrackIds.isEmpty {
-                let matchingReceivers: [(receiver: RTCRtpReceiver, track: RTCAudioTrack)] = conn.peerConnection.receivers.compactMap { receiver in
-                    guard let track = receiver.track as? RTCAudioTrack,
-                          track.readyState != .ended,
-                          advertisedTrackIds.contains(track.trackId)
-                    else {
-                        return nil
-                    }
-                    return (receiver, track)
-                }
-
-                if matchingReceivers.count == 1, let match = matchingReceivers.first {
-                    conn.remoteAudioTracksByParticipantId[provisioned] = match.track
-                    await connectionManager.updateConnection(id: conn.id, with: conn)
-
-                    if let mediaDelegate {
-                        await mediaDelegate.didAddRemoteTrack(
-                            connectionId: conn.id,
-                            participantId: provisioned,
-                            kind: "audio",
-                            trackId: match.track.trackId)
-                    }
-
-                    if !shouldSkipGroupReceiverFrameCryptor(connection: conn, participantIdOverride: provisioned),
-                       !shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
-                        connection: conn,
-                        participantIdOverride: provisioned) {
-                        try await createEncryptedFrame(
-                            connection: conn,
-                            kind: .audioReceiver(match.receiver),
-                            participantIdOverride: provisioned)
-                        await refreshConn()
-                        logger.log(
-                            level: .info,
-                            message: "Bound SFU audio receiver FrameCryptor from SDP msid participant=\(provisioned) trackId=\(match.track.trackId) connection=\(conn.id)")
-                    }
-                } else if matchingReceivers.count > 1 {
-                    logger.log(
-                        level: .warning,
-                        message: "Skipped SFU audio receiver FrameCryptor fallback for participant=\(provisioned): SDP matched \(matchingReceivers.count) live audio receivers")
-                }
-            }
-        }
+#if !os(Android)
+        try await appleBindGroupAudioReceiverCryptorFromAdvertisedMsidIfNeeded(
+            conn: &conn,
+            participantId: provisioned)
+#endif
 
         for (streamPid, screenTrack) in conn.remoteScreenTracksByParticipantId {
             guard let receiver = conn.peerConnection.receivers.first(where: { $0.track?.trackId == screenTrack.trackId })
@@ -2092,13 +4418,64 @@ extension RTCSession {
             return candidates.count == 1 ? candidates[0] : nil
         }
 
+        // Receiver whose live track the remote SDP advertises for this participant (msid stream
+        // label). This is the receiver that actually carries the peer's RTP after the SFU
+        // renegotiates their published tracks into the room; mapped/single fallbacks can point at
+        // the placeholder receive half of our own send m-line. When the SFU advertises multiple
+        // tracks of the same kind for the peer (observed: duplicated audio m-lines across
+        // renegotiations), prefer the deterministically named `<kind>_<peer>…` track — every
+        // advertised track is encrypted with the same per-participant sender key, so decrypting
+        // the named one is sufficient.
+        func advertisedReceiver(kind: String) -> RTCRtpReceiver? {
+            let mediaKind = kind == kRTCMediaStreamTrackKindVideo ? "video" : "audio"
+            let advertisedIds = advertisedSfuRemoteMediaTrackIds(
+                mediaKind: mediaKind,
+                participantId: participantId,
+                connection: conn
+            )
+            guard !advertisedIds.isEmpty else { return nil }
+            let matches = conn.peerConnection.receivers.filter { candidate in
+                guard let track = candidate.track,
+                      track.kind == kind,
+                      track.readyState != .ended,
+                      advertisedIds.contains(track.trackId)
+                else { return false }
+                if kind == kRTCMediaStreamTrackKindVideo,
+                   RTCSession.isScreenShareId(track.trackId) {
+                    return false
+                }
+                return true
+            }
+            if matches.count <= 1 { return matches.first }
+            let participantKey = RTCSession.conferenceParticipantIdentityKey(participantId)
+            let namedPrefix = "\(mediaKind)_\(participantKey)"
+            return matches.first { candidate in
+                (candidate.track?.trackId.lowercased() ?? "").hasPrefix(namedPrefix)
+            } ?? matches.first
+        }
+
+        // A cryptor entry in the map is only "bound" if it still points at the receiver we want
+        // media decrypted on. After SFU renegotiation the map can hold a cryptor attached to a
+        // dead placeholder receiver while the peer's frames arrive (encrypted) on the advertised
+        // receiver — createEncryptedFrame rebinds when the binding differs.
+        func bindingIsCurrent(_ binding: RTCReceiverCryptorBinding?, receiver: RTCRtpReceiver) -> Bool {
+            guard let binding, let track = receiver.track else { return false }
+            return binding.trackId == track.trackId
+                && binding.receiverId == String(describing: ObjectIdentifier(receiver))
+        }
+
         var didBindAudio = conn.audioReceiverCryptorsByParticipantId[participantId] != nil
         var didBindVideo = conn.videoReceiverCryptorsByParticipantId[participantId] != nil
+        var didBindScreen = conn.screenReceiverCryptorsByParticipantId[participantId] != nil
 
-        let mappedAudioReceiver = receiver(matching: conn.remoteAudioTracksByParticipantId[participantId])
+        let mappedAudioReceiver = advertisedReceiver(kind: kRTCMediaStreamTrackKindAudio)
+            ?? receiver(matching: conn.remoteAudioTracksByParticipantId[participantId])
             ?? singleLiveReceiver(kind: kRTCMediaStreamTrackKindAudio)
-        if !didBindAudio,
-           let audioReceiver = mappedAudioReceiver {
+        if let audioReceiver = mappedAudioReceiver,
+           !didBindAudio || !bindingIsCurrent(
+            conn.audioReceiverCryptorBindingsByParticipantId[participantId],
+            receiver: audioReceiver
+           ) {
             try await createEncryptedFrame(
                 connection: conn,
                 kind: .audioReceiver(audioReceiver),
@@ -2106,14 +4483,21 @@ extension RTCSession {
             if let latest = await connectionManager.findConnection(with: conn.id) {
                 conn = latest
             }
+            if let audioTrack = audioReceiver.track as? RTCAudioTrack {
+                conn.remoteAudioTracksByParticipantId[participantId] = audioTrack
+            }
             didBindAudio = conn.audioReceiverCryptorsByParticipantId[participantId] != nil
         }
 
         let mappedVideoTrack = conn.remoteVideoTracksByParticipantId[participantId] ?? conn.remoteVideoTrack
-        let mappedVideoReceiver = receiver(matching: mappedVideoTrack)
+        let mappedVideoReceiver = advertisedReceiver(kind: kRTCMediaStreamTrackKindVideo)
+            ?? receiver(matching: mappedVideoTrack)
             ?? singleLiveReceiver(kind: kRTCMediaStreamTrackKindVideo)
-        if !didBindVideo,
-           let videoReceiver = mappedVideoReceiver {
+        if let videoReceiver = mappedVideoReceiver,
+           !didBindVideo || !bindingIsCurrent(
+            conn.videoReceiverCryptorBindingsByParticipantId[participantId],
+            receiver: videoReceiver
+           ) {
             try await createEncryptedFrame(
                 connection: conn,
                 kind: .videoReceiver(videoReceiver),
@@ -2121,7 +4505,34 @@ extension RTCSession {
             if let latest = await connectionManager.findConnection(with: conn.id) {
                 conn = latest
             }
+            if let videoTrack = videoReceiver.track as? RTCVideoTrack {
+                conn.remoteVideoTracksByParticipantId[participantId] = videoTrack
+            }
             didBindVideo = conn.videoReceiverCryptorsByParticipantId[participantId] != nil
+        }
+
+        let mappedScreenTrack = conn.remoteScreenTracksByParticipantId[participantId]
+            ?? conn.remoteScreenTracksByParticipantId.first {
+                Self.conferenceParticipantIdentityKey($0.key) == Self.conferenceParticipantIdentityKey(participantId)
+            }?.value
+        let mappedScreenReceiver = receiver(matching: mappedScreenTrack)
+            ?? conn.peerConnection.receivers.first {
+                guard let track = $0.track,
+                      track.kind == kRTCMediaStreamTrackKindVideo,
+                      track.readyState != .ended
+                else { return false }
+                return RTCSession.isScreenShareId(track.trackId)
+            }
+        if !didBindScreen,
+           let screenReceiver = mappedScreenReceiver {
+            try await createEncryptedFrame(
+                connection: conn,
+                kind: .screenReceiver(screenReceiver),
+                participantIdOverride: participantId)
+            if let latest = await connectionManager.findConnection(with: conn.id) {
+                conn = latest
+            }
+            didBindScreen = conn.screenReceiverCryptorsByParticipantId[participantId] != nil
         }
 
         let receiverSummary = conn.peerConnection.receivers.map { receiver in
@@ -2131,7 +4542,7 @@ extension RTCSession {
         }.joined(separator: ",")
         logger.log(
             level: (didBindAudio && didBindVideo) ? .info : .warning,
-            message: "1:1 SFU receiver FrameCryptor bind check participantId='\(participantId)' connId=\(conn.id) audioBound=\(didBindAudio) videoBound=\(didBindVideo) receivers=[\(receiverSummary)]")
+            message: "1:1 SFU receiver FrameCryptor bind check participantId='\(participantId)' connId=\(conn.id) audioBound=\(didBindAudio) videoBound=\(didBindVideo) screenBound=\(didBindScreen) receivers=[\(receiverSummary)]")
     }
 #endif
 
@@ -2187,9 +4598,15 @@ extension RTCSession {
             switch notification {
             case .iceGatheringDidChange(_, let newState):
                 self.logger.log(level: .info, message: "peerConnection new gathering state: \(newState.description)")
-            case .signalingStateDidChange(_, let stateChanged):
+            case .signalingStateDidChange(let connectionId, let stateChanged):
                 self.logger.log(level: .info, message: "peerConnection new signaling state: \(stateChanged.description)")
-                if stateChanged.description == "stable" {}
+                let norm = connectionId.normalizedConnectionId
+                if self.isGroupCallConnection(norm) || self.groupCalls[norm] != nil {
+                    self.noteSfuGroupSignalingStability(
+                        for: connectionId,
+                        isStable: stateChanged.description == "stable"
+                    )
+                }
             case .addedStream(_, let streamId):
                 self.logger.log(level: .info, message: "peerConnection did add stream")
 #if os(Android)
@@ -2217,9 +4634,18 @@ extension RTCSession {
                    )?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !remoteTrackOwner.isEmpty {
                     var updated = await connectionManager.findConnection(with: connection.id) ?? connection
-                    if let videoTrack = rtcClient.getRemoteVideoTrack(peerConnection: updated.peerConnection) {
-                        updated.remoteVideoTrack = videoTrack
-                        updated.remoteVideoTracksByParticipantId[remoteTrackOwner] = videoTrack
+                    if let videoTrack = resolveOneToOneSfuInboundRemoteCameraVideoTrack(connection: &updated),
+                       videoTrack.isLiveVideoTrack {
+                        let resolvedId = videoTrack.trackIdIfAvailable
+                        let cachedTrack = updated.remoteVideoTrack
+                        let cachedId = cachedTrack?.isLiveVideoTrack == true ? cachedTrack?.trackIdIfAvailable : nil
+                        if !Self.oneToOneSfuRemoteTrackWouldDowngradeRelayToPlaceholder(
+                            previousTrackId: cachedId,
+                            resolvedTrackId: resolvedId
+                        ) {
+                            updated.remoteVideoTrack = videoTrack
+                            updated.remoteVideoTracksByParticipantId[remoteTrackOwner] = videoTrack
+                        }
                         await connectionManager.updateConnection(id: updated.id, with: updated)
                         notifyRemoteParticipantTrackChanged(
                             RemoteParticipantTrackEvent(
@@ -2230,7 +4656,19 @@ extension RTCSession {
                         )
                     }
                     if enableEncryption,
-                       oneToOneSfuReceiveKeyReadyConnectionIds.contains(teardownConnectionIdKey(updated.id)) {
+                       oneToOneSfuReceiveKeyReadyConnectionIds.contains(teardownConnectionIdKey(updated.id)),
+                       let trackId = updated.remoteVideoTracksByParticipantId[remoteTrackOwner]?.trackIdIfAvailable
+                        ?? updated.remoteVideoTrack?.trackIdIfAvailable {
+                        rtcClient.createReceiverEncryptedFrame(
+                            participant: remoteTrackOwner,
+                            connectionId: updated.id,
+                            trackKind: "video",
+                            trackId: trackId)
+                        logger.log(
+                            level: .info,
+                            message: "Android 1:1 SFU renegotiation: rebound current receiver FrameCryptors for participantId='\(remoteTrackOwner)' trackId=\(trackId) connId=\(updated.id)")
+                    } else if enableEncryption,
+                              oneToOneSfuReceiveKeyReadyConnectionIds.contains(teardownConnectionIdKey(updated.id)) {
                         rtcClient.createReceiverEncryptedFrame(
                             participant: remoteTrackOwner,
                             connectionId: updated.id)
@@ -2253,10 +4691,16 @@ extension RTCSession {
                         // Apply a conservative *starting* ceiling if none is set yet.
                         // The adaptive send loop will raise/lower this based on `availableOutgoingBitrate`.
                         if connection.id.isGroupCall, sender.track?.kind == kRTCMediaStreamTrackKindVideo {
-                            let cfg = sfuVideoQualityProfile.adaptiveConfig
+                            let isOneToOneSfu = Self.isTrueOneToOneSfuRoom(call: connection.call)
+                            let cfg = sfuAdaptiveConfig(for: connection.call)
                             if encoding.maxBitrateBps == nil { encoding.maxBitrateBps = NSNumber(value: cfg.startingBitrateBps) }
                             if encoding.maxFramerate == nil { encoding.maxFramerate = NSNumber(value: cfg.startingFramerate) }
-                            encoding.scaleResolutionDownBy = NSNumber(value: RTCVideoQualityProfile.resolutionScaleDownBy(for: cfg.startingBitrateBps))
+                            encoding.scaleResolutionDownBy = NSNumber(
+                                value: RTCVideoQualityProfile.resolutionScaleDownBy(
+                                    for: cfg.startingBitrateBps,
+                                    isOneToOneSfu: isOneToOneSfu
+                                )
+                            )
                         }
                     }
                     sender.parameters = params
@@ -2304,7 +4748,17 @@ extension RTCSession {
                         connection: connection,
                         participantIdFromStreamIds: trimmedStreamId
                     )
-                    let stableParticipantId = e2eeParticipantId ?? trimmedStreamId
+                    var stableParticipantId = e2eeParticipantId ?? trimmedStreamId
+                    if UUID(uuidString: stableParticipantId) != nil,
+                       isGroupCallConnection(connection.id),
+                       !Self.isTrueOneToOneSfuRoom(call: connection.call),
+                       let relayParticipant = resolvedAppleRelayScreenShareParticipantId(
+                           streamIds: [trimmedStreamId],
+                           trackId: "",
+                           connection: connection
+                       ) ?? ambiguousRelayScreenParticipantId(in: connection) {
+                        stableParticipantId = relayParticipant
+                    }
                     let localParticipantId = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
                     let shouldDelayReceiverCryptorUntilReceiveKey =
                         lastFrameKeyIndexByParticipantId[stableParticipantId] == nil &&
@@ -2315,40 +4769,49 @@ extension RTCSession {
                     if !stableParticipantId.isEmpty,
                        UUID(uuidString: stableParticipantId) == nil,
                        stableParticipantId.caseInsensitiveCompare(localParticipantId) != .orderedSame,
-                        !shouldDelayReceiverCryptorUntilReceiveKey {
+                        !shouldDelayReceiverCryptorUntilReceiveKey,
+                        !sfuRenegotiationReceiverCryptorRebindIsDeferred(for: connection.id) {
+                        let currentConnection = await connectionManager.findConnection(with: connection.id) ?? connection
+                        if appleGroupParticipantReceiverCryptorsNeedRebind(
+                            connection: currentConnection,
+                            participantId: stableParticipantId
+                        ) {
                         do {
                             // Disable any prior UUID-aliased cryptors on the same receivers before
                             // rebinding to the stable id; otherwise libwebrtc has two cryptors on
                             // the same RTPReceiver and the alias map keeps stale entries.
-                            let currentConnection = await connectionManager.findConnection(with: connection.id) ?? connection
                             var cleaned = clearUuidAliasedReceiverCryptors(
                                 on: currentConnection,
                                 keepingParticipantId: stableParticipantId
                             )
                             await connectionManager.updateConnection(id: cleaned.id, with: cleaned)
 
-                            let mappedCameraTracks = Array(cleaned.remoteVideoTracksByParticipantId.values)
-                            let unmappedVideoReceiver = cleaned.peerConnection.transceivers.first(where: {
-                                guard $0.mediaType == .video,
-                                      !RTCSession.isScreenShareId($0.receiver.track?.trackId ?? ""),
-                                      let candidate = $0.receiver.track as? WebRTC.RTCVideoTrack
-                                else {
-                                    return false
-                                }
-                                return !mappedCameraTracks.contains(where: { $0 === candidate })
-                            })?.receiver
-                            let fallbackVideoReceiver = cleaned.peerConnection.transceivers.first(where: {
-                                $0.mediaType == .video && !RTCSession.isScreenShareId($0.receiver.track?.trackId ?? "")
-                            })?.receiver
-                            if let videoReceiver = unmappedVideoReceiver ?? fallbackVideoReceiver {
-                                if let videoTrack = videoReceiver.track as? WebRTC.RTCVideoTrack,
-                                   cleaned.remoteVideoTracksByParticipantId[stableParticipantId] == nil {
-                                    cleaned.remoteVideoTrack = videoTrack
-                                    cleaned.remoteVideoTracksByParticipantId[stableParticipantId] = videoTrack
-                                    await connectionManager.updateConnection(id: cleaned.id, with: cleaned)
-                                    notifyRemoteParticipantTrackChanged(
-                                        RemoteParticipantTrackEvent(connectionId: cleaned.id, participantId: stableParticipantId, kind: "video", isActive: true)
+                            if let videoMatch = appleResolveLiveVideoReceiver(
+                                for: stableParticipantId,
+                                connection: cleaned
+                            ) {
+                                let videoReceiver = videoMatch.receiver
+                                let videoTrack = videoMatch.track
+                                if cleaned.remoteVideoTracksByParticipantId[stableParticipantId] == nil {
+                                    let didClaimCameraTrack = Self.claimRemoteCameraTrack(
+                                        videoTrack,
+                                        participantId: stableParticipantId,
+                                        in: &cleaned
                                     )
+                                    if didClaimCameraTrack {
+                                        cleaned.remoteVideoTrack = videoTrack
+                                    }
+                                    await connectionManager.updateConnection(id: cleaned.id, with: cleaned)
+                                    if didClaimCameraTrack {
+                                        notifyRemoteParticipantTrackChanged(
+                                            RemoteParticipantTrackEvent(connectionId: cleaned.id, participantId: stableParticipantId, kind: "video", isActive: true)
+                                        )
+                                    } else {
+                                        logger.log(
+                                            level: .warning,
+                                            message: "Rejected duplicate stable camera receiver claim during cryptor rebind participant=\(stableParticipantId) trackId=\(videoTrack.trackId) connection=\(cleaned.id)"
+                                        )
+                                    }
                                 }
                                 try await self.createEncryptedFrame(
                                     connection: cleaned,
@@ -2356,11 +4819,13 @@ extension RTCSession {
                                     participantIdOverride: stableParticipantId
                                 )
                             }
-                            if let audioReceiver = cleaned.peerConnection.transceivers.first(where: {
-                                $0.mediaType == .audio
-                            })?.receiver {
-                                if let audioTrack = audioReceiver.track as? WebRTC.RTCAudioTrack,
-                                   cleaned.remoteAudioTracksByParticipantId[stableParticipantId] == nil {
+                            if let audioMatch = appleResolveLiveAudioReceiver(
+                                for: stableParticipantId,
+                                connection: cleaned
+                            ) {
+                                let audioReceiver = audioMatch.receiver
+                                let audioTrack = audioMatch.track
+                                if cleaned.remoteAudioTracksByParticipantId[stableParticipantId] == nil {
                                     cleaned.remoteAudioTracksByParticipantId[stableParticipantId] = audioTrack
                                     await connectionManager.updateConnection(id: cleaned.id, with: cleaned)
                                     if let mediaDelegate {
@@ -2380,6 +4845,7 @@ extension RTCSession {
                             logger.log(level: .info, message: "Rebound SFU receiver FrameCryptors to stable participantId='\(stableParticipantId)' for connection=\(connection.id)")
                         } catch {
                             logger.log(level: .error, message: "Failed to rebind SFU receiver FrameCryptors for participantId='\(stableParticipantId)': \(error)")
+                        }
                         }
                     } else if shouldDelayReceiverCryptorUntilReceiveKey {
                         let scope = isGroupCallConnection(connection.id) ? "group/conference SFU" : "1:1 SFU"
@@ -2408,7 +4874,10 @@ extension RTCSession {
                         RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
                     )
                 } else {
-                    let participantId = streamId.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let rawParticipantId = streamId.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let participantId = isGroupCallConnection(connection.id)
+                        ? (normalizedRemoteParticipantIdFromSfuStreamLabel(rawParticipantId, connection: connection) ?? rawParticipantId)
+                        : rawParticipantId
                     if !participantId.isEmpty {
                         if var updated = await connectionManager.findConnection(with: connection.id) {
                             updated.remoteAudioTracksByParticipantId.removeValue(forKey: participantId)
@@ -2439,7 +4908,10 @@ extension RTCSession {
                     }
                 }
 #elseif os(Android)
-                let participantId = RTCSession.participantIdFromScreenShareId(streamId) ?? streamId
+                let rawParticipantId = RTCSession.participantIdFromScreenShareId(streamId) ?? streamId
+                let participantId = isGroupCallConnection(connection.id)
+                    ? (androidNormalizedRemoteParticipantIdFromSfuStreamLabel(rawParticipantId, connection: connection) ?? rawParticipantId)
+                    : rawParticipantId
                 if RTCSession.isScreenShareId(streamId) {
                     if var updated = await connectionManager.findConnection(with: connection.id) {
                         updated.remoteScreenTracksByParticipantId.removeValue(forKey: participantId)
@@ -2454,9 +4926,11 @@ extension RTCSession {
                         updated.remoteVideoTracksByParticipantId.removeValue(forKey: participantId)
                         await connectionManager.updateConnection(id: updated.id, with: updated)
                     }
-                    notifyRemoteParticipantTrackChanged(
-                        RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
-                    )
+                    if shouldSurfaceRemoteParticipantCameraTrack(connection: connection, participantId: participantId) {
+                        notifyRemoteParticipantTrackChanged(
+                            RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
+                        )
+                    }
                 }
 #endif
             case .didAddReceiver(_, let trackKind, let streamIds, let trackId):
@@ -2471,6 +4945,21 @@ extension RTCSession {
                         ? remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
                             .trimmingCharacters(in: .whitespacesAndNewlines)
                         : nil
+                    let androidResolvedMediaParticipantId: String = {
+                        guard self.isGroupCallConnection(connection.id) else {
+                            return participantId
+                        }
+                        for label in streamIds + [trackId, participantId] {
+                            if let normalized = androidNormalizedRemoteParticipantIdFromSfuStreamLabel(
+                                label,
+                                connection: connection
+                            ) {
+                                return normalized
+                            }
+                        }
+                        return participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }()
+                    var androidDelegateParticipantId = androidResolvedMediaParticipantId
 
                     if trackKind == "video" {
                         var updated = connection
@@ -2481,6 +4970,7 @@ extension RTCSession {
                                 trackId: trackId,
                                 fallback: fallbackScreenParticipant
                             )
+                            androidDelegateParticipantId = resolvedScreenParticipant
                             let screenTrack = rtcClient.getRemoteScreenVideoTrackById(peerConnection: connection.peerConnection, trackId: trackId)
                                 ?? rtcClient.getRemoteScreenVideoTrack(peerConnection: connection.peerConnection)
                             if let screenTrack {
@@ -2490,27 +4980,79 @@ extension RTCSession {
                             }
                         } else {
                             let videoTrack = rtcClient.getRemoteVideoTrackById(peerConnection: connection.peerConnection, trackId: trackId)
-                                ?? rtcClient.getRemoteVideoTrack(peerConnection: connection.peerConnection)
                             if let videoTrack {
                                 let resolvedParticipant: String
                                 if let oneToOneRemoteTrackOwner,
                                    !oneToOneRemoteTrackOwner.isEmpty {
                                     resolvedParticipant = oneToOneRemoteTrackOwner
+                                } else if self.isGroupCallConnection(connection.id) {
+                                    let trimmedParticipant = androidResolvedMediaParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !trimmedParticipant.isEmpty else {
+                                        logger.log(
+                                            level: .warning,
+                                            message: "Ignoring Android group camera receiver with empty participant id trackId=\(trackId) streamIds=\(streamIds)"
+                                        )
+                                        break
+                                    }
+                                    resolvedParticipant = trimmedParticipant
                                 } else {
                                     resolvedParticipant = participantId.isEmpty
                                         ? (connection.remoteParticipantId.isEmpty ? connection.id : connection.remoteParticipantId)
                                         : participantId
                                 }
+                                androidDelegateParticipantId = resolvedParticipant
                                 if shouldSurfaceRemoteParticipantCameraTrack(connection: connection, participantId: resolvedParticipant) {
-                                    updated.remoteVideoTrack = videoTrack
-                                    if !resolvedParticipant.isEmpty {
-                                        updated.remoteVideoTracksByParticipantId[resolvedParticipant] = videoTrack
+                                    let claimSucceeded: Bool
+                                    if self.isGroupCallConnection(connection.id) {
+                                        claimSucceeded = Self.claimRemoteCameraTrack(
+                                            videoTrack,
+                                            participantId: resolvedParticipant,
+                                            in: &updated
+                                        )
+                                    } else {
+                                        if !resolvedParticipant.isEmpty {
+                                            updated.remoteVideoTracksByParticipantId[resolvedParticipant] = videoTrack
+                                        }
+                                        claimSucceeded = true
+                                    }
+                                    guard claimSucceeded else {
+                                        await connectionManager.updateConnection(id: updated.id, with: updated)
+                                        logger.log(
+                                            level: .warning,
+                                            message: "Rejected duplicate Android remote camera receiver claim participant=\(resolvedParticipant) trackId=\(trackId) connection=\(connection.id)"
+                                        )
+                                        break
+                                    }
+                                    if !self.isGroupCallConnection(connection.id) || updated.remoteVideoTracksByParticipantId.count <= 1 {
+                                        updated.remoteVideoTrack = videoTrack
                                     }
                                     await connectionManager.updateConnection(id: updated.id, with: updated)
 
-                                    if let pendingRenderer = pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: updated.id.normalizedConnectionId) as? AndroidSampleCaptureView {
-                                        logger.log(level: .info, message: "Attaching buffered remote renderer for 1:1 call (trackId=\(trackId))")
-                                        pendingRenderer.attach(videoTrack)
+                                    if let pendingRenderer = pendingRemoteVideoRenderersByConnectionId[updated.id.normalizedConnectionId] as? AndroidSampleCaptureView {
+                                        let normalizedConnectionId = updated.id.normalizedConnectionId
+                                        let receiveKeyReady = oneToOneSfuReceiveKeyReadyConnectionIds.contains(
+                                            teardownConnectionIdKey(normalizedConnectionId))
+                                        if Self.isTrueOneToOneSfuRoom(call: updated.call),
+                                           Self.shouldDeferOneToOneSfuRemoteRendererAttach(
+                                            isOneToOneSfuRoom: true,
+                                            frameEncryptionEnabled: enableEncryption,
+                                            receiveKeyReady: receiveKeyReady
+                                           ) {
+                                            logger.log(
+                                                level: .info,
+                                                message: "Deferring buffered remote renderer for 1:1 call until receive key is installed (trackId=\(trackId))"
+                                            )
+                                        } else if Self.isTrueOneToOneSfuRoom(call: updated.call),
+                                                  sfuRenegotiationReceiverCryptorRebindIsDeferred(for: updated.id) {
+                                            logger.log(
+                                                level: .info,
+                                                message: "Deferring buffered remote renderer for 1:1 call until SFU renegotiation answer completes (trackId=\(trackId))"
+                                            )
+                                        } else {
+                                            logger.log(level: .info, message: "Attaching buffered remote renderer for 1:1 call (trackId=\(trackId))")
+                                            _ = pendingRenderer.attach(videoTrack)
+                                            pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedConnectionId)
+                                        }
                                     }
 
                                     notifyRemoteParticipantTrackChanged(
@@ -2533,18 +5075,33 @@ extension RTCSession {
                             RemoteScreenTrackEvent(connectionId: connection.id, participantId: resolvedScreenParticipant, isActive: true)
                         )
                     }
-                    if let mediaDelegate, !participantId.isEmpty {
-                        await mediaDelegate.didAddRemoteTrack(connectionId: connection.id, participantId: participantId, kind: reportedKind, trackId: trackId)
+                    if let mediaDelegate, !androidDelegateParticipantId.isEmpty {
+                        await mediaDelegate.didAddRemoteTrack(connectionId: connection.id, participantId: androidDelegateParticipantId, kind: reportedKind, trackId: trackId)
                     }
 
                     let receiverParticipantId: String
+                    let shouldSkipAndroidGroupReceiverCryptor: Bool
                     if let remoteTrackOwner = oneToOneRemoteTrackOwner,
                        !remoteTrackOwner.isEmpty {
                         receiverParticipantId = remoteTrackOwner
+                        shouldSkipAndroidGroupReceiverCryptor = false
                     } else if self.isGroupCallConnection(connection.id) {
-                        receiverParticipantId = participantId.isEmpty ? connection.remoteParticipantId : participantId
+                        let groupParticipant = (isScreenTrack ? androidDelegateParticipantId : androidResolvedMediaParticipantId)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        receiverParticipantId = groupParticipant
+                        shouldSkipAndroidGroupReceiverCryptor =
+                            groupParticipant.isEmpty
+                            || shouldSkipGroupReceiverFrameCryptor(
+                                connection: connection,
+                                participantIdOverride: groupParticipant
+                            )
+                            || shouldDelayGroupReceiverFrameCryptorUntilStableParticipantId(
+                                connection: connection,
+                                participantIdOverride: groupParticipant
+                            )
                     } else {
                         receiverParticipantId = connection.remoteParticipantId
+                        shouldSkipAndroidGroupReceiverCryptor = false
                     }
 
                     let shouldDelayOneToOneSfuReceiverCryptorUntilReceiveKey =
@@ -2552,16 +5109,22 @@ extension RTCSession {
                         self.frameEncryptionKeyMode == .perParticipant &&
                         isOneToOneSfuRoom &&
                         !oneToOneSfuReceiveKeyReadyConnectionIds.contains(teardownConnectionIdKey(connection.id))
+                    let receiverTrackKind = isScreenTrack ? "screen" : trackKind
 
                     if shouldDelayOneToOneSfuReceiverCryptorUntilReceiveKey {
                         self.logger.log(
                             level: .info,
-                            message: "Android 1:1 SFU receive-key guard: delaying \(trackKind) receiver FrameCryptor until receive key is installed participantId='\(receiverParticipantId)' connId=\(connection.id)")
+                            message: "Android 1:1 SFU receive-key guard: delaying \(receiverTrackKind) receiver FrameCryptor until receive key is installed participantId='\(receiverParticipantId)' connId=\(connection.id)")
+                    } else if shouldSkipAndroidGroupReceiverCryptor {
+                        self.logger.log(
+                            level: .info,
+                            message: "Skipping Android group \(receiverTrackKind) receiver FrameCryptor until stable participant id is known trackId=\(trackId) participantId='\(receiverParticipantId)' connId=\(connection.id)"
+                        )
                     } else if enableEncryption, !receiverParticipantId.isEmpty {
                         rtcClient.createReceiverEncryptedFrame(
                             participant: receiverParticipantId,
                             connectionId: connection.id,
-                            trackKind: trackKind,
+                            trackKind: receiverTrackKind,
                             trackId: trackId
                         )
                     }
@@ -2572,15 +5135,67 @@ extension RTCSession {
                     var isScreenTrack = RTCSession.isScreenShareId(trackId) || streamIds.contains(where: { RTCSession.isScreenShareId($0) })
                     if !isScreenTrack,
                        trackKind == kRTCMediaStreamTrackKindVideo,
+                       let receiver = connection.peerConnection.receivers.first(where: { $0.track?.trackId == trackId }),
+                       let transceiver = appleTransceiver(for: receiver, in: connection.peerConnection) {
+                        isScreenTrack = shouldTreatAppleVideoTrackAsRemoteScreenShare(
+                            trackId: trackId,
+                            streamIds: streamIds,
+                            transceiver: transceiver,
+                            connection: connection
+                        )
+                    }
+                    if !isScreenTrack,
+                       trackKind == kRTCMediaStreamTrackKindVideo,
                        isGroupCallConnection(connection.id),
+                       Self.isTrueOneToOneSfuRoom(call: connection.call),
                        let latestConnection = await connectionManager.findConnection(with: connection.id) {
                         let stableParticipantId = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                        // A receiver whose msid stream is the participant's *plain* id is that
+                        // participant's camera (screen legs advertise `screen_<participant>`).
+                        // SFU renegotiation republished cameras arrive with a new trackId while the
+                        // stale camera mapping is still present — that must never flip to screen.
+                        let carriesPlainCameraStreamId = streamIds.contains {
+                            let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                            return !trimmed.isEmpty
+                                && Self.conferenceParticipantIdentityKey(trimmed)
+                                    == Self.conferenceParticipantIdentityKey(stableParticipantId)
+                        }
                         if !stableParticipantId.isEmpty,
+                           Self.isPlausibleConferenceScreenShareParticipantId(stableParticipantId),
+                           !carriesPlainCameraStreamId,
                            let existingCamera = latestConnection.remoteVideoTracksByParticipantId[stableParticipantId],
                            existingCamera.trackId != trackId {
-                            // Native SFU relay SDP can lose the original `screen_` msid. A second
-                            // video receiver for the same participant is the screen-share leg.
+                            // True 1:1 SFU relay SDP can lose the original `screen_` msid. Multi-party
+                            // rooms add one camera video receiver per participant, so they must not use
+                            // this receiver-count heuristic.
                             isScreenTrack = true
+                        } else if UUID(uuidString: stableParticipantId) != nil,
+                                  let relayParticipant = ambiguousRelayScreenParticipantId(in: latestConnection),
+                                  !streamIds.contains(where: {
+                                      Self.conferenceParticipantIdentityKey($0.trimmingCharacters(in: .whitespacesAndNewlines))
+                                          == Self.conferenceParticipantIdentityKey(relayParticipant)
+                                  }),
+                                  let existingCamera = latestConnection.remoteVideoTracksByParticipantId[relayParticipant],
+                                  existingCamera.trackId != trackId {
+                            isScreenTrack = true
+                        }
+                    }
+
+                    if trackKind == kRTCMediaStreamTrackKindVideo, isScreenTrack {
+                        let streamFallback = participantId.isEmpty ? connection.id : participantId
+                        let relayFallback = ambiguousRelayScreenParticipantId(in: connection) ?? streamFallback
+                        let resolvedScreenParticipant = resolvedAppleRemoteScreenParticipantId(
+                            streamIds: streamIds,
+                            trackId: trackId,
+                            fallback: relayFallback,
+                            connection: connection
+                        )
+                        if !Self.isPlausibleConferenceScreenShareParticipantId(resolvedScreenParticipant) {
+                            self.logger.log(
+                                level: .info,
+                                message: "Ignoring remote screen-share receiver with unresolved SFU placeholder participant trackId=\(trackId) streamIds=\(streamIds)"
+                            )
+                            isScreenTrack = false
                         }
                     }
 
@@ -2588,75 +5203,161 @@ extension RTCSession {
                        let receiver = connection.peerConnection.receivers.first(where: { $0.track?.trackId == trackId }),
                        let videoTrack = receiver.track as? WebRTC.RTCVideoTrack {
                         var updated = connection
-                        let fallbackScreenParticipant = participantId.isEmpty ? connection.id : participantId
+                        let streamFallback = participantId.isEmpty ? connection.id : participantId
+                        let relayFallback = ambiguousRelayScreenParticipantId(in: updated) ?? streamFallback
                         let resolvedScreenParticipant = resolvedAppleRemoteScreenParticipantId(
                             streamIds: streamIds,
                             trackId: trackId,
-                            fallback: fallbackScreenParticipant,
+                            fallback: relayFallback,
                             connection: connection
                         )
-                        updated.remoteScreenTracksByParticipantId[resolvedScreenParticipant] = videoTrack
-                        await connectionManager.updateConnection(id: updated.id, with: updated)
-                        notifyRemoteScreenTrackChanged(
-                            RemoteScreenTrackEvent(connectionId: updated.id, participantId: resolvedScreenParticipant, isActive: true)
+                        let mappedKey = Self.conferenceParticipantIdentityKey(resolvedScreenParticipant)
+                        let activeScreenKeys = Set(
+                            sdpAdvertisedActiveRemoteScreenShareParticipantIds(connection: updated)
+                                .map { Self.conferenceParticipantIdentityKey($0) }
+                                .filter { !$0.isEmpty }
                         )
-
-                        if let mediaDelegate {
-                            await mediaDelegate.didAddRemoteTrack(connectionId: updated.id, participantId: resolvedScreenParticipant, kind: "screen", trackId: trackId)
-                        }
-
-                        if enableEncryption {
-                            let resolved = receiverParticipantIdOverrideForE2EE(
-                                connection: connection,
-                                participantIdFromStreamIds: resolvedScreenParticipant
+                        if !mappedKey.isEmpty,
+                           updated.suppressedRemoteScreenShareParticipantIds.contains(mappedKey),
+                           !activeScreenKeys.contains(mappedKey) {
+                            logger.log(
+                                level: .warning,
+                                message: "Ignoring stale remote screen-share receiver after authoritative stop participant=\(resolvedScreenParticipant) trackId=\(trackId) connection=\(updated.id)"
                             )
-                            let receiverParticipantId = resolved.override
-                            if !shouldSkipGroupReceiverFrameCryptor(
-                                connection: updated,
-                                participantIdOverride: receiverParticipantId) {
-                                try await self.createEncryptedFrame(
+                        } else {
+                            updated.remoteScreenTracksByParticipantId[resolvedScreenParticipant] = videoTrack
+                            if !mappedKey.isEmpty {
+                                updated.suppressedRemoteScreenShareParticipantIds.remove(mappedKey)
+                            }
+                            await connectionManager.updateConnection(id: updated.id, with: updated)
+                            notifyRemoteScreenTrackChanged(
+                                RemoteScreenTrackEvent(connectionId: updated.id, participantId: resolvedScreenParticipant, isActive: true)
+                            )
+
+                            if let mediaDelegate {
+                                await mediaDelegate.didAddRemoteTrack(connectionId: updated.id, participantId: resolvedScreenParticipant, kind: "screen", trackId: trackId)
+                            }
+
+                            if enableEncryption {
+                                let resolved = receiverParticipantIdOverrideForE2EE(
+                                    connection: connection,
+                                    participantIdFromStreamIds: resolvedScreenParticipant
+                                )
+                                let receiverParticipantId = resolved.override
+                                if !shouldSkipGroupReceiverFrameCryptor(
                                     connection: updated,
-                                    kind: .screenReceiver(receiver),
-                                    participantIdOverride: receiverParticipantId)
-                            } else {
-                                self.logger.log(
-                                    level: .debug,
-                                    message: "Skipping screen receiver FrameCryptor: participant id matches local (SFU self-label).")
+                                    participantIdOverride: receiverParticipantId) {
+                                    try await self.createEncryptedFrame(
+                                        connection: updated,
+                                        kind: .screenReceiver(receiver),
+                                        participantIdOverride: receiverParticipantId)
+                                } else {
+                                    self.logger.log(
+                                        level: .debug,
+                                        message: "Skipping screen receiver FrameCryptor: participant id matches local (SFU self-label).")
+                                }
                             }
                         }
                     } else if trackKind == kRTCMediaStreamTrackKindVideo, !isScreenTrack,
                        let receiver = connection.peerConnection.receivers.first(where: { $0.track?.trackId == trackId }),
                        let videoTrack = receiver.track as? WebRTC.RTCVideoTrack {
                         var updated = connection
+                        let cameraParticipantId: String = {
+                            let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmed.isEmpty {
+                                if isGroupCallConnection(connection.id),
+                                   let normalized = normalizedRemoteParticipantIdFromSfuStreamLabel(trimmed, connection: connection) {
+                                    return normalized
+                                }
+                                return trimmed
+                            }
+                            guard !isGroupCallConnection(connection.id) || Self.isTrueOneToOneSfuRoom(call: connection.call) else {
+                                return trimmed
+                            }
+                            if let owner = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
+                                .trimmingCharacters(in: .whitespacesAndNewlines),
+                               !owner.isEmpty {
+                                return owner
+                            }
+                            let remote = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !remote.isEmpty {
+                                return remote
+                            }
+                            return trimmed
+                        }()
                         let shouldSurfaceCameraTrack = shouldSurfaceRemoteParticipantCameraTrack(
                             connection: connection,
-                            participantId: participantId
+                            participantId: cameraParticipantId
                         )
                         let shouldStoreLegacyRemoteTrack = !isGroupCallConnection(connection.id) || shouldSurfaceCameraTrack
-                        if shouldSurfaceCameraTrack {
-                            updated.remoteVideoTracksByParticipantId[participantId] = videoTrack
+                        let advertisedCameraOwner = (connection.peerConnection.remoteDescription?.sdp)
+                            .flatMap { Self.advertisedRemoteCameraOwnersByTrackId(in: $0)[videoTrack.trackId] }
+                        let allowCameraOwnershipTransfer = advertisedCameraOwner == Self.conferenceParticipantIdentityKey(cameraParticipantId)
+                        let didClaimCameraTrack = shouldSurfaceCameraTrack
+                            ? Self.claimRemoteCameraTrack(
+                                videoTrack,
+                                participantId: cameraParticipantId,
+                                in: &updated,
+                                allowReplacingExistingStableOwner: allowCameraOwnershipTransfer
+                            )
+                            : false
+                        if shouldSurfaceCameraTrack, !didClaimCameraTrack {
+                            logger.log(
+                                level: .warning,
+                                message: "Rejected duplicate remote camera receiver claim connection=\(updated.id.normalizedConnectionId) trackId=\(trackId) participantId=\(cameraParticipantId)"
+                            )
                         }
-                        if shouldStoreLegacyRemoteTrack {
+                        if shouldStoreLegacyRemoteTrack && (!shouldSurfaceCameraTrack || didClaimCameraTrack) {
                             updated.remoteVideoTrack = videoTrack
                         }
                         await connectionManager.updateConnection(id: updated.id, with: updated)
 
                         let normalizedConnectionId = updated.id.normalizedConnectionId
-                        if shouldStoreLegacyRemoteTrack,
+                        let hasPendingRenderer = pendingRemoteVideoRenderersByConnectionId[normalizedConnectionId] != nil
+                        logger.log(
+                            level: .info,
+                            message: "Stored remote camera receiver connection=\(normalizedConnectionId) trackId=\(trackId) participantId=\(cameraParticipantId) shouldSurface=\(shouldSurfaceCameraTrack) shouldStoreLegacy=\(shouldStoreLegacyRemoteTrack) hasPendingRenderer=\(hasPendingRenderer) media=\(RTCPeerConnectionMediaDiagnostics.summary(updated.peerConnection))"
+                        )
+                        if shouldStoreLegacyRemoteTrack && (!shouldSurfaceCameraTrack || didClaimCameraTrack),
                            let pendingRenderer = pendingRemoteVideoRenderersByConnectionId[normalizedConnectionId] {
-                            logger.log(level: .info, message: "Rebinding remote renderer now that remote video track is available (trackId=\(trackId))")
-                            connection.remoteVideoTrack?.remove(pendingRenderer)
-                            videoTrack.add(pendingRenderer)
+                            let receiveKeyReady = oneToOneSfuReceiveKeyReadyConnectionIds.contains(
+                                teardownConnectionIdKey(normalizedConnectionId))
+                            if Self.shouldDeferOneToOneSfuRemoteRendererAttach(
+                                isOneToOneSfuRoom: Self.isTrueOneToOneSfuRoom(call: updated.call),
+                                frameEncryptionEnabled: enableEncryption,
+                                receiveKeyReady: receiveKeyReady
+                            ) {
+                                logger.log(
+                                    level: .info,
+                                    message: "Deferring remote renderer rebind until 1:1 SFU receive key is installed (trackId=\(trackId))"
+                                )
+                            } else if sfuRenegotiationReceiverCryptorRebindIsDeferred(for: updated.id) {
+                                logger.log(
+                                    level: .info,
+                                    message: "Deferring remote renderer rebind until SFU renegotiation answer completes (trackId=\(trackId))"
+                                )
+                            } else {
+                                logger.log(level: .info, message: "Rebinding remote renderer now that remote video track is available (trackId=\(trackId))")
+                                connection.remoteVideoTrack?.remove(pendingRenderer)
+                                videoTrack.add(pendingRenderer)
+                                pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedConnectionId)
+                                logRtpStatsSnapshotOnce(
+                                    connectionId: normalizedConnectionId,
+                                    delayNanoseconds: 2_000_000_000,
+                                    reason: "afterDidAddReceiverAttachRemoteRenderer"
+                                )
+                                startInboundVideoFlowProbe(connectionId: normalizedConnectionId)
+                            }
                         }
 
-                        if shouldSurfaceCameraTrack {
+                        if shouldSurfaceCameraTrack && didClaimCameraTrack {
                             notifyRemoteParticipantTrackChanged(
-                                RemoteParticipantTrackEvent(connectionId: updated.id, participantId: participantId, kind: "video", isActive: true)
+                                RemoteParticipantTrackEvent(connectionId: updated.id, participantId: cameraParticipantId, kind: "video", isActive: true)
                             )
                         }
 
-                        if let mediaDelegate, shouldSurfaceCameraTrack {
-                            await mediaDelegate.didAddRemoteTrack(connectionId: updated.id, participantId: participantId, kind: "video", trackId: trackId)
+                        if let mediaDelegate, shouldSurfaceCameraTrack && didClaimCameraTrack {
+                            await mediaDelegate.didAddRemoteTrack(connectionId: updated.id, participantId: cameraParticipantId, kind: "video", trackId: trackId)
                         }
 
                         // Determine the correct participant ID for the receiver cryptor:
@@ -2756,13 +5457,46 @@ extension RTCSession {
                        let receiver = connection.peerConnection.receivers.first(where: { $0.track?.trackId == trackId }),
                        let audioTrack = receiver.track as? WebRTC.RTCAudioTrack {
                         var updated = connection
-                        if !participantId.isEmpty {
-                            updated.remoteAudioTracksByParticipantId[participantId] = audioTrack
+                        let audioParticipantId: String = {
+                            let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmed.isEmpty {
+                                if isGroupCallConnection(connection.id),
+                                   let normalized = normalizedRemoteParticipantIdFromSfuStreamLabel(trimmed, connection: connection) {
+                                    return normalized
+                                }
+                                return trimmed
+                            }
+                            guard !isGroupCallConnection(connection.id) || Self.isTrueOneToOneSfuRoom(call: connection.call) else {
+                                return trimmed
+                            }
+                            if let owner = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
+                                .trimmingCharacters(in: .whitespacesAndNewlines),
+                               !owner.isEmpty {
+                                return owner
+                            }
+                            let remote = connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !remote.isEmpty {
+                                return remote
+                            }
+                            return trimmed
+                        }()
+                        if !audioParticipantId.isEmpty {
+                            if let prior = updated.remoteAudioTracksByParticipantId[audioParticipantId],
+                               prior !== audioTrack,
+                               prior.readyState != .ended {
+                                prior.isEnabled = false
+                            }
+                            updated.remoteAudioTracksByParticipantId[audioParticipantId] = audioTrack
                         }
+                        let activeAudioTrackIds = Set(updated.remoteAudioTracksByParticipantId.values.map(\.trackId))
+                        _ = disableSupersededAppleInboundAudioReceivers(
+                            connection: &updated,
+                            keepingActiveTrackIds: activeAudioTrackIds
+                        )
                         await connectionManager.updateConnection(id: updated.id, with: updated)
 
-                        if let mediaDelegate, !participantId.isEmpty {
-                            await mediaDelegate.didAddRemoteTrack(connectionId: updated.id, participantId: participantId, kind: "audio", trackId: trackId)
+                        if let mediaDelegate, !audioParticipantId.isEmpty {
+                            await mediaDelegate.didAddRemoteTrack(connectionId: updated.id, participantId: audioParticipantId, kind: "audio", trackId: trackId)
                         }
 
                         // Determine the correct participant ID for the receiver cryptor:
@@ -2983,6 +5717,9 @@ extension RTCSession {
                                 callDirection,
                                 connection.call))
                     }
+#if canImport(WebRTC) && !os(Android)
+                    await reconcileDeferredAppleRemoteScreenTracksIfNeeded(connectionId: connection.id)
+#endif
                 }
 
                 // During relay fallback retry we intentionally close/recreate the peer.
@@ -3048,8 +5785,19 @@ extension RTCSession {
                 self.logger.log(level: .info, message: "peerConnection did remove candidate(s)")
             case .startedReceiving(_, let trackKind):
                 self.logger.log(level: .info, message: "peerConnection didStartReceiving \(trackKind)")
+#if os(Android)
+                if trackKind == "removed_video" {
+                    await handleAndroidRemoteVideoTrackRemoved(connectionId: connection.id)
+                    continue
+                }
+#endif
 #if canImport(WebRTC)
                 do {
+#if !os(Android)
+                    if trackKind == "video", isGroupCallConnection(connection.id) {
+                        await reconcileDeferredAppleRemoteScreenTracksIfNeeded(connectionId: connection.id)
+                    }
+#endif
                     await tryCompleteAppleDeferredReceivingMessageKey(connectionId: connection.id)
                     if enableEncryption,
                        self.frameEncryptionKeyMode == .perParticipant,

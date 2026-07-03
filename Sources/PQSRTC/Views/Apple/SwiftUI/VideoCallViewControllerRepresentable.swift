@@ -288,13 +288,15 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         }
 
         public func screenShareDidChange(isSharing: Bool) async {
-            DispatchQueue.main.async {
+            Task { @MainActor in
+                await Task.yield()
                 self.parent.isScreenSharing = isSharing
             }
         }
 
         public func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async {
-            DispatchQueue.main.async {
+            Task { @MainActor in
+                await Task.yield()
                 self.parent.hasActiveRemoteScreenShare = isSharing
             }
         }
@@ -593,13 +595,15 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         }
 
         public func screenShareDidChange(isSharing: Bool) async {
-            DispatchQueue.main.async {
+            Task { @MainActor in
+                await Task.yield()
                 self.parent.isScreenSharing = isSharing
             }
         }
 
         public func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async {
-            DispatchQueue.main.async {
+            Task { @MainActor in
+                await Task.yield()
                 self.parent.hasActiveRemoteScreenShare = isSharing
             }
         }

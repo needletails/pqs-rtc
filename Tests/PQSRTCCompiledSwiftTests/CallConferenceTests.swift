@@ -179,9 +179,13 @@ struct CallConferenceTests {
         #expect(RTCSession.participantIdFromScreenShareId("screen_echo") == "echo")
     }
 
-    @Test("screen share system audio egress is explicit when unsupported")
-    func screenShareSystemAudioEgressIsExplicitWhenUnsupported() {
+    @Test("screen share system audio egress flag matches WebRTC build")
+    func screenShareSystemAudioEgressMatchesBuild() {
+#if canImport(WebRTC) && !os(Android)
+        #expect(RTCSession.supportsScreenShareSystemAudioEgress == true)
+#else
         #expect(RTCSession.supportsScreenShareSystemAudioEgress == false)
+#endif
     }
 
     @Test("conference role updates preserve server timing and normalize participant keys")

@@ -116,6 +116,8 @@ public actor CallStateMachine {
     }
     
     func createStreams(with call: Call) async {
+        let preservedState = currentState
+        let preservedDirection = callDirection
         await cleanup()
         
         logger.log(level: .info, message: "Creating streams for call: \(call.sharedCommunicationId)")
@@ -143,7 +145,57 @@ public actor CallStateMachine {
             }
         }
         
+        if let preservedState,
+           case .ready(let existing) = preservedState,
+           existing.sharedCommunicationId.normalizedConnectionId == call.sharedCommunicationId.normalizedConnectionId {
+            await self.transition(to: .ready(call))
+            return
+        }
+
+        if let preservedState,
+           preservedDirection != nil,
+           callsShareSession(preservedState, call),
+           let remapped = remappedState(preservedState, for: call) {
+            currentCall = call
+            if let direction = preservedDirection {
+                callDirection = direction
+                switch direction {
+                case .inbound(let type), .outbound(let type):
+                    callType = type
+                }
+            }
+            await transition(to: remapped)
+            return
+        }
+
         await self.transition(to: .ready(call))
+    }
+
+    private func remappedState(_ state: State, for call: Call) -> State? {
+        switch state {
+        case .ready:
+            return .ready(call)
+        case .connecting(let direction, _):
+            return .connecting(direction, call)
+        case .connected(let direction, _):
+            return .connected(direction, call)
+        case .held(let direction, _):
+            return .held(direction, call)
+        case .waiting, .ended, .failed, .callAnsweredAuxDevice:
+            return nil
+        }
+    }
+
+    private func callsShareSession(_ state: State, _ call: Call) -> Bool {
+        let normalizedId = call.sharedCommunicationId.normalizedConnectionId
+        switch state {
+        case .ready(let existing), .connecting(_, let existing), .connected(_, let existing),
+             .held(_, let existing), .ended(_, let existing), .failed(_, let existing, _),
+             .callAnsweredAuxDevice(let existing):
+            return existing.sharedCommunicationId.normalizedConnectionId == normalizedId
+        case .waiting:
+            return false
+        }
     }
     
     /// The media type of a call.
@@ -197,8 +249,8 @@ public actor CallStateMachine {
     }
     
     /// High-level reason a call ended.
-    public enum EndState: Codable, Sendable {
-        case userInitiated, partnerInitiated, userInitiatedUnanswered, partnerInitiatedUnanswered, partnerInitiatedRejected, failed, auxialaryDevcieAnswered
+    public enum EndState: Codable, Sendable, Equatable {
+        case userInitiated, partnerInitiated, userInitiatedUnanswered, partnerInitiatedUnanswered, partnerInitiatedRejected, failed, auxiliaryDeviceAnswered
         
         public init(from decoder: Decoder) throws {
             let container = try decoder.singleValueContainer()
@@ -210,7 +262,7 @@ public actor CallStateMachine {
             case "partnerInitiatedUnanswered": self = .partnerInitiatedUnanswered
             case "partnerInitiatedRejected": self = .partnerInitiatedRejected
             case "failed": self = .failed
-            case "auxialaryDevcieAnswered": self = .auxialaryDevcieAnswered
+            case "auxiliaryDeviceAnswered", "auxialaryDevcieAnswered": self = .auxiliaryDeviceAnswered
             default: throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid EndState: \(stringValue)")
             }
         }
@@ -224,7 +276,7 @@ public actor CallStateMachine {
             case .partnerInitiatedUnanswered: try container.encode("partnerInitiatedUnanswered")
             case .partnerInitiatedRejected: try container.encode("partnerInitiatedRejected")
             case .failed: try container.encode("failed")
-            case .auxialaryDevcieAnswered: try container.encode("auxialaryDevcieAnswered")
+            case .auxiliaryDeviceAnswered: try container.encode("auxiliaryDeviceAnswered")
             }
         }
     }

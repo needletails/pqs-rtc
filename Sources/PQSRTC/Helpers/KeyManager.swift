@@ -41,32 +41,25 @@ public actor KeyManager: SessionIdentityDelegate {
     private let logger: NeedleTailLogger
     
     private let crypto = NeedleTailCrypto()
-let id = UUID()
+
     public init(logger: NeedleTailLogger = NeedleTailLogger("[CallKeyStore]")) {
-        print("INTIALIZED KEY MANAGER id \(id)")
         self.logger = logger
     }
     
     // MARK: - SessionIdentityDelegate
     
     public func updateSessionIdentity(_ identity: DoubleRatchetKit.SessionIdentity) async throws {
-        // Find the connection identity by searching through all connection identities
-        // since they're keyed by connectionId, not session identity UUID
-        for (connectionId, var connIdentity) in connectionIdentities {
-            if connIdentity.sessionIdentity.id == identity.id {
-                connIdentity.sessionIdentity = identity
-                connectionIdentities[connectionId] = connIdentity
-                logger.log(level: .info, message: "Updated session identity: \(identity.id) for connectionId: \(connectionId)")
-                return
-            }
+        var updatedCount = 0
+        for connectionId in Array(connectionIdentities.keys) {
+            guard var connIdentity = connectionIdentities[connectionId] else { continue }
+            guard connIdentity.sessionIdentity.id == identity.id || connectionId == identity.id.uuidString else { continue }
+            connIdentity.sessionIdentity = identity
+            connectionIdentities[connectionId] = connIdentity
+            updatedCount += 1
         }
-        
-        // If not found by session identity ID, try by UUID string (for backward compatibility)
-        if let connectionIdentity = connectionIdentities[identity.id.uuidString] {
-            var updated = connectionIdentity
-            updated.sessionIdentity = identity
-            connectionIdentities[identity.id.uuidString] = updated
-            logger.log(level: .info, message: "Updated session identity: \(identity.id)")
+
+        if updatedCount > 0 {
+            logger.log(level: .info, message: "Updated session identity: \(identity.id) for \(updatedCount) cached connection lookup keys")
             return
         }
 
@@ -328,8 +321,115 @@ let id = UUID()
         return identity
     }
 
+    /// Creates and stores the SFU signaling identity for one participant device in one room.
+    ///
+    /// SwiftSFU keys encrypted signaling ratchets by `(roomId, deviceId, callId)` so a reconnect or
+    /// a later call cannot accidentally reuse an old chain for the same device. The SDK still looks
+    /// up outbound SFU signaling by the room/shared communication id, so this stores the same
+    /// identity under the server-compatible composite key plus room aliases.
+    func createSFUSignalingRecipientIdentity(
+        roomId: String,
+        deviceId: UUID,
+        sessionContext: String?,
+        props: SessionIdentity.UnwrappedProps,
+        aliases: [String] = []
+    ) async throws -> ConnectionSessionIdentity {
+        let normalizedRoomId = normalizedSessionConnectionId(roomId)
+        guard !normalizedRoomId.isEmpty else {
+            throw RTCErrors.invalidConfiguration("Invalid empty roomId")
+        }
+
+        let compositeConnectionId = "\(normalizedRoomId)|\(deviceId.uuidString)"
+        let sessionId = compositeSFUSignalingSessionId(
+            normalizedRoomId: normalizedRoomId,
+            deviceId: deviceId,
+            sessionContext: sessionContext)
+
+        var remoteProps = props
+        if remoteProps.state != nil {
+            remoteProps.state = nil
+            logger.log(level: .warning, message: "Dropping imported ratchet state from SFU recipient identity for key=\(compositeConnectionId)")
+        }
+
+        let lookupKeys = sfuSignalingIdentityLookupKeys(
+            roomId: roomId,
+            compositeConnectionId: compositeConnectionId,
+            aliases: aliases)
+        let existingCiphertext = lookupKeys.compactMap { key -> Data? in
+            if let ciphertext = connectionIdentities[key]?.ciphertext {
+                return ciphertext
+            }
+            return pendingCiphertext[key]
+        }.first
+
+        var identity = ConnectionSessionIdentity(
+            connectionId: compositeConnectionId,
+            symmetricKey: dbsk,
+            sessionIdentity: try SessionIdentity(
+                id: sessionId,
+                props: remoteProps,
+                symmetricKey: dbsk))
+
+        if let existingCiphertext {
+            identity.ciphertext = existingCiphertext
+            for key in lookupKeys {
+                pendingCiphertext.removeValue(forKey: key)
+            }
+            logger.log(level: .info, message: "Attached pending ciphertext to newly created SFU identity for key=\(compositeConnectionId)")
+        }
+
+        for key in lookupKeys {
+            connectionIdentities[key] = identity
+        }
+        logger.log(level: .info, message: "Created new SFU signaling recipient identity \(identity) on connection identity \(compositeConnectionId) with sessionId: \(sessionId) sessionContext=\(sessionContext ?? "<none>")")
+        return identity
+    }
+
     private func normalizedSessionConnectionId(_ id: String) -> String {
         id.trimmingCharacters(in: .whitespacesAndNewlines).normalizedUUIDConnectionId.lowercased()
+    }
+
+    private func compositeSFUSignalingSessionId(
+        normalizedRoomId: String,
+        deviceId: UUID,
+        sessionContext: String?
+    ) -> UUID {
+        let normalizedContext = sessionContext?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let base = "\(normalizedRoomId)|\(deviceId.uuidString)"
+        let input = normalizedContext?.isEmpty == false
+            ? "\(base)|\(normalizedContext!)"
+            : base
+        let digest = SHA256.hash(data: Data(input.utf8))
+        let bytes = Array(digest)
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+    }
+
+    private func sfuSignalingIdentityLookupKeys(
+        roomId: String,
+        compositeConnectionId: String,
+        aliases: [String]
+    ) -> [String] {
+        var keys: [String] = []
+        func append(_ key: String) {
+            guard !key.isEmpty, !keys.contains(key) else { return }
+            keys.append(key)
+        }
+
+        for candidate in [roomId, compositeConnectionId] + aliases {
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            for key in identityLookupKeys(for: trimmed) {
+                append(key)
+            }
+        }
+        return keys
     }
 
     private func identityLookupKeys(for id: String) -> [String] {

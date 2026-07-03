@@ -41,6 +41,7 @@ extension RTCVideoQualityProfile {
         let highFps: Int
     }
 
+    /// Base adaptive config for the selected profile (multi-party SFU / group defaults).
     var adaptiveConfig: AdaptiveConfig {
         switch self {
         case .low:
@@ -70,42 +71,38 @@ extension RTCVideoQualityProfile {
         case .standard:
 #if os(iOS)
             return AdaptiveConfig(
-                // iPhone sustained-call default: keep encoder/network work bounded for long rooms.
-                minBitrateBps: 150_000,
+                minBitrateBps: 200_000,
                 maxBitrateBps: 1_500_000,
-                startingBitrateBps: 650_000,
-                startingFramerate: 15,
+                startingBitrateBps: 700_000,
+                startingFramerate: 20,
                 headroomFactor: 0.65,
-                highFpsThresholdBps: 1_000_000,
-                lowFps: 10,
-                highFps: 15
+                highFpsThresholdBps: 450_000,
+                lowFps: 15,
+                highFps: 24
             )
 #else
             return AdaptiveConfig(
-                // Allow survival on truly poor uplinks. WebRTC will still adapt below ceilings.
-                // Keeping this too high causes "freeze until keyframe" symptoms on slow/latent internet.
                 minBitrateBps: 200_000,
                 maxBitrateBps: 4_000_000,
                 startingBitrateBps: 1_200_000,
-                startingFramerate: 15,
+                startingFramerate: 20,
                 headroomFactor: 0.75,
-                highFpsThresholdBps: 1_800_000,
-                // Lower FPS is more resilient under loss/jitter and reduces decoder pressure.
-                lowFps: 10,
+                highFpsThresholdBps: 600_000,
+                lowFps: 15,
                 highFps: 30
             )
 #endif
         case .high:
 #if os(iOS)
             return AdaptiveConfig(
-                minBitrateBps: 200_000,
+                minBitrateBps: 250_000,
                 maxBitrateBps: 2_200_000,
                 startingBitrateBps: 900_000,
-                startingFramerate: 15,
+                startingFramerate: 24,
                 headroomFactor: 0.65,
-                highFpsThresholdBps: 1_400_000,
-                lowFps: 10,
-                highFps: 20
+                highFpsThresholdBps: 600_000,
+                lowFps: 18,
+                highFps: 24
             )
 #else
             return AdaptiveConfig(
@@ -114,22 +111,22 @@ extension RTCVideoQualityProfile {
                 startingBitrateBps: 1_800_000,
                 startingFramerate: 30,
                 headroomFactor: 0.75,
-                highFpsThresholdBps: 2_200_000,
-                lowFps: 10,
+                highFpsThresholdBps: 1_200_000,
+                lowFps: 15,
                 highFps: 30
             )
 #endif
         case .highest:
 #if os(iOS)
             return AdaptiveConfig(
-                minBitrateBps: 250_000,
+                minBitrateBps: 300_000,
                 maxBitrateBps: 3_000_000,
                 startingBitrateBps: 1_100_000,
-                startingFramerate: 20,
+                startingFramerate: 24,
                 headroomFactor: 0.65,
-                highFpsThresholdBps: 1_800_000,
-                lowFps: 12,
-                highFps: 24
+                highFpsThresholdBps: 800_000,
+                lowFps: 20,
+                highFps: 30
             )
 #else
             return AdaptiveConfig(
@@ -138,18 +135,32 @@ extension RTCVideoQualityProfile {
                 startingBitrateBps: 2_500_000,
                 startingFramerate: 30,
                 headroomFactor: 0.75,
-                highFpsThresholdBps: 2_800_000,
-                lowFps: 10,
+                highFpsThresholdBps: 1_800_000,
+                lowFps: 15,
                 highFps: 30
             )
 #endif
         }
     }
 
-    static func resolutionScaleDownBy(for targetBitrateBps: Int) -> Double {
+    /// Adaptive config for an SFU room, optionally elevated for ephemeral 2-person calls.
+    func sfuAdaptiveConfig(oneToOneSfu: Bool) -> AdaptiveConfig {
+        guard oneToOneSfu else { return adaptiveConfig }
+        return adaptiveConfig.elevatedForOneToOneSfu()
+    }
+
+    static func resolutionScaleDownBy(for targetBitrateBps: Int, isOneToOneSfu: Bool = false) -> Double {
+        if isOneToOneSfu {
 #if os(Android)
-        // Android hardware/WebRTC adaptation is already willing to reduce captured frames. Keep
-        // resolution stable longer so good networks do not quickly collapse to soft 360p video.
+            if targetBitrateBps < 200_000 { return 4.0 }
+            if targetBitrateBps < 400_000 { return 2.0 }
+#else
+            if targetBitrateBps < 220_000 { return 4.0 }
+            if targetBitrateBps < 550_000 { return 2.0 }
+#endif
+            return 1.0
+        }
+#if os(Android)
         if targetBitrateBps < 250_000 { return 4.0 }
         if targetBitrateBps < 500_000 { return 2.0 }
         return 1.0
@@ -157,6 +168,46 @@ extension RTCVideoQualityProfile {
         if targetBitrateBps < 350_000 { return 4.0 }
         if targetBitrateBps < 900_000 { return 2.0 }
         return 1.0
+#endif
+    }
+}
+
+extension RTCVideoQualityProfile.AdaptiveConfig {
+    /// Elevated ceilings for ephemeral 2-person SFU calls (camera 1:1 routed through the SFU).
+    fileprivate func elevatedForOneToOneSfu() -> Self {
+#if os(iOS)
+        return Self(
+            minBitrateBps: max(minBitrateBps, 300_000),
+            maxBitrateBps: max(maxBitrateBps, 2_200_000),
+            startingBitrateBps: max(startingBitrateBps, 900_000),
+            startingFramerate: max(startingFramerate, 24),
+            headroomFactor: max(headroomFactor, 0.68),
+            highFpsThresholdBps: min(highFpsThresholdBps, 400_000),
+            lowFps: max(lowFps, 20),
+            highFps: max(highFps, 24)
+        )
+#elseif os(Android)
+        return Self(
+            minBitrateBps: max(minBitrateBps, 300_000),
+            maxBitrateBps: max(maxBitrateBps, 4_000_000),
+            startingBitrateBps: max(startingBitrateBps, 1_200_000),
+            startingFramerate: max(startingFramerate, 24),
+            headroomFactor: max(headroomFactor, 0.72),
+            highFpsThresholdBps: min(highFpsThresholdBps, 500_000),
+            lowFps: max(lowFps, 18),
+            highFps: max(highFps, 30)
+        )
+#else
+        return Self(
+            minBitrateBps: max(minBitrateBps, 350_000),
+            maxBitrateBps: max(maxBitrateBps, 5_000_000),
+            startingBitrateBps: max(startingBitrateBps, 1_500_000),
+            startingFramerate: max(startingFramerate, 24),
+            headroomFactor: max(headroomFactor, 0.72),
+            highFpsThresholdBps: min(highFpsThresholdBps, 600_000),
+            lowFps: max(lowFps, 20),
+            highFps: max(highFps, 30)
+        )
 #endif
     }
 }
@@ -172,32 +223,32 @@ extension RTCVideoQualityProfile.AdaptiveConfig {
                 maxBitrateBps: 1_100_000,
                 startingBitrateBps: 550_000,
                 headroomFactor: 0.55,
-                lowFps: min(lowFps, 10),
-                highFps: min(highFps, 12)
+                lowFps: min(lowFps, 12),
+                highFps: min(highFps, 18)
             )
         case .serious:
             return capped(
                 maxBitrateBps: 750_000,
                 startingBitrateBps: 400_000,
                 headroomFactor: 0.45,
-                lowFps: min(lowFps, 8),
-                highFps: min(highFps, 10)
+                lowFps: min(lowFps, 10),
+                highFps: min(highFps, 15)
             )
         case .critical:
             return capped(
                 maxBitrateBps: 450_000,
                 startingBitrateBps: 300_000,
                 headroomFactor: 0.35,
-                lowFps: min(lowFps, 5),
-                highFps: min(highFps, 8)
+                lowFps: min(lowFps, 8),
+                highFps: min(highFps, 12)
             )
         @unknown default:
             return capped(
                 maxBitrateBps: 750_000,
                 startingBitrateBps: 400_000,
                 headroomFactor: 0.45,
-                lowFps: min(lowFps, 8),
-                highFps: min(highFps, 10)
+                lowFps: min(lowFps, 10),
+                highFps: min(highFps, 15)
             )
         }
     }

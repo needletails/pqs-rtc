@@ -63,13 +63,14 @@ struct EndToEndGroupCallFlowTests {
 
         let sfuRecipientId = "sfu"
 
-        let local = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: "alice-device")
-        let bob = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "bob-device")
-        let carol = try Call.Participant(secretName: "carol", nickname: "Carol", deviceId: "carol-device")
+        let localDeviceId = try #require(UUID(uuidString: "2D4087FD-0E8A-4D96-B558-33142F345AD2"))
+        let local = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: localDeviceId.uuidString)
+        let bob = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: UUID().uuidString)
+        let carol = try Call.Participant(secretName: "carol", nickname: "Carol", deviceId: UUID().uuidString)
 
         // Join group call. This should trigger negotiateGroupIdentity on transport.
         try await step("join") {
-            try await session.join(sender: local, participants: [bob, carol], sfuRecipientId: sfuRecipientId)
+            try await session.join(sender: local, participants: [bob, carol], sfuRecipientId: sfuRecipientId, supportsVideo: false)
         }
         let negotiated = await waitUntil {
             await transport.negotiated.isEmpty == false
@@ -92,16 +93,25 @@ struct EndToEndGroupCallFlowTests {
             Issue.record("Missing SFU identity props")
             return
         }
+        let serverClientIdentity = try await sfuKeyStore.createSFUSignalingRecipientIdentity(
+            roomId: negotiatedCall.sharedCommunicationId,
+            deviceId: localDeviceId,
+            sessionContext: negotiatedCall.id.uuidString,
+            props: clientProps,
+            aliases: [sfuRecipientId]
+        )
         let sfuExecutor = RatchetExecutor(queue: DispatchQueue(label: "tests.sfu.ratchet"))
         let sfuRatchet = DoubleRatchetStateManager<SHA256>(executor: sfuExecutor)
 
         // Call used to create SFU identity and start the SFU peer connection/offer.
-        var call = try Call(sharedCommunicationId: sfuRecipientId, sender: local, recipients: [bob, carol], supportsVideo: false)
+        var call = negotiatedCall
         call.signalingIdentityProps = sfuProps
 
         try await step("createSFUIdentity + beginGroupCallMedia (encrypt offer)") {
             try await session.createSFUIdentity(sfuRecipientId: sfuRecipientId, call: call)
-            try await session.beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId: sfuRecipientId)
+            try await session.beginGroupCallMediaAfterSfuRegistrationIfNeeded(
+                sfuRecipientId: sfuRecipientId,
+                updatedCall: call)
         }
 
         let gotOffer = await waitUntil { await transport.sfuMessages.contains(where: { $0.packet.flag == .offer }) }
@@ -114,7 +124,7 @@ struct EndToEndGroupCallFlowTests {
         // Receiver initializes from header and decrypts the offer payload.
         try await step("SFU decrypt offer") {
             try await sfuRatchet.recipientInitialization(
-            sessionIdentity: sfuLocalIdentity.sessionIdentity,
+            sessionIdentity: serverClientIdentity.sessionIdentity,
             sessionSymmetricKey: sfuLocalIdentity.symmetricKey,
             header: offerPacket.header,
             localKeys: sfuLocalIdentity.localKeys
@@ -122,7 +132,7 @@ struct EndToEndGroupCallFlowTests {
         }
         let decryptedOfferBytes = try await sfuRatchet.ratchetDecrypt(
             offerPacket.ratchetMessage,
-            sessionId: sfuLocalIdentity.sessionIdentity.id
+            sessionId: serverClientIdentity.sessionIdentity.id
         )
         let decryptedOfferCall = try BinaryDecoder().decode(Call.self, from: decryptedOfferBytes)
         #expect(decryptedOfferCall.sharedCommunicationId == sfuRecipientId)
@@ -150,7 +160,7 @@ struct EndToEndGroupCallFlowTests {
         // For subsequent messages, do not re-run recipientInitialization; let the ratchet state advance naturally.
         let decryptedCandidateBytes = try await sfuRatchet.ratchetDecrypt(
             candidatePacket.ratchetMessage,
-            sessionId: sfuLocalIdentity.sessionIdentity.id
+            sessionId: serverClientIdentity.sessionIdentity.id
         )
         let decryptedCandidateCall = try BinaryDecoder().decode(Call.self, from: decryptedCandidateBytes)
         guard let decryptedCandidateMetadata = decryptedCandidateCall.metadata else {
@@ -164,7 +174,7 @@ struct EndToEndGroupCallFlowTests {
         // Initialize SFU sender state so it can encrypt to the client.
         try await step("SFU senderInitialization") {
             try await sfuRatchet.senderInitialization(
-            sessionIdentity: sfuLocalIdentity.sessionIdentity,
+            sessionIdentity: serverClientIdentity.sessionIdentity,
             sessionSymmetricKey: sfuLocalIdentity.symmetricKey,
             remoteKeys: RemoteKeys(
                 longTerm: CurvePublicKey(clientProps.longTermPublicKey),
@@ -189,7 +199,7 @@ struct EndToEndGroupCallFlowTests {
         let sfuAnswerPlain = try BinaryEncoder().encode(sfuAnswerCall)
         let sfuAnswerMsg = try await sfuRatchet.ratchetEncrypt(
             plainText: sfuAnswerPlain,
-            sessionId: sfuLocalIdentity.sessionIdentity.id
+            sessionId: serverClientIdentity.sessionIdentity.id
         )
         let sfuAnswerPacket = RatchetMessagePacket(
             sfuIdentity: sfuRecipientId,
@@ -203,10 +213,7 @@ struct EndToEndGroupCallFlowTests {
             Issue.record("Client missing recipient identity for SFU")
             return
         }
-        guard let clientBundle = try await session.pcKeyManager.fetchCallKeyBundle() else {
-            Issue.record("Client missing local call bundle for SFU decrypt")
-            return
-        }
+        let clientBundle = try await session.pcKeyManager.fetchCallKeyBundle()
         try await step("Client decrypt SFU answer") {
             try await session.pcRatchetManager.recipientInitialization(
             sessionIdentity: clientSfuIdentity.sessionIdentity,
@@ -292,7 +299,8 @@ struct EndToEndGroupCallFlowTests {
 
         let sharedCommunicationId = UUID().uuidString
         let channelWireId = "#travel_\(UUID().uuidString.lowercased())"
-        let local = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: UUID().uuidString)
+        let localDeviceId = try #require(UUID(uuidString: "2D4087FD-0E8A-4D96-B558-33142F345AD2"))
+        let local = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: localDeviceId.uuidString)
         let bob = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "bob-device")
         let carol = try Call.Participant(secretName: "carol", nickname: "Carol", deviceId: "carol-device")
         let call = try Call(
@@ -323,11 +331,26 @@ struct EndToEndGroupCallFlowTests {
         let sfuExecutor = RatchetExecutor(queue: DispatchQueue(label: "tests.sfu.channel-route"))
         let sfuRatchet = DoubleRatchetStateManager<SHA256>(executor: sfuExecutor)
 
-        var registrationReply = await transport.negotiated.last!.call
+        let negotiatedCall = await transport.negotiated.last!.call
+        guard let clientProps = negotiatedCall.signalingIdentityProps else {
+            Issue.record("Expected channel-backed registration to include client signaling props")
+            return
+        }
+        let serverClientIdentity = try await sfuKeyStore.createSFUSignalingRecipientIdentity(
+            roomId: sharedCommunicationId,
+            deviceId: localDeviceId,
+            sessionContext: negotiatedCall.id.uuidString,
+            props: clientProps,
+            aliases: [channelWireId]
+        )
+
+        var registrationReply = negotiatedCall
         registrationReply.signalingIdentityProps = sfuProps
 
         try await session.createSFUIdentity(sfuRecipientId: channelWireId, call: registrationReply)
-        try await session.beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId: channelWireId)
+        try await session.beginGroupCallMediaAfterSfuRegistrationIfNeeded(
+            sfuRecipientId: channelWireId,
+            updatedCall: registrationReply)
 
         let gotOffer = await waitUntil { await transport.sfuMessages.contains(where: { $0.packet.flag == .offer }) }
         #expect(gotOffer, "Expected encrypted SFU offer packet to be sent")
@@ -336,7 +359,7 @@ struct EndToEndGroupCallFlowTests {
         #expect(offerPacket.sfuIdentity == channelWireId)
 
         try await sfuRatchet.recipientInitialization(
-            sessionIdentity: sfuLocalIdentity.sessionIdentity,
+            sessionIdentity: serverClientIdentity.sessionIdentity,
             sessionSymmetricKey: sfuLocalIdentity.symmetricKey,
             header: offerPacket.header,
             localKeys: sfuLocalIdentity.localKeys
@@ -344,7 +367,7 @@ struct EndToEndGroupCallFlowTests {
 
         let decryptedOfferBytes = try await sfuRatchet.ratchetDecrypt(
             offerPacket.ratchetMessage,
-            sessionId: sfuLocalIdentity.sessionIdentity.id
+            sessionId: serverClientIdentity.sessionIdentity.id
         )
         let decryptedOfferCall = try BinaryDecoder().decode(Call.self, from: decryptedOfferBytes)
         #expect(decryptedOfferCall.sharedCommunicationId == sharedCommunicationId)
@@ -354,5 +377,3 @@ struct EndToEndGroupCallFlowTests {
         try? await sfuRatchet.shutdown()
     }
 }
-
-

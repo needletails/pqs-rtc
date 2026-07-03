@@ -98,7 +98,8 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     var renderer: RendererDelegate?
     @MainActor private(set) var prefersAspectFit = false
     
-    /// Letterboxes camera video inside its tile instead of cropping. Used for participant thumbnails during screen share.
+    /// Letterboxes video inside its tile instead of cropping. Participant camera tiles opt in via
+    /// ``setPrefersAspectFit(_:)`` so remote video preserves the sender's aspect ratio.
     @MainActor
     public func setPrefersAspectFit(_ enabled: Bool) {
         guard type == .sample, !contextName.hasPrefix("screen_") else { return }
@@ -151,13 +152,27 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     @MainActor
     override public var bounds: CGRect {
         didSet {
-            let renderer = self.renderer
-            if let pRenderer = renderer as? PreviewViewRender {
-                setBounds(renderer: pRenderer, bounds: bounds)
-            }
-            if let sRenderer = renderer as? SampleBufferViewRenderer {
-                setBounds(renderer: sRenderer, bounds: bounds)
-            }
+            propagateRendererBoundsToAttachedRenderers()
+        }
+    }
+
+    /// UICollectionView can resize cells through `layoutSubviews` without always touching the
+    /// `bounds` observer first. Mirror macOS's layout-path propagation so Metal scaling uses
+    /// the live tile size instead of a stale zero or conference-sized rect (stretched screen).
+    @MainActor
+    override public func layoutSubviews() {
+        super.layoutSubviews()
+        propagateRendererBoundsToAttachedRenderers()
+    }
+
+    @MainActor
+    private func propagateRendererBoundsToAttachedRenderers() {
+        let renderer = self.renderer
+        if let pRenderer = renderer as? PreviewViewRender {
+            setBounds(renderer: pRenderer, bounds: bounds)
+        }
+        if let sRenderer = renderer as? SampleBufferViewRenderer {
+            setBounds(renderer: sRenderer, bounds: bounds)
         }
     }
     
@@ -436,7 +451,14 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
             layoutSubtreeIfNeeded()
             scheduleRendererBoundsPropagation()
 #endif
+            #if os(iOS)
+            // iOS normally shows the raw AVCaptureVideoPreviewLayer. When appearance softening is
+            // enabled, render the processed frames on Metal instead so the self-view matches the
+            // video remote participants receive.
+            shouldRenderOnMetal = PQSRTCCallUIPreferences.resolvedVideoAppearanceSofteningEnabled()
+            #else
             shouldRenderOnMetal = true
+            #endif
 
         case .sample:
             let view = SampleCaptureView()
@@ -452,7 +474,7 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
 #endif
             let layer = view.layer as! AVSampleBufferDisplayLayer
             let rendersScreenShare = contextName.hasPrefix("screen_")
-            layer.videoGravity = rendersScreenShare ? .resizeAspect : .resizeAspectFill
+            layer.videoGravity = (rendersScreenShare || prefersAspectFit) ? .resizeAspect : .resizeAspectFill
             let layerBox = SampleBufferDisplayLayerBox(layer: layer)
             let renderer = SampleBufferViewRenderer(
                 layerBox: layerBox,
@@ -960,6 +982,19 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         handleOutputStream(metalCommandQueue)
     }
     
+    /// Clears the displayed Metal texture and cancels post-resize redraw bursts.
+    ///
+    /// Prevents a texture rasterized for a smaller layout (e.g. camera strip during screen share)
+    /// from being stretched when the view expands back to full size.
+    @MainActor
+    func clearMetalDisplayTexture() {
+        postResizeRedrawTask?.cancel()
+        postResizeRedrawTask = nil
+        texture = nil
+        metalDrawInFlight = false
+        metalDrawInFlightSinceUptimeNs = 0
+    }
+
     /// Receives an updated frame texture from the renderer.
     func passTexture(texture: any MTLTexture) async throws {
         await MainActor.run {

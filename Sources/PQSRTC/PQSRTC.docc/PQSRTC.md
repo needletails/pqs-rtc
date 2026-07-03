@@ -49,6 +49,7 @@ derive group media frame keys from pairwise `call_cipher`; that path is reserved
 - <doc:Transport>
 - <doc:One-to-One-Calls>
 - <doc:End-to-End-Encryption>
+- <doc:GroupConferenceRemoteVideo> — group/conference **remote video** architecture (Apple + Android)
 
 ### Server SFU, CallKit, and frame E2EE (NeedleTails)
 

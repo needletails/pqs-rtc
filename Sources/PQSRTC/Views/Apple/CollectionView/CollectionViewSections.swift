@@ -369,9 +369,6 @@ public struct CollectionViewSections {
         }
 
         if itemCount == 2 {
-            #if os(macOS)
-            return (2, 1)
-            #else
             let sideBySide = conferenceTileSize(
                 columns: 2,
                 rows: 1,
@@ -393,7 +390,6 @@ public struct CollectionViewSections {
             } else {
                 return (1, 2)
             }
-            #endif
         }
 
         var bestGrid = (columns: 1, rows: itemCount)
@@ -418,11 +414,9 @@ public struct CollectionViewSections {
 
             score += CGFloat(columns) * tile.area * 0.03
 
-            #if os(iOS)
-            if itemCount >= 3, columns == 1 {
+            if itemCount >= 3, columns == 1, availableSize.height > availableSize.width * 1.12 {
                 score *= 0.85
             }
-            #endif
 
             if score > bestScore {
                 bestScore = score
@@ -542,7 +536,9 @@ public struct CollectionViewSections {
     /// Produces a balanced rows x columns grid for conference tiles.
     private func conferenceGridDimensions(for itemCount: Int) -> (columns: Int, rows: Int) {
         switch itemCount {
-        case 1...2:
+        case 1:
+            return (1, 1)
+        case 2:
             return (2, 1)
         case 3...4:
             return (2, 2)

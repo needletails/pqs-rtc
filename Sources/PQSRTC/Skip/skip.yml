@@ -5,8 +5,8 @@ build:
   contents:
     - block: 'dependencies'
       contents:
-        - 'implementation("io.github.webrtc-sdk:android:144.7559.05")'
-        - 'implementation("androidx.compose.ui:ui")'
-        - 'implementation("androidx.compose.foundation:foundation")'
+        - 'implementation("io.github.webrtc-sdk:android:144.7559.09")'
+        - 'implementation("androidx.compose.ui:ui:1.6.0")'
+        - 'implementation("androidx.compose.foundation:foundation:1.6.0")'
 skip:
   mode: 'native'

@@ -12,25 +12,32 @@
 import Foundation
 
 #if os(Android)
-/// Holds MediaProjection permission state outside actor isolation so Skip’s JNI `Task` hop does
-/// not need to send non-`Sendable` references across the actor boundary.
+/// Holds the MediaProjection consent result code outside actor isolation so Skip’s JNI `Task`
+/// hop does not need to send non-`Sendable` references across the actor boundary.
+///
+/// Only the `Int` result code lives here. The consent `Intent` is an arbitrary Java object that
+/// SkipBridge cannot bridge into Swift; it stays on the Kotlin side in
+/// `AndroidMediaProjectionResultHolder` and is consumed directly by the screen capturer.
 final class AndroidMediaProjectionPermissionBox: @unchecked Sendable {
     private let lock = NSLock()
     private var storedResultCode: Int?
-    private var storedIntent: Any?
 
-    func store(resultCode: Int, intent: Any) {
+    func store(resultCode: Int) {
         lock.lock()
         storedResultCode = resultCode
-        storedIntent = intent
         lock.unlock()
     }
 
-    func readSnapshot() -> (resultCode: Int, intent: Any)? {
+    func readResultCode() -> Int? {
         lock.lock()
         defer { lock.unlock() }
-        guard let rc = storedResultCode, let intent = storedIntent else { return nil }
-        return (rc, intent)
+        return storedResultCode
+    }
+
+    func clear() {
+        lock.lock()
+        storedResultCode = nil
+        lock.unlock()
     }
 }
 #else

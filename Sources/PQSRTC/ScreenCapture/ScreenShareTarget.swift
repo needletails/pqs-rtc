@@ -44,6 +44,16 @@ public struct ScreenShareOptions: Sendable, Equatable {
     }
 }
 
+/// Control payload for ``PacketFlag/screenSharePreempt``.
+public struct ScreenSharePreemptCommand: Codable, Sendable, Equatable {
+    /// Secret name of the participant who must stop screen sharing.
+    public var targetParticipantSecretName: String
+
+    public init(targetParticipantSecretName: String) {
+        self.targetParticipantSecretName = targetParticipantSecretName
+    }
+}
+
 /// Fired by ``RTCSession/remoteScreenTrackStream()`` whenever a remote participant
 /// starts or stops sharing their screen.
 public struct RemoteScreenTrackEvent: Sendable {
@@ -81,5 +91,20 @@ public struct RemoteParticipantTrackEvent: Sendable {
         self.participantId = participantId
         self.kind = kind
         self.isActive = isActive
+    }
+}
+
+/// One coordinated Android tile-attach episode after SFU renegotiation settles.
+///
+/// Emitted once per rebound batch so the call UI can bind every affected participant from live
+/// peer-connection receivers in a single pass instead of racing `participant-track-refresh`,
+/// grid relayout, and inbound-render recovery.
+public struct PostSfuRenegotiationAttachEpisode: Sendable {
+    public let connectionId: String
+    public let participantIds: [String]
+
+    public init(connectionId: String, participantIds: [String]) {
+        self.connectionId = connectionId
+        self.participantIds = participantIds
     }
 }

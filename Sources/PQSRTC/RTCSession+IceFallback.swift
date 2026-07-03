@@ -96,9 +96,18 @@ extension RTCSession {
         let normalizedId = normalizedFallbackConnectionId(for: connectionId)
         clearFallbackState(connectionId: normalizedId)
         resetTeardownIdempotency(forConnectionId: connectionId)
+#if canImport(WebRTC)
+        stopInboundVideoFlowProbe(connectionId: normalizedId)
+        stopOutboundVideoFlowProbe(connectionId: normalizedId)
+#endif
         oneToOneSfuReceiveKeyReadyConnectionIds.remove(normalizedId)
         oneToOneSfuPostCipherHandshakeSentConnectionIds.remove(normalizedId)
+        remoteVideoRendererAttachedTrackIdByConnectionId.removeValue(forKey: normalizedId)
+        clearRemoteParticipantVideoRendererAttachments(connectionId: normalizedId)
+        sfuRenegotiationReceiverCryptorRebindDeferredConnectionIds.remove(normalizedId)
+        oneToOneSfuLockedRemoteDeviceIdByNormalizedConnectionId.removeValue(forKey: normalizedId)
         senderFrameKeyIdentityFingerprintByConnectionId.removeValue(forKey: normalizedId)
+        pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
 
         logger.log(level: .debug, message: "Reset per-connection retry flags for new call attempt: \(normalizedId)")
     }
@@ -147,6 +156,7 @@ extension RTCSession {
     func retryWithRelayIfNeeded(call: Call, reason: String) async -> Bool {
         let connectionId = normalizedFallbackConnectionId(for: call.sharedCommunicationId)
         guard var existing = connectionFallbackStateByConnectionId[connectionId] else { return false }
+        guard !isConnectionFinishingOrEnded(connectionId) else { return false }
         guard case .outbound = existing.direction else { return false }
         guard existing.currentPolicy == .all, !existing.hasRetriedToRelay else { return false }
 
@@ -256,6 +266,14 @@ extension RTCSession {
             stopOutboundRtpStatsLogging(connectionId: connectionId)
             stopOutboundVideoFlowProbe(connectionId: connectionId)
             stopAdaptiveVideoSend(connectionId: connectionId)
+#if os(iOS) || os(macOS)
+            // Stop injecting camera frames before the peer connection (and its RTP senders) is
+            // closed below. The renderer stays registered; the retry attempt rebinds it via
+            // rebindRegisteredLocalPreviewCaptureIfNeeded when the fresh video source is created.
+            if let previewRenderer = localPreviewCaptureRenderersByConnectionId[connectionId] {
+                await previewRenderer.setCapture(nil)
+            }
+#endif
             connection.videoFrameCryptor?.enabled = false
             connection.videoSenderCryptor?.enabled = false
             connection.audioFrameCryptor?.enabled = false
@@ -293,6 +311,9 @@ extension RTCSession {
                 )
             }
             connection.remoteScreenTracksByParticipantId.removeAll()
+            // Capture injection unbound and sender cryptors disabled above; drain in-flight
+            // encrypted frames before the close below destroys the RTP senders.
+            await drainAppleSenderFrameTransformersBeforeSenderTeardown()
 #endif
 #if os(Android)
             stopAdaptiveVideoSend(connectionId: connectionId)
@@ -306,7 +327,7 @@ extension RTCSession {
                     RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: false)
                 )
             }
-            rtcClient.close()
+            rtcClient.resetPeerConnectionForRetry()
 #else
             connection.peerConnection.delegate = nil
             connection.peerConnection.close()
@@ -356,5 +377,64 @@ extension RTCSession {
     func cancelDisconnectGraceTask() {
         disconnectGraceTask?.cancel()
         disconnectGraceTask = nil
+    }
+
+    // MARK: - ICE restart during SFU media renegotiation
+
+    private static let iceRestartCooldownNs: UInt64 = 15_000_000_000
+
+    /// Attempts an ICE-restart SFU renegotiation when transport collapses during screen-share churn.
+    func attemptIceRestartRenegotiationIfNeeded(connectionId: String, reason: String) async {
+#if canImport(WebRTC) && !os(Android)
+        let normalizedId = normalizedFallbackConnectionId(for: connectionId)
+        guard !normalizedId.isEmpty else { return }
+        guard await isConnectionStillActiveForRecovery(normalizedId) else { return }
+        guard let connection = await connectionManager.findConnection(with: normalizedId) else { return }
+
+        let wireRoomId = connection.call.resolvedChannelWireId ?? connection.call.sharedCommunicationId
+        let isSfuConnection = connection.id.isGroupCall
+            || wireRoomId.isGroupCall
+            || groupCall(forSfuIdentity: normalizedId) != nil
+            || groupCall(forSfuIdentity: wireRoomId) != nil
+        guard isSfuConnection else { return }
+
+        guard case .connected = await callState.currentState else { return }
+
+        let iceState = connection.peerConnection.iceConnectionState
+        let inboundFlow = await evaluateInboundRemoteVideoFlow(connectionId: normalizedId)
+        let dtlsDisconnected = inboundFlow?.dtlsState != "connected"
+        let transportUnstable = iceState == .disconnected
+            || iceState == .failed
+            || dtlsDisconnected
+        guard transportUnstable else { return }
+
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let last = lastIceRestartAttemptUptimeNsByConnectionId[normalizedId],
+           now >= last,
+           now - last < Self.iceRestartCooldownNs {
+            return
+        }
+        lastIceRestartAttemptUptimeNsByConnectionId[normalizedId] = now
+
+        logger.log(
+            level: .warning,
+            message: "Attempting ICE-restart SFU renegotiation connId=\(normalizedId) reason=\(reason) iceState=\(iceState.rawValue)"
+        )
+        do {
+            let updatedCall = try await sendGroupCallOffer(connection.call, iceRestart: true)
+            if var refreshed = await connectionManager.findConnection(with: normalizedId) {
+                refreshed.call = updatedCall
+                await connectionManager.updateConnection(id: normalizedId, with: refreshed)
+            }
+            if let group = groupCall(forSfuIdentity: wireRoomId) ?? groupCall(forSfuIdentity: normalizedId) {
+                await group.applyUpdatedCallForNegotiation(updatedCall)
+            }
+        } catch {
+            logger.log(
+                level: .error,
+                message: "ICE-restart SFU renegotiation failed connId=\(normalizedId) reason=\(reason): \(error)"
+            )
+        }
+#endif
     }
 }

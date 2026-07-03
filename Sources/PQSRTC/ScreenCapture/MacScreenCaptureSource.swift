@@ -33,10 +33,23 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
     private lazy var capturer = RTCVideoCapturer()
     private let screenSampleQueue = DispatchQueue(label: "com.needletails.pqsrtc.mac-screen-capture.video", qos: .userInteractive)
     private let audioSampleQueue = DispatchQueue(label: "com.needletails.pqsrtc.mac-screen-capture.audio", qos: .userInitiated)
-    private var loggedUnsupportedAudioSample = false
+    private var loggedAudioConversionFailure = false
     private let onUnexpectedStop: (@Sendable () -> Void)?
+    private let systemAudioEgress: ScreenShareSystemAudioEgress
+    private let localPreviewLock = NSLock()
+    private var localPreviewRenderers: [RTCVideoRenderWrapper] = []
+    private var loggedFirstLocalPreviewFrame = false
+    private var loggedFirstSystemAudioFrame = false
+    private var loggedFirstNonSilentSystemAudioFrame = false
+    private var silentSystemAudioFrameCount = 0
+    /// True only while a capture with `shareSystemAudio` is running.
+    private var systemAudioActive = false
 
-    init(onUnexpectedStop: (@Sendable () -> Void)? = nil) {
+    init(
+        systemAudioEgress: ScreenShareSystemAudioEgress = NoOpScreenShareSystemAudioEgress(),
+        onUnexpectedStop: (@Sendable () -> Void)? = nil
+    ) {
+        self.systemAudioEgress = systemAudioEgress
         self.onUnexpectedStop = onUnexpectedStop
         super.init()
     }
@@ -120,7 +133,8 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
             config.preservesAspectRatio = true
         }
         config.queueDepth = 4
-        if options.shareSystemAudio {
+        let wantsSystemAudio = options.shareSystemAudio && RTCSession.supportsScreenShareSystemAudioEgress
+        if wantsSystemAudio {
             config.capturesAudio = true
             config.excludesCurrentProcessAudio = true
             config.sampleRate = 48_000
@@ -129,12 +143,24 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: self)
         try scStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: screenSampleQueue)
-        if options.shareSystemAudio {
+        if wantsSystemAudio {
             try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSampleQueue)
         }
-        try await scStream.startCapture()
+        if wantsSystemAudio {
+            systemAudioActive = true
+            systemAudioEgress.activate()
+        }
+        do {
+            try await scStream.startCapture()
+        } catch {
+            deactivateSystemAudioIfNeeded()
+            throw error
+        }
         self.stream = scStream
-        loggedUnsupportedAudioSample = false
+        loggedAudioConversionFailure = false
+        loggedFirstSystemAudioFrame = false
+        loggedFirstNonSilentSystemAudioFrame = false
+        silentSystemAudioFrameCount = 0
         logger.log(
             level: .info,
             message: "Screen capture started output=\(config.width)x\(config.height) optimizeForVideo=\(options.optimizeForVideo) shareSystemAudio=\(options.shareSystemAudio)"
@@ -143,6 +169,9 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
 
     /// Stop capturing and release the stream.
     func stopCapture() async {
+        // Cut system audio first so no buffered samples outlive the share.
+        deactivateSystemAudioIfNeeded()
+        clearLocalPreviewRenderers()
         guard let stream else { return }
         do {
             try await stream.stopCapture()
@@ -152,6 +181,53 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
         self.stream = nil
         self.videoSource = nil
         logger.log(level: .info, message: "Screen capture stopped")
+    }
+
+    func addLocalPreviewRenderer(_ renderer: RTCVideoRenderWrapper) {
+        localPreviewLock.withLock {
+            guard !localPreviewRenderers.contains(where: { $0 === renderer }) else { return }
+            localPreviewRenderers.append(renderer)
+            loggedFirstLocalPreviewFrame = false
+        }
+    }
+
+    func removeLocalPreviewRenderer(_ renderer: RTCVideoRenderWrapper) {
+        localPreviewLock.withLock {
+            localPreviewRenderers.removeAll { $0 === renderer }
+        }
+    }
+
+    private func clearLocalPreviewRenderers() {
+        localPreviewLock.withLock {
+            localPreviewRenderers.removeAll(keepingCapacity: false)
+            loggedFirstLocalPreviewFrame = false
+        }
+    }
+
+    private func deliverLocalPreviewFrame(_ frame: RTCVideoFrame) {
+        let (renderers, shouldLogFirstFrame) = localPreviewLock.withLock {
+            let shouldLog = !loggedFirstLocalPreviewFrame && !localPreviewRenderers.isEmpty
+            if shouldLog {
+                loggedFirstLocalPreviewFrame = true
+            }
+            return (localPreviewRenderers, shouldLog)
+        }
+        guard !renderers.isEmpty else { return }
+        if shouldLogFirstFrame {
+            logger.log(level: .info, message: "Delivering first ScreenCaptureKit frame to local preview renderer(s) count=\(renderers.count)")
+        }
+        for renderer in renderers {
+            renderer.renderFrame(frame)
+        }
+    }
+
+    private func deactivateSystemAudioIfNeeded() {
+        guard systemAudioActive else { return }
+        systemAudioActive = false
+        loggedFirstSystemAudioFrame = false
+        loggedFirstNonSilentSystemAudioFrame = false
+        silentSystemAudioFrameCount = 0
+        systemAudioEgress.deactivate()
     }
 
     private func captureOutputSize(for sourcePixels: CGSize, options: ScreenShareOptions) -> (width: Int, height: Int) {
@@ -225,24 +301,53 @@ extension MacScreenCaptureSource: SCStreamOutput {
     private func handleScreenSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
         guard sampleBuffer.isValid else { return }
         guard sampleBufferContainsCompleteFrame(sampleBuffer) else { return }
-        guard let videoSource else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         let timestampSeconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         let timeStampNs = (timestampSeconds.isFinite ? timestampSeconds : CACurrentMediaTime()) * kNanosecondsPerSecond
         let rtcPixelBuffer = RTCCVPixelBuffer(pixelBuffer: pixelBuffer)
         let frame = RTCVideoFrame(buffer: rtcPixelBuffer, rotation: ._0, timeStampNs: Int64(timeStampNs))
-        videoSource.capturer(capturer, didCapture: frame)
+        deliverLocalPreviewFrame(frame)
+        videoSource?.capturer(capturer, didCapture: frame)
     }
 
     private func handleAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
-        guard sampleBuffer.isValid else { return }
-        if !loggedUnsupportedAudioSample {
-            loggedUnsupportedAudioSample = true
-            logger.log(
-                level: .warning,
-                message: "Captured ScreenCaptureKit system-audio samples, but this WebRTC build does not expose a push-audio source for RTP egress"
-            )
+        guard sampleBuffer.isValid, systemAudioActive else { return }
+        do {
+            let frame = try ScreenSharePCMSampleConverter.pcmFrame(from: sampleBuffer)
+            if !loggedFirstSystemAudioFrame {
+                loggedFirstSystemAudioFrame = true
+                logger.log(
+                    level: .info,
+                    message: "First ScreenCaptureKit system-audio frame pushed sampleRate=\(frame.sampleRate) channels=\(frame.channelCount) samples=\(frame.samples.count) peak=\(frame.peakMagnitude) rms=\(frame.rmsMagnitude)"
+                )
+            }
+            if frame.containsMeaningfulAudio {
+                if !loggedFirstNonSilentSystemAudioFrame {
+                    loggedFirstNonSilentSystemAudioFrame = true
+                    logger.log(
+                        level: .info,
+                        message: "First non-silent ScreenCaptureKit system-audio frame sampleRate=\(frame.sampleRate) channels=\(frame.channelCount) samples=\(frame.samples.count) peak=\(frame.peakMagnitude) rms=\(frame.rmsMagnitude) silentFramesBefore=\(silentSystemAudioFrameCount)"
+                    )
+                }
+            } else if !loggedFirstNonSilentSystemAudioFrame {
+                silentSystemAudioFrameCount += 1
+                if silentSystemAudioFrameCount == 100 || silentSystemAudioFrameCount == 500 {
+                    logger.log(
+                        level: .warning,
+                        message: "ScreenCaptureKit system audio still silent frames=\(silentSystemAudioFrameCount) lastPeak=\(frame.peakMagnitude) lastRms=\(frame.rmsMagnitude)"
+                    )
+                }
+            }
+            systemAudioEgress.push(frame)
+        } catch {
+            if !loggedAudioConversionFailure {
+                loggedAudioConversionFailure = true
+                logger.log(
+                    level: .warning,
+                    message: "Dropping ScreenCaptureKit system-audio samples; conversion failed: \(error)"
+                )
+            }
         }
     }
 
@@ -264,6 +369,7 @@ extension MacScreenCaptureSource: SCStreamOutput {
 extension MacScreenCaptureSource: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
         logger.log(level: .error, message: "SCStream stopped with error: \(error)")
+        deactivateSystemAudioIfNeeded()
         self.stream = nil
         self.videoSource = nil
         onUnexpectedStop?()

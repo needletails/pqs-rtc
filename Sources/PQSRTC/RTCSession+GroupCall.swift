@@ -24,6 +24,33 @@ extension RTCSession {
         groupCall(forSfuIdentity: roomId)
     }
 
+    /// Whether an SFU group renegotiation is currently in flight for the room.
+    func isSfuGroupRenegotiationInFlight(for connectionId: String) -> Bool {
+        sfuRenegotiationInFlightConnectionIds.contains(connectionId.normalizedConnectionId)
+    }
+
+    /// Whether SFU group SDP signaling is currently stable for the room.
+    func isSfuGroupSignalingStable(for connectionId: String) -> Bool {
+        sfuGroupSignalingIsStableByConnectionId[connectionId.normalizedConnectionId] ?? true
+    }
+
+    func noteSfuGroupSignalingStability(for connectionId: String, isStable: Bool) {
+        let norm = connectionId.normalizedConnectionId
+        sfuGroupSignalingIsStableByConnectionId[norm] = isStable
+        if isStable {
+            notifySfuGroupSignalingBecameStable(connectionId: norm)
+        }
+    }
+
+    /// Defer participant renderer attaches while SFU renegotiation or SDP signaling is still settling.
+    func shouldDeferSfuGroupParticipantVideoAttach(for connectionId: String) -> Bool {
+        let norm = connectionId.normalizedConnectionId
+        return GroupSfuVideoAttachPolicy.shouldDeferParticipantVideoAttach(
+            renegotiationInFlight: sfuRenegotiationInFlightConnectionIds.contains(norm),
+            signalingIsStable: sfuGroupSignalingIsStableByConnectionId[norm] ?? true
+        )
+    }
+
     /// Tells the SFU this client has installed the group sender key for a specific source.
     ///
     /// Group/conference E2EE uses one sender key per publishing participant. The SFU must not
@@ -90,7 +117,7 @@ extension RTCSession {
         if !updatedWireId.isEmpty {
             merged.channelWireId = update.channelWireId
         } else if merged.channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
-            merged.channelWireId = sfuRecipientId.ensureIRCChannel
+            merged.channelWireId = sfuRecipientId.isGroupCall ? sfuRecipientId.ensureIRCChannel : nil
         }
 
         if merged.channelDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
@@ -144,13 +171,31 @@ extension RTCSession {
     ) async throws {
         let normalizedId = sfuRecipientId.normalizedConnectionId
         // Allow joining an SFU room even if the participant list is currently empty.
-        let call = try Call(
+        var call = try Call(
             groupSharedCommunicationId: normalizedId,
             sender: sender,
             recipients: participants,
             supportsVideo: supportsVideo,
             isActive: true)
+        if !sfuRecipientId.isGroupCall {
+            call.channelWireId = nil
+        }
         try await groupCallNegotiation(call: call, sfuRecipientId: sfuRecipientId)
+    }
+
+    /// Backward-compatible entry point for joining/registering an SFU group call.
+    public func join(
+        sender: Call.Participant,
+        participants: [Call.Participant],
+        sfuRecipientId: String,
+        supportsVideo: Bool = true
+    ) async throws {
+        try await groupCallNegotiation(
+            sender: sender,
+            participants: participants,
+            sfuRecipientId: sfuRecipientId,
+            supportsVideo: supportsVideo
+        )
     }
 
     /// Starts SFU group-call registration while preserving the caller-supplied call identity.
@@ -167,7 +212,8 @@ extension RTCSession {
         let normalizedConnectionId = originalCall.sharedCommunicationId.normalizedConnectionId
         resetAttemptFlagsForNewCall(connectionId: normalizedConnectionId)
         var call = originalCall
-        if call.channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+        if call.channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,
+           sfuRecipientId.isGroupCall {
             call.channelWireId = sfuRecipientId.ensureIRCChannel
         }
         
@@ -193,27 +239,32 @@ extension RTCSession {
             localIdentity: signalingLocalIdentity)
         
         groupCalls[normalizedId] = group
+        notifyGroupCallRegistered(roomId: normalizedId)
         
         setMediaDelegate(group)
         try await group.join()
         
-        // Transport uses IRC channel format (with "#").
+        let transportSfuRecipientId = sfuRecipientId.isGroupCall ? sfuRecipientId.ensureIRCChannel : sfuRecipientId
         try await delegate?.negotiateGroupIdentity(
             call: call,
-            sfuRecipientId: sfuRecipientId.ensureIRCChannel)
+            sfuRecipientId: transportSfuRecipientId)
     }
     
-    public func leave(sfuRecipientId: String, call: Call) async throws {
+    public func leave(
+        sfuRecipientId: String,
+        call: Call,
+        endState: CallStateMachine.EndState = .userInitiated
+    ) async throws {
         let normalizedId = sfuRecipientId.normalizedConnectionId
         guard let group = groupCalls[normalizedId] else {
             throw RTCErrors.missingGroupCall
         }
         await group.leave()
         groupCalls.removeValue(forKey: normalizedId)
-        await shutdown(with: call)
+        await shutdown(with: call, endState: endState)
     }
     
-    public func sendGroupCallOffer(_ call: Call) async throws -> Call {
+    public func sendGroupCallOffer(_ call: Call, iceRestart: Bool = false) async throws -> Call {
         var call = call
         let offerKey = call.sharedCommunicationId.normalizedConnectionId
         guard !offerInFlightConnectionIds.contains(offerKey) else {
@@ -231,8 +282,15 @@ extension RTCSession {
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).
         activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
 
+        if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
+           call.sharedCommunicationId.isGroupCall,
+           connection.call.supportsVideo {
+            let reserved = ensureGroupCallScreenSlotReserved(with: connection)
+            await connectionManager.updateConnection(id: reserved.id, with: reserved)
+        }
+
         // Create the offer (sets local SDP, triggers ICE gathering).
-        call = try await createOffer(call: call)
+        call = try await createOffer(call: call, iceRestart: iceRestart)
         
         // Encrypt and send; roomId stored normalized, "#" reattached at transport.
         let offerPlaintext = try BinaryEncoder().encode(call)
@@ -260,6 +318,10 @@ extension RTCSession {
         // Identity props must be sent back from the SFU Server's group identity.
         guard let props = call.signalingIdentityProps else { throw EncryptionErrors.missingProps }
         let connId = call.sharedCommunicationId.normalizedConnectionId
+        let senderDeviceId = call.sender.deviceId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let deviceId = UUID(uuidString: senderDeviceId) else {
+            throw RTCErrors.invalidConfiguration("Invalid SFU sender deviceId: \(senderDeviceId)")
+        }
 
         // Signaling ratchet (SDP/ICE over SFU): `pcKeyManager` + `TaskProcessor`.
         //
@@ -267,9 +329,12 @@ extension RTCSession {
         // before registration and create a room-scoped signaling identity with the peer's props; if
         // we keep that provisional identity, the next `.offer` / `.candidate` is encrypted to the
         // peer instead of the SFU and the server rejects it with `maxSkippedHeadersExceeded`.
-        _ = try await pcKeyManager.createRecipientIdentity(
-            connectionId: connId,
-            props: props)
+        _ = try await pcKeyManager.createSFUSignalingRecipientIdentity(
+            roomId: call.sharedCommunicationId,
+            deviceId: deviceId,
+            sessionContext: call.id.uuidString,
+            props: props,
+            aliases: [connId, sfuRecipientId, call.resolvedChannelWireId ?? ""])
 
         // Provisional media ratchet bootstrap: `keyManager` + `ratchetManager`.
         //
@@ -298,7 +363,8 @@ extension RTCSession {
     /// `.offer` so the server can attach local source tracks and replay them to other participants.
     public func beginGroupCallMediaAfterSfuRegistrationIfNeeded(
         sfuRecipientId: String,
-        updatedCall: Call? = nil
+        updatedCall: Call? = nil,
+        sendInitialOffer: Bool = true
     ) async throws {
         let normalizedLookup = sfuRecipientId.normalizedConnectionId
         guard let group = groupCall(forSfuIdentity: normalizedLookup) else {
@@ -372,6 +438,16 @@ extension RTCSession {
         }
 
         if var existingConnection = await connectionManager.findConnection(with: mediaCall.sharedCommunicationId) {
+            existingConnection.call = mediaCall
+            await connectionManager.updateConnection(id: existingConnection.id, with: existingConnection)
+
+            if !sendInitialOffer {
+                logger.log(
+                    level: .info,
+                    message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: reusing SFU PeerConnection without initial offer for room=\(normalizedLookup)")
+                return
+            }
+
             guard !initialSfuGroupMediaOfferSentConnectionIds.contains(bootstrapKey) else {
                 logger.log(
                     level: .debug,
@@ -383,11 +459,10 @@ extension RTCSession {
                 level: .info,
                 message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: reusing pre-created SFU PeerConnection and sending initial offer for room=\(normalizedLookup)")
 
-            existingConnection.call = mediaCall
-            await connectionManager.updateConnection(id: existingConnection.id, with: existingConnection)
-
             pendingInitialSfuGroupOfferConnectionIds.insert(bootstrapKey)
             defer { pendingInitialSfuGroupOfferConnectionIds.remove(bootstrapKey) }
+
+            try await bootstrapOneToOneSfuSenderKeyIfReady(call: mediaCall)
 
             let updatedCall = try await sendGroupCallOffer(mediaCall)
             initialSfuGroupMediaOfferSentConnectionIds.insert(bootstrapKey)
@@ -402,21 +477,45 @@ extension RTCSession {
 
         logger.log(
             level: .info,
-            message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: creating SFU PeerConnection and offer for room=\(normalizedLookup)")
+            message: sendInitialOffer
+                ? "beginGroupCallMediaAfterSfuRegistrationIfNeeded: creating SFU PeerConnection and offer for room=\(normalizedLookup)"
+                : "beginGroupCallMediaAfterSfuRegistrationIfNeeded: creating SFU PeerConnection (awaiting remote offer) for room=\(normalizedLookup)")
 
-        pendingInitialSfuGroupOfferConnectionIds.insert(bootstrapKey)
-        defer { pendingInitialSfuGroupOfferConnectionIds.remove(bootstrapKey) }
+        if sendInitialOffer {
+            pendingInitialSfuGroupOfferConnectionIds.insert(bootstrapKey)
+        }
+        defer {
+            if sendInitialOffer {
+                pendingInitialSfuGroupOfferConnectionIds.remove(bootstrapKey)
+            }
+        }
 
 #if os(iOS)
         // No CallKit `didActivate:` for channel/conference SFU — align WebRTC with `AVAudioSession`
         // before `createPeerConnection` (see `prepareNonCallKitGroupCallAudio`).
-        do {
-            try await self.prepareNonCallKitGroupCallAudio(supportsVideo: mediaCall.supportsVideo)
-        } catch {
-            self.logger.log(
-                level: .error,
-                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: non-CallKit audio prep failed before SFU PeerConnection: \(error)")
-            throw error
+        // Inbound 1:1 CallKit answers defer until `didActivate:`; do not activate the session here.
+        if isAudioActivated && audioSession.useManualAudio {
+            logger.log(
+                level: .debug,
+                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: skipping non-CallKit audio prep (CallKit/manual audio already active) room=\(normalizedLookup)")
+        } else {
+            do {
+                try await MainActor.run {
+                    try self.prepareNonCallKitGroupCallAudio(supportsVideo: mediaCall.supportsVideo)
+                }
+            } catch {
+                let message = String(describing: error).lowercased()
+                if message.contains("session activation failed") {
+                    logger.log(
+                        level: .info,
+                        message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: deferring SFU PeerConnection until CallKit audio activation for room=\(normalizedLookup)")
+                    return
+                }
+                self.logger.log(
+                    level: .error,
+                    message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: non-CallKit audio prep failed before SFU PeerConnection: \(error)")
+                throw error
+            }
         }
 #endif
 
@@ -442,6 +541,10 @@ extension RTCSession {
             }
             throw error
         }
+
+        try await bootstrapOneToOneSfuSenderKeyIfReady(call: mediaCall)
+
+        guard sendInitialOffer else { return }
 
         let updatedCall = try await sendGroupCallOffer(mediaCall)
         initialSfuGroupMediaOfferSentConnectionIds.insert(bootstrapKey)
@@ -510,6 +613,17 @@ extension RTCSession {
     
     /// Applies an inbound SFU renegotiation offer (e.g. when a new peer joins) and feeds to TaskProcessor for decrypt then handle.
     func handleSfuOffer(_ packet: RatchetMessagePacket) async throws {
+        try await enqueueSfuEncryptedPacket(packet)
+    }
+
+    /// Routes an encrypted SFU control packet through decrypt + ``handleDecryptedPacket(_:packet:call:)``.
+    ///
+    /// Use for flags handled only after ratchet decrypt (e.g. ``PacketFlag/screenSharePreempt``).
+    public func handleSfuEncryptedPacket(_ packet: RatchetMessagePacket) async throws {
+        try await enqueueSfuEncryptedPacket(packet)
+    }
+
+    private func enqueueSfuEncryptedPacket(_ packet: RatchetMessagePacket) async throws {
         var call: Call
         if let group = groupCall(forSfuIdentity: packet.sfuIdentity) {
             call = await group.currentCall
@@ -531,7 +645,7 @@ extension RTCSession {
         let encryptableTask = EncryptableTask(task: .streamMessage(streamTask))
         try await taskProcessor.feedTask(task: encryptableTask)
     }
-    
+
     /// Applies an inbound SFU ICE candidate to the underlying PeerConnection.
     func handleSfuCandidate(_ packet: RatchetMessagePacket) async throws {
         
@@ -637,15 +751,15 @@ extension RTCSession {
                 throw RTCErrors.missingGroupCall
             }
             let call = await group.currentCall
-            let processedCall = try await handleRenegotiationOffer(sdp: sdp, call: call)
-            let answerPlaintext = try BinaryEncoder().encode(processedCall)
-            let writeTask = WriteTask(
-                data: answerPlaintext,
-                roomId: (call.resolvedChannelWireId ?? call.sharedCommunicationId).normalizedConnectionId,
-                flag: .answer,
-                call: processedCall)
-            try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
-            logger.log(level: .info, message: "Handled SFU renegotiation offer for group call: \(packet.sfuIdentity)")
+            do {
+                try await completeSfuRenegotiationOfferHandling(sdp: sdp, call: call)
+                logger.log(level: .info, message: "Handled SFU renegotiation offer for group call: \(packet.sfuIdentity)")
+            } catch RTCErrors.deferredSfuRenegotiationOffer {
+                logger.log(
+                    level: .info,
+                    message: "Queued inbound SFU renegotiation offer for later processing connId=\(call.sharedCommunicationId)"
+                )
+            }
         case .participants:
             let participants: [RTCGroupCall.Participant] = try BinaryDecoder().decode([RTCGroupCall.Participant].self, from: plaintext)
             guard let group = groupCall(forSfuIdentity: packet.sfuIdentity) else {
@@ -676,6 +790,9 @@ extension RTCSession {
             logger.log(
                 level: .debug,
                 message: "Ignoring inbound SFU mediaReady packet on client; media readiness is consumed by the SFU room=\(packet.sfuIdentity)")
+        case .screenSharePreempt:
+            let decoded = try BinaryDecoder().decode(Call.self, from: plaintext)
+            await handleInboundScreenSharePreempt(call: decoded, sfuIdentity: packet.sfuIdentity)
         }
     }
 
@@ -701,7 +818,19 @@ extension RTCSession {
     ) -> GroupRemoteMediaPruneResult {
         var result = GroupRemoteMediaPruneResult()
 
+        func clearScreenShareBookkeeping(for participantId: String) {
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            guard !participantKey.isEmpty else { return }
+            connection.suppressedRemoteScreenShareParticipantIds.remove(participantKey)
+            connection.remoteScreenShareStopRequestedParticipantKeys.remove(participantKey)
+            clearRemoteScreenIngressFlatObservation(
+                connectionId: connection.id,
+                participantKey: participantKey
+            )
+        }
+
         for participantId in Array(connection.remoteVideoTracksByParticipantId.keys) where shouldPruneParticipant(participantId) {
+            clearScreenShareBookkeeping(for: participantId)
             let track = connection.remoteVideoTracksByParticipantId.removeValue(forKey: participantId)
             if let track, connection.remoteVideoTrack === track {
                 connection.remoteVideoTrack = nil
@@ -719,6 +848,7 @@ extension RTCSession {
         }
 
         for participantId in Array(connection.remoteAudioTracksByParticipantId.keys) where shouldPruneParticipant(participantId) {
+            clearScreenShareBookkeeping(for: participantId)
             let track = connection.remoteAudioTracksByParticipantId.removeValue(forKey: participantId)
             track?.isEnabled = false
             if let cryptor = connection.audioReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
@@ -734,6 +864,7 @@ extension RTCSession {
         }
 
         for participantId in Array(connection.remoteScreenTracksByParticipantId.keys) where shouldPruneParticipant(participantId) {
+            clearScreenShareBookkeeping(for: participantId)
             connection.remoteScreenTracksByParticipantId.removeValue(forKey: participantId)
             if let cryptor = connection.screenReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
                 cryptor.enabled = false
@@ -790,8 +921,19 @@ extension RTCSession {
             Self.conferenceParticipantIdentityKey(candidate) == targetKey
         }
         retireFrameKeyIndex(forParticipantId: participantId)
+        let clearedSuppressedState = connection.suppressedRemoteScreenShareParticipantIds.remove(targetKey) != nil
+        let clearedStopRequestState = connection.remoteScreenShareStopRequestedParticipantKeys.remove(targetKey) != nil
+        if clearedSuppressedState || clearedStopRequestState {
+            clearRemoteScreenIngressFlatObservation(
+                connectionId: connection.id,
+                participantKey: targetKey
+            )
+        }
 
         guard result.didUpdate else {
+            if clearedSuppressedState || clearedStopRequestState {
+                await connectionManager.updateConnection(id: connection.id, with: connection)
+            }
             notifyRemoteParticipantTrackChanged(
                 RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
             )

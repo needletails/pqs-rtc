@@ -103,8 +103,20 @@ import FoundationEssentials
 
     /// Group-call support (SFU / conference): multiple remote participants on a single PeerConnection.
     public var remoteVideoTracksByParticipantId: [String: RTCVideoTrack] = [:]
+    /// Last resolved SFU camera track ids keyed by stable participant id.
+    /// Android WebRTC wrappers can briefly lose `trackIdIfAvailable` during SFU renegotiation.
+    var androidRemoteCameraResolvedTrackIdsByParticipantId: [String: String] = [:]
+    /// Last resolved SFU camera mids keyed by stable participant id.
+    var androidRemoteCameraResolvedMidsByParticipantId: [String: String] = [:]
+    public var remoteAudioTracksByParticipantId: [String: RTCAudioTrack] = [:]
     /// Screen share tracks received from remote participants, keyed by participant ID.
     public var remoteScreenTracksByParticipantId: [String: RTCVideoTrack] = [:]
+    /// Participants whose remote screen-share mapping was cleared during SDP reconcile and
+    /// should not be rediscovered from stale WebRTC receivers until SFU readvertises them.
+    var suppressedRemoteScreenShareParticipantIds: Set<String> = []
+    /// Remote participants we asked to stop sharing via ``PacketFlag/screenSharePreempt``.
+    /// Used to clear stale UUID relay mappings once SFU renegotiation completes.
+    var remoteScreenShareStopRequestedParticipantKeys: Set<String> = []
 #elseif canImport(WebRTC)
     public let peerConnection: WebRTC.RTCPeerConnection
     internal var rtcVideoCaptureWrapper: RTCVideoCaptureWrapper?
@@ -127,11 +139,18 @@ import FoundationEssentials
     public var remoteAudioTracksByParticipantId: [String: WebRTC.RTCAudioTrack] = [:]
     /// Screen share tracks received from remote participants, keyed by participant ID.
     public var remoteScreenTracksByParticipantId: [String: WebRTC.RTCVideoTrack] = [:]
+    /// Participants whose remote screen-share mapping was cleared during SDP reconcile and
+    /// should not be rediscovered from stale WebRTC receivers until SFU readvertises them.
+    var suppressedRemoteScreenShareParticipantIds: Set<String> = []
+    /// Remote participants we asked to stop sharing via ``PacketFlag/screenSharePreempt``.
+    /// Used to clear stale UUID relay mappings once SFU renegotiation completes.
+    var remoteScreenShareStopRequestedParticipantKeys: Set<String> = []
     var videoReceiverCryptorsByParticipantId: [String: RTCFrameCryptor] = [:]
     var audioReceiverCryptorsByParticipantId: [String: RTCFrameCryptor] = [:]
     var videoReceiverCryptorBindingsByParticipantId: [String: RTCReceiverCryptorBinding] = [:]
     var audioReceiverCryptorBindingsByParticipantId: [String: RTCReceiverCryptorBinding] = [:]
     var screenSenderCryptor: RTCFrameCryptor?
+    var screenSenderCryptorBinding: RTCSenderCryptorBinding?
     var screenReceiverCryptorsByParticipantId: [String: RTCFrameCryptor] = [:]
     var screenReceiverCryptorBindingsByParticipantId: [String: RTCReceiverCryptorBinding] = [:]
 #endif
@@ -213,10 +232,10 @@ actor RTCConnectionManager {
     }
 
     /// Group / SFU connections keep `Call.sharedCommunicationId` as stored `RTCConnection.id`, often with a `#` prefix.
-    /// Many APIs (mute, render helpers) pass ``String/normalizedConnectionId`` without `#`. Match both forms.
+    /// Signaling may use `slug_<uuid>` wire routes while the stored connection id is the bare UUID stem.
     /// Case-insensitive: conference room IDs can arrive in varying case from different code paths.
     private func normalizedLookupKey(_ id: String) -> String {
-        id.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId.lowercased()
+        id.trimmingCharacters(in: .whitespacesAndNewlines).normalizedUUIDConnectionId.lowercased()
     }
 
     private func indexOfConnection(matchingLookupId lookupId: String) -> Int? {
@@ -326,5 +345,11 @@ struct RTCReceiverCryptorBinding: Sendable, Equatable {
     let participantId: String
     let trackId: String
     let receiverId: String
+}
+
+/// Stable metadata for an Apple screen-share sender FrameCryptor binding.
+struct RTCSenderCryptorBinding: Sendable, Equatable {
+    let trackId: String
+    let senderId: String
 }
 #endif

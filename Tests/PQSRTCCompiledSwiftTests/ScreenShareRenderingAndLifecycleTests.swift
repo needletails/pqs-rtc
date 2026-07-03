@@ -1,5 +1,9 @@
 import CoreGraphics
+import CoreImage
 import Testing
+#if canImport(WebRTC)
+import WebRTC
+#endif
 
 @testable import PQSRTC
 
@@ -44,9 +48,43 @@ struct ScreenShareRenderingAndLifecycleTests {
         ))
     }
 
-    @Test("camera tiles prefer aspect fit while screen share is the dominant layout")
+#if canImport(CoreImage)
+    @Test("ReplayKit host JPEG decode bakes portrait orientation into upright pixels")
+    func replayKitHostJPEGDecodeBakesPortraitOrientationIntoUprightPixels() {
+        #expect(!ReplayKitScreenShareJPEGOrientation.needsHostUprightCorrection(width: 1920, height: 1080))
+        #expect(!ReplayKitScreenShareJPEGOrientation.needsHostUprightCorrection(width: 1080, height: 1920))
+
+        let landscape = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 200, height: 100))
+        let unchanged = ReplayKitScreenShareJPEGOrientation.uprightCIImage(
+            landscape,
+            orientationRawValue: UInt8(CGImagePropertyOrientation.up.rawValue)
+        )
+        #expect(unchanged.extent == landscape.extent)
+
+        let landscapeBuffer = CIImage(color: .blue).cropped(to: CGRect(x: 0, y: 0, width: 200, height: 100))
+        let portraitUpright = ReplayKitScreenShareJPEGOrientation.uprightCIImage(
+            landscapeBuffer,
+            orientationRawValue: UInt8(CGImagePropertyOrientation.right.rawValue)
+        )
+        let (normalized, width, height) = ReplayKitScreenShareJPEGOrientation.normalizedUprightImage(portraitUpright)
+        #expect(width == 100)
+        #expect(height == 200)
+    }
+#endif
+
+#if canImport(WebRTC)
+    @Test("ReplayKit orientation maps to WebRTC rotation metadata")
+    func replayKitOrientationMapsToWebRTCRotation() {
+        #expect(ReplayKitScreenShareJPEGOrientation.videoRotation(forRawValue: UInt8(CGImagePropertyOrientation.up.rawValue)) == ._0)
+        #expect(ReplayKitScreenShareJPEGOrientation.videoRotation(forRawValue: UInt8(CGImagePropertyOrientation.right.rawValue)) == ._270)
+        #expect(ReplayKitScreenShareJPEGOrientation.videoRotation(forRawValue: UInt8(CGImagePropertyOrientation.down.rawValue)) == ._180)
+        #expect(ReplayKitScreenShareJPEGOrientation.videoRotation(forRawValue: UInt8(CGImagePropertyOrientation.left.rawValue)) == ._90)
+    }
+#endif
+
+    @Test("participant camera tiles default to aspect fill on mobile")
     @MainActor
-    func cameraTilesPreferAspectFitDuringScreenShare() {
+    func participantCameraTilesDefaultToAspectFill() {
         let view = NTMTKView(fallbackType: .sample, contextName: "camera_echo")
         defer { view.shutdownMetalStream() }
 

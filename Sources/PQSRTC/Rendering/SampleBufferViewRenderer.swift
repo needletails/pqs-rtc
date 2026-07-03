@@ -21,6 +21,7 @@
 import NeedleTailMediaKit
 import NeedleTailLogger
 import CoreVideo
+import CoreImage
 import Foundation
 
 
@@ -99,6 +100,8 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     private let rendersScreenShare: Bool
     /// When true, camera tiles letterbox inside the tile instead of cropping (used during screen share).
     private var prefersAspectFit = false
+    /// Last frame processed for Metal; re-scaled when host bounds change while ingress is stalled (frozen tile).
+    private var lastMetalDisplayPixelBuffer: CVPixelBuffer?
     @MainActor var bounds: CGRect
     private weak var delegate: BufferToMetalDelegate?
     
@@ -194,7 +197,11 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     }
 
     func setPrefersAspectFit(_ enabled: Bool) {
+        let changed = prefersAspectFit != enabled
         prefersAspectFit = enabled
+        if changed {
+            Task { await self.reprocessCachedMetalFrameIfNeeded(reason: "prefersAspectFit") }
+        }
     }
 
     /// Fits source pixels inside a tile without cropping or stretching.
@@ -252,8 +259,41 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     /// reliably trigger Swift `frame.didSet`. If these bounds stay `.zero`, ``handleCVPixelBufferFrame``
     /// skips Metal output (`boundsNotValid` path) and the call UI stays blank despite decoded frames.
     func applyHostViewBounds(_ rect: CGRect) async {
+        let previousSize = await MainActor.run { bounds.size }
         await MainActor.run {
             bounds = rect
+        }
+        let sizeChanged = abs(previousSize.width - rect.width) > 0.5
+            || abs(previousSize.height - rect.height) > 0.5
+        if sizeChanged {
+            await reprocessCachedMetalFrameIfNeeded(reason: "hostBounds")
+        }
+    }
+
+    /// Drops the last rasterized frame without shutting down the renderer or stream.
+    ///
+    /// Used when the hosting view's aspect ratio changes (e.g. camera tile expanding after screen
+    /// share ends) so a stale strip-sized Metal texture is not stretched to the new bounds.
+    func clearCachedMetalDisplayFrame() async {
+        lastMetalDisplayPixelBuffer = nil
+        if let mtkView = delegate as? NTMTKView {
+            await mtkView.clearMetalDisplayTexture()
+        }
+    }
+
+    /// Re-rasterizes the last decoded frame when layout changes but WebRTC callbacks are stalled.
+    private func reprocessCachedMetalFrameIfNeeded(reason: String) async {
+        guard !pauseMetalRendering, !isShutdown, let cached = lastMetalDisplayPixelBuffer else { return }
+        let width = CVPixelBufferGetWidth(cached)
+        let height = CVPixelBufferGetHeight(cached)
+        guard width > 0, height > 0 else { return }
+        do {
+            try await processFrameForMetal(pixelBuffer: cached)
+        } catch {
+            logger.log(
+                level: .debug,
+                message: "Cached frame reprocess after \(reason) failed: \(error)"
+            )
         }
     }
     
@@ -408,6 +448,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         remoteVideoInboundExpected = false
         remoteVideoExpectedSinceUptimeNs = 0
         lastLogRemoteExpectedNoCallbacksUptimeNs = 0
+        lastMetalDisplayPixelBuffer = nil
         
         logger.log(level: .info, message: "Shutdown completed")
     }
@@ -636,16 +677,42 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         }
         
         if !pauseMetalRendering {
-            // Process for Metal rendering
-            try await processFrameForMetal(pixelBuffer: pixelBuffer)
+            let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
+                from: pixelBuffer,
+                rotation: frame.rotation
+            )
+            try await processFrameForMetal(pixelBuffer: displayBuffer)
         } else {
+            let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
+                from: pixelBuffer,
+                rotation: frame.rotation
+            )
             // For sample-buffer path (PiP / non-Metal), prefer native NV12 when already provided by
             // WebRTC to avoid unnecessary color conversion churn. Fall back to explicit I420->NV12
             // conversion for other formats.
-            let normalizedBuffer = try makeSampleDisplayPixelBuffer(from: frame.buffer, fallback: pixelBuffer)
+            let normalizedBuffer = try makeSampleDisplayPixelBuffer(from: frame.buffer, fallback: displayBuffer)
             let time = normalizedPresentationTime(for: frame)
             try await processPixelBufferForSampleBuffer(pixelBuffer: normalizedBuffer, time: time)
         }
+    }
+
+    private func uprightScreenSharePixelBufferIfNeeded(
+        from pixelBuffer: CVPixelBuffer,
+        rotation: RTCVideoRotation
+    ) throws -> CVPixelBuffer {
+        guard rotation != ._0 else { return pixelBuffer }
+        guard let rotated = ReplayKitScreenShareJPEGOrientation.uprightPixelBuffer(
+            from: pixelBuffer,
+            webRTCRotation: rotation,
+            context: ciContext
+        ) else {
+            logger.log(
+                level: .warning,
+                message: "Failed to apply remote video rotation=\(rotation.rawValue); using source buffer"
+            )
+            return pixelBuffer
+        }
+        return rotated
     }
     
     private func handleI420BufferFrame(_ buffer: RTCI420Buffer, frame: RTCVideoFrame) async throws {
@@ -654,6 +721,15 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             logger.log(level: .trace, message: "First remote I420 frame received (detailed wire log emitted separately)")
         }
         if !pauseMetalRendering {
+            if frame.rotation != ._0 {
+                let pixelBuffer = try makeNV12PixelBuffer(fromI420: buffer)
+                let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
+                    from: pixelBuffer,
+                    rotation: frame.rotation
+                )
+                try await processFrameForMetal(pixelBuffer: displayBuffer)
+                return
+            }
             #if os(iOS)
             // Render iOS remote frames from source I420 planes directly for Metal.
             // This avoids an extra I420->NV12 interleave step and preserves source strides.
@@ -748,6 +824,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     }
     
     private func processFrameForMetal(pixelBuffer: CVPixelBuffer) async throws {
+        lastMetalDisplayPixelBuffer = pixelBuffer
         do {
             let renderBounds = await resolveRenderableBounds()
             let aspectRatio = await metalProcessor.getAspectRatio(
@@ -756,22 +833,19 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             )
             
             let scaleMode: ScaleMode
-#if os(iOS)
-            // Camera tiles fill the viewport unless screen share is active; screen shares always fit.
-            scaleMode = usesAspectFitRendering ? .aspectFitHorizontal : .aspectFill
-#elseif os(macOS)
-            scaleMode = .aspectFitHorizontal
-#endif
-            
             let originalSize = CGSize(width: pixelBuffer.width, height: pixelBuffer.height)
             let scaleInfo: MetalProcessor.ScaledInfo
-#if os(iOS)
             if usesAspectFitRendering {
                 scaleInfo = Self.aspectFitScaleInfo(
                     sourceSize: originalSize,
                     destinationSize: renderBounds
                 )
             } else {
+#if os(iOS)
+                scaleMode = .aspectFill
+#else
+                scaleMode = .aspectFitHorizontal
+#endif
                 scaleInfo = await metalProcessor.createSize(
                     for: scaleMode,
                     originalSize: originalSize,
@@ -779,12 +853,6 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                     aspectRatio: aspectRatio
                 )
             }
-#else
-            scaleInfo = Self.aspectFitScaleInfo(
-                sourceSize: originalSize,
-                destinationSize: renderBounds
-            )
-#endif
             
             let info = try await metalProcessor.createMetalImage(
                 fromPixelBuffer: pixelBuffer,
@@ -1017,20 +1085,20 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 height: CGFloat(buffer.height)
             )
             let scaleMode: ScaleMode
-#if os(iOS)
-            scaleMode = usesAspectFitRendering ? .aspectFitHorizontal : .aspectFill
-#else
-            scaleMode = .aspectFitHorizontal
-#endif
             let originalSize = CGSize(width: CGFloat(buffer.width), height: CGFloat(buffer.height))
             let scaleInfo: MetalProcessor.ScaledInfo
-#if os(iOS)
             if usesAspectFitRendering {
+                scaleMode = .none
                 scaleInfo = Self.aspectFitScaleInfo(
                     sourceSize: originalSize,
                     destinationSize: renderBounds
                 )
             } else {
+#if os(iOS)
+                scaleMode = .aspectFill
+#else
+                scaleMode = .aspectFitHorizontal
+#endif
                 scaleInfo = await metalProcessor.createSize(
                     for: scaleMode,
                     originalSize: originalSize,
@@ -1038,12 +1106,6 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                     aspectRatio: aspectRatio
                 )
             }
-#else
-            scaleInfo = Self.aspectFitScaleInfo(
-                sourceSize: originalSize,
-                destinationSize: renderBounds
-            )
-#endif
             if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogFirstRemoteMetalScale == false {
                 didLogFirstRemoteMetalScale = true
                 logger.log(

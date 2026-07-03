@@ -221,15 +221,28 @@ struct RTCSessionStateHandlingTests {
 
         let call = try makeCall(sharedId: "grace-2")
         try await session.createStateStream(with: call)
+        guard let stream = await session.appStateStream() else {
+            Issue.record("Expected app state stream after createStateStream")
+            return
+        }
+        let observedFailure = BoolBox()
+        let observeTask = Task {
+            for await state in stream {
+                if state.description.contains("Failed") {
+                    await observedFailure.setTrue()
+                    break
+                }
+            }
+        }
         await session.callState.transition(to: .connecting(.outbound(.voice), call))
         await session.callState.transition(to: .connected(.outbound(.voice), call))
 
         await session.armDisconnectGraceTimer(call: call, connectionId: call.sharedCommunicationId)
 
         try await Task.sleep(nanoseconds: 250_000_000)
+        observeTask.cancel()
 
-        let state = await session.callState.currentState
-        #expect(state?.description.contains("Failed") == true)
+        #expect(await observedFailure.value)
     }
 
     @Test("cancelDisconnectGraceTask prevents the timer from firing")
@@ -350,4 +363,12 @@ struct RTCSessionStateHandlingTests {
         #expect(isConnecting)
     }
 #endif
+}
+
+private actor BoolBox {
+    private(set) var value = false
+
+    func setTrue() {
+        value = true
+    }
 }

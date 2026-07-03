@@ -8,17 +8,35 @@
 import Foundation
 import NeedleTailLogger
 
+extension RTCSession {
+    /// Whether a duplicate participant-track event should skip renderer reattach.
+    internal static func shouldSkipParticipantTrackReattach(
+        hasActiveSink: Bool,
+        boundTrackSharesRendererSinkWithTarget: Bool,
+        rendererLayoutNeedsSinkReconcile: Bool = false,
+        targetTrackIsLive: Bool = true
+    ) -> Bool {
+        if rendererLayoutNeedsSinkReconcile { return false }
+        if hasActiveSink, !targetTrackIsLive { return true }
+        return hasActiveSink && boundTrackSharesRendererSinkWithTarget
+    }
+
+    /// Minimal inbound video flow deltas published to renderer recovery observers.
+    ///
+    /// The full ``InboundVideoFlowCheck`` type is WebRTC-only; Android recovery uses this
+    /// snapshot shape via ``inboundVideoFlowUpdateStream()``.
+    struct InboundVideoFlowSnapshot: Sendable {
+        let deltaFramesDecoded: Int64
+        let deltaPacketsReceived: Int64
+
+        static let inactive = InboundVideoFlowSnapshot(deltaFramesDecoded: 0, deltaPacketsReceived: 0)
+    }
+}
+
 #if canImport(WebRTC)
 import WebRTC
 
 extension RTCSession {
-    enum InboundVideoFlowState: String, Sendable {
-        case noTraffic
-        case stalledIngress
-        case advancingIngress
-        case decodeStalled
-    }
-
     struct InboundVideoFlowCheck: Sendable {
         let state: InboundVideoFlowState
         let likelyCause: String
@@ -32,6 +50,161 @@ extension RTCSession {
         let deltaFramesDecoded: Int64
         let dtlsState: String
         let selectedPairState: String
+    }
+
+    /// True when per-mid screen ingress has flatlined while other media still advances — the remote
+    /// sharer likely stopped even if the SFU still advertises a stale relay `sendrecv` screen leg.
+    static func screenFlowIndicatesRemoteShareStopped(_ flow: InboundVideoFlowCheck) -> Bool {
+        guard flow.deltaPacketsReceived <= 0, flow.deltaFramesReceived <= 0 else { return false }
+        if flow.packetsReceived == 0,
+           flow.framesReceived == 0,
+           flow.deltaPacketsReceived < 0 || flow.deltaFramesReceived < 0 || flow.deltaFramesDecoded < 0 {
+            return true
+        }
+        switch flow.state {
+        case .stalledIngress, .noTraffic:
+            let flatScreenLeg = flow.likelyCause.contains("screen_video_flat")
+                || flow.likelyCause.contains("both_audio_and_screen_video_flat")
+            guard flatScreenLeg else { return false }
+            // After SFU stop-forward renegotiation, per-mid screen counters can reset to zero even
+            // though the sharer had been sending. Audio still advancing is enough to confirm the
+            // flat line is on the screen leg, not total transport loss.
+            return flow.packetsReceived > 0 || flow.deltaAudioPacketsReceived > 0
+        case .advancingIngress, .decodeStalled:
+            return false
+        }
+    }
+
+    /// Whether a stalled remote renderer should trigger cryptor rebind + track re-attach.
+    static func shouldAttemptInboundRemoteVideoRendererRecovery(
+        inboundFlow: InboundVideoFlowCheck?,
+        callbackAgeMs: Int64,
+        hasAnyCallbacks: Bool,
+        expectationAgeMs: Int64 = 0,
+        cameraDecodeStallThresholdMs: Int64 = 3_000,
+        prolongedStallThresholdMs: Int64 = 12_000
+    ) -> Bool {
+        let effectiveStallAgeMs = callbackAgeMs >= 0 ? callbackAgeMs : expectationAgeMs
+        if let flow = inboundFlow {
+            switch flow.state {
+            case .decodeStalled:
+                if effectiveStallAgeMs >= cameraDecodeStallThresholdMs,
+                   flow.deltaPacketsReceived > 0 {
+                    if hasAnyCallbacks, flow.deltaFramesDecoded == 0 {
+                        return true
+                    }
+                }
+                return effectiveStallAgeMs >= prolongedStallThresholdMs
+            case .advancingIngress:
+                // RTP and decode are moving; the heavy recovery path would churn live bindings.
+                return false
+            case .noTraffic, .stalledIngress:
+                if flow.likelyCause == "transport_or_ice_instability" {
+                    return false
+                }
+                break
+            }
+        }
+        return hasAnyCallbacks && effectiveStallAgeMs >= prolongedStallThresholdMs
+    }
+
+    // MARK: - Test hooks (package-internal; used by `PQSRTCCompiledSwiftTests`)
+
+    internal func testing_usesGroupCallAnswerSdpPolicy(for connectionId: String) -> Bool {
+        isGroupCallConnection(connectionId)
+    }
+
+    internal func testing_configureGroupSessionForTests(activeConnectionId: String) {
+        isGroupCall = true
+        self.activeConnectionId = activeConnectionId
+    }
+
+    internal func testing_seedRemoteScreenIngressFlatSinceForTests(
+        key: String,
+        since date: Date
+    ) {
+        remoteScreenIngressFlatSinceByKey[key] = date
+        if let separator = key.firstIndex(of: "|") {
+            let connectionId = String(key[..<separator])
+            let participantKey = String(key[key.index(after: separator)...])
+            remoteScreenIngressFlatSinceByKey[
+                remoteScreenIngressFlatObservationKey(connectionId: connectionId, participantKey: participantKey)
+            ] = date
+        }
+    }
+
+    internal func testing_seedLastInboundScreenVideoCountersForTests(
+        connectionId: String,
+        audioPacketsReceived: Int64,
+        packetsReceived: Int64,
+        framesReceived: Int64,
+        framesDecoded: Int64
+    ) {
+        let counters = InboundVideoCounters(
+            audioPacketsReceived: audioPacketsReceived,
+            packetsReceived: packetsReceived,
+            framesReceived: framesReceived,
+            framesDecoded: framesDecoded
+        )
+        lastInboundScreenVideoCountersByConnectionId[connectionId] = counters
+        lastInboundScreenVideoCountersByConnectionId[connectionId.normalizedConnectionId] = counters
+    }
+
+    /// Screen-share renderer recovery uses per-mid ingress so camera traffic cannot mask a stalled
+    /// screen leg. Also recovers sooner when transport/ICE is unstable during SFU renegotiation.
+    static func shouldAttemptInboundRemoteScreenRendererRecovery(
+        screenFlow: InboundVideoFlowCheck?,
+        aggregateFlow: InboundVideoFlowCheck?,
+        callbackAgeMs: Int64,
+        hasAnyCallbacks: Bool,
+        expectationAgeMs: Int64 = 0,
+        screenDecodeStallThresholdMs: Int64 = 6_000,
+        transportRecoveryThresholdMs: Int64 = 4_000,
+        prolongedStallThresholdMs: Int64 = 12_000
+    ) -> Bool {
+        let effectiveStallAgeMs = callbackAgeMs >= 0 ? callbackAgeMs : expectationAgeMs
+        let transportFlow = screenFlow ?? aggregateFlow
+        if let flow = transportFlow,
+           flow.likelyCause == "transport_or_ice_instability",
+           effectiveStallAgeMs >= transportRecoveryThresholdMs {
+            return true
+        }
+
+        if let flow = screenFlow {
+            switch flow.state {
+            case .decodeStalled:
+                if flow.packetsReceived > 0, flow.framesDecoded == 0,
+                   effectiveStallAgeMs >= 3_000 {
+                    return true
+                }
+                return effectiveStallAgeMs >= screenDecodeStallThresholdMs
+            case .advancingIngress:
+                if !hasAnyCallbacks {
+                    return effectiveStallAgeMs >= screenDecodeStallThresholdMs
+                }
+                return effectiveStallAgeMs >= prolongedStallThresholdMs
+            case .noTraffic, .stalledIngress:
+                if !hasAnyCallbacks {
+                    if effectiveStallAgeMs >= screenDecodeStallThresholdMs {
+                        return true
+                    }
+                    if flow.packetsReceived == 0,
+                       flow.likelyCause.contains("screen_video_flat"),
+                       effectiveStallAgeMs >= 3_000 {
+                        return true
+                    }
+                }
+                break
+            }
+        }
+
+        return shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: aggregateFlow,
+            callbackAgeMs: callbackAgeMs,
+            hasAnyCallbacks: hasAnyCallbacks,
+            expectationAgeMs: expectationAgeMs,
+            prolongedStallThresholdMs: prolongedStallThresholdMs
+        )
     }
 
     enum OutboundVideoFlowState: String, Sendable {
@@ -104,7 +277,67 @@ extension RTCSession {
         if let task = inboundVideoFlowProbeTasksByConnectionId.removeValue(forKey: normalizedId) {
             task.cancel()
         }
+        stopInboundVideoFlowSampler(connectionId: normalizedId)
         lastInboundVideoCountersByConnectionId.removeValue(forKey: normalizedId)
+    }
+
+    func startInboundVideoFlowSamplerIfNeeded(connectionId: String) {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !normalizedId.isEmpty else { return }
+        if let existing = inboundVideoFlowSamplerTasksByConnectionId[normalizedId], !existing.isCancelled {
+            return
+        }
+
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                guard await self.connectionManager.findConnection(with: normalizedId) != nil else { break }
+                if let flow = await self.evaluateInboundRemoteVideoFlow(connectionId: normalizedId) {
+                    await self.setCachedInboundVideoFlow(connectionId: normalizedId, flow: flow)
+                }
+                if let screenFlow = await self.evaluateInboundRemoteScreenVideoFlow(connectionId: normalizedId) {
+                    await self.setCachedInboundScreenVideoFlow(connectionId: normalizedId, flow: screenFlow)
+                }
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+        }
+        inboundVideoFlowSamplerTasksByConnectionId[normalizedId] = task
+    }
+
+    func cachedInboundRemoteVideoFlow(connectionId: String) -> InboundVideoFlowCheck? {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        return cachedInboundVideoFlowByConnectionId[normalizedId]
+    }
+
+    func cachedInboundRemoteScreenVideoFlow(connectionId: String) -> InboundVideoFlowCheck? {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        return cachedInboundScreenVideoFlowByConnectionId[normalizedId]
+    }
+
+    private func setCachedInboundVideoFlow(connectionId: String, flow: InboundVideoFlowCheck) {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        cachedInboundVideoFlowByConnectionId[normalizedId] = flow
+        publishInboundVideoFlowUpdate(
+            InboundVideoFlowSnapshot(
+                deltaFramesDecoded: flow.deltaFramesDecoded,
+                deltaPacketsReceived: flow.deltaPacketsReceived
+            )
+        )
+    }
+
+    private func setCachedInboundScreenVideoFlow(connectionId: String, flow: InboundVideoFlowCheck) {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        cachedInboundScreenVideoFlowByConnectionId[normalizedId] = flow
+    }
+
+    func stopInboundVideoFlowSampler(connectionId: String) {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        if let task = inboundVideoFlowSamplerTasksByConnectionId.removeValue(forKey: normalizedId) {
+            task.cancel()
+        }
+        cachedInboundVideoFlowByConnectionId.removeValue(forKey: normalizedId)
+        cachedInboundScreenVideoFlowByConnectionId.removeValue(forKey: normalizedId)
+        lastInboundScreenVideoCountersByConnectionId.removeValue(forKey: normalizedId)
     }
 
     /// Starts a local outbound video probe (includes optional sender recovery; probe logs are trace-gated).
@@ -235,18 +468,47 @@ extension RTCSession {
             let stillFlat = afterToggle.deltaPacketsSent <= 0 && afterToggle.deltaFramesEncoded <= 0 && afterToggle.deltaFramesSent <= 0
             if stillFlat {
                 var captureInfo = "captureTelemetry=unavailable"
+                var captureAppearsStale = false
+#if os(iOS) || os(macOS)
+                var staleCaptureWrapper: RTCVideoCaptureWrapper?
+#endif
                 if let connection = await connectionManager.findConnection(with: connectionId),
                    let wrapper = connection.rtcVideoCaptureWrapper {
                     let snapshot = wrapper.captureTelemetrySnapshot()
                     let now = DispatchTime.now().uptimeNanoseconds
                     let ageMs: UInt64 = now >= snapshot.lastCaptureUptimeNanoseconds ? (now - snapshot.lastCaptureUptimeNanoseconds) / 1_000_000 : 0
                     captureInfo = "captureFrames=\(snapshot.capturedFrameCount), captureLastMsAgo=\(ageMs)"
+                    captureAppearsStale = ageMs >= 3_000
+#if os(iOS) || os(macOS)
+                    staleCaptureWrapper = captureAppearsStale ? wrapper : nil
+#endif
                 }
 
                 logger.log(
                     level: .warning,
-                    message: "Outbound video still flat after toggle; escalating to sender pipeline rebuild (connId=\(connectionId), dOutVideoPackets=\(afterToggle.deltaPacketsSent), dOutFramesEncoded=\(afterToggle.deltaFramesEncoded), dOutFramesSent=\(afterToggle.deltaFramesSent), \(captureInfo))"
+                    message: "Outbound video still flat after toggle; attempting capture restart or sender rebuild (connId=\(connectionId), dOutVideoPackets=\(afterToggle.deltaPacketsSent), dOutFramesEncoded=\(afterToggle.deltaFramesEncoded), dOutFramesSent=\(afterToggle.deltaFramesSent), \(captureInfo))"
                 )
+
+#if os(iOS) || os(macOS)
+                if captureAppearsStale,
+                   let wrapper = staleCaptureWrapper,
+                   await restartRegisteredLocalPreviewCaptureForRecovery(connectionId: connectionId, wrapper: wrapper) {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    if let afterCaptureRestart = await evaluateOutboundLocalVideoFlow(connectionId: connectionId) {
+                        let recovered = afterCaptureRestart.deltaPacketsSent > 0
+                            || afterCaptureRestart.deltaFramesEncoded > 0
+                            || afterCaptureRestart.deltaFramesSent > 0
+                        if recovered {
+                            logRtpStatsSnapshotOnce(
+                                connectionId: connectionId,
+                                delayNanoseconds: 500_000_000,
+                                reason: "afterOutboundVideoRecoveryCaptureRestart"
+                            )
+                            return
+                        }
+                    }
+                }
+#endif
 
                 if await restartLocalVideoSenderPipeline(connectionId: connectionId) {
                     await setVideoTrack(isEnabled: true, connectionId: connectionId)
@@ -430,7 +692,13 @@ extension RTCSession {
         let deltaDecoded = framesDecoded - (previous?.framesDecoded ?? framesDecoded)
 
         let state: InboundVideoFlowState
-        if packetsReceived == 0 && framesReceived == 0 {
+        if previous == nil {
+            if packetsReceived == 0 && framesReceived == 0 {
+                state = .noTraffic
+            } else {
+                state = framesDecoded > 0 ? .advancingIngress : .decodeStalled
+            }
+        } else if packetsReceived == 0 && framesReceived == 0 {
             state = .noTraffic
         } else if deltaPackets > 0 || deltaFrames > 0 {
             state = (deltaDecoded <= 0) ? .decodeStalled : .advancingIngress
@@ -452,6 +720,154 @@ extension RTCSession {
                     return "transport_or_ice_instability"
                 }
                 return "both_audio_and_video_flat_remote_sender_or_sfu_stopped_or_path_stalled"
+            }
+        }()
+
+        return InboundVideoFlowCheck(
+            state: state,
+            likelyCause: likelyCause,
+            audioPacketsReceived: audioPacketsReceived,
+            packetsReceived: packetsReceived,
+            framesReceived: framesReceived,
+            framesDecoded: framesDecoded,
+            deltaAudioPacketsReceived: deltaAudioPackets,
+            deltaPacketsReceived: deltaPackets,
+            deltaFramesReceived: deltaFrames,
+            deltaFramesDecoded: deltaDecoded,
+            dtlsState: dtlsState,
+            selectedPairState: selectedPairState
+        )
+    }
+
+    /// Checks whether inbound remote *screen-share* video counters are advancing.
+    ///
+    /// Uses SFU remote SDP screen mids when available; otherwise sums non-camera video mids.
+    func evaluateInboundRemoteScreenVideoFlow(connectionId: String) async -> InboundVideoFlowCheck? {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !normalizedId.isEmpty else { return nil }
+        guard let current = await connectionManager.findConnection(with: normalizedId) else { return nil }
+
+        let report = await collectStats(peerConnection: current.peerConnection)
+
+        func int64(_ any: Any?) -> Int64? {
+            if let n = any as? NSNumber { return n.int64Value }
+            if let s = any as? String, let v = Int64(s) { return v }
+            return nil
+        }
+        func string(_ any: Any?) -> String? {
+            if let s = any as? String { return s }
+            if let n = any as? NSNumber { return n.stringValue }
+            return nil
+        }
+
+        var screenMids = Set<String>()
+        if let remoteSdp = current.peerConnection.remoteDescription?.sdp,
+           !remoteSdp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            screenMids = Self.remoteActiveIncomingScreenShareVideoMids(in: remoteSdp)
+            if screenMids.isEmpty {
+                screenMids = Self.sfuRelayIncomingScreenShareVideoMids(in: remoteSdp)
+            }
+        }
+        for mappedTrack in current.remoteScreenTracksByParticipantId.values {
+            for transceiver in current.peerConnection.transceivers where transceiver.mediaType == .video {
+                guard transceiver.receiver.track === mappedTrack else { continue }
+                let mid = transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !mid.isEmpty else { continue }
+                screenMids.insert(mid)
+            }
+        }
+
+        let cameraTrackIds = Set(current.remoteVideoTracksByParticipantId.values.map(\.trackId))
+        var cameraMids = Set<String>()
+        for transceiver in current.peerConnection.transceivers where transceiver.mediaType == .video {
+            let mid = transceiver.mid.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !mid.isEmpty,
+                  let track = transceiver.receiver.track as? RTCVideoTrack,
+                  cameraTrackIds.contains(track.trackId)
+            else { continue }
+            cameraMids.insert(mid)
+        }
+
+        func isScreenMid(_ mid: String) -> Bool {
+            if screenMids.contains(mid) { return true }
+            if cameraMids.contains(mid) { return false }
+            return mid != "1"
+        }
+
+        var packetsReceived: Int64 = 0
+        var framesReceived: Int64 = 0
+        var framesDecoded: Int64 = 0
+        var audioPacketsReceived: Int64 = 0
+        var selectedPairState = "unknown"
+        var dtlsState = "unknown"
+
+        for (_, stat) in report.statistics {
+            if stat.type == "inbound-rtp" {
+                let kind = (string(stat.values["kind"]) ?? string(stat.values["mediaType"]) ?? "").lowercased()
+                if kind == "audio" {
+                    audioPacketsReceived += int64(stat.values["packetsReceived"]) ?? 0
+                } else if kind == "video" {
+                    let mid = string(stat.values["mid"]) ?? ""
+                    guard isScreenMid(mid) else { continue }
+                    packetsReceived += int64(stat.values["packetsReceived"]) ?? 0
+                    framesReceived += int64(stat.values["framesReceived"]) ?? 0
+                    framesDecoded += int64(stat.values["framesDecoded"]) ?? 0
+                }
+            } else if stat.type == "candidate-pair" {
+                let selected = (stat.values["selected"] as? Bool) ?? (stat.values["selected"] as? NSNumber)?.boolValue ?? false
+                let nominated = (stat.values["nominated"] as? Bool) ?? (stat.values["nominated"] as? NSNumber)?.boolValue ?? false
+                let state = (string(stat.values["state"]) ?? "unknown").lowercased()
+                if selected || (nominated && state == "succeeded") {
+                    selectedPairState = state
+                }
+            } else if stat.type == "transport" {
+                dtlsState = (string(stat.values["dtlsState"]) ?? "unknown").lowercased()
+            }
+        }
+
+        let counters = InboundVideoCounters(
+            audioPacketsReceived: audioPacketsReceived,
+            packetsReceived: packetsReceived,
+            framesReceived: framesReceived,
+            framesDecoded: framesDecoded
+        )
+        let previous = lastInboundScreenVideoCountersByConnectionId[normalizedId]
+        lastInboundScreenVideoCountersByConnectionId[normalizedId] = counters
+
+        let deltaAudioPackets = audioPacketsReceived - (previous?.audioPacketsReceived ?? audioPacketsReceived)
+        let deltaPackets = packetsReceived - (previous?.packetsReceived ?? packetsReceived)
+        let deltaFrames = framesReceived - (previous?.framesReceived ?? framesReceived)
+        let deltaDecoded = framesDecoded - (previous?.framesDecoded ?? framesDecoded)
+
+        let state: InboundVideoFlowState
+        if previous == nil {
+            if packetsReceived == 0 && framesReceived == 0 {
+                state = .noTraffic
+            } else {
+                state = framesDecoded > 0 ? .advancingIngress : .decodeStalled
+            }
+        } else if packetsReceived == 0 && framesReceived == 0 {
+            state = .noTraffic
+        } else if deltaPackets > 0 || deltaFrames > 0 {
+            state = (deltaDecoded <= 0) ? .decodeStalled : .advancingIngress
+        } else {
+            state = .stalledIngress
+        }
+
+        let likelyCause: String = {
+            switch state {
+            case .advancingIngress:
+                return "inbound_screen_video_advancing"
+            case .decodeStalled:
+                return "inbound_screen_video_advancing_but_decode_stalled"
+            case .noTraffic, .stalledIngress:
+                if deltaAudioPackets > 0 {
+                    return "audio_advancing_screen_video_flat_remote_sender_or_sfu_screen_forward_stopped"
+                }
+                if dtlsState != "connected" || (selectedPairState != "succeeded" && selectedPairState != "in-progress" && selectedPairState != "inprogress") {
+                    return "transport_or_ice_instability"
+                }
+                return "both_audio_and_screen_video_flat_remote_sender_or_sfu_stopped_or_path_stalled"
             }
         }()
 
@@ -606,16 +1022,14 @@ extension RTCSession {
 
             while !Task.isCancelled {
                 guard let current = await self.connectionManager.findConnection(with: normalizedId) else { break }
-                // Stop if video isn't being used anymore.
                 if !current.call.supportsVideo { break }
                 if !current.peerConnection.senders.contains(where: { $0.track?.kind == kRTCMediaStreamTrackKindVideo }) { break }
 
                 let report = await self.collectStats(peerConnection: current.peerConnection)
-                let baseCfg = await self.sfuVideoQualityProfile.adaptiveConfig
+                let isOneToOneSfu = Self.isTrueOneToOneSfuRoom(call: current.call)
+                var cfg = await self.sfuAdaptiveConfig(for: current.call)
 #if os(iOS)
-                let cfg = await self.thermalAdjustedAdaptiveVideoConfig(baseCfg, connectionId: normalizedId)
-#else
-                let cfg = baseCfg
+                cfg = await self.thermalAdjustedAdaptiveVideoConfig(cfg, connectionId: normalizedId)
 #endif
 
                 func double(_ any: Any?) -> Double? {
@@ -624,8 +1038,8 @@ extension RTCSession {
                     return nil
                 }
 
-                // Find the selected candidate pair and read availableOutgoingBitrate.
                 var availableOutgoingBps: Double?
+                var availableIncomingBps: Double?
                 var currentRttSeconds: Double?
                 for (_, stat) in report.statistics {
                     guard stat.type == "candidate-pair" else { continue }
@@ -636,70 +1050,60 @@ extension RTCSession {
                         if let v = double(stat.values["availableOutgoingBitrate"]) {
                             availableOutgoingBps = v
                         }
-                        // `currentRoundTripTime` is seconds (double) in standard WebRTC stats.
+                        if let v = double(stat.values["availableIncomingBitrate"]) {
+                            availableIncomingBps = v
+                        }
                         if let rtt = double(stat.values["currentRoundTripTime"]) ?? double(stat.values["totalRoundTripTime"]) {
                             currentRttSeconds = rtt
                         }
-                        // We found the selected/nominated succeeded pair; no need to scan further.
                         break
                     }
                 }
 
-                guard let available = availableOutgoingBps, available > 0 else {
-                    try? await Task.sleep(nanoseconds: 5_000_000_000)
-                    continue
-                }
-
-                // Compute target bitrate with headroom and clamp.
-                //
-                // If RTT is very high, be more conservative. High latency often correlates with
-                // bufferbloat / queueing and unstable throughput; backing off reduces freeze/burst.
-                var headroom = cfg.headroomFactor
-                if let rtt = currentRttSeconds {
-                    if rtt >= 0.70 {
-                        headroom = min(headroom, 0.55)
-                    } else if rtt >= 0.35 {
-                        headroom = min(headroom, 0.65)
-                    }
-                }
-
-                let rawTarget = Int(available * headroom)
-                let targetBps = max(cfg.minBitrateBps, min(cfg.maxBitrateBps, rawTarget))
-
-                // Simple fps ladder based on ceiling; keeps motion decent on good uplink.
-                let targetFps: Int = (targetBps >= cfg.highFpsThresholdBps) ? cfg.highFps : cfg.lowFps
-                let targetScale = RTCVideoQualityProfile.resolutionScaleDownBy(for: targetBps)
-
-                // Avoid thrashing: only apply when we change meaningfully.
-                let last = await self.adaptiveVideoLastAppliedByConnectionId[normalizedId]
-                let lastBps = last?.bitrateBps ?? 0
-                let lastFps = last?.framerate ?? 0
-                let lastScale = last?.scaleResolutionDownBy ?? 0
-                let deltaOk: Bool
-                if lastBps == 0 {
-                    deltaOk = true
+                let targets: AdaptiveVideoTargets
+                let reportedAvailableBps: Int?
+                if let available = availableOutgoingBps, available > 0 {
+                    targets = RTCAdaptiveVideoTargets.compute(
+                        cfg: cfg,
+                        isOneToOneSfu: isOneToOneSfu,
+                        reportedAvailableOutgoingBps: available,
+                        currentRttSeconds: currentRttSeconds
+                    )
+                    reportedAvailableBps = Int(available)
                 } else {
-                    let ratio = Double(abs(targetBps - lastBps)) / Double(max(1, lastBps))
-                    deltaOk = ratio >= 0.15 || targetFps != lastFps || abs(targetScale - lastScale) >= 0.25
+                    targets = RTCAdaptiveVideoTargets.conservativeStartupTargets(
+                        cfg: cfg,
+                        isOneToOneSfu: isOneToOneSfu
+                    )
+                    reportedAvailableBps = nil
                 }
+
+                let lastApplied = await self.adaptiveVideoLastAppliedByConnectionId[normalizedId]
+                let deltaOk = RTCAdaptiveVideoTargets.shouldApply(targets, lastApplied: lastApplied)
 
                 if deltaOk {
-                    // Apply to all local video senders.
                     for sender in current.peerConnection.senders where sender.track?.kind == kRTCMediaStreamTrackKindVideo {
                         var params = sender.parameters
                         guard !params.encodings.isEmpty else { continue }
                         for encoding in params.encodings {
-                            encoding.maxBitrateBps = NSNumber(value: targetBps)
-                            encoding.maxFramerate = NSNumber(value: targetFps)
-                            encoding.scaleResolutionDownBy = NSNumber(value: targetScale)
+                            encoding.maxBitrateBps = NSNumber(value: targets.maxBitrateBps)
+                            encoding.maxFramerate = NSNumber(value: targets.maxFramerate)
+                            encoding.scaleResolutionDownBy = NSNumber(value: targets.scaleResolutionDownBy)
                         }
                         sender.parameters = params
                     }
-                    await self.setAdaptiveVideoLastApplied(connectionId: normalizedId, bitrateBps: targetBps, framerate: targetFps, scaleResolutionDownBy: targetScale)
-                    self.logger.log(level: .debug, message: "Adaptive video send applied (connId=\(normalizedId)): maxBitrateBps=\(targetBps) maxFramerate=\(targetFps) scaleResolutionDownBy=\(targetScale) (availableOutgoingBitrate=\(Int(available)))")
+                    await self.setAdaptiveVideoLastApplied(
+                        connectionId: normalizedId,
+                        bitrateBps: targets.maxBitrateBps,
+                        framerate: targets.maxFramerate,
+                        scaleResolutionDownBy: targets.scaleResolutionDownBy
+                    )
+                    self.logger.log(
+                        level: .debug,
+                        message: "Adaptive video send applied (connId=\(normalizedId) oneToOne=\(isOneToOneSfu)): maxBitrateBps=\(targets.maxBitrateBps) maxFramerate=\(targets.maxFramerate) scaleResolutionDownBy=\(targets.scaleResolutionDownBy) reportedAvailableBps=\(reportedAvailableBps.map(String.init) ?? "nil")"
+                    )
                 }
 
-                // Emit coarse network-quality updates for UI/analytics consumers.
                 func bucketByBitrate(_ bps: Double) -> RTCNetworkQuality {
                     if bps < 150_000 { return .veryPoor }
                     if bps < 300_000 { return .poor }
@@ -715,7 +1119,6 @@ extension RTCSession {
                     return .excellent
                 }
                 func worse(_ a: RTCNetworkQuality, _ b: RTCNetworkQuality) -> RTCNetworkQuality {
-                    // Order: excellent < good < fair < poor < veryPoor
                     func rank(_ q: RTCNetworkQuality) -> Int {
                         switch q {
                         case .excellent: return 0
@@ -728,7 +1131,7 @@ extension RTCSession {
                     return (rank(a) >= rank(b)) ? a : b
                 }
 
-                let q1 = bucketByBitrate(available)
+                let q1 = availableOutgoingBps.map(bucketByBitrate) ?? .poor
                 let q2 = currentRttSeconds.map(bucketByRtt) ?? .excellent
                 let quality = worse(q1, q2)
 
@@ -737,10 +1140,11 @@ extension RTCSession {
                 await self.emitNetworkQualityUpdateIfNeeded(
                     connectionId: normalizedId,
                     quality: quality,
-                    availableOutgoingBitrateBps: Int(available),
+                    availableOutgoingBitrateBps: reportedAvailableBps,
+                    availableIncomingBitrateBps: availableIncomingBps.map { Int($0) },
                     rttMs: rttMs,
-                    appliedVideoMaxBitrateBps: targetBps,
-                    appliedVideoMaxFramerate: targetFps,
+                    appliedVideoMaxBitrateBps: targets.maxBitrateBps,
+                    appliedVideoMaxFramerate: targets.maxFramerate,
                     nowUptimeNs: nowUptimeNs
                 )
 
@@ -903,6 +1307,95 @@ extension RTCSession {
                 message: "RTP stats (connId=\(connectionId)\(reasonDesc))\(anomalyNote): OUT audio packetsSent=\(audioPacketsSent) bytesSent=\(audioBytesSent) | OUT video packetsSent=\(videoPacketsSent) bytesSent=\(videoBytesSent) || IN audio packetsReceived=\(audioPacketsReceived) bytesReceived=\(audioBytesReceived) | IN video packetsReceived=\(videoPacketsReceived) bytesReceived=\(videoBytesReceived) framesReceived=\(videoFramesReceived) framesDecoded=\(videoFramesDecoded) | \(dtlsDesc) | \(pairDesc)"
             )
         }
+    }
+
+    /// Per-mid screen-share diagnostics — always logs inbound/outbound RTP split by `mid` plus
+    /// live transceiver + cryptor binding state. Use this to distinguish camera (`mid=1`) from
+    /// screen (`mid=2`) when aggregate video counters look healthy.
+    func logScreenShareDiagnostics(connectionId: String, delayNanoseconds: UInt64 = 0, reason: String) {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !normalizedId.isEmpty else { return }
+
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            if delayNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: delayNanoseconds)
+            }
+            await self.logScreenShareDiagnosticsSnapshot(connectionId: normalizedId, reason: reason)
+        }
+    }
+
+    private func logScreenShareDiagnosticsSnapshot(connectionId: String, reason: String) async {
+        guard let connection = await connectionManager.findConnection(with: connectionId) else { return }
+        let report = await collectStats(peerConnection: connection.peerConnection)
+
+        func int64(_ any: Any?) -> Int64? {
+            if let n = any as? NSNumber { return n.int64Value }
+            if let s = any as? String, let v = Int64(s) { return v }
+            return nil
+        }
+        func string(_ any: Any?) -> String? {
+            if let s = any as? String { return s }
+            if let n = any as? NSNumber { return n.stringValue }
+            return nil
+        }
+
+        var inboundByMid: [String: (packets: Int64, framesReceived: Int64, framesDecoded: Int64)] = [:]
+        var outboundByMid: [String: (packets: Int64, framesEncoded: Int64, framesSent: Int64)] = [:]
+
+        for (_, stat) in report.statistics {
+            let kind = (string(stat.values["kind"]) ?? string(stat.values["mediaType"]) ?? "").lowercased()
+            let mid = string(stat.values["mid"]) ?? "?"
+            if stat.type == "inbound-rtp", kind == "video" {
+                var entry = inboundByMid[mid] ?? (0, 0, 0)
+                entry.packets += int64(stat.values["packetsReceived"]) ?? 0
+                entry.framesReceived += int64(stat.values["framesReceived"]) ?? 0
+                entry.framesDecoded += int64(stat.values["framesDecoded"]) ?? 0
+                inboundByMid[mid] = entry
+            } else if stat.type == "outbound-rtp", kind == "video" {
+                var entry = outboundByMid[mid] ?? (0, 0, 0)
+                entry.packets += int64(stat.values["packetsSent"]) ?? 0
+                entry.framesEncoded += int64(stat.values["framesEncoded"]) ?? 0
+                entry.framesSent += int64(stat.values["framesSent"]) ?? 0
+                outboundByMid[mid] = entry
+            }
+        }
+
+        let inboundDesc = inboundByMid.keys.sorted().map { mid in
+            let e = inboundByMid[mid]!
+            return "mid=\(mid):pkts=\(e.packets),framesRx=\(e.framesReceived),framesDec=\(e.framesDecoded)"
+        }.joined(separator: ";")
+        let outboundDesc = outboundByMid.keys.sorted().map { mid in
+            let e = outboundByMid[mid]!
+            return "mid=\(mid):pkts=\(e.packets),framesEnc=\(e.framesEncoded),framesSent=\(e.framesSent)"
+        }.joined(separator: ";")
+
+        let transceiverDesc = connection.peerConnection.transceivers
+            .filter { $0.mediaType == .video }
+            .map { t in
+                let mid = t.mid.trimmingCharacters(in: .whitespacesAndNewlines)
+                let recvId = t.receiver.track?.trackId ?? "nil"
+                let sendId = t.sender.track?.trackId ?? "nil"
+                return "mid=\(mid.isEmpty ? "?" : mid),dir=\(t.direction),recv=\(recvId),send=\(sendId)"
+            }
+            .joined(separator: ";")
+
+        let screenBindingDesc = connection.screenReceiverCryptorBindingsByParticipantId.map { key, binding in
+            "\(key):track=\(binding.trackId),receiver=\(binding.receiverId)"
+        }.sorted().joined(separator: ";")
+
+        let senderBinding = connection.screenSenderCryptorBinding.map {
+            "track=\($0.trackId),sender=\($0.senderId)"
+        } ?? "nil"
+
+        let remoteScreenTracks = connection.remoteScreenTracksByParticipantId.map { key, track in
+            "\(key)=\(track.trackId)"
+        }.sorted().joined(separator: ";")
+
+        logger.log(
+            level: .info,
+            message: "Screen-share diagnostics (connId=\(connectionId) reason=\(reason)): inboundVideo=[\(inboundDesc.isEmpty ? "none" : inboundDesc)] outboundVideo=[\(outboundDesc.isEmpty ? "none" : outboundDesc)] transceivers=[\(transceiverDesc.isEmpty ? "none" : transceiverDesc)] remoteScreenTracks=[\(remoteScreenTracks.isEmpty ? "none" : remoteScreenTracks)] screenReceiverCryptors=[\(screenBindingDesc.isEmpty ? "none" : screenBindingDesc)] screenSenderCryptorBinding=\(senderBinding)"
+        )
     }
 
     /// Emits a single `getStats` snapshot after an optional delay.

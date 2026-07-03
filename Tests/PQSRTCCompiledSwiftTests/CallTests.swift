@@ -73,6 +73,50 @@ struct CallTests {
     }
 
     @Test
+    func callEqualityComparesFrameIdentityKeyMaterial() async throws {
+        let keyManager = KeyManager()
+        let localIdentity = try await keyManager.generateSenderIdentity(connectionId: "conn-call-equality", secretName: "alice")
+        guard let frameProps = await localIdentity.sessionIdentity.props(symmetricKey: localIdentity.symmetricKey) else {
+            Issue.record("Expected generated identity props")
+            return
+        }
+        guard !frameProps.longTermPublicKey.isEmpty else {
+            Issue.record("Expected generated identity props to include long-term key material")
+            return
+        }
+
+        var changedFrameProps = frameProps
+        var changedLongTermPublicKey = Array(changedFrameProps.longTermPublicKey)
+        changedLongTermPublicKey[0] ^= 0x01
+        changedFrameProps.setLongTermPublicKey(Data(changedLongTermPublicKey))
+
+        let sender = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: "dev-a")
+        let recipient = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "dev-b")
+        let id = UUID()
+        let createdAt = Date(timeIntervalSince1970: 1_234)
+
+        let lhs = try Call(
+            id: id,
+            sharedCommunicationId: "comm-call-equality",
+            sender: sender,
+            recipients: [recipient],
+            createdAt: createdAt,
+            frameIdentityProps: frameProps
+        )
+        let rhs = try Call(
+            id: id,
+            sharedCommunicationId: "comm-call-equality",
+            sender: sender,
+            recipients: [recipient],
+            createdAt: createdAt,
+            frameIdentityProps: changedFrameProps
+        )
+
+        #expect(frameProps.deviceId == changedFrameProps.deviceId)
+        #expect(lhs != rhs)
+    }
+
+    @Test
     func groupCallConnectionIdDetection() {
         #expect("#room".isGroupCall)
         #expect("#conf-7dd14337-c20e-436e-9220-40ea234cafa6".isGroupCall)

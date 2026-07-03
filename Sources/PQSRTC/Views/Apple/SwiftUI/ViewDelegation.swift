@@ -115,6 +115,9 @@ public protocol VideoCallDelegate: AnyObject, Sendable {
     /// Called when a remote participant starts or stops sharing their screen.
     func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async
 
+    /// Called when group/conference participant camera tile assignments change.
+    func remoteParticipantTilesDidChange() async
+
     /// Called when conference permissions change (roles updated by server).
     func conferencePermissionsDidChange(_ permissions: ConferencePermissions) async
 
@@ -130,6 +133,7 @@ public extension VideoCallDelegate {
     func localMuteDisplayDidChange(videoMuted: Bool, audioMuted: Bool) async {}
     func screenShareDidChange(isSharing: Bool) async {}
     func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async {}
+    func remoteParticipantTilesDidChange() async {}
     func conferencePermissionsDidChange(_ permissions: ConferencePermissions) async {}
     func permissionRequestReceived(from participant: String, action: ConferencePermissionAction) async {}
 }

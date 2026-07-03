@@ -215,3 +215,10 @@ If encrypted video is correct but encrypted audio is garbled, check that the aud
 reconciled to the same sender id as the video receiver and that a sender key exists for that id.
 
 See <doc:GroupSfuFrameE2EE> and <doc:End-to-End-Encryption>.
+
+## Remote video rendering
+
+Group/conference **camera tiles** (SFU renegotiation, wrapper rotation, Apple vs Android
+settlement, and host UI contracts) are documented in
+<doc:GroupConferenceRemoteVideo>. Read that article when implementing or reviewing multiparty
+video—not only when debugging frozen tiles.

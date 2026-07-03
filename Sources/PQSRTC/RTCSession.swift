@@ -136,6 +136,20 @@ public actor RTCSession {
         await renderer.setCapture(wrapper)
         logger.log(level: .info, message: "Rebound local preview capture to fresh WebRTC video source for connectionId=\(trimmed)")
     }
+
+    @discardableResult
+    internal func restartRegisteredLocalPreviewCaptureForRecovery(
+        connectionId: String,
+        wrapper: RTCVideoCaptureWrapper
+    ) async -> Bool {
+        let trimmed = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !trimmed.isEmpty else { return false }
+        guard let renderer = localPreviewCaptureRenderersByConnectionId[trimmed] else { return false }
+        await renderer.setCapture(wrapper)
+        await renderer.restartCaptureSessionForRecovery()
+        logger.log(level: .warning, message: "Restarted local preview capture for outbound video recovery connectionId=\(trimmed)")
+        return true
+    }
 #endif
 #endif
     
@@ -268,6 +282,10 @@ public actor RTCSession {
     
     /// Per-call group-call state keyed by `sharedCommunicationId`.
     var groupCalls: [String: RTCGroupCall] = [:]
+
+    /// Subscribers waiting for SFU group-call registration. This lets app-layer media key exchange
+    /// bind to the actual RTCGroupCall lifecycle without polling for room creation.
+    private var groupCallRegistrationContinuations: [UUID: AsyncStream<String>.Continuation] = [:]
     
     /// Pending inbound call identifier whose acceptance is being gated.
     var pendingAnswerCallId: UUID?
@@ -368,6 +386,8 @@ public actor RTCSession {
     // Mirrors the Apple implementation but uses `org.webrtc.PeerConnection.getStats`.
     var adaptiveVideoSendTasksByConnectionId: [String: Task<Void, Never>] = [:]
     var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double)] = [:]
+    /// Last inbound video counters snapshot per connection (Android renderer recovery sampler).
+    var lastInboundVideoCountersByConnectionId: [String: AndroidInboundVideoCounters] = [:]
 #endif
     
     // MARK: - Platform-specific RTC clients & encryption
@@ -431,6 +451,61 @@ public actor RTCSession {
     /// which would produce mismatched m-line ordering and crash WebRTC.
     var offerInFlightConnectionIds: Set<String> = []
 
+    /// Inbound SFU renegotiation offers deferred until signaling is stable or a placeholder relay
+    /// offer is replaced by a distinct screen SSRC.
+    var pendingDeferredSfuRenegotiationOffers: [String: (SessionDescription, Call)] = [:]
+
+#if os(Android)
+    /// Last SFU remote offer successfully applied on Android, keyed by normalized connection id.
+    ///
+    /// Android renderer reconciliation can fire after concurrent signaling updates have replaced
+    /// `connection.call.metadata`, so recovery needs the actual remote offer used for `setRemoteSDP`.
+    var latestAndroidRemoteOfferSdpByConnectionId: [String: String] = [:]
+
+    func rememberAndroidRemoteOfferSdp(_ sdp: String, connectionId: String) {
+        let normalizedId = connectionId.normalizedConnectionId
+        let trimmed = sdp.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        latestAndroidRemoteOfferSdpByConnectionId[normalizedId] = sdp
+    }
+
+    func latestAndroidRemoteOfferSdp(connectionId: String) -> String? {
+        latestAndroidRemoteOfferSdpByConnectionId[connectionId.normalizedConnectionId]
+    }
+#endif
+
+    /// Connection ids currently answering an inbound SFU renegotiation offer (serialize duplicates).
+    var sfuRenegotiationInFlightConnectionIds: Set<String> = []
+
+    /// Participant ids that need a renderer sink refresh once SFU group attach defer clears.
+    var pendingParticipantRendererSinkRefreshByConnectionId: [String: Set<String>] = [:]
+
+    /// Participant ids whose camera sink must rebind after the current SFU renegotiation completes.
+    /// Populated silently during in-flight renegotiation; flushed once in
+    /// ``emitRemoteParticipantTrackRefreshAfterSfuRenegotiation``.
+    var sfuRenegotiationReboundParticipantIdsByConnectionId: [String: Set<String>] = [:]
+
+    /// Active camera track-add events already delivered for the current SFU settlement window.
+    /// Suppresses duplicate peer-notification emits until the next renegotiation starts or the
+    /// participant track is removed.
+    var deliveredActiveParticipantVideoTrackKeysByConnectionId: [String: Set<String>] = [:]
+
+    /// Continuations for inbound video flow sampler updates (Android renderer recovery).
+    private var inboundVideoFlowUpdateContinuations: [UUID: AsyncStream<InboundVideoFlowSnapshot>.Continuation] = [:]
+
+    /// Shared inbound-flow sampler tasks keyed by connection id.
+    var inboundVideoFlowSamplerTasksByConnectionId: [String: Task<Void, Never>] = [:]
+
+    /// Last known SDP signaling stability for SFU group rooms (`false` while offer/answer is settling).
+    var sfuGroupSignalingIsStableByConnectionId: [String: Bool] = [:]
+
+    /// Normalized connection ids currently starting local screen share capture.
+    ///
+    /// Starting ReplayKit / ScreenCaptureKit yields out of the actor before
+    /// `localScreenTrack` is populated, so duplicate user actions can otherwise
+    /// race into the platform capture stack.
+    var screenShareStartInFlightConnectionIds: Set<String> = []
+
     /// Normalized connection ids for which the first SFU group offer is not sent yet.
     ///
     /// WebRTC emits `negotiationNeeded` as soon as the first sender is attached; the peer-notifications
@@ -460,6 +535,10 @@ public actor RTCSession {
     /// real remote track owner key exists.
     var oneToOneSfuReceiveKeyReadyConnectionIds: Set<String> = []
 
+    /// Normalized connection ids where inbound receiver FrameCryptor binds are deferred until an
+    /// SFU renegotiation offer/answer cycle completes (avoids binding to transient receivers).
+    var sfuRenegotiationReceiverCryptorRebindDeferredConnectionIds: Set<String> = []
+
     /// Normalized connection ids that have already emitted the post-cipher `.handshakeComplete`.
     ///
     /// For encrypted 1:1-over-SFU calls this readiness signal is sent only after the peer's
@@ -467,12 +546,35 @@ public actor RTCSession {
     /// signal can be sent immediately after the answer path reaches this stage.
     var oneToOneSfuPostCipherHandshakeSentConnectionIds: Set<String> = []
 
+    /// Normalized connection id -> inbound camera track id the main remote renderer is attached to.
+    /// Avoids redundant remove/add churn during recovery and repeated flush calls.
+    var remoteVideoRendererAttachedTrackIdByConnectionId: [String: String] = [:]
+    /// Normalized connection id + participant id -> inbound camera track id attached to that tile.
+    /// Group-call renegotiation and repeated key envelopes can otherwise remove/add the same sink.
+    var remoteParticipantVideoRendererAttachedTrackIdByKey: [String: String] = [:]
+
+    /// Remote peer `deviceId` locked after the first accepted 1:1-SFU `call_cipher`.
+    ///
+    /// Nudge can fan the same `call_cipher` to every logged-in device for a user. Once media
+    /// keys are established with one device, ignore sibling-device payloads for this room.
+    var oneToOneSfuLockedRemoteDeviceIdByNormalizedConnectionId: [String: String] = [:]
+
 #if canImport(WebRTC)
     /// Delegate that surfaces frame-cryptor events for debugging and monitoring.
     var frameCryptorDelegate = FrameCryptorDelegate()
 
     /// Last inbound media counters snapshot per connection, used to verify whether remote media is still arriving.
     var lastInboundVideoCountersByConnectionId: [String: InboundVideoCounters] = [:]
+    /// Last inbound screen-share counters snapshot per connection (non-camera video mids only).
+    var lastInboundScreenVideoCountersByConnectionId: [String: InboundVideoCounters] = [:]
+    /// First observation of flat screen mid RTP during an exclusive-share preempt wait.
+    var remoteScreenIngressFlatSinceByKey: [String: Date] = [:]
+    /// Cached inbound-flow snapshot shared by overlay and recovery code.
+    var cachedInboundVideoFlowByConnectionId: [String: InboundVideoFlowCheck] = [:]
+    /// Cached inbound screen-share flow snapshot used by screen renderer recovery.
+    var cachedInboundScreenVideoFlowByConnectionId: [String: InboundVideoFlowCheck] = [:]
+    /// Last ICE-restart renegotiation attempt per connection (DispatchTime uptime nanoseconds).
+    var lastIceRestartAttemptUptimeNsByConnectionId: [String: UInt64] = [:]
     /// Last outbound media counters snapshot per connection, used to verify whether local media is still leaving this client.
     var lastOutboundVideoCountersByConnectionId: [String: OutboundVideoCounters] = [:]
     /// Non-gated periodic inbound video probes for remote-render bring-up diagnostics.
@@ -521,10 +623,20 @@ public actor RTCSession {
 #endif
 #if os(iOS) && !os(Android)
     var _iOSScreenCaptureSourceStorage: iOSScreenCaptureSource?
-    /// Connections waiting for ReplayKit broadcast start before advertising screen share to the SFU.
-    var pendingScreenShareRenegotiationConnectionIds: Set<String> = []
 #endif
-#if os(iOS) || os(macOS)
+#if canImport(WebRTC) && !os(Android)
+    /// Connections currently mixing screen-share system audio on mid=0.
+    var systemAudioShareActiveConnectionIds: Set<String> = []
+    /// Mic was muted before system-audio share; restore that mute when share ends.
+    var systemAudioShareMicWasMutedByConnectionId: [String: Bool] = [:]
+#endif
+#if os(iOS) || os(macOS) || os(Android)
+    /// Connections waiting for platform capture start before advertising screen share to the SFU.
+    var pendingScreenShareRenegotiationConnectionIds: Set<String> = []
+#if os(iOS) || os(Android)
+    /// Rolls back deferred screen-share starts when platform capture never becomes ready.
+    var abandonedScreenShareCaptureCleanupTasks: [String: Task<Void, Never>] = [:]
+#endif
     /// Identifies the capture source that currently owns the outgoing screen track.
     /// Late termination callbacks from a stopped source must never stop a replacement share.
     private var platformScreenCaptureGeneration: UInt64 = 0
@@ -552,13 +664,17 @@ public actor RTCSession {
 #if os(Android)
     nonisolated internal let androidMediaProjectionPermission = AndroidMediaProjectionPermissionBox()
 
-    /// Stores the MediaProjection permission result for use by `addScreenTrackToStream`.
-    /// Must be called before `startScreenShare(target: .androidScreen)`.
+    /// Records that the MediaProjection consent was granted. Must be called before
+    /// `startScreenShare(target: .androidScreen)`.
+    ///
+    /// Only the bridge-safe result code crosses into Swift; the consent `Intent` itself is an
+    /// arbitrary Java object that SkipBridge cannot bridge and must stay on the Kotlin side in
+    /// `AndroidMediaProjectionResultHolder` (see `AndroidRTCNativeSupport.kt`).
     ///
     /// `nonisolated` keeps Skip’s generated JNI adapter from awaiting into the actor for this
     /// Android-only permission handoff (Swift 6 `Sendable` / `Task` diagnostics).
-    /* SKIP @bridge */ public nonisolated func setAndroidMediaProjectionResult(resultCode: Int, data: Any) {
-        androidMediaProjectionPermission.store(resultCode: resultCode, intent: data)
+    /* SKIP @bridge */ public nonisolated func setAndroidMediaProjectionResult(resultCode: Int) {
+        androidMediaProjectionPermission.store(resultCode: resultCode)
     }
 #endif
 
@@ -586,9 +702,10 @@ public actor RTCSession {
     private func storeLocalScreenShareStateContinuation(_ id: UUID, continuation: AsyncStream<Bool>.Continuation) async {
         localScreenShareStateContinuations[id] = continuation
         let connections = await connectionManager.findAllConnections()
-        let isSharing = connections.contains { connection in
-            connection.localScreenTrack != nil
-        }
+        let isSharing = Self.isLocalScreenShareActiveForPresentation(
+            connections: connections,
+            pendingCaptureReadyIds: pendingScreenShareRenegotiationConnectionIds
+        )
         continuation.yield(isSharing)
     }
 
@@ -663,6 +780,8 @@ public actor RTCSession {
     // MARK: - Remote participant track notifications
 
     private var remoteParticipantTrackContinuations: [UUID: AsyncStream<RemoteParticipantTrackEvent>.Continuation] = [:]
+    private var postSfuRenegotiationAttachEpisodeContinuations: [UUID: AsyncStream<PostSfuRenegotiationAttachEpisode>.Continuation] = [:]
+    private var sfuGroupSignalingStableContinuations: [UUID: AsyncStream<String>.Continuation] = [:]
 
     /// Returns an async stream that yields events whenever a remote participant's camera
     /// video track is added or removed. The Android controller subscribes to assign
@@ -708,9 +827,219 @@ public actor RTCSession {
         remoteParticipantTrackContinuations.removeValue(forKey: id)
     }
 
+    /// Yields once per post-SFU renegotiation rebound batch with the participant ids that need
+    /// coordinated tile refresh on Android.
+    public func postSfuRenegotiationAttachEpisodeStream() -> AsyncStream<PostSfuRenegotiationAttachEpisode> {
+        let id = UUID()
+        return AsyncStream { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            Task { await self.storePostSfuRenegotiationAttachEpisodeContinuation(id, continuation: continuation) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                Task { await self.removePostSfuRenegotiationAttachEpisodeContinuation(id) }
+            }
+        }
+    }
+
+    private func storePostSfuRenegotiationAttachEpisodeContinuation(
+        _ id: UUID,
+        continuation: AsyncStream<PostSfuRenegotiationAttachEpisode>.Continuation
+    ) {
+        postSfuRenegotiationAttachEpisodeContinuations[id] = continuation
+    }
+
+    private func removePostSfuRenegotiationAttachEpisodeContinuation(_ id: UUID) {
+        postSfuRenegotiationAttachEpisodeContinuations.removeValue(forKey: id)
+    }
+
+    func notifyPostSfuRenegotiationAttachEpisode(_ episode: PostSfuRenegotiationAttachEpisode) {
+        for (_, continuation) in postSfuRenegotiationAttachEpisodeContinuations {
+            continuation.yield(episode)
+        }
+    }
+
+    /// Yields the normalized connection id whenever an SFU group peer connection reaches `stable`.
+    public func sfuGroupSignalingStableStream() -> AsyncStream<String> {
+        let id = UUID()
+        return AsyncStream { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            Task { await self.storeSfuGroupSignalingStableContinuation(id, continuation: continuation) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                Task { await self.removeSfuGroupSignalingStableContinuation(id) }
+            }
+        }
+    }
+
+    private func storeSfuGroupSignalingStableContinuation(
+        _ id: UUID,
+        continuation: AsyncStream<String>.Continuation
+    ) {
+        sfuGroupSignalingStableContinuations[id] = continuation
+    }
+
+    private func removeSfuGroupSignalingStableContinuation(_ id: UUID) {
+        sfuGroupSignalingStableContinuations.removeValue(forKey: id)
+    }
+
+    func notifySfuGroupSignalingBecameStable(connectionId: String) {
+        let norm = connectionId.normalizedConnectionId
+        for (_, continuation) in sfuGroupSignalingStableContinuations {
+            continuation.yield(norm)
+        }
+    }
+
     func notifyRemoteParticipantTrackChanged(_ event: RemoteParticipantTrackEvent) {
+        if let suppressionReason = remoteParticipantTrackSuppressionReason(for: event) {
+            logger.log(
+                level: .info,
+                message: "Suppressed participant track event participant=\(event.participantId) isActive=\(event.isActive) connection=\(event.connectionId) reason=\(suppressionReason.rawValue)"
+            )
+            return
+        }
+        recordDeliveredRemoteParticipantTrackEvent(event)
         for (_, continuation) in remoteParticipantTrackContinuations {
             continuation.yield(event)
+        }
+    }
+
+    func stableParticipantVideoTrackEventKey(participantId: String) -> String {
+        let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+        if !participantKey.isEmpty {
+            return participantKey
+        }
+        return participantId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private enum RemoteParticipantTrackSuppressionReason: String {
+        case sfuRenegotiationInFlight
+        case duplicateActiveVideo
+    }
+
+    private func remoteParticipantTrackSuppressionReason(
+        for event: RemoteParticipantTrackEvent
+    ) -> RemoteParticipantTrackSuppressionReason? {
+        guard event.kind == "video" else { return nil }
+        let norm = event.connectionId.normalizedConnectionId
+        guard isGroupCallConnection(norm) else { return nil }
+
+        if !event.isActive {
+            clearDeliveredActiveParticipantVideoTrackKey(connectionId: norm, participantId: event.participantId)
+            return nil
+        }
+
+        if isSfuGroupRenegotiationInFlight(for: norm) {
+            return .sfuRenegotiationInFlight
+        }
+
+        let stableKey = stableParticipantVideoTrackEventKey(participantId: event.participantId)
+        guard !stableKey.isEmpty else { return nil }
+        let delivered = deliveredActiveParticipantVideoTrackKeysByConnectionId[norm] ?? []
+        return delivered.contains(stableKey) ? .duplicateActiveVideo : nil
+    }
+
+    private func recordDeliveredRemoteParticipantTrackEvent(_ event: RemoteParticipantTrackEvent) {
+        guard event.kind == "video", event.isActive else { return }
+        let norm = event.connectionId.normalizedConnectionId
+        guard isGroupCallConnection(norm) else { return }
+        let stableKey = stableParticipantVideoTrackEventKey(participantId: event.participantId)
+        guard !stableKey.isEmpty else { return }
+        var delivered = deliveredActiveParticipantVideoTrackKeysByConnectionId[norm, default: []]
+        delivered.insert(stableKey)
+        deliveredActiveParticipantVideoTrackKeysByConnectionId[norm] = delivered
+    }
+
+    func clearDeliveredActiveParticipantVideoTrackKey(connectionId: String, participantId: String) {
+        let norm = connectionId.normalizedConnectionId
+        let stableKey = stableParticipantVideoTrackEventKey(participantId: participantId)
+        guard !stableKey.isEmpty else { return }
+        guard var delivered = deliveredActiveParticipantVideoTrackKeysByConnectionId[norm] else { return }
+        delivered.remove(stableKey)
+        if delivered.isEmpty {
+            deliveredActiveParticipantVideoTrackKeysByConnectionId.removeValue(forKey: norm)
+        } else {
+            deliveredActiveParticipantVideoTrackKeysByConnectionId[norm] = delivered
+        }
+    }
+
+    func noteSfuGroupRenegotiationSettlementStarted(connectionId: String) {
+        let norm = connectionId.normalizedConnectionId
+        deliveredActiveParticipantVideoTrackKeysByConnectionId.removeValue(forKey: norm)
+    }
+
+    /// Yields whenever the inbound video flow sampler records a new aggregate snapshot.
+    func inboundVideoFlowUpdateStream() -> AsyncStream<InboundVideoFlowSnapshot> {
+        let id = UUID()
+        return AsyncStream { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            Task { await self.storeInboundVideoFlowUpdateContinuation(id, continuation: continuation) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                Task { await self.removeInboundVideoFlowUpdateContinuation(id) }
+            }
+        }
+    }
+
+    private func storeInboundVideoFlowUpdateContinuation(
+        _ id: UUID,
+        continuation: AsyncStream<InboundVideoFlowSnapshot>.Continuation
+    ) {
+        inboundVideoFlowUpdateContinuations[id] = continuation
+    }
+
+    private func removeInboundVideoFlowUpdateContinuation(_ id: UUID) {
+        inboundVideoFlowUpdateContinuations.removeValue(forKey: id)
+    }
+
+    internal func publishInboundVideoFlowUpdate(_ flow: InboundVideoFlowSnapshot) {
+        for (_, continuation) in inboundVideoFlowUpdateContinuations {
+            continuation.yield(flow)
+        }
+    }
+
+    /// Returns an async stream of normalized SFU room ids as group calls are registered.
+    ///
+    /// Existing rooms are yielded when the subscriber attaches, so callers can safely subscribe
+    /// after `groupCallNegotiation` without losing the creation event.
+    public func groupCallRegistrationStream() -> AsyncStream<String> {
+        let id = UUID()
+        return AsyncStream { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            Task { await self.storeGroupCallRegistrationContinuation(id, continuation: continuation) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                Task { await self.removeGroupCallRegistrationContinuation(id) }
+            }
+        }
+    }
+
+    private func storeGroupCallRegistrationContinuation(_ id: UUID, continuation: AsyncStream<String>.Continuation) {
+        groupCallRegistrationContinuations[id] = continuation
+        for roomId in groupCalls.keys {
+            continuation.yield(roomId)
+        }
+    }
+
+    private func removeGroupCallRegistrationContinuation(_ id: UUID) {
+        groupCallRegistrationContinuations.removeValue(forKey: id)
+    }
+
+    func notifyGroupCallRegistered(roomId: String) {
+        let normalizedRoomId = roomId.normalizedConnectionId
+        for (_, continuation) in groupCallRegistrationContinuations {
+            continuation.yield(normalizedRoomId)
         }
     }
 
@@ -768,7 +1097,7 @@ public actor RTCSession {
         conferencePermissionContinuations.removeValue(forKey: id)
     }
 
-    /// Called by the app layer when a `ConferencePermissionEvent` is received from NeedleTailKit.
+    /// Called by the app layer when a `ConferencePermissionEvent` is received from NudgeKit.
     /// Translates the string-based role map into typed `ConferenceRole` values.
     ///
     /// Username matching is case-insensitive because the server keys roles by IRC nick
@@ -777,6 +1106,14 @@ public actor RTCSession {
         var normalized = participant.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if normalized.hasPrefix(screenStreamPrefix) {
             normalized.removeFirst(screenStreamPrefix.count)
+        }
+        if normalized.hasPrefix("streamid_") {
+            normalized.removeFirst("streamid_".count)
+        }
+        if normalized.hasPrefix("video_") {
+            normalized.removeFirst("video_".count)
+        } else if normalized.hasPrefix("audio_") {
+            normalized.removeFirst("audio_".count)
         }
         if normalized.hasSuffix("_") {
             normalized.removeLast()
@@ -1170,6 +1507,11 @@ public actor RTCSession {
         self.handshakeComplete = handshakeComplete
     }
 
+    /// Retries paused outbound signaling jobs (e.g. after the SFU writer reconnects).
+    public func resumePausedSignalingJobs() async throws {
+        try await taskProcessor.loadTasks()
+    }
+
     // MARK: - Public network quality API
 
     /// Creates a stream that emits coarse network quality updates.
@@ -1200,6 +1542,7 @@ public actor RTCSession {
         connectionId: String,
         quality: RTCNetworkQuality,
         availableOutgoingBitrateBps: Int?,
+        availableIncomingBitrateBps: Int? = nil,
         rttMs: Int?,
         appliedVideoMaxBitrateBps: Int?,
         appliedVideoMaxFramerate: Int?,
@@ -1228,6 +1571,7 @@ public actor RTCSession {
             connectionId: normalizedId,
             quality: quality,
             availableOutgoingBitrateBps: availableOutgoingBitrateBps,
+            availableIncomingBitrateBps: availableIncomingBitrateBps,
             rttMs: rttMs,
             appliedVideoMaxBitrateBps: appliedVideoMaxBitrateBps,
             appliedVideoMaxFramerate: appliedVideoMaxFramerate)
@@ -1316,6 +1660,28 @@ public actor RTCSession {
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             .normalizedConnectionId
             .lowercased()
+    }
+
+    func isConnectionFinishingOrEnded(_ connectionId: String) -> Bool {
+        let key = teardownConnectionIdKey(connectionId)
+        guard !key.isEmpty else { return true }
+        return finishingConnectionIds.contains(key) || endedConnectionIds.contains(key)
+    }
+
+    func isConnectionStillActiveForRecovery(_ connectionId: String) async -> Bool {
+        let key = teardownConnectionIdKey(connectionId)
+        guard !key.isEmpty else { return false }
+        guard !isConnectionFinishingOrEnded(key) else { return false }
+        if let active = activeConnectionId,
+           teardownConnectionIdKey(active) != key {
+            return false
+        }
+        switch await callState.currentState {
+        case .connecting, .connected, .held:
+            return true
+        default:
+            return false
+        }
     }
 
     private func removeFromAuxiliaryTeardownSets(connectionId raw: String) {
@@ -1439,6 +1805,60 @@ public actor RTCSession {
 
     // MARK: - Peer-connection factory & initialization
 #if canImport(WebRTC)
+    /// Mixes screen-share system audio into the outbound mic capture path.
+    /// Installed as the factory's `capturePostProcessingDelegate`; inert
+    /// (no buffer modification) unless a system-audio share is active.
+    /// Retained here because the processing module holds it weakly.
+    static let screenShareSystemAudioProcessor = ScreenShareSystemAudioCapturePostProcessor()
+
+#if !os(Android)
+    /// Routes ScreenCaptureKit / ReplayKit PCM into the shared capture post-processor.
+    static let screenShareSystemAudioEgress = WebRTCScreenShareSystemAudioEgress(
+        processor: screenShareSystemAudioProcessor
+    )
+#endif
+
+    /// Retained for the lifetime of the factory. The peer connection factory does
+    /// not keep a strong reference to the processing module; if this object is
+    /// released, `capturePostProcessingDelegate` is cleared and ReplayKit /
+    /// ScreenCaptureKit audio is pushed into the mixer but never reaches RTP.
+    static let screenShareSystemAudioProcessingModule: RTCDefaultAudioProcessingModule = {
+        RTCDefaultAudioProcessingModule(
+            config: nil,
+            capturePostProcessingDelegate: screenShareSystemAudioProcessor,
+            renderPreProcessingDelegate: nil
+        )
+    }()
+
+    private static let systemAudioShareBypassLock = NSLock()
+    nonisolated(unsafe) private static var systemAudioShareVoiceProcessingBypassCount = 0
+
+    /// Rebinds the capture post-processor and prepares WebRTC to mix system audio.
+    static func activateSystemAudioCaptureProcessing() {
+        screenShareSystemAudioProcessingModule.capturePostProcessingDelegate = screenShareSystemAudioProcessor
+        screenShareSystemAudioProcessor.prepareForSystemAudioShare()
+
+        systemAudioShareBypassLock.withLock {
+            systemAudioShareVoiceProcessingBypassCount += 1
+            guard systemAudioShareVoiceProcessingBypassCount == 1 else { return }
+#if os(macOS)
+            // Custom capture post-processing runs outside the voice-processing chain.
+            factory.audioDeviceModule.isVoiceProcessingBypassed = true
+#endif
+        }
+    }
+
+    static func deactivateSystemAudioCaptureProcessing() {
+        systemAudioShareBypassLock.withLock {
+            guard systemAudioShareVoiceProcessingBypassCount > 0 else { return }
+            systemAudioShareVoiceProcessingBypassCount -= 1
+            guard systemAudioShareVoiceProcessingBypassCount == 0 else { return }
+#if os(macOS)
+            factory.audioDeviceModule.isVoiceProcessingBypassed = false
+#endif
+        }
+    }
+
     static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
         let videoEncoderFactory = RTCDefaultVideoEncoderFactory()
@@ -1457,7 +1877,16 @@ public actor RTCSession {
         }
 #endif
         let videoDecoderFactory = RTCDefaultVideoDecoderFactory()
-        return RTCPeerConnectionFactory(encoderFactory: videoEncoderFactory, decoderFactory: videoDecoderFactory)
+        // `.platformDefault` + `bypassVoiceProcessing: false` matches the ADM the
+        // plain `init(encoderFactory:decoderFactory:)` produced; the only change
+        // is the audio processing module carrying the screen-share audio mixer.
+        return RTCPeerConnectionFactory(
+            audioDeviceModuleType: .platformDefault,
+            bypassVoiceProcessing: false,
+            encoderFactory: videoEncoderFactory,
+            decoderFactory: videoDecoderFactory,
+            audioProcessingModule: screenShareSystemAudioProcessingModule
+        )
     }()
 #endif
     
@@ -1500,6 +1929,9 @@ public actor RTCSession {
         // taskProcessor is lazy and will be initialized on first access
         // This avoids using self before all stored properties are initialized
         logger.log(level: .trace, message: "Created RTCSession")
+#if os(Android)
+        installAndroidVideoReceiverFrameCryptorReadyHandler()
+#endif
     }
 
 #if canImport(WebRTC)
@@ -1651,6 +2083,8 @@ public enum RTCErrors: Error, LocalizedError, Sendable {
     case mediaError(String)
     
     case missingGroupCall
+    /// Inbound SFU renegotiation was queued; the caller must not treat this as a call failure.
+    case deferredSfuRenegotiationOffer(String)
     /// An operation was denied due to insufficient conference permissions.
     case permissionDenied(String)
     /// Human-readable description suitable for logging/UX.
@@ -1678,6 +2112,8 @@ public enum RTCErrors: Error, LocalizedError, Sendable {
             return "Media error: \(message)"
         case .missingGroupCall:
             return "No group call available"
+        case .deferredSfuRenegotiationOffer(let connectionId):
+            return "Deferred SFU renegotiation offer for \(connectionId)"
         case .permissionDenied(let message):
             return "Permission denied: \(message)"
         }

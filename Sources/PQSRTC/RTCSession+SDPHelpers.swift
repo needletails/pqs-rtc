@@ -52,15 +52,19 @@ extension RTCSession {
         hasVideo: Bool = false,
         stripSsrcLines: Bool = false,
         vp8OnlyVideo: Bool = false,
+        preserveAudioDirectionsForMids: Set<String> = [],
         preserveVideoDirectionsForMids: Set<String> = [],
         forceReceiveOnlyVideoMids: Set<String> = []
     ) async -> String {
         var sdp = sdp
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
+        let preservedAudioDirectionMids = preserveAudioDirectionsForMids
+            .union(Self.receiveOnlyAudioMidsWithoutLocalMedia(in: sdp))
         let preservedVideoDirectionMids = preserveVideoDirectionsForMids
             .union(Self.screenShareVideoMids(in: sdp))
             .union(Self.receiveOnlyVideoMidsWithoutLocalMedia(in: sdp))
+            .union(Self.inactiveVideoMidsWithoutLocalMedia(in: sdp))
 
         func payloadType(in line: String, prefix: String) -> String? {
             guard line.hasPrefix(prefix) else { return nil }
@@ -271,11 +275,19 @@ extension RTCSession {
             if inAudioSection {
                 // Only process lines that contain direction attributes
                 if line.contains("a=recvonly") || line.contains("a=sendonly") || line.contains("a=inactive") {
-                    let (modifiedLine, didModify) = sendAndReceiveMedia(in: line)
-                    modifiedLines.append(modifiedLine)
-                    if didModify {
-                        // Once we've updated a media direction line, we can stop looking for audio direction
+                    let shouldPreserveDirection = currentMediaMid.map {
+                        preservedAudioDirectionMids.contains($0)
+                    } ?? false
+                    if shouldPreserveDirection {
+                        modifiedLines.append(line)
                         inAudioSection = false
+                    } else {
+                        let (modifiedLine, didModify) = sendAndReceiveMedia(in: line)
+                        modifiedLines.append(modifiedLine)
+                        if didModify {
+                            // Once we've updated a media direction line, we can stop looking for audio direction
+                            inAudioSection = false
+                        }
                     }
                 } else {
                     modifiedLines.append(line)
@@ -361,7 +373,219 @@ extension RTCSession {
         }
         flushCurrentSection()
 
+        return mids.union(sfuRelayIncomingScreenShareVideoMids(in: sdp))
+    }
+
+    /// True when the remote SDP advertises at least one `m=video` section the peer is actively
+    /// sending on (`sendrecv` / `sendonly`), meaning we should be able to receive camera/video.
+    nonisolated static func remoteSdpIncludesInboundVideoFromPeer(in sdp: String) -> Bool {
+        !remoteSendingVideoMids(in: sdp).isEmpty
+    }
+
+    /// Video mids in a remote SDP where the peer is actively sending screen-share media toward us.
+    nonisolated static func remoteActiveIncomingScreenShareVideoMids(in sdp: String) -> Set<String> {
+        activeScreenShareVideoMids(in: sdp).intersection(remoteSendingVideoMids(in: sdp))
+    }
+
+    /// Legacy 1:1 SFU screen relays can arrive on the contract screen mid with UUID-only msids.
+    /// Only call this after verifying the connection is a true 1:1 SFU room.
+    nonisolated static func oneToOneSfuIncomingScreenShareVideoMids(in sdp: String) -> Set<String> {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let contractMid = ScreenShareGroupCallContract.MediaMid.screen.rawValue
+        var mids = Set<String>()
+        var currentIsVideo = false
+        var currentMid: String?
+        var currentDirection: String?
+        var currentHasMediaIdentity = false
+
+        func flushCurrentSection() {
+            guard currentIsVideo,
+                  currentMid == contractMid,
+                  currentDirection == "sendrecv" || currentDirection == "sendonly",
+                  currentHasMediaIdentity else {
+                return
+            }
+            mids.insert(contractMid)
+        }
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentIsVideo = line.hasPrefix("m=video")
+                currentMid = nil
+                currentDirection = nil
+                currentHasMediaIdentity = false
+                continue
+            }
+
+            guard currentIsVideo else { continue }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if line == "a=sendrecv" || line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive" {
+                currentDirection = String(line.dropFirst("a=".count))
+            } else if line.hasPrefix("a=msid:") || line.hasPrefix("a=ssrc:") || line.hasPrefix("a=ssrc-group:") {
+                currentHasMediaIdentity = true
+            }
+        }
+        flushCurrentSection()
+
         return mids
+    }
+
+    /// Video mids in a remote SDP where the offerer/answerer is sending media toward us.
+    nonisolated static func remoteSendingVideoMids(in sdp: String) -> Set<String> {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var mids = Set<String>()
+        var currentIsVideo = false
+        var currentMid: String?
+        var currentDirection: String?
+
+        func flushCurrentSection() {
+            guard currentIsVideo,
+                  let currentMid,
+                  !currentMid.isEmpty,
+                  currentDirection == "sendrecv" || currentDirection == "sendonly"
+            else { return }
+            mids.insert(currentMid)
+        }
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentIsVideo = line.hasPrefix("m=video")
+                currentMid = nil
+                currentDirection = nil
+                continue
+            }
+
+            guard currentIsVideo else { continue }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if line == "a=sendrecv" || line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive" {
+                currentDirection = String(line.dropFirst("a=".count))
+            }
+        }
+        flushCurrentSection()
+
+        return mids
+    }
+
+    /// One `a=msid:` (or `a=ssrc:` … `msid:`) label pair parsed from an SDP media section.
+    struct SfuSdpMsidEntry: Equatable {
+        let streamLabel: String
+        let trackId: String?
+    }
+
+    /// Parses msid stream/track labels from one SDP `m=` section's attribute lines.
+    ///
+    /// WebRTC can emit `a=msid:<stream>` and the track id on the following continuation line
+    /// (observed on 1:1 SFU renegotiation offers). Single-line `a=msid:<stream> <track>` is also
+    /// supported.
+    nonisolated static func sfuSdpMsidEntries(inSectionLines lines: [String]) -> [SfuSdpMsidEntry] {
+        var entries: [SfuSdpMsidEntry] = []
+        var pendingStreamLabel: String?
+
+        func commit(streamLabel: String, trackId: String?) {
+            let label = streamLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !label.isEmpty else { return }
+            entries.append(SfuSdpMsidEntry(streamLabel: label, trackId: trackId))
+        }
+
+        func consumeMsidRemainder(_ remainder: String) {
+            let parts = remainder
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .map(String.init)
+            guard let streamLabel = parts.first else { return }
+            if parts.count > 1 {
+                commit(streamLabel: streamLabel, trackId: parts[1])
+                pendingStreamLabel = nil
+            } else {
+                pendingStreamLabel = streamLabel
+            }
+        }
+
+        for line in lines {
+            if line.hasPrefix("a=msid:") {
+                consumeMsidRemainder(String(line.dropFirst("a=msid:".count)))
+            } else if let range = line.range(of: " msid:") {
+                consumeMsidRemainder(String(line[range.upperBound...]))
+            } else if let pending = pendingStreamLabel,
+                      !line.hasPrefix("a="),
+                      !line.hasPrefix("m=") {
+                let trackId = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trackId.isEmpty else { continue }
+                commit(streamLabel: pending, trackId: trackId)
+                pendingStreamLabel = nil
+            }
+        }
+
+        return entries
+    }
+
+    /// Legacy hook for pre-contract SFU relay offers.
+    ///
+    /// Group/conference screen share now has an explicit contract: screen media uses `screen_*`
+    /// identifiers on the screen leg. Bare UUID video labels are ambiguous in multi-party rooms and
+    /// can be regular camera relays, so they must not activate screen-share UI.
+    nonisolated static func sfuRelayIncomingScreenShareVideoMids(in sdp: String) -> Set<String> {
+        _ = sdp
+        return []
+    }
+
+    /// True when every remote `m=video` section is `recvonly`/`inactive` and the peer is not
+    /// actively sending video — the SFU placeholder layout used between share cycles.
+    nonisolated static func isSfuRecvonlyPlaceholderOnlyRemoteSdp(_ sdp: String) -> Bool {
+        guard remoteSendingVideoMids(in: sdp).isEmpty else { return false }
+
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var sawVideo = false
+        var currentIsVideo = false
+        var currentDirection: String?
+
+        func flushCurrentSection() -> Bool {
+            guard currentIsVideo else { return true }
+            sawVideo = true
+            guard let currentDirection,
+                  currentDirection == "recvonly" || currentDirection == "inactive"
+            else { return false }
+            return true
+        }
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                guard flushCurrentSection() else { return false }
+                currentIsVideo = line.hasPrefix("m=video")
+                currentDirection = nil
+                continue
+            }
+            guard currentIsVideo else { continue }
+            if line == "a=sendrecv" || line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive" {
+                currentDirection = String(line.dropFirst("a=".count))
+            }
+        }
+        guard flushCurrentSection() else { return false }
+        return sawVideo
     }
 
     nonisolated static func activeScreenShareVideoMids(in sdp: String) -> Set<String> {
@@ -409,7 +633,7 @@ extension RTCSession {
         }
         flushCurrentSection()
 
-        return mids
+        return mids.union(sfuRelayIncomingScreenShareVideoMids(in: sdp))
     }
 
     nonisolated static func receiveOnlyVideoMidsWithoutLocalMedia(in sdp: String) -> Set<String> {
@@ -462,6 +686,252 @@ extension RTCSession {
         return mids
     }
 
+    /// Video mids that are `inactive` relay placeholders (no msid/ssrc) in an SFU offer or answer.
+    nonisolated static func inactiveVideoMidsWithoutLocalMedia(in sdp: String) -> Set<String> {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var mids = Set<String>()
+        var currentIsVideo = false
+        var currentMid: String?
+        var currentDirection: String?
+        var currentHasLocalMedia = false
+
+        func flushCurrentSection() {
+            guard currentIsVideo,
+                  currentDirection == "inactive",
+                  !currentHasLocalMedia,
+                  let currentMid,
+                  !currentMid.isEmpty else { return }
+            mids.insert(currentMid)
+        }
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentIsVideo = line.hasPrefix("m=video")
+                currentMid = nil
+                currentDirection = nil
+                currentHasLocalMedia = false
+                continue
+            }
+
+            guard currentIsVideo else { continue }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if line == "a=sendrecv" || line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive" {
+                currentDirection = String(line.dropFirst("a=".count))
+            } else if line.hasPrefix("a=msid:") ||
+                        line.hasPrefix("a=ssrc:") ||
+                        line.hasPrefix("a=ssrc-group:") {
+                currentHasLocalMedia = true
+            }
+        }
+        flushCurrentSection()
+
+        return mids
+    }
+
+    nonisolated static func receiveOnlyAudioMidsWithoutLocalMedia(in sdp: String) -> Set<String> {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var mids = Set<String>()
+        var currentIsAudio = false
+        var currentMid: String?
+        var currentDirection: String?
+        var currentHasLocalMedia = false
+
+        func flushCurrentSection() {
+            guard currentIsAudio,
+                  currentDirection == "recvonly",
+                  !currentHasLocalMedia,
+                  let currentMid,
+                  !currentMid.isEmpty else { return }
+            mids.insert(currentMid)
+        }
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                flushCurrentSection()
+                currentIsAudio = line.hasPrefix("m=audio")
+                currentMid = nil
+                currentDirection = nil
+                currentHasLocalMedia = false
+                continue
+            }
+
+            guard currentIsAudio else { continue }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if line == "a=sendrecv" || line == "a=sendonly" || line == "a=recvonly" || line == "a=inactive" {
+                currentDirection = String(line.dropFirst("a=".count))
+            } else if line.hasPrefix("a=msid:") ||
+                        line.hasPrefix("a=ssrc:") ||
+                        line.hasPrefix("a=ssrc-group:") {
+                currentHasLocalMedia = true
+            }
+        }
+        flushCurrentSection()
+
+        return mids
+    }
+
+    nonisolated static func audioMids(in sdp: String) -> Set<String> {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var mids = Set<String>()
+        var currentIsAudio = false
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                currentIsAudio = line.hasPrefix("m=audio")
+                continue
+            }
+            guard currentIsAudio, line.hasPrefix("a=mid:") else { continue }
+            let mid = String(line.dropFirst("a=mid:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !mid.isEmpty {
+                mids.insert(mid)
+            }
+        }
+
+        return mids
+    }
+
+    nonisolated static func videoMids(in sdp: String) -> Set<String> {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var mids = Set<String>()
+        var currentIsVideo = false
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                currentIsVideo = line.hasPrefix("m=video")
+                continue
+            }
+            guard currentIsVideo, line.hasPrefix("a=mid:") else { continue }
+            let mid = String(line.dropFirst("a=mid:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !mid.isEmpty {
+                mids.insert(mid)
+            }
+        }
+
+        return mids
+    }
+
+    /// Makes an SDP answer's video directions legal for the current local offer.
+    ///
+    /// SFU screen-share handoffs can leave stale receive-only screen mids in the local offer while
+    /// the answer still advertises `sendrecv` on those mids. Apple WebRTC rejects that with
+    /// "incompatible send direction". Normalize only answer directions that conflict with the
+    /// offer; payloads, msid, SSRCs and active media sections are left intact.
+    nonisolated static func normalizeAnswerVideoDirectionsForLocalOffer(
+        answerSdp: String,
+        localOfferSdp: String
+    ) -> String {
+        let localDirections = videoDirectionsByMid(in: localOfferSdp)
+        guard !localDirections.isEmpty else { return answerSdp }
+
+        var currentIsVideo = false
+        var currentMid: String?
+        let lines = answerSdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+
+        let rewritten = lines.map { rawLine -> String in
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix("m=") {
+                currentIsVideo = line.hasPrefix("m=video")
+                currentMid = nil
+                return rawLine
+            }
+            guard currentIsVideo else { return rawLine }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return rawLine
+            }
+            guard ["a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"].contains(line),
+                  let currentMid,
+                  let offerDirection = localDirections[currentMid]
+            else { return rawLine }
+
+            let answerDirection = String(line.dropFirst("a=".count))
+            let normalized: String
+            switch offerDirection {
+            case "sendonly":
+                normalized = (answerDirection == "inactive" || answerDirection == "recvonly") ? answerDirection : "recvonly"
+            case "recvonly":
+                normalized = (answerDirection == "inactive" || answerDirection == "sendonly") ? answerDirection : "sendonly"
+            case "inactive":
+                normalized = "inactive"
+            default:
+                normalized = answerDirection
+            }
+            guard normalized != answerDirection else { return rawLine }
+            return "a=\(normalized)"
+        }
+
+        return rewritten.joined(separator: "\n")
+    }
+
+    private nonisolated static func videoDirectionsByMid(in sdp: String) -> [String: String] {
+        let lines = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var result: [String: String] = [:]
+        var currentIsVideo = false
+        var currentMid: String?
+
+        for line in lines {
+            if line.hasPrefix("m=") {
+                currentIsVideo = line.hasPrefix("m=video")
+                currentMid = nil
+                continue
+            }
+            guard currentIsVideo else { continue }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                continue
+            }
+            guard ["a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"].contains(line),
+                  let currentMid,
+                  !currentMid.isEmpty
+            else { continue }
+            result[currentMid] = String(line.dropFirst("a=".count))
+        }
+
+        return result
+    }
+
     private nonisolated static func lineContainsScreenShareMsid(_ line: String) -> Bool {
         let remainder: String
         if line.hasPrefix("a=msid:") {
@@ -511,7 +981,11 @@ extension RTCSession {
     ///   - hasVideo: Whether to include video
     /// - Returns: RTCMediaConstraints object
     /// - Throws: SDPHandlerError if constraints are invalid
-    private nonisolated func createMediaConstraints(hasAudio: Bool, hasVideo: Bool) throws -> WebRTC.RTCMediaConstraints {
+    private nonisolated func createMediaConstraints(
+        hasAudio: Bool,
+        hasVideo: Bool,
+        iceRestart: Bool = false
+    ) throws -> WebRTC.RTCMediaConstraints {
         guard hasAudio || hasVideo else {
             throw SDPHandlerError.invalidConstraints("At least one media type must be enabled")
         }
@@ -524,6 +998,10 @@ extension RTCSession {
         
         if hasVideo {
             mandatoryConstraints[kRTCMediaConstraintsOfferToReceiveVideo] = kRTCMediaConstraintsValueTrue
+        }
+
+        if iceRestart {
+            mandatoryConstraints[kRTCMediaConstraintsIceRestart] = kRTCMediaConstraintsValueTrue
         }
         
         // Optional constraints for better compatibility
@@ -550,12 +1028,16 @@ extension RTCSession {
     nonisolated func generateSDPOffer(
         for connection: RTCConnection,
         hasAudio: Bool,
-        hasVideo: Bool
+        hasVideo: Bool,
+        iceRestart: Bool = false
     ) async throws -> WebRTC.RTCSessionDescription {
         do {
-            let constraints = try createMediaConstraints(hasAudio: hasAudio, hasVideo: hasVideo)
+            let constraints = try createMediaConstraints(hasAudio: hasAudio, hasVideo: hasVideo, iceRestart: iceRestart)
             
-            self.logger.log(level: .info, message: "Generating SDP offer for connection: \(connection.id)")
+            self.logger.log(
+                level: .info,
+                message: "Generating SDP offer for connection: \(connection.id) iceRestart=\(iceRestart)"
+            )
             
             let description = try await connection.peerConnection.offer(for: constraints)
             
@@ -631,6 +1113,15 @@ extension RTCSession {
             await reconcileAppleRemoteParticipantCameraTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
             await reconcileAppleRemoteParticipantAudioTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
             await reconcileAppleRemoteScreenTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
+#if canImport(WebRTC) && !os(Android)
+            if Self.isTrueOneToOneSfuRoom(call: connection.call),
+               let refreshed = await self.connectionManager.findConnection(with: connection.id) {
+                await self.ensureAppleInboundCameraReceiveAfterSfuRenegotiation(
+                    connection: refreshed,
+                    remoteSdp: sdp.sdp
+                )
+            }
+#endif
             self.logger.log(level: .info, message: "PeerConnection media graph after setRemoteSDP connection=\(connection.id): \(RTCPeerConnectionMediaDiagnostics.summary(connection.peerConnection))")
             
         } catch let error as SDPHandlerError {
@@ -725,8 +1216,18 @@ extension RTCSession {
             try await client.setRemoteDescription(sdp)
             self.logger.log(level: .info, message: "Successfully set remote SDP\n \(sdp.sdp)")
             self.logger.log(level: .info, message: "Remote SDP summary after set connection=\(connection.id): \(RTCSdpDiagnostics.summary(sdp.sdp))")
+            if sdp.typeDescription == "OFFER" {
+                await rememberAndroidRemoteOfferSdp(sdp.sdp, connectionId: connection.id)
+            }
             await reconcileAndroidRemoteParticipantCameraTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
+            await reconcileAndroidRemoteParticipantAudioTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
             await reconcileAndroidRemoteScreenTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
+            if Self.isTrueOneToOneSfuRoom(call: connection.call) {
+                // 1:1 SFU renderer rebind runs after the answer completes via
+                // rebindInboundRemoteVideoAfterSfuRenegotiationIfNeeded, not the group wrapper-sync path.
+            } else if await isGroupCallConnection(connection.id) {
+                await rebindAndroidGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(connectionId: connection.id)
+            }
             
         } catch let error as SDPHandlerError {
             self.logger.log(level: .error, message: "Failed to set remote SDP: \(error.localizedDescription)")

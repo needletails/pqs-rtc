@@ -80,18 +80,30 @@ extension RTCSession {
     /// This method:
     /// 1. Handles the incoming SDP offer and generates an answer
     /// 2. Sends encrypted SDP answer via SwiftSFU
-    /// 3. Sends call_answered notification to the caller
-    /// 4. Sends call_answered_aux_device notification to other devices
+    /// 3. Sends call_answered_aux_device notification to the user's other devices (always immediate)
+    /// 4. Sends call_answered notification to the caller (immediate, or deferred via
+    ///    ``sendCallAnsweredNotifications(for:)`` when `deferTransportAnswered` is `true`)
     ///
-    /// - Parameter call: The incoming call with SDP offer in metadata
-    public func answerCall(_ call: Call) async throws {
+    /// - Parameters:
+    ///   - call: The incoming call with SDP offer in metadata
+    ///   - deferTransportAnswered: When `true`, prepares local state and acceptance gating but does
+    ///     not send `call_answered` yet. The host app should call ``sendCallAnsweredNotifications(for:)``
+    ///     after inbound SFU media bootstrap (PeerConnection creation) completes.
+    ///     `call_answered_aux_device` is **not** deferred: sibling devices must stop ringing the
+    ///     moment this device commits to answering, independent of media/audio bootstrap.
+    public func answerCall(_ call: Call, deferTransportAnswered: Bool = false) async throws {
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).
         activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
-        let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: call)
+        let roleCall = await callForOneToOneSfuRoleDetection(call)
+        let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: roleCall)
         if isOneToOneSfuRoom {
-            // 1:1-over-SFU is still a client<->SFU media session on each device, so the answering
-            // participant must negotiate its own peer connection with the SFU.
-            shouldOffer = true
+            // Inbound 1:1-over-SFU answerers establish their SFU leg via
+            // `beginGroupCallMediaAfterSfuRegistrationIfNeeded(sendInitialOffer: true)` (host app).
+            // The caller's first encrypted `.offer` is consumed by SwiftSFU, not relayed here.
+            // Remote caller media arrives on a deferred SFU renegotiation `.offer` after
+            // `call_cipher` + post-cipher `handshakeComplete`. Keep `shouldOffer = false` so
+            // `finishCryptoSessionCreation` does not emit a competing WebRTC createOffer.
+            shouldOffer = false
         } else if isGroupCall {
             shouldOffer = true
         } else {
@@ -154,13 +166,47 @@ extension RTCSession {
         await setConnectingIfReady(call: call, callDirection: .inbound(call.supportsVideo ? .video : .voice))
         
         setCanAnswer(true)
-        // Send call_answered notification to the caller
-        try await requireTransport().sendCallAnswered(call)
-        logger.log(level: .info, message: "Sent call_answered notification for \(call.sharedCommunicationId)")
-        
-        // Send call_answered_aux_device notification to other devices
-        try await requireTransport().sendCallAnsweredAuxDevice(call)
-        logger.log(level: .info, message: "Sent call_answered_aux_device notification for \(call.sharedCommunicationId)")
+
+        // Stop ringing on this user's other devices the moment this device commits to answering.
+        // Unlike `call_answered`, this control message carries no crypto/media dependency, so it
+        // must never wait for CallKit audio activation or SFU media bootstrap (which previously
+        // left sibling devices ringing for 10+ seconds after an answer).
+        do {
+            try await requireTransport().sendCallAnsweredAuxDevice(call)
+            logger.log(level: .info, message: "Sent call_answered_aux_device notification for \(call.sharedCommunicationId)")
+        } catch {
+            // Failing to notify sibling devices must not abort the answer on this device.
+            logger.log(level: .error, message: "Failed to send call_answered_aux_device for \(call.sharedCommunicationId): \(error)")
+        }
+
+        if deferTransportAnswered {
+            logger.log(
+                level: .info,
+                message: "Deferred call_answered transport notifications until inbound SFU media bootstrap for \(call.sharedCommunicationId)")
+        } else {
+            try await sendCallAnsweredNotifications(for: call)
+        }
+    }
+
+    /// Sends `call_answered` after inbound media bootstrap is ready.
+    ///
+    /// `call_answered_aux_device` is sent eagerly by ``answerCall(_:deferTransportAnswered:)``
+    /// and is intentionally not resent here.
+    public func sendCallAnsweredNotifications(for call: Call) async throws {
+        // `answerCall` provisions frame/signaling props on the RTCSession call state. Deferred SFU
+        // bootstrap sends `call_answered` from CallManager's tracked copy, which can omit them and
+        // leave the caller unable to derive outbound `call_cipher` keys before the initial offer.
+        let normalizedId = call.sharedCommunicationId.normalizedConnectionId
+        let outbound: Call
+        if let sessionCall = await callState.currentCall,
+           sessionCall.sharedCommunicationId.normalizedConnectionId == normalizedId {
+            outbound = sessionCall
+        } else {
+            outbound = call
+        }
+
+        try await requireTransport().sendCallAnswered(outbound)
+        logger.log(level: .info, message: "Sent call_answered notification for \(outbound.sharedCommunicationId)")
     }
     
     /// Handles notification that the call was answered on another device.
@@ -191,6 +237,16 @@ extension RTCSession {
     }
 }
 
+public extension Call {
+    /// True for 1:1 calls relayed through the SFU using a transient `#<uuid>` room id.
+    ///
+    /// These rooms use a `#`-prefixed ``sharedCommunicationId`` but still have a single remote peer.
+    /// Prefer this over ``String/isGroupCall`` when choosing UI layout (e.g. Android remote tile count).
+    var isTrueOneToOneSfuRoom: Bool {
+        RTCSession.isTrueOneToOneSfuRoom(call: self)
+    }
+}
+
 extension String {
     /// Channel-backed group rooms use a `#` prefix. SFU conference rooms often use `conf-<uuid>` (with or
     /// without `#`) as the peer-connection id — treat those as group for E2EE sender deferral, SSRC stripping,
@@ -209,17 +265,33 @@ extension String {
     /// Accepted forms:
     /// - `room`
     /// - `#room`
-    /// - `conf-room`
-    /// - `#conf-room`
-    ///
-    /// UUID-shaped room stems are preserved for backwards compatibility.
+    /// - `conf-room` / `#conf-room`
+    /// - `slug_<uuid>` / `#slug_<uuid>` (conference wire routes; mirrors SwiftSFU ``SFURoomId``)
+    /// - bare UUID strings
     public var normalizedUUIDConnectionId: String {
         let noChannelPrefix = self
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .normalizedConnectionId
+
         if noChannelPrefix.hasPrefix("conf-") {
-            return String(noChannelPrefix.dropFirst("conf-".count))
+            let conferenceId = String(noChannelPrefix.dropFirst("conf-".count))
+            if let uuid = UUID(uuidString: conferenceId) {
+                return uuid.uuidString.lowercased()
+            }
+            return conferenceId.lowercased()
         }
+
+        if let uuid = UUID(uuidString: noChannelPrefix) {
+            return uuid.uuidString.lowercased()
+        }
+
+        if let separatorIndex = noChannelPrefix.lastIndex(of: "_") {
+            let suffix = String(noChannelPrefix[noChannelPrefix.index(after: separatorIndex)...])
+            if let uuid = UUID(uuidString: suffix) {
+                return uuid.uuidString.lowercased()
+            }
+        }
+
         return noChannelPrefix
     }
 

@@ -50,6 +50,7 @@ receiver logs for a missing `Created receiver FrameCryptor kind=audio participan
 
 ## See also
 
+- <doc:GroupConferenceRemoteVideo> — group/conference remote **video tile** architecture (Apple + Android)
 - <doc:HostAppCallKitAndSFU> for **iOS CallKit** ordering with SFU
 - <doc:OneToOneSfuFrameE2EE> for `call_cipher` and 1:1 SFU frame-key agreement
 - <doc:GroupSfuFrameE2EE> for group/conference sender keys and app-injected frame keys

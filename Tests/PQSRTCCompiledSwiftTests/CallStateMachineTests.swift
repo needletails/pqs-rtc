@@ -25,6 +25,8 @@ struct CallStateMachineTests {
         #expect(inbound.description == inboundDecoded.description)
         #expect(outbound.description == outboundDecoded.description)
 
+        let canonicalAuxiliaryDeviceAnswered = CallStateMachine.EndState.auxiliaryDeviceAnswered
+
         let endStates: [CallStateMachine.EndState] = [
             .userInitiated,
             .partnerInitiated,
@@ -32,7 +34,7 @@ struct CallStateMachineTests {
             .partnerInitiatedUnanswered,
             .partnerInitiatedRejected,
             .failed,
-            .auxialaryDevcieAnswered
+            canonicalAuxiliaryDeviceAnswered
         ]
 
         let encoder = JSONEncoder()
@@ -44,6 +46,26 @@ struct CallStateMachineTests {
             let reencoded = try encoder.encode(decoded)
             #expect(reencoded == data)
         }
+    }
+
+    @Test
+    func endStateAuxiliaryDeviceAnsweredWireCompatibility() throws {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let canonical = CallStateMachine.EndState.auxiliaryDeviceAnswered
+        let legacyWireData = Data(#""auxialaryDevcieAnswered""#.utf8)
+        let canonicalWireData = Data(#""auxiliaryDeviceAnswered""#.utf8)
+
+        let encodedCanonical = try encoder.encode(canonical)
+        #expect(encodedCanonical == canonicalWireData)
+
+        let decodedLegacy = try decoder.decode(CallStateMachine.EndState.self, from: legacyWireData)
+        let reencodedLegacy = try encoder.encode(decodedLegacy)
+        #expect(reencodedLegacy == canonicalWireData)
+
+        let decodedCanonical = try decoder.decode(CallStateMachine.EndState.self, from: canonicalWireData)
+        let reencodedCanonical = try encoder.encode(decodedCanonical)
+        #expect(reencodedCanonical == canonicalWireData)
     }
 
     @Test
@@ -199,7 +221,6 @@ struct CallStateMachineTests {
         #expect(descriptions[1].contains("Connecting"))
         #expect(descriptions[2].contains("Connected"))
     }
-}
 
     @Test("createStreams called twice produces fresh working streams")
     func createStreamsReplacesExistingStreams() async throws {

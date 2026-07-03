@@ -13,9 +13,10 @@
 //  This file is part of the PQSRTC SDK, which provides
 //  Frame Encrypted VoIP Capabilities
 //
-
+#if os(Android) || SKIP
 import SkipFuseUI
 import NeedleTailLogger
+
 #if SKIP
 import androidx.compose.runtime.__
 import androidx.compose.ui.__
@@ -26,18 +27,6 @@ import androidx.compose.foundation.shape.__
 import androidx.compose.ui.draw.__
 import androidx.compose.ui.platform.__
 import androidx.compose.ui.viewinterop.__
-import android.graphics.__
-import android.view.__
-
-// SKIP INSERT: private fun ntApplyRoundedOutline(view: android.view.View, radiusDp: Float) {
-// SKIP INSERT:     val radiusPx = radiusDp * view.resources.displayMetrics.density
-// SKIP INSERT:     view.clipToOutline = true
-// SKIP INSERT:     view.outlineProvider = object : android.view.ViewOutlineProvider() {
-// SKIP INSERT:         override fun getOutline(v: android.view.View, outline: android.graphics.Outline) {
-// SKIP INSERT:             outline.setRoundRect(0, 0, v.width, v.height, radiusPx)
-// SKIP INSERT:         }
-// SKIP INSERT:     }
-// SKIP INSERT: }
 
 // MARK: - Android Local Video Compose View
 /// Compose view that hosts the local preview renderer.
@@ -63,6 +52,8 @@ public struct AndroidLocalVideoCompose: ContentComposer {
     @Composable
     public func Compose(context: ComposeContext) {
         let localCaptureView = captureView
+        AndroidCaptureUIPreferenceCache.refreshFromStoredPreferences()
+        let mirrorLocalPreview = AndroidCaptureUIPreferenceCache.isLocalVideoMirroredEnabled()
 
         androidx.compose.runtime.DisposableEffect(localCaptureView) {
             onDispose {
@@ -72,15 +63,20 @@ public struct AndroidLocalVideoCompose: ContentComposer {
             }
         }
         Box(
-            modifier: context.modifier.fillMaxSize()
+            modifier: context.modifier
+                .fillMaxSize()
+                .clip(RoundedCornerShape(12.dp))
         ) {
             androidx.compose.ui.viewinterop.AndroidView(
                 factory: { ctx in
-                    client.initializeSurfaceRenderer(localCaptureView.surfaceViewRenderer, mirror: true)
+                    localCaptureView.configureRoundedOutline(radiusDp: Float(12))
+                    _ = client.safelyInitializeSurfaceRenderer(localCaptureView.surfaceViewRenderer, mirror: mirrorLocalPreview)
+                    localCaptureView.setMirror(mirrorLocalPreview)
                     // Match content to parent container by filling while preserving aspect
                     localCaptureView.surfaceViewRenderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
-                    // SKIP INSERT: localCaptureView.surfaceViewRenderer.setZOrderMediaOverlay(true)
-                    // SKIP INSERT: ntApplyRoundedOutline(localCaptureView.surfaceViewRenderer, 12f)
+                    AndroidRTCViewSupport.setZOrderMediaOverlay(renderer: localCaptureView.surfaceViewRenderer)
+                    AndroidRTCViewSupport.applyRoundedOutline(view: localCaptureView.surfaceViewRenderer, radiusDp: Float(12))
+                    AndroidRTCViewSupport.detachFromParent(view: localCaptureView.surfaceViewRenderer)
                     localCaptureView.surfaceViewRenderer
                 },
                 modifier: Modifier
@@ -113,7 +109,7 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
         androidx.compose.runtime.DisposableEffect(renderer) {
             onDispose {
                 client.removeRenderer(renderer)
-                // SKIP INSERT: try { renderer.clearImage() } catch (e: Exception) { /* Ignore if context destroyed */ }
+                AndroidRTCViewSupport.clearRendererImage(renderer: renderer)
                 client.safeReleaseRenderer(renderer)
             }
         }
@@ -121,12 +117,17 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
         Box(modifier: context.modifier.fillMaxSize()) {
             androidx.compose.ui.viewinterop.AndroidView(
                 factory: { ctx in
-                    client.initializeSurfaceRenderer(renderer, mirror: false)
-                    renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+                    _ = client.safelyInitializeSurfaceRenderer(renderer, mirror: false)
+                    renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                    captureView.rendererDidInitialize()
+                    AndroidRTCViewSupport.applyRoundedOutline(view: renderer, radiusDp: Float(12))
+                    AndroidRTCViewSupport.detachFromParent(view: renderer)
                     renderer
                 },
                 modifier: Modifier.fillMaxSize(),
-                update: { _ in }
+                update: { _ in
+                    captureView.rendererDidUpdateLayoutFromCompose()
+                }
             )
         }
     }
@@ -165,8 +166,9 @@ public struct AndroidScreenShareCompose: ContentComposer {
         Box(modifier: context.modifier.fillMaxSize()) {
             androidx.compose.ui.viewinterop.AndroidView(
                 factory: { ctx in
-                    client.initializeSurfaceRenderer(renderer, mirror: false)
+                    _ = client.safelyInitializeSurfaceRenderer(renderer, mirror: false)
                     renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                    AndroidRTCViewSupport.detachFromParent(view: renderer)
                     renderer
                 },
                 modifier: Modifier.fillMaxSize(),
@@ -212,7 +214,7 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         client: AndroidRTCClient,
         remoteCaptureViews: [AndroidSampleCaptureView],
         raisedHandFlags: [Bool] = [],
-        prefersAspectFit: Bool = false,
+        prefersAspectFit: Bool = true,
         cleanupOnDispose: Bool = true,
         onDispose: @escaping () -> Void
     ) {
@@ -241,32 +243,58 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         Box(
             modifier: context.modifier.fillMaxSize()
         ) {
+            let configuration = LocalConfiguration.current
+            let isPortrait = configuration.screenHeightDp >= configuration.screenWidthDp
             let paddedRaisedHandFlags = raisedHandFlags + Array(
                 repeating: false,
                 count: max(0, remoteCaptureViews.count - raisedHandFlags.count)
             )
             let flaggedViews = zip(remoteCaptureViews, paddedRaisedHandFlags).map { ($0.0, $0.1) }
-            let grid = conferenceGridDimensions(for: remoteCaptureViews.count)
+            let itemCount = remoteCaptureViews.count
+            let contentPaddingDp = conferenceContentPaddingDp(for: itemCount)
+            let tileSpacingDp = conferenceTileSpacingDp(
+                screenWidthDp: configuration.screenWidthDp,
+                itemCount: itemCount
+            )
+            let tileCornerRadiusDp = conferenceTileCornerRadiusDp(for: itemCount)
+            let grid = conferenceGridDimensions(for: itemCount, isPortrait: isPortrait)
             let rows = chunked(flaggedViews, size: grid.columns)
-            Column(modifier: Modifier.fillMaxSize()) {
+            Column(
+                modifier: Modifier.fillMaxSize().padding(contentPaddingDp.dp),
+                verticalArrangement: Arrangement.spacedBy(tileSpacingDp.dp)
+            ) {
                 for row in rows {
-                    Row(modifier: Modifier.weight(Float(1.0)).fillMaxWidth()) {
+                    Row(
+                        modifier: Modifier.weight(Float(1.0)).fillMaxWidth(),
+                        horizontalArrangement: Arrangement.spacedBy(tileSpacingDp.dp)
+                    ) {
                         for (view, showRaisedHand) in row {
-                            let scalingType = prefersAspectFit
-                                ? org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT
-                                : org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL
+                            let scalingType = org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT
+                            let rendererSlotKey = Int(view.surfaceViewRenderer.hashCode())
+                            androidx.compose.runtime.key(rendererSlotKey) {
                             Box(
-                                modifier: Modifier.weight(Float(1.0)).fillMaxWidth().fillMaxHeight()
+                                modifier: Modifier
+                                    .weight(Float(1.0))
+                                    .fillMaxWidth()
+                                    .fillMaxHeight()
+                                    .clip(RoundedCornerShape(tileCornerRadiusDp.dp))
+                                    .background(androidx.compose.ui.graphics.Color.Black)
                             ) {
                                 androidx.compose.ui.viewinterop.AndroidView(
                                     factory: { _ in
-                                        client.initializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
+                                        _ = client.safelyInitializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
                                         view.surfaceViewRenderer.setScalingType(scalingType)
+                                        view.rendererDidInitialize()
+                                        AndroidRTCViewSupport.applyRoundedOutline(
+                                            view: view.surfaceViewRenderer,
+                                            radiusDp: Float(tileCornerRadiusDp)
+                                        )
+                                        AndroidRTCViewSupport.detachFromParent(view: view.surfaceViewRenderer)
                                         view.surfaceViewRenderer
                                     },
                                     modifier: Modifier.fillMaxSize(),
-                                    update: { renderer in
-                                        renderer.setScalingType(scalingType)
+                                    update: { _ in
+                                        view.rendererDidUpdateLayoutFromCompose()
                                     }
                                 )
                                 if showRaisedHand {
@@ -277,6 +305,7 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                                             .padding(8.dp)
                                     )
                                 }
+                            }
                             }
                         }
                         let missingColumns = max(0, grid.columns - row.count)
@@ -297,14 +326,14 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         }
     }
 
-    private func conferenceGridDimensions(for itemCount: Int) -> (columns: Int, rows: Int) {
+    private func conferenceGridDimensions(for itemCount: Int, isPortrait: Bool) -> (columns: Int, rows: Int) {
         switch itemCount {
         case 0:
             return (1, 1)
         case 1:
             return (1, 1)
         case 2:
-            return (2, 1)
+            return isPortrait ? (1, 2) : (2, 1)
         case 3...4:
             return (2, 2)
         case 5...6:
@@ -314,6 +343,31 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         default:
             return (4, 3)
         }
+    }
+
+    /// Matches Apple `CollectionViewSections.defaultContentInsets`, scaled down as roster grows.
+    private func conferenceContentPaddingDp(for itemCount: Int) -> Int {
+        guard itemCount > 1 else { return 0 }
+        let scale: Double
+        switch itemCount {
+        case ...4:
+            scale = 1.0
+        case 5...9:
+            scale = 0.75
+        default:
+            scale = 0.5
+        }
+        return Int((15.0 * scale).rounded())
+    }
+
+    /// Matches Apple conference tile spacing (6pt phone / 10pt tablet).
+    private func conferenceTileSpacingDp(screenWidthDp: Int, itemCount: Int) -> Int {
+        guard itemCount > 1 else { return 0 }
+        return screenWidthDp < 600 ? 6 : 10
+    }
+
+    private func conferenceTileCornerRadiusDp(for itemCount: Int) -> Int {
+        itemCount > 1 ? 12 : 0
     }
 
     private func chunked<T>(_ source: [T], size: Int) -> [[T]] {
@@ -330,7 +384,6 @@ public struct AndroidRemoteGridCompose: ContentComposer {
 }
 #endif
 
-#if os(Android) || SKIP
 @MainActor
 fileprivate final class AndroidVideoCallCoordinator: VideoCallDelegate {
     private var errorMessage: Binding<String>
@@ -338,6 +391,7 @@ fileprivate final class AndroidVideoCallCoordinator: VideoCallDelegate {
     private var callState: Binding<CallStateMachine.State>
     var isScreenSharing: Binding<Bool>?
     var hasActiveRemoteScreenShare: Binding<Bool>?
+    var remoteParticipantTilesDidChangeHandler: (() -> Void)?
 
     init(
         errorMessage: Binding<String>,
@@ -372,11 +426,24 @@ fileprivate final class AndroidVideoCallCoordinator: VideoCallDelegate {
     }
 
     public func screenShareDidChange(isSharing: Bool) async {
-        isScreenSharing?.wrappedValue = isSharing
+        Task { @MainActor in
+            await Task.yield()
+            isScreenSharing?.wrappedValue = isSharing
+        }
     }
 
     public func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async {
-        hasActiveRemoteScreenShare?.wrappedValue = isSharing
+        Task { @MainActor in
+            await Task.yield()
+            hasActiveRemoteScreenShare?.wrappedValue = isSharing
+        }
+    }
+
+    public func remoteParticipantTilesDidChange() async {
+        Task { @MainActor in
+            await Task.yield()
+            remoteParticipantTilesDidChangeHandler?()
+        }
     }
 }
 
@@ -384,9 +451,19 @@ fileprivate final class AndroidVideoCallCoordinator: VideoCallDelegate {
 fileprivate final class AndroidVideoCallResources {
     let controller: AndroidVideoCallController
     let localCaptureView: AndroidPreviewCaptureView
-    let remoteCaptureViews: [AndroidSampleCaptureView]
+    private(set) var remoteCaptureViews: [AndroidSampleCaptureView]
+    /// Whether video surfaces are hidden (call chrome minimized to browse the app).
+    private(set) var videoSurfacesHidden = false
+    private var _screenCaptureView: AndroidSampleCaptureView?
+    private static let minimizeLogger = NeedleTailLogger()
     /// Lazily created view for rendering a remote screen share.
-    lazy var screenCaptureView: AndroidSampleCaptureView = AndroidCaptureViewFactory.createSampleCaptureView(client: _client)
+    var screenCaptureView: AndroidSampleCaptureView {
+        if let existing = _screenCaptureView { return existing }
+        let created = AndroidCaptureViewFactory.createSampleCaptureView(client: _client)
+        created.setHidden(videoSurfacesHidden)
+        _screenCaptureView = created
+        return created
+    }
     var coordinator: AndroidVideoCallCoordinator?
     private let _client: AndroidRTCClient
 
@@ -394,14 +471,50 @@ fileprivate final class AndroidVideoCallResources {
         self._client = session.rtcClient
         self.controller = AndroidVideoCallController(session: session)
         self.localCaptureView = AndroidCaptureViewFactory.createPreviewCaptureView(client: session.rtcClient)
+        self.localCaptureView.setMirror(PQSRTCCallUIPreferences.resolvedLocalVideoMirroredEnabled())
+        self.remoteCaptureViews = Self.makeRemoteCaptureViews(client: session.rtcClient, count: remoteCount)
+    }
 
-        var remotes: [AndroidSampleCaptureView] = []
-        if remoteCount > 0 {
-            for _ in 0..<remoteCount {
-                remotes.append(AndroidCaptureViewFactory.createSampleCaptureView(client: session.rtcClient))
-            }
+    func ensureRemoteCapacity(atLeast remoteCount: Int) {
+        guard remoteCount > remoteCaptureViews.count else { return }
+        let additional = remoteCount - remoteCaptureViews.count
+        let added = Self.makeRemoteCaptureViews(client: _client, count: additional)
+        if videoSurfacesHidden {
+            for view in added { view.setHidden(true) }
         }
-        self.remoteCaptureViews = remotes
+        remoteCaptureViews.append(contentsOf: added)
+    }
+
+    /// SurfaceViews ignore Compose alpha/size/offset modifiers, so hiding the call chrome must
+    /// toggle native View visibility on every renderer. Sinks stay attached; restoring is instant.
+    func setVideoSurfacesHidden(_ hidden: Bool, source: String = "unknown") {
+        guard videoSurfacesHidden != hidden else {
+            Self.minimizeLogger.log(
+                level: .debug,
+                message: "[CallChromeMinimize] setVideoSurfacesHidden skipped (already \(hidden)) source=\(source)"
+            )
+            return
+        }
+        videoSurfacesHidden = hidden
+        let remoteCount = remoteCaptureViews.count
+        let hasScreenView = _screenCaptureView != nil
+        Self.minimizeLogger.log(
+            level: .info,
+            message: "[CallChromeMinimize] setVideoSurfacesHidden hidden=\(hidden) source=\(source) remoteCount=\(remoteCount) hasScreenView=\(hasScreenView)"
+        )
+        localCaptureView.setHidden(hidden)
+        for view in remoteCaptureViews { view.setHidden(hidden) }
+        _screenCaptureView?.setHidden(hidden)
+    }
+
+    private static func makeRemoteCaptureViews(
+        client: AndroidRTCClient,
+        count: Int
+    ) -> [AndroidSampleCaptureView] {
+        guard count > 0 else { return [] }
+        return (0..<count).map { _ in
+            AndroidCaptureViewFactory.createSampleCaptureView(client: client)
+        }
     }
 }
 
@@ -415,6 +528,7 @@ fileprivate enum AndroidVideoCallResourceStore {
         remoteCount: Int
     ) -> AndroidVideoCallResources {
         if let existing = storage[key] {
+            existing.ensureRemoteCapacity(atLeast: remoteCount)
             return existing
         }
 
@@ -488,7 +602,7 @@ public struct AndroidRemoteGrid: View {
         client: AndroidRTCClient,
         remoteCaptureViews: [AndroidSampleCaptureView],
         raisedHandFlags: [Bool] = [],
-        prefersAspectFit: Bool = false,
+        prefersAspectFit: Bool = true,
         cleanupOnDispose: Bool = true,
         onDispose: @escaping () -> Void
     ) {
@@ -550,10 +664,16 @@ public struct AndroidVideoCallView: View {
     private let remoteCount: Int
     private let session: RTCSession
     private let conferenceRaisedHands: [String: Bool]
+    /// Hides all native video SurfaceViews (call chrome minimized to browse the app).
+    private let hidesVideoSurfaces: Bool
+    private static let minimizeLogger = NeedleTailLogger()
     @State var resourceKey: String
     @State var currentRemotePage: Int = 0
     @State var localViewSize: CGSize = .zero
     @State var gridRaisedHandFlags: [Bool] = []
+    @State var visibleRemoteCaptureViews: [AndroidSampleCaptureView] = []
+    @State var mountedMultipartyRemoteSlotCount: Int = 0
+    var actionBridge: AndroidVideoCallActionBridge?
     @Binding var delegate: CallActionDelegate?
     @Binding var errorMessage: String
     @Binding var endedCall: Bool
@@ -566,6 +686,7 @@ public struct AndroidVideoCallView: View {
     public init(
         session: RTCSession,
         remoteCount: Int = 1,
+        actionBridge: AndroidVideoCallActionBridge? = nil,
         delegate: Binding<CallActionDelegate?>,
         errorMessage: Binding<String>,
         endedCall: Binding<Bool>,
@@ -574,11 +695,14 @@ public struct AndroidVideoCallView: View {
         callState: Binding<CallStateMachine.State>,
         isScreenSharing: Binding<Bool> = .constant(false),
         hasActiveRemoteScreenShare: Binding<Bool> = .constant(false),
-        conferenceRaisedHands: [String: Bool] = [:]
+        conferenceRaisedHands: [String: Bool] = [:],
+        hidesVideoSurfaces: Bool = false
     ) {
         self.session = session
         self.remoteCount = remoteCount
+        self.actionBridge = actionBridge
         self.conferenceRaisedHands = conferenceRaisedHands
+        self.hidesVideoSurfaces = hidesVideoSurfaces
         self._delegate = delegate
         self._errorMessage = errorMessage
         self._endedCall = endedCall
@@ -596,16 +720,42 @@ public struct AndroidVideoCallView: View {
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: "|")
     }
+
+    private var isMultipartyCall: Bool {
+        switch callState {
+        case .ready(let call),
+             .connecting(_, let call),
+             .connected(_, let call):
+            if call.isTrueOneToOneSfuRoom { return false }
+            let normalizedSharedId = call.sharedCommunicationId.normalizedConnectionId
+            return call.conferencePassword != nil
+                || call.resolvedChannelWireId != nil
+                || call.recipients.count > 1
+                || call.sharedCommunicationId.isGroupCall
+                || normalizedSharedId.hasPrefix("conf-")
+        default:
+            return remoteCount > 1
+        }
+    }
+
+    /// Size the renderer pool from roster/remote count. Group calls keep two slots mounted so the
+    /// first assigned participant does not remount through a fullscreen `SurfaceViewRenderer`.
+    private var effectiveRemoteCount: Int {
+        isMultipartyCall ? max(remoteCount, 2) : max(remoteCount, 1)
+    }
     
     public var body: some View {
         let resources = AndroidVideoCallResourceStore.resources(
             for: resourceKey,
             session: session,
-            remoteCount: remoteCount
+            remoteCount: effectiveRemoteCount
         )
+        let displayedRemoteCaptureViews = isMultipartyCall
+            ? visibleRemoteCaptureViews
+            : Array(resources.remoteCaptureViews.prefix(max(effectiveRemoteCount, 1)))
         let remotePageSize = hasActiveRemoteScreenShare ? 8 : 12
-        let remotePages = paginateRemotes(resources.remoteCaptureViews, pageSize: remotePageSize)
-        let activeRemoteCount = resources.remoteCaptureViews.count
+        let remotePages = paginateRemotes(displayedRemoteCaptureViews, pageSize: remotePageSize)
+        let activeRemoteCount = displayedRemoteCaptureViews.count
         let screenShareHeightFraction: CGFloat = {
             guard hasActiveRemoteScreenShare else { return 0 }
             return activeRemoteCount <= 1 ? 0.64 : 0.68
@@ -641,8 +791,8 @@ public struct AndroidVideoCallView: View {
                                 AndroidRemoteGrid(
                                     client: session.rtcClient,
                                     remoteCaptureViews: remotes,
-                                    raisedHandFlags: raisedHandFlags(for: remotes, in: resources),
-                                    prefersAspectFit: hasActiveRemoteScreenShare,
+                                    raisedHandFlags: raisedHandFlags(for: remotes, allViews: displayedRemoteCaptureViews),
+                                    prefersAspectFit: true,
                                     cleanupOnDispose: false,
                                     onDispose: {}
                                 )
@@ -665,14 +815,11 @@ public struct AndroidVideoCallView: View {
                     } else {
                         AndroidRemoteGrid(
                             client: session.rtcClient,
-                            remoteCaptureViews: resources.remoteCaptureViews,
-                            raisedHandFlags: raisedHandFlags(for: resources.remoteCaptureViews, in: resources),
-                            prefersAspectFit: hasActiveRemoteScreenShare,
-                            onDispose: {
-                                Task { @MainActor in
-                                    await resources.controller.stop()
-                                }
-                            }
+                            remoteCaptureViews: displayedRemoteCaptureViews,
+                            raisedHandFlags: raisedHandFlags(for: displayedRemoteCaptureViews, allViews: displayedRemoteCaptureViews),
+                            prefersAspectFit: true,
+                            cleanupOnDispose: false,
+                            onDispose: {}
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color.black.opacity(hasActiveRemoteScreenShare ? 0.92 : 1.0))
@@ -690,7 +837,7 @@ public struct AndroidVideoCallView: View {
                     .zIndex(1)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                     .padding(.trailing, 20)
-                    .padding(.bottom, 100)
+                    .padding(.bottom, 128)
                     .onAppear {
                         NeedleTailLogger().log(level: .debug, message: "GEO SIZE \(geo.size)")
                         localViewSize = setSize(size: geo.size)
@@ -709,27 +856,64 @@ public struct AndroidVideoCallView: View {
             }
             currentRemotePage = min(currentRemotePage, newCount - 1)
         }
+        .onChange(of: hidesVideoSurfaces) { _, hidden in
+            Self.minimizeLogger.log(
+                level: .info,
+                message: "[CallChromeMinimize] AndroidVideoCallView onChange hidesVideoSurfaces=\(hidden)"
+            )
+            resources.setVideoSurfacesHidden(hidden, source: "onChange")
+        }
+        .task(id: hidesVideoSurfaces) { @MainActor in
+            Self.minimizeLogger.log(
+                level: .info,
+                message: "[CallChromeMinimize] AndroidVideoCallView task(id:) hidesVideoSurfaces=\(hidesVideoSurfaces)"
+            )
+            resources.setVideoSurfacesHidden(hidesVideoSurfaces, source: "task")
+        }
         .onAppear {
+            Self.minimizeLogger.log(
+                level: .info,
+                message: "[CallChromeMinimize] AndroidVideoCallView onAppear hidesVideoSurfaces=\(hidesVideoSurfaces)"
+            )
+            resources.setVideoSurfacesHidden(hidesVideoSurfaces, source: "onAppear")
             Task { @MainActor in
                 await configureController(resources: resources)
+            }
+        }
+        .onChange(of: remoteCount) { _, newCount in
+            Task { @MainActor in
+                let slotCount = max(newCount, effectiveRemoteCount)
+                let updatedResources = AndroidVideoCallResourceStore.resources(
+                    for: resourceKey,
+                    session: session,
+                    remoteCount: slotCount
+                )
+                guard updatedResources.remoteCaptureViews.count > 0 else { return }
+                await updatedResources.controller.setRemoteViews(remotes: updatedResources.remoteCaptureViews)
+                await refreshGridRaisedHandFlags(resources: updatedResources)
+                await refreshVisibleRemoteCaptureViews(resources: updatedResources)
+            }
+        }
+        .onChange(of: callState) { _, _ in
+            Task { @MainActor in
+                let slotCount = effectiveRemoteCount
+                guard slotCount > 1 else { return }
+                let updatedResources = AndroidVideoCallResourceStore.resources(
+                    for: resourceKey,
+                    session: session,
+                    remoteCount: slotCount
+                )
+                await updatedResources.controller.setRemoteViews(remotes: updatedResources.remoteCaptureViews)
+                await refreshGridRaisedHandFlags(resources: updatedResources)
+                await refreshVisibleRemoteCaptureViews(resources: updatedResources)
             }
         }
         .task(id: raisedHandsRefreshToken) {
             await refreshGridRaisedHandFlags(resources: resources)
         }
-        .task {
-            var lastAssignmentSignature = ""
-            while !Task.isCancelled {
-                let signature = await resources.controller.participantAssignmentSignature()
-                if signature != lastAssignmentSignature {
-                    lastAssignmentSignature = signature
-                    await refreshGridRaisedHandFlags(resources: resources)
-                }
-                try? await Task.sleep(nanoseconds: 300_000_000)
-            }
-        }
         .onDisappear {
             Task { @MainActor in
+                actionBridge?.clearBinding()
                 await resources.controller.stop()
                 AndroidVideoCallResourceStore.remove(for: resourceKey)
             }
@@ -739,12 +923,11 @@ public struct AndroidVideoCallView: View {
     @MainActor
     private func raisedHandFlags(
         for views: [AndroidSampleCaptureView],
-        in resources: AndroidVideoCallResources
+        allViews: [AndroidSampleCaptureView]
     ) -> [Bool] {
         guard !gridRaisedHandFlags.isEmpty, views.count == gridRaisedHandFlags.count else {
             return Array(repeating: false, count: views.count)
         }
-        let allViews = resources.remoteCaptureViews
         return views.map { view in
             guard let index = allViews.firstIndex(where: { $0 === view }),
                   index < gridRaisedHandFlags.count else {
@@ -754,10 +937,54 @@ public struct AndroidVideoCallView: View {
         }
     }
 
+    /// Multiparty grids mount a stable pool prefix so `AndroidRemoteGrid` itemCount matches the
+    /// expected roster layout without remounting assigned tiles through a transient one-up grid.
+    @MainActor
+    private func multipartyRemoteCaptureViews(from resources: AndroidVideoCallResources) async -> [AndroidSampleCaptureView] {
+        let assignedCount = await resources.controller.assignedParticipantCount()
+        let slotCount = AndroidMultipartyVideoLayout.multipartyGridSlotCount(
+            assignedParticipantCount: assignedCount,
+            rosterRemoteSlotCount: effectiveRemoteCount,
+            poolSize: resources.remoteCaptureViews.count
+        )
+        mountedMultipartyRemoteSlotCount = slotCount
+        return Array(resources.remoteCaptureViews.prefix(slotCount))
+    }
+
     @MainActor
     private func refreshGridRaisedHandFlags(resources: AndroidVideoCallResources) async {
         await resources.controller.updateConferenceRaisedHands(conferenceRaisedHands)
-        gridRaisedHandFlags = await resources.controller.raisedHandFlags(for: resources.remoteCaptureViews)
+        let views = isMultipartyCall
+            ? await multipartyRemoteCaptureViews(from: resources)
+            : resources.remoteCaptureViews
+        gridRaisedHandFlags = await resources.controller.raisedHandFlags(for: views)
+    }
+
+    @MainActor
+    private func refreshVisibleRemoteCaptureViews(resources: AndroidVideoCallResources) async {
+        let previousViews = visibleRemoteCaptureViews
+        let previousSignature = await resources.controller.participantAssignmentSignature()
+        let previousVisibleCount = previousViews.count
+        if !isMultipartyCall {
+            mountedMultipartyRemoteSlotCount = 0
+        }
+        visibleRemoteCaptureViews = isMultipartyCall
+            ? await multipartyRemoteCaptureViews(from: resources)
+            : resources.remoteCaptureViews
+        let signature = await resources.controller.participantAssignmentSignature()
+        let nextVisibleCount = visibleRemoteCaptureViews.count
+        let gridLayoutChanged = AndroidMultipartyVideoLayout.shouldReattachAssignedParticipantVideo(
+            previousVisibleCount: previousVisibleCount,
+            nextVisibleCount: nextVisibleCount,
+            previousSignature: previousSignature,
+            nextSignature: signature
+        )
+        if gridLayoutChanged {
+            for view in visibleRemoteCaptureViews {
+                view.rendererDidUpdateLayout()
+            }
+            await resources.controller.reattachAssignedParticipantVideoIfNeeded()
+        }
     }
 
     @MainActor
@@ -770,6 +997,12 @@ public struct AndroidVideoCallView: View {
             )
             coordinator.isScreenSharing = $isScreenSharing
             coordinator.hasActiveRemoteScreenShare = $hasActiveRemoteScreenShare
+            coordinator.remoteParticipantTilesDidChangeHandler = {
+                Task { @MainActor in
+                    await refreshVisibleRemoteCaptureViews(resources: resources)
+                    await refreshGridRaisedHandFlags(resources: resources)
+                }
+            }
         } else {
             let coordinator = AndroidVideoCallCoordinator(
                 errorMessage: $errorMessage,
@@ -778,15 +1011,23 @@ public struct AndroidVideoCallView: View {
             )
             coordinator.isScreenSharing = $isScreenSharing
             coordinator.hasActiveRemoteScreenShare = $hasActiveRemoteScreenShare
+            coordinator.remoteParticipantTilesDidChangeHandler = {
+                Task { @MainActor in
+                    await refreshVisibleRemoteCaptureViews(resources: resources)
+                    await refreshGridRaisedHandFlags(resources: resources)
+                }
+            }
             resources.coordinator = coordinator
             await resources.controller.setVideoCallDelegate(coordinator)
         }
 
         delegate = resources.controller
+        actionBridge?.bind(resources.controller)
         await resources.controller.setVideoViews(
             local: resources.localCaptureView,
             remotes: resources.remoteCaptureViews
         )
+        await refreshVisibleRemoteCaptureViews(resources: resources)
         await refreshGridRaisedHandFlags(resources: resources)
         await resources.controller.start()
     }

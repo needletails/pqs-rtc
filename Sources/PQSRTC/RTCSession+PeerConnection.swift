@@ -34,16 +34,18 @@ extension RTCSession {
     /// If iOS publishes at too high a bitrate for the real uplink, receivers can freeze
     /// until keyframes (loss/jitter + PLI recovery). Capping sender egress is the highest
     /// impact fix for the "remote video freeze/burst" symptom on poor uplinks.
-    private func applySfuVideoSenderLimitsIfNeeded(sender: RTCRtpSender) {
+    private func applySfuVideoSenderLimitsIfNeeded(sender: RTCRtpSender, call: Call) {
         // Only enforce for SFU/group calls (our convention: connection id prefixed with "#").
-        // Avoid changing 1:1 behavior unless explicitly needed.
+        // Avoid changing plain P2P behavior unless explicitly needed.
         guard sender.track?.kind == kRTCMediaStreamTrackKindVideo else { return }
 
-        // Initial ceiling comes from the selected profile.
-        let cfg = sfuVideoQualityProfile.adaptiveConfig
-        let maxBitrateBps = cfg.startingBitrateBps
-        let maxFramerate = cfg.startingFramerate
-        let scaleResolutionDownBy = RTCVideoQualityProfile.resolutionScaleDownBy(for: maxBitrateBps)
+        let isOneToOneSfu = Self.isTrueOneToOneSfuRoom(call: call)
+        // Start conservative until candidate-pair stats are available; the adaptive loop ramps up.
+        let cfg = sfuAdaptiveConfig(for: call)
+        let targets = RTCAdaptiveVideoTargets.conservativeStartupTargets(
+            cfg: cfg,
+            isOneToOneSfu: isOneToOneSfu
+        )
 
         var params = sender.parameters
         guard !params.encodings.isEmpty else { return }
@@ -52,12 +54,12 @@ extension RTCSession {
             // Keep existing active/priority semantics; set a *starting* ceiling only.
             // The adaptive send loop will raise/lower these as network conditions change.
             if encoding.maxBitrateBps == nil {
-                encoding.maxBitrateBps = NSNumber(value: maxBitrateBps)
+                encoding.maxBitrateBps = NSNumber(value: targets.maxBitrateBps)
             }
             if encoding.maxFramerate == nil {
-                encoding.maxFramerate = NSNumber(value: maxFramerate)
+                encoding.maxFramerate = NSNumber(value: targets.maxFramerate)
             }
-            encoding.scaleResolutionDownBy = NSNumber(value: scaleResolutionDownBy)
+            encoding.scaleResolutionDownBy = NSNumber(value: targets.scaleResolutionDownBy)
         }
         sender.parameters = params
     }
@@ -149,6 +151,11 @@ extension RTCSession {
         if connection.localVideoTrack != nil {
             await setTrackEnabled(WebRTC.RTCVideoTrack.self, isEnabled: false, with: connection)
         }
+
+        // Capture injection was unbound by the caller and tracks are disabled above; let
+        // encrypted frames already in the sender transformer pipeline drain before the
+        // senders below are removed.
+        await drainAppleSenderFrameTransformersBeforeSenderTeardown()
 
         for sender in connection.peerConnection.senders {
             guard let kind = sender.track?.kind,
@@ -379,6 +386,10 @@ extension RTCSession {
             connection = try await self.addVideoToStream(with: connection)
         }
         #endif
+
+        if call.supportsVideo {
+            connection = ensureGroupCallScreenSlotReserved(with: connection)
+        }
         
         // Update connection in manager with any changes from adding tracks
         await connectionManager.updateConnection(id: connection.id, with: connection)
@@ -406,7 +417,17 @@ extension RTCSession {
             if let latestConnection = await connectionManager.findConnection(with: connection.id) {
                 connection = latestConnection
             }
-            try await setMessageKey(connection: connection, call: call)
+            // Ephemeral 1:1-over-SFU must not derive a sender key from the provisional room
+            // identity at PC creation. The caller bootstraps after `call_answered`; the answerer
+            // bootstraps in `receiveCiphertext` after the caller's `call_cipher` arrives.
+            if Self.isTrueOneToOneSfuRoom(call: call) {
+                logger.log(
+                    level: .info,
+                    message: "1:1 SFU: deferring sender call_cipher at PeerConnection creation connId=\(connection.id)"
+                )
+            } else {
+                try await setMessageKey(connection: connection, call: call)
+            }
             if let foundConnection = await connectionManager.findConnection(with: connection.id) {
                 connection = foundConnection
             }
@@ -424,7 +445,10 @@ extension RTCSession {
     ///
     /// - Parameter call: The call to end. If `nil`, the session attempts to close any remaining
     ///   connections as a fallback.
-    public func shutdown(with call: Call?) async {
+    public func shutdown(
+        with call: Call?,
+        endState: CallStateMachine.EndState = .userInitiated
+    ) async {
         await releaseLocalMediaResourcesForCallEnding(call: call)
 
         // Stop background consumers first so we don't process late callbacks
@@ -449,7 +473,7 @@ extension RTCSession {
         // Prefer idempotent teardown: `shutdown(with:)` can be invoked multiple times from
         // different end-call triggers (e.g. signaling end_call + CallKit). The rest of
         // `shutdown(with:)` still performs a full reset.
-        await finishEndConnection(currentCall: call, force: false)
+        await finishEndConnection(currentCall: call, force: false, endState: endState)
 
         // Close any remaining peer connections and notify delegates.
         // (Normally `finishEndConnection` already removed them, but keep this as a safety net.)
@@ -465,8 +489,8 @@ extension RTCSession {
         }
 
     #if os(Android)
-        self.rtcClient.close()
-        logger.log(level: .info, message: "Did close AndroidRTCClient during shutdown")
+        self.rtcClient.resetPeerConnectionForRetry()
+        logger.log(level: .info, message: "Did reset AndroidRTCClient during shutdown")
     #endif
 
     #if os(iOS)
@@ -492,6 +516,7 @@ extension RTCSession {
         iceDequeByConnectionId.removeAll()
         readyForCandidatesByConnectionId.removeAll()
         pendingRemoteVideoRenderersByConnectionId.removeAll()
+        remoteParticipantVideoRendererAttachedTrackIdByKey.removeAll()
 #if os(iOS) || os(macOS)
         localPreviewCaptureRenderersByConnectionId.removeAll()
 #endif
@@ -627,7 +652,7 @@ extension RTCSession {
             // Apply SFU/group-call sender caps and codec preferences immediately.
             // This prevents iOS from overshooting uplink defaults before negotiation settles.
             if updatedConnection.id.isGroupCall, let videoSender = maybeVideoSender {
-                applySfuVideoSenderLimitsIfNeeded(sender: videoSender)
+                applySfuVideoSenderLimitsIfNeeded(sender: videoSender, call: updatedConnection.call)
             }
 #endif
             
@@ -736,9 +761,8 @@ extension RTCSession {
         // `setConnectingIfReady` while `CallStateMachine.currentState` was still `nil`, so
         // the transition was skipped. Once we are `.ready`, retry if a connection exists.
         if await hasConnection(id: call.sharedCommunicationId) {
-            await setConnectingIfReady(
-                call: call,
-                callDirection: inferredCallDirection(for: call))
+            let callDirection = await callState.callDirection ?? inferredCallDirection(for: call)
+            await setConnectingIfReady(call: call, callDirection: callDirection)
         }
     }
     
@@ -793,7 +817,11 @@ extension RTCSession {
     ///   - currentCall: The call to end.
     ///   - force: If `true`, performs cleanup even if the session has already recorded teardown
     ///     for this call key. This is used by `shutdown(with:)` to guarantee a full reset.
-    public func finishEndConnection(currentCall: Call?, force: Bool) async {
+    public func finishEndConnection(
+        currentCall: Call?,
+        force: Bool,
+        endState: CallStateMachine.EndState = .userInitiated
+    ) async {
         let callKey = currentCall.map { teardownKey(for: $0) }
         let connectionIdKey = currentCall?.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines)
         clearFallbackState(connectionId: connectionIdKey)
@@ -837,12 +865,24 @@ extension RTCSession {
 
         if let connectionId, let callForTeardown = currentCall {
             await taskProcessor.removeJobs(forConnectionId: connectionId)
+#if canImport(WebRTC)
+            stopInboundVideoFlowProbe(connectionId: connectionId)
+            stopOutboundVideoFlowProbe(connectionId: connectionId)
+#endif
             initialSfuGroupMediaOfferSentConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
             oneToOneSfuReceiveKeyReadyConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
             oneToOneSfuPostCipherHandshakeSentConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
+            remoteVideoRendererAttachedTrackIdByConnectionId.removeValue(forKey: connectionId)
+            clearRemoteParticipantVideoRendererAttachments(connectionId: connectionId)
+            sfuRenegotiationReceiverCryptorRebindDeferredConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
             pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
 #if os(iOS) || os(macOS)
-            localPreviewCaptureRenderersByConnectionId.removeValue(forKey: connectionId)
+            if let previewRenderer = localPreviewCaptureRenderersByConnectionId.removeValue(forKey: connectionId) {
+                // Stop injecting camera frames into WebRTC before the senders are destroyed below;
+                // in-flight frames on the `video_frame_transformer` queue can otherwise deadlock
+                // teardown (see drainAppleSenderFrameTransformersBeforeSenderTeardown).
+                await previewRenderer.setCapture(nil)
+            }
 #endif
 #if os(Android)
             pendingLocalVideoRenderersByConnectionId.removeValue(forKey: connectionId)
@@ -899,6 +939,7 @@ extension RTCSession {
             connection.screenSenderCryptor?.enabled = false
             connection.screenSenderCryptor?.delegate = nil
             connection.screenSenderCryptor = nil
+            connection.screenSenderCryptorBinding = nil
             for (_, cryptor) in connection.screenReceiverCryptorsByParticipantId {
                 cryptor.enabled = false
                 cryptor.delegate = nil
@@ -908,6 +949,10 @@ extension RTCSession {
             if connection.localScreenTrack != nil, let captureSource = screenCaptureSourceForCurrentPlatform {
                 await stopPlatformScreenCapture(captureSource)
             }
+            // Capture injection is unbound and sender cryptors are disabled above; let encrypted
+            // frames already in flight drain before `cleanup` closes the peer connection and
+            // destroys the RTP senders.
+            await drainAppleSenderFrameTransformersBeforeSenderTeardown()
             let hadLocalScreenTrack = connection.localScreenTrack != nil
             connection.localScreenTrack = nil
             connection.screenCaptureWrapper = nil
@@ -940,7 +985,7 @@ extension RTCSession {
 #elseif os(Android)
             // Stop adaptive video sender control for this connection.
             stopAdaptiveVideoSend(connectionId: connectionId)
-            // Android cleanup is handled in rtcClient.close(), but ensure video is disabled
+            // Android cleanup resets the shared rtcClient for reuse, but ensure video is disabled.
             await setVideoTrack(isEnabled: false, connectionId: connectionId)
 
             // Stop local screen capture
@@ -974,6 +1019,7 @@ extension RTCSession {
             }
             connection.remoteVideoTracksByParticipantId.removeAll()
             connection.remoteVideoTrack = nil
+            connection.remoteAudioTracksByParticipantId.removeAll()
 
             await connectionManager.updateConnection(id: connectionId, with: connection)
 #endif
@@ -988,8 +1034,8 @@ extension RTCSession {
         
         func cleanup(connection: RTCConnection) async {
 #if os(Android)
-            self.rtcClient.close()
-            logger.log(level: .info, message: "Did close AndroidRTCClient for call: \(connection)")
+            self.rtcClient.resetPeerConnectionForRetry()
+            logger.log(level: .info, message: "Did reset AndroidRTCClient for call: \(connection)")
 #else
             connection.peerConnection.delegate = nil
             connection.peerConnection.close()
@@ -1015,6 +1061,10 @@ extension RTCSession {
         } else {
             let remainingConnections = await connectionManager.findAllConnections()
             for connection in remainingConnections {
+#if canImport(WebRTC)
+                stopInboundVideoFlowProbe(connectionId: connection.id)
+                stopOutboundVideoFlowProbe(connectionId: connection.id)
+#endif
                 await cleanup(connection: connection)
                 // Remove per-connection identity so the next call starts clean.
                 await keyManager.removeConnectionIdentity(connectionId: connection.id)
@@ -1043,6 +1093,8 @@ extension RTCSession {
             await connectionManager.removeConnection(with: currentCall.sharedCommunicationId)
         }
         
+        await emitTerminalEndedStateIfNeeded(for: currentCall, endState: endState)
+
         // Reset call state
         await self.callState.resetState()
 
@@ -1053,6 +1105,27 @@ extension RTCSession {
         pcState = PeerConnectionState.none
         pcStateByConnectionId.removeAll()
         readyForCandidatesByConnectionId.removeAll()
+        for task in inboundVideoFlowSamplerTasksByConnectionId.values {
+            task.cancel()
+        }
+        inboundVideoFlowSamplerTasksByConnectionId.removeAll()
+#if os(Android)
+        lastInboundVideoCountersByConnectionId.removeAll()
+#endif
+#if canImport(WebRTC)
+        for task in inboundVideoFlowProbeTasksByConnectionId.values {
+            task.cancel()
+        }
+        inboundVideoFlowProbeTasksByConnectionId.removeAll()
+        cachedInboundVideoFlowByConnectionId.removeAll()
+        lastInboundVideoCountersByConnectionId.removeAll()
+        for task in outboundVideoFlowProbeTasksByConnectionId.values {
+            task.cancel()
+        }
+        outboundVideoFlowProbeTasksByConnectionId.removeAll()
+        lastOutboundVideoCountersByConnectionId.removeAll()
+        lastOutboundVideoRecoveryUptimeNsByConnectionId.removeAll()
+#endif
 
         // Clear any queued outbound candidates.
         iceDequeByConnectionId.removeAll()
@@ -1063,6 +1136,10 @@ extension RTCSession {
         senderFrameKeyIdentityFingerprintByConnectionId.removeAll()
         oneToOneSfuReceiveKeyReadyConnectionIds.removeAll()
         oneToOneSfuPostCipherHandshakeSentConnectionIds.removeAll()
+        remoteVideoRendererAttachedTrackIdByConnectionId.removeAll()
+        remoteParticipantVideoRendererAttachedTrackIdByKey.removeAll()
+        sfuRenegotiationReceiverCryptorRebindDeferredConnectionIds.removeAll()
+        oneToOneSfuLockedRemoteDeviceIdByNormalizedConnectionId.removeAll()
         lastFrameKeyIndexByParticipantId.removeAll()
         lastSharedFrameKeyIndex = 0
 #if canImport(WebRTC) && !os(Android)
@@ -1086,6 +1163,19 @@ extension RTCSession {
         iceId = 0
         
         logger.log(level: .info, message: "Successfully finished connection for call: \(String(describing: currentCall?.id))")
+    }
+
+    private func emitTerminalEndedStateIfNeeded(
+        for call: Call?,
+        endState: CallStateMachine.EndState
+    ) async {
+        guard let call else { return }
+        switch await callState.currentState {
+        case .ended, .failed, .callAnsweredAuxDevice:
+            return
+        default:
+            await callState.transition(to: .ended(endState, call))
+        }
     }
     
     /// Returns `true` if the connection manager currently contains a connection with `id`.

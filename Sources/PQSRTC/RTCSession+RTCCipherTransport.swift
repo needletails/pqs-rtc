@@ -114,6 +114,33 @@ extension RTCSession {
         call.recipients.count <= 1 || isTrueOneToOneSfuRoom(call: call)
     }
 
+    /// Remote peer on an inbound `call_cipher` after ``resolveProperRecipient(call:)`` may live in
+    /// `recipients` while `sender` is the local participant.
+    internal static func inboundRemotePeer(in call: Call, localSecretName: String?) -> Call.Participant {
+        let local = localSecretName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let senderSecret = call.sender.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !local.isEmpty,
+           senderSecret.caseInsensitiveCompare(local) == .orderedSame,
+           let remote = call.recipients.first {
+            return remote
+        }
+        return call.sender
+    }
+
+    /// True for Nudge's UUID-shaped 1:1-over-SFU relay rooms even when a copied `Call` is missing
+    /// `channelWireId`. Used only for guards that must not fail open (e.g. sibling `call_cipher`).
+    internal static func isLikelyOneToOneSfuRoom(call: Call) -> Bool {
+        if isTrueOneToOneSfuRoom(call: call) { return true }
+        let commNorm = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard UUID(uuidString: commNorm) != nil else { return false }
+        let distinctPeers = Set(
+            call.recipients.map {
+                $0.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }
+        )
+        return distinctPeers.count <= 1
+    }
+
     /// True iff an inbound 1:1-SFU `call_cipher` belongs to the active media peer device.
     ///
     /// Nudge can fan out `call_cipher` packets from sibling devices that share the same
@@ -123,27 +150,60 @@ extension RTCSession {
     /// pairwise `call_cipher` media-key path, so this guard only applies to true 1:1-SFU calls.
     internal static func shouldProcessOneToOneSfuCallCipher(
         connectionCall: Call,
-        inboundCall: Call
+        inboundCall: Call,
+        lockedRemoteDeviceId: String? = nil,
+        cipherState: CipherNegotiationState? = nil,
+        localSecretName: String? = nil
     ) -> Bool {
-        guard isTrueOneToOneSfuRoom(call: connectionCall),
-              isTrueOneToOneSfuRoom(call: inboundCall) else {
+        guard isLikelyOneToOneSfuRoom(call: connectionCall)
+            || isLikelyOneToOneSfuRoom(call: inboundCall) else {
             return true
         }
 
-        let inboundSecret = inboundCall.sender.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let inboundDevice = inboundCall.sender.deviceId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !inboundSecret.isEmpty, !inboundDevice.isEmpty else { return true }
+        let inboundRemote = inboundRemotePeer(in: inboundCall, localSecretName: localSecretName)
+        let inboundSecret = inboundRemote.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let inboundDevice = inboundRemote.deviceId.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let activeDevices = ([connectionCall.sender] + connectionCall.recipients)
-            .filter {
-                $0.secretName
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .caseInsensitiveCompare(inboundSecret) == .orderedSame
+        if inboundDevice.isEmpty {
+            switch cipherState {
+            case .waiting, nil:
+                return true
+            default:
+                return false
             }
-            .map { $0.deviceId.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        }
 
-        guard !activeDevices.isEmpty else { return true }
+        if let locked = lockedRemoteDeviceId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !locked.isEmpty {
+            return locked.caseInsensitiveCompare(inboundDevice) == .orderedSame
+        }
+
+        let connectionRemote = inboundRemotePeer(in: connectionCall, localSecretName: localSecretName)
+        let connectionRemoteDevice = connectionRemote.deviceId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let activeDevices: [String]
+        if !connectionRemoteDevice.isEmpty,
+           connectionRemote.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare(inboundSecret) == .orderedSame {
+            activeDevices = [connectionRemoteDevice]
+        } else {
+            activeDevices = ([connectionCall.sender] + connectionCall.recipients)
+                .filter {
+                    $0.secretName
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .caseInsensitiveCompare(inboundSecret) == .orderedSame
+                }
+                .map { $0.deviceId.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
+
+        guard !activeDevices.isEmpty else {
+            switch cipherState {
+            case .waiting, nil:
+                return true
+            default:
+                return false
+            }
+        }
         return activeDevices.contains {
             $0.caseInsensitiveCompare(inboundDevice) == .orderedSame
         }
@@ -156,6 +216,30 @@ extension RTCSession {
         let wire = call.channelWireId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !wire.isEmpty else { return false }
         return wire.normalizedConnectionId == commNorm
+    }
+
+    /// Prefer the negotiated group-call `Call` when classifying ephemeral 1:1 SFU relay rooms.
+    /// The app passes `Call` by value; `channelWireId` can be missing on the host copy even after
+    /// `groupCallNegotiation` stored the wire route on the internal `RTCGroupCall`.
+    func callForOneToOneSfuRoleDetection(_ call: Call) async -> Call {
+        let norm = call.sharedCommunicationId.normalizedConnectionId
+        if let group = groupCall(forSfuIdentity: norm) {
+            return await group.currentCall
+        }
+        return call
+    }
+
+    /// True when this client is the 1:1 SFU answerer that has not yet sent its initial SFU leg offer.
+    ///
+    /// After the host sends `beginGroupCallMediaAfterSfuRegistrationIfNeeded(sendInitialOffer: true)`,
+    /// the answerer waits for SwiftSFU deferred renegotiation (caller tracks), not a relayed copy of
+    /// the caller's first `.offer`.
+    func isOneToOneSfuAnswererAwaitingCallerOffer(_ call: Call) async -> Bool {
+        let roleCall = await callForOneToOneSfuRoleDetection(call)
+        guard Self.isTrueOneToOneSfuRoom(call: roleCall) else { return false }
+        let bootstrapKey = teardownConnectionIdKey(roleCall.sharedCommunicationId)
+        guard !initialSfuGroupMediaOfferSentConnectionIds.contains(bootstrapKey) else { return false }
+        return await connectionManager.findConnection(with: roleCall.sharedCommunicationId) != nil
     }
 
     /// Participant id used by ``setMessageKey`` for outbound media in per-participant mode.
@@ -426,7 +510,11 @@ extension RTCSession {
                 // In both cases a post-cipher `createOffer` can leave the PC in `have-local-offer`
                 // and crash on the next inbound SFU offer with SDPHandlerError 3.
                 if initialOfferSent || initialOfferBootstrapInFlight {
-                    if Self.isTrueOneToOneSfuRoom(call: resolvedCall) {
+                    if Self.isTrueOneToOneSfuRoom(call: await callForOneToOneSfuRoleDetection(resolvedCall)) {
+                        logger.log(
+                            level: .info,
+                            message: "Skipping post-cipher WebRTC createOffer for 1:1 SFU; sending media readiness only connId=\(resolvedCall.sharedCommunicationId)"
+                        )
                         if let connection = await connectionManager.findConnection(with: resolvedCall.sharedCommunicationId) {
                             try await sendOneToOneSfuPostCipherHandshakeCompleteIfNeeded(
                                 connection: connection,
@@ -470,6 +558,13 @@ extension RTCSession {
                         )
                         return resolvedCall
                     }
+                }
+                if await isOneToOneSfuAnswererAwaitingCallerOffer(resolvedCall) {
+                    logger.log(
+                        level: .info,
+                        message: "Skipping post-cipher createOffer for 1:1 SFU answerer awaiting caller SFU offer connId=\(resolvedCall.sharedCommunicationId)"
+                    )
+                    return resolvedCall
                 }
                 var resolvedCall = try await createOffer(call: resolvedCall)
 
@@ -587,6 +682,15 @@ extension RTCSession {
         }
         outboundCall.frameIdentityProps = frameProps
         outboundCall.signalingIdentityProps = signalingProps
+        if let sessionParticipant,
+           outboundCall.sender.secretName.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare(sessionParticipant.secretName) == .orderedSame {
+            var sender = outboundCall.sender
+            if sender.deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                sender.deviceId = sessionParticipant.deviceId
+            }
+            outboundCall.sender = sender
+        }
         return outboundCall
     }
 
@@ -774,15 +878,125 @@ extension RTCSession {
         cryptor?.delegate = nil
     }
 
+    /// Detaches the outbound screen-share FrameCryptor before the RTP sender is removed.
+    ///
+    /// WebRTC's `FrameCryptorTransformer::encryptFrame` runs on the serial
+    /// `video_frame_transformer` queue. Removing the sender (or letting the cryptor deallocate)
+    /// while encryption is in flight can `dispatch_sync` that same queue and hang or crash.
+    func prepareAppleScreenSenderCryptorForTrackRemoval(
+        from connection: inout RTCConnection,
+        reason: String
+    ) async {
+#if canImport(WebRTC) && !os(Android)
+        guard let cryptor = connection.screenSenderCryptor else {
+            connection.screenSenderCryptorBinding = nil
+            return
+        }
+        cryptor.enabled = false
+        // Allow any in-flight encrypt pass to finish before we drop delegate / deallocate.
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        cryptor.delegate = nil
+        connection.screenSenderCryptor = nil
+        connection.screenSenderCryptorBinding = nil
+        logger.log(
+            level: .debug,
+            message: "Detached screen sender FrameCryptor before track removal reason=\(reason) connId=\(connection.id)"
+        )
+#endif
+    }
+
+    /// Quiesces the outbound video frame-encryption pipeline before RTP senders are destroyed
+    /// (peer connection close, or discarding an attempt for retry).
+    ///
+    /// WebRTC's `RTPSenderVideoFrameTransformerDelegate` owns the serial `video_frame_transformer`
+    /// GCD queue, and every encrypted frame that `FrameCryptorTransformer::encryptFrame` hands back
+    /// is posted to that queue as a task retaining the delegate. If the RTP sender is destroyed
+    /// while such a task is queued, the task drops the *last* delegate reference on that queue;
+    /// the delegate destructor then deletes its own queue (`TaskQueueGcd::Delete`), which
+    /// `dispatch_sync`s onto the queue it is currently running on and deadlocks
+    /// (`__DISPATCH_WAIT_FOR_QUEUE__` crash on the `video_frame_transformer` queue).
+    ///
+    /// The transformer lives inside the prebuilt WebRTC binary and exposes no drain event, so this
+    /// cannot be made event-driven from Swift. Callers must first stop frame production (unbind
+    /// capture injection and disable sender cryptors); this then allows one bounded drain for
+    /// encrypt/send tasks already in flight, mirroring
+    /// ``prepareAppleScreenSenderCryptorForTrackRemoval(from:reason:)``.
+    func drainAppleSenderFrameTransformersBeforeSenderTeardown() async {
+#if canImport(WebRTC) && !os(Android)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+#endif
+    }
+
+    private func resolveLiveAppleScreenRtpSender(in connection: RTCConnection) -> RTCRtpSender? {
+        guard let localScreenTrack = connection.localScreenTrack else { return nil }
+        let localTrackId = localScreenTrack.trackId
+        return connection.peerConnection.senders.first {
+            $0.track?.kind == kRTCMediaStreamTrackKindVideo
+                && $0.track?.trackId == localTrackId
+        }
+    }
+
+    func ensureAppleScreenSenderCryptorIfNeeded(connection: RTCConnection) async {
+        guard enableEncryption else { return }
+        guard let conn = await connectionManager.findConnection(with: connection.id) else { return }
+        guard let screenSender = resolveLiveAppleScreenRtpSender(in: conn) else { return }
+
+        let trackId = screenSender.track?.trackId ?? ""
+        let senderId = String(describing: ObjectIdentifier(screenSender))
+        let binding = RTCSenderCryptorBinding(trackId: trackId, senderId: senderId)
+
+        if let existing = conn.screenSenderCryptor,
+           conn.screenSenderCryptorBinding == binding {
+            enableAppleFrameCryptor(existing, participantId: conn.localParticipantId)
+            return
+        }
+
+        if let stale = conn.screenSenderCryptor {
+            disableAppleFrameCryptor(stale)
+            var cleared = conn
+            cleared.screenSenderCryptor = nil
+            cleared.screenSenderCryptorBinding = nil
+            await connectionManager.updateConnection(id: cleared.id, with: cleared)
+        }
+
+        do {
+            try await createEncryptedFrame(connection: conn, kind: .screenSender(screenSender))
+            if var latest = await connectionManager.findConnection(with: conn.id) {
+                latest.screenSenderCryptorBinding = binding
+                await connectionManager.updateConnection(id: latest.id, with: latest)
+            }
+            logger.log(
+                level: .info,
+                message: "Ensured screen sender FrameCryptor is bound connId=\(conn.id) trackId=\(trackId) senderId=\(senderId)"
+            )
+            logScreenShareDiagnostics(connectionId: conn.id, reason: "afterEnsureScreenSenderCryptor")
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "Failed to ensure screen sender FrameCryptor connId=\(conn.id): \(error)"
+            )
+        }
+    }
+
     private func shouldReuseReceiverFrameCryptor(
         existingBinding: RTCReceiverCryptorBinding,
         newBinding: RTCReceiverCryptorBinding
     ) -> Bool {
-        // RTCFrameCryptor is constructed against one concrete RTCRtpReceiver. Even when the
-        // logical track id is unchanged after SFU renegotiation, a different receiver binding
-        // must get a fresh cryptor so decrypted frames flow through the active receive path.
-        existingBinding.trackId == newBinding.trackId &&
-            existingBinding.receiverId == newBinding.receiverId
+        Self.shouldReuseReceiverFrameCryptorBinding(
+            existingTrackId: existingBinding.trackId,
+            newTrackId: newBinding.trackId,
+            existingReceiverId: existingBinding.receiverId,
+            newReceiverId: newBinding.receiverId
+        )
+    }
+
+    internal static func shouldReuseReceiverFrameCryptorBinding(
+        existingTrackId: String,
+        newTrackId: String,
+        existingReceiverId: String,
+        newReceiverId: String
+    ) -> Bool {
+        existingTrackId == newTrackId && existingReceiverId == newReceiverId
     }
 
     private func receiverFrameCryptorRebindReason(
@@ -821,6 +1035,10 @@ extension RTCSession {
                 enableAppleFrameCryptor(existing, participantId: participantId)
                 connection.videoFrameCryptor = existing
                 connection.videoReceiverCryptorBindingsByParticipantId[participantId] = binding
+                logger.log(
+                    level: .info,
+                    message: "Reused receiver FrameCryptor by stable track kind=video participantId=\(participantId) connId=\(connection.id) trackId=\(binding.trackId) previousReceiverId=\(existingBinding.receiverId) currentReceiverId=\(binding.receiverId) keyIndex=\(appleFrameCryptorKeyIndex(for: participantId))"
+                )
                 return existing
             }
             if connection.videoReceiverCryptorsByParticipantId[participantId] != nil {
@@ -871,6 +1089,10 @@ extension RTCSession {
                 enableAppleFrameCryptor(existing, participantId: participantId)
                 connection.audioFrameCryptor = existing
                 connection.audioReceiverCryptorBindingsByParticipantId[participantId] = binding
+                logger.log(
+                    level: .info,
+                    message: "Reused receiver FrameCryptor by stable track kind=audio participantId=\(participantId) connId=\(connection.id) trackId=\(binding.trackId) previousReceiverId=\(existingBinding.receiverId) currentReceiverId=\(binding.receiverId) keyIndex=\(appleFrameCryptorKeyIndex(for: participantId))"
+                )
                 return existing
             }
             if connection.audioReceiverCryptorsByParticipantId[participantId] != nil {
@@ -920,6 +1142,10 @@ extension RTCSession {
                shouldReuseReceiverFrameCryptor(existingBinding: existingBinding, newBinding: binding) {
                 enableAppleFrameCryptor(existing, participantId: participantId)
                 connection.screenReceiverCryptorBindingsByParticipantId[participantId] = binding
+                logger.log(
+                    level: .info,
+                    message: "Reused receiver FrameCryptor by stable track kind=screen participantId=\(participantId) connId=\(connection.id) trackId=\(binding.trackId) previousReceiverId=\(existingBinding.receiverId) currentReceiverId=\(binding.receiverId) keyIndex=\(appleFrameCryptorKeyIndex(for: participantId))"
+                )
                 return existing
             }
             if connection.screenReceiverCryptorsByParticipantId[participantId] != nil {
@@ -995,6 +1221,12 @@ extension RTCSession {
                 forParticipant: participantId,
                 ratchetSalt: ratchetSalt)
             lastFrameKeyIndexByParticipantId[participantId] = keyRingIndex
+        }
+        if enableEncryption, frameEncryptionKeyMode == .perParticipant {
+            let connections = await connectionManager.findAllConnections()
+            for connection in connections {
+                await reconcileAndroidReceiverFrameCryptorsAfterSfuRenegotiation(connectionId: connection.id)
+            }
         }
 #endif
 #if canImport(WebRTC)
@@ -1082,6 +1314,13 @@ extension RTCSession {
         case .videoReceiver, .audioReceiver, .screenReceiver:
             if let latest = await connectionManager.findConnection(with: connection.id) {
                 connection = latest
+            }
+            if sfuRenegotiationReceiverCryptorRebindIsDeferred(for: connection.id) {
+                logger.log(
+                    level: .debug,
+                    message: "Deferring receiver FrameCryptor bind until SFU renegotiation answer completes connId=\(connection.id) kind=\(kind)"
+                )
+                return
             }
         case .videoSender, .audioSender, .screenSender:
             break
@@ -1228,6 +1467,16 @@ extension RTCSession {
 
             enableAppleFrameCryptor(screenCryptor, participantId: connection.localParticipantId)
             connection.screenSenderCryptor = screenCryptor
+            if let trackId = sender.track?.trackId {
+                connection.screenSenderCryptorBinding = RTCSenderCryptorBinding(
+                    trackId: trackId,
+                    senderId: String(describing: ObjectIdentifier(sender))
+                )
+            }
+            logger.log(
+                level: .info,
+                message: "Created sender FrameCryptor kind=screen participantId=\(connection.localParticipantId) connId=\(connection.id) trackId=\(sender.track?.trackId ?? "nil") senderId=\(String(describing: ObjectIdentifier(sender))) keyIndex=\(appleFrameCryptorKeyIndex(for: connection.localParticipantId))"
+            )
         case .screenReceiver(let receiver):
             let receiverParticipantId = receiverFrameCryptorParticipantId(
                 connection: connection,
@@ -1318,6 +1567,39 @@ extension RTCSession {
         throw RTCErrors.invalidConfiguration(
             "Timed out waiting for sender frame key provisioning for connection \(displayConnectionId)"
         )
+    }
+
+    /// Provisions the outbound 1:1-SFU sender frame key once the peer's frame identity is known.
+    ///
+    /// SFU PeerConnection creation skips automatic ``setMessageKey`` for ephemeral 1:1 rooms so
+    /// neither side derives a key from the provisional room identity. The caller bootstraps here
+    /// after `call_answered` carries the answerer's props; the answerer bootstraps in
+    /// ``receiveCiphertext`` after the caller's `call_cipher` arrives.
+    func bootstrapOneToOneSfuSenderKeyIfReady(call: Call) async throws {
+        guard Self.isTrueOneToOneSfuRoom(call: call),
+              !Self.usesApplicationInjectedGroupFrameKeys(call: call) else {
+            return
+        }
+        guard let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) else {
+            return
+        }
+        let hasRemoteFrameIdentity = call.frameIdentityProps.map {
+            framePropsBelongToRemotePeer(
+                $0,
+                localParticipantId: connection.localParticipantId)
+        } ?? false
+        guard hasRemoteFrameIdentity else {
+            logger.log(
+                level: .info,
+                message: "1:1 SFU: waiting for peer frame identity before sender call_cipher connId=\(connection.id)"
+            )
+            return
+        }
+        let normalizedConnectionId = connection.id.normalizedConnectionId
+        if senderFrameKeyProvisionedConnectionIds.contains(normalizedConnectionId) {
+            return
+        }
+        try await setMessageKey(connection: connection, call: call)
     }
 
     /// Derives and installs this client's outbound media frame key.
@@ -1616,6 +1898,7 @@ extension RTCSession {
                 message: enableEncryption
                     ? "1:1 SFU receive key installed; media readiness may be sent for remoteTrackOwner='\(remoteParticipantId)' connId=\(connection.id)"
                     : "1:1 SFU call_cipher received with FrameCryptor disabled; media readiness may be sent for remoteTrackOwner='\(remoteParticipantId)' connId=\(connection.id)")
+            await flushPendingOneToOneSfuRemoteVideoRenderersIfNeeded(connectionId: connection.id)
             try await sendOneToOneSfuPostCipherHandshakeCompleteIfNeeded(
                 connection: connection,
                 call: connection.call)
@@ -1871,6 +2154,48 @@ extension RTCSession {
             }
         }
 
+        let normalizedCallCipherConnectionId = call.sharedCommunicationId.normalizedConnectionId
+        let roleInboundCall = await callForOneToOneSfuRoleDetection(call)
+        if Self.isLikelyOneToOneSfuRoom(call: roleInboundCall) {
+            let callId = call.sharedCommunicationId.stableUUIDConnectionId
+            let hasConnectionForCall = await hasConnection(id: call.sharedCommunicationId)
+            if !hasConnectionForCall, !shouldOffer {
+                let answerState = callAnswerStatesById[callId] ?? callAnswerState
+                if answerState != .answered {
+                    logger.log(
+                        level: .info,
+                        message: "Ignoring 1:1 SFU call_cipher on non-active local device connectionId=\(call.sharedCommunicationId) answerState=\(answerState)"
+                    )
+                    return
+                }
+            }
+
+            let roleConnectionCall: Call
+            if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
+                roleConnectionCall = await callForOneToOneSfuRoleDetection(connection.call)
+            } else {
+                roleConnectionCall = roleInboundCall
+            }
+            let lockedRemoteDeviceId = oneToOneSfuLockedRemoteDeviceIdByNormalizedConnectionId[normalizedCallCipherConnectionId]
+            let cipherState = await connectionManager.findConnection(with: call.sharedCommunicationId)?.cipherNegotiationState
+            let inboundRemotePeer = Self.inboundRemotePeer(
+                in: roleInboundCall,
+                localSecretName: sessionParticipant?.secretName)
+            guard Self.shouldProcessOneToOneSfuCallCipher(
+                connectionCall: roleConnectionCall,
+                inboundCall: roleInboundCall,
+                lockedRemoteDeviceId: lockedRemoteDeviceId,
+                cipherState: cipherState,
+                localSecretName: sessionParticipant?.secretName
+            ) else {
+                logger.log(
+                    level: .info,
+                    message: "Ignoring 1:1 SFU call_cipher from non-active peer device sender=\(inboundRemotePeer.secretName) deviceId=\(inboundRemotePeer.deviceId) connectionId=\(call.sharedCommunicationId)"
+                )
+                return
+            }
+        }
+
         guard let remoteFrameProps = call.frameIdentityProps else {
             logger.log(level: .error, message: "Call will not proceed the session identity for sender is missing, Call will not proceed the frame session identity for sender is missing, Call: \(call)")
             return
@@ -1881,7 +2206,6 @@ extension RTCSession {
             return
         }
         let remoteFrameIdentityFingerprint = frameIdentityPropsFingerprint(remoteFrameProps)
-        let normalizedCallCipherConnectionId = call.sharedCommunicationId.normalizedConnectionId
         let previousSenderRemoteFingerprint = senderFrameKeyIdentityFingerprintByConnectionId[normalizedCallCipherConnectionId]
         let shouldRefreshSenderFrameKey =
             previousSenderRemoteFingerprint != nil &&
@@ -1951,21 +2275,21 @@ extension RTCSession {
             throw RTCErrors.connectionNotFound
         }
 
-        guard Self.shouldProcessOneToOneSfuCallCipher(
-            connectionCall: connection.call,
-            inboundCall: call
-        ) else {
-            logger.log(
-                level: .info,
-                message: "Ignoring 1:1 SFU call_cipher from non-active peer device sender=\(call.sender.secretName) deviceId=\(call.sender.deviceId) connectionId=\(connection.id)"
-            )
-            return
-        }
-
         let initialState = connection.cipherNegotiationState
         logger.log(level: .info, message: "Received ciphertext for connectionId: \(connection.id) in cipher negotiation state: \(initialState)")
         switch initialState {
         case .waiting, .setSenderKey, .complete:
+            if initialState == .complete,
+               !shouldRefreshSenderFrameKey,
+               senderFrameKeyProvisionedConnectionIds.contains(normalizedCallCipherConnectionId) {
+                logger.log(
+                    level: .info,
+                    message: "Ignoring duplicate 1:1 SFU call_cipher after media keys are established connectionId=\(connection.id)"
+                )
+                rememberProcessedCiphertext = true
+                return
+            }
+
             var connection = connection
 
             logger.log(level: .info, message: "\(connection.sender.uppercased()) received ciphertext for connectionId: \(connection.id)")
@@ -2011,7 +2335,26 @@ extension RTCSession {
                 logger.log(level: .info, message: "Completed cipher negotiation 🔒")
             }
             rememberProcessedCiphertext = true
+            let inboundRemotePeer = Self.inboundRemotePeer(
+                in: roleInboundCall,
+                localSecretName: sessionParticipant?.secretName)
+            let inboundDevice = inboundRemotePeer.deviceId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !inboundDevice.isEmpty,
+               Self.isLikelyOneToOneSfuRoom(call: roleInboundCall) {
+                oneToOneSfuLockedRemoteDeviceIdByNormalizedConnectionId[normalizedCallCipherConnectionId] = inboundDevice
+            }
             if shouldRefreshSenderFrameKey {
+                if let locked = oneToOneSfuLockedRemoteDeviceIdByNormalizedConnectionId[normalizedCallCipherConnectionId]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !locked.isEmpty,
+                   !inboundDevice.isEmpty,
+                   locked.caseInsensitiveCompare(inboundDevice) != .orderedSame {
+                    logger.log(
+                        level: .info,
+                        message: "Ignoring sender frame key refresh from non-active peer device sender=\(inboundRemotePeer.secretName) deviceId=\(inboundDevice) locked=\(locked) connectionId=\(connection.id)"
+                    )
+                    rememberProcessedCiphertext = true
+                    return
+                }
                 senderFrameKeyProvisionedConnectionIds.remove(normalizedCallCipherConnectionId)
                 logger.log(
                     level: .info,

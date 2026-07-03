@@ -26,6 +26,9 @@ public enum PacketFlag: Codable, Sendable {
     case mediaReady
     // SFU group-call control (roster)
     case participants, participantDemuxId
+    /// Requests that the targeted participant stop an active screen share so another member
+    /// can take over (one active room screen share at a time).
+    case screenSharePreempt
 }
 
 public struct RatchetMessagePacket: Codable, Sendable, Equatable {
@@ -36,6 +39,8 @@ public struct RatchetMessagePacket: Codable, Sendable, Equatable {
     public let sfuIdentity: String
     /// The encrypted ratchet message containing the payload.
     public let ratchetMessage: RatchetMessage
+    /// Compatibility accessor for callers that previously read the packet header directly.
+    public var header: EncryptedHeader { ratchetMessage.header }
     
     public let flag: PacketFlag
     

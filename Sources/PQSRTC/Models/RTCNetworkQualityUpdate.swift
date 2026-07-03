@@ -28,6 +28,9 @@ public struct RTCNetworkQualityUpdate: Sendable, Equatable {
     /// Selected ICE candidate pair's `availableOutgoingBitrate` (bps), if available.
     public let availableOutgoingBitrateBps: Int?
 
+    /// Selected ICE candidate pair's `availableIncomingBitrate` (bps), if available.
+    public let availableIncomingBitrateBps: Int?
+
     /// Selected ICE candidate pair RTT (ms), if available.
     public let rttMs: Int?
 
@@ -43,6 +46,7 @@ public struct RTCNetworkQualityUpdate: Sendable, Equatable {
         connectionId: String,
         quality: RTCNetworkQuality,
         availableOutgoingBitrateBps: Int?,
+        availableIncomingBitrateBps: Int? = nil,
         rttMs: Int?,
         appliedVideoMaxBitrateBps: Int?,
         appliedVideoMaxFramerate: Int?,
@@ -51,6 +55,7 @@ public struct RTCNetworkQualityUpdate: Sendable, Equatable {
         self.connectionId = connectionId
         self.quality = quality
         self.availableOutgoingBitrateBps = availableOutgoingBitrateBps
+        self.availableIncomingBitrateBps = availableIncomingBitrateBps
         self.rttMs = rttMs
         self.appliedVideoMaxBitrateBps = appliedVideoMaxBitrateBps
         self.appliedVideoMaxFramerate = appliedVideoMaxFramerate

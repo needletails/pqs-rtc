@@ -38,9 +38,7 @@ actor PreviewViewRender: RendererDelegate {
     var bounds: CGRect {
         didSet {
 #if os(iOS)
-            if let connection = layer.connection {
-                _ = handleOrientation(connection: connection)
-            }
+            reapplyCaptureVideoOrientation()
 #endif
         }
     }
@@ -221,6 +219,35 @@ actor PreviewViewRender: RendererDelegate {
         
         await shutdown()
     }
+
+    func restartCaptureSessionForRecovery() async {
+        let existingCaptureWrapper = rtcVideoCaptureWrapper
+
+        streamContinuation?.finish()
+        streamContinuation = nil
+        streamTask?.cancel()
+        streamTask = nil
+        captureOutputWrapper.captureOutput = nil
+        rtcVideoRenderWrapper.frameOutput = nil
+
+        if let session = layer.session {
+            if session.isRunning {
+                session.stopRunning()
+            }
+            session.beginConfiguration()
+            for input in session.inputs {
+                session.removeInput(input)
+            }
+            for output in session.outputs {
+                session.removeOutput(output)
+            }
+            session.commitConfiguration()
+        }
+
+        rtcVideoCaptureWrapper = existingCaptureWrapper
+        await startStreamTask()
+        logger.log(level: .warning, message: "Restarted local preview capture session for outbound video recovery")
+    }
     
     private func shutdown() async {
         streamContinuation?.finish()
@@ -267,9 +294,7 @@ actor PreviewViewRender: RendererDelegate {
         for connection in output.connections {
             applyManualVideoMirroring(mirrorLocalVideo, to: connection)
 #if os(iOS)
-            if connection.isVideoRotationAngleSupported(VideoRotation.portrait.angle) {
-                connection.videoRotationAngle = VideoRotation.portrait.angle
-            }
+            await applyInitialVideoRotation(to: connection)
 #elseif os(macOS)
             // macOS camera capture already arrives in the expected desktop orientation for WebRTC.
             // Forcing a landscape rotation here flips the outbound media for the remote peer.
@@ -288,6 +313,9 @@ actor PreviewViewRender: RendererDelegate {
 #endif
         self.logger.log(level: .debug, message: "Created the Capture Session")
         applyLocalVideoMirroringToPreviewLayerConnection(mirrorLocalVideo)
+#if os(iOS)
+        await reapplyCaptureVideoOrientation()
+#endif
     }
 
     /// Reads ``PQSRTCCallUIPreferences/localVideoMirroredUserDefaultsKey``; missing key defaults to `true`.
@@ -354,9 +382,7 @@ actor PreviewViewRender: RendererDelegate {
             for connection in videoOutput.connections {
                 applyManualVideoMirroring(mirrorLocalVideo, to: connection)
 #if os(iOS)
-                if connection.isVideoRotationAngleSupported(VideoRotation.portrait.angle) {
-                    connection.videoRotationAngle = VideoRotation.portrait.angle
-                }
+                await applyInitialVideoRotation(to: connection)
 #elseif os(macOS)
                 if connection.isVideoRotationAngleSupported(0) {
                     connection.videoRotationAngle = 0
@@ -445,12 +471,10 @@ actor PreviewViewRender: RendererDelegate {
 #if os(iOS)
     @MainActor
     var determineScale: ScaleMode {
-        //We are landscape no matter what, whether upright or flat
-        if UIScreen.main.bounds.width > UIScreen.main.bounds.height {
+        if bounds.width > bounds.height {
             return .aspectFitHorizontal
-        } else {
-            return .aspectFitVertical
         }
+        return .aspectFitVertical
     }
 #endif
     enum VideoRotation {
@@ -500,6 +524,144 @@ actor PreviewViewRender: RendererDelegate {
     
 #if os(iOS)
     @MainActor
+    private func updateDeviceOrientationState(for rotation: VideoRotation) {
+        switch rotation {
+        case .landscapeLeft:
+            deviceOrientationState = .wasLandscapeLeft
+        case .landscapeRight:
+            deviceOrientationState = .wasLandscapeRight
+        case .portrait, .portraitUpsideDown:
+            deviceOrientationState = .none
+        case .faceUp(let state):
+            deviceOrientationState = state
+        }
+    }
+
+    @MainActor
+    private func reapplyCaptureVideoOrientation() {
+#if os(iOS)
+        if let connection = layer.connection {
+            _ = handleOrientation(connection: connection)
+        }
+        guard let session = layer.session else { return }
+        for output in session.outputs {
+            guard let videoOutput = output as? AVCaptureVideoDataOutput else { continue }
+            for connection in videoOutput.connections where connection.isActive {
+                _ = handleOrientation(connection: connection)
+            }
+        }
+#endif
+    }
+
+    private static func isConcreteDeviceOrientation(_ orientation: UIDeviceOrientation) -> Bool {
+        switch orientation {
+        case .portrait, .portraitUpsideDown, .landscapeLeft, .landscapeRight:
+            return true
+        default:
+            return false
+        }
+    }
+
+    @MainActor
+    private static func videoRotation(forInterfaceOrientation orientation: UIInterfaceOrientation) -> VideoRotation? {
+        switch orientation {
+        case .portrait:
+            return .portrait
+        case .portraitUpsideDown:
+            return .portraitUpsideDown
+        // UIInterfaceOrientation landscape names are opposite UIDevice landscape names.
+        case .landscapeLeft:
+            return .landscapeRight
+        case .landscapeRight:
+            return .landscapeLeft
+        default:
+            return nil
+        }
+    }
+
+    @MainActor
+    private static func hostBoundsIndicateLandscape(_ hostBounds: CGRect) -> Bool {
+        hostBounds.width > 0 && hostBounds.height > 0 && hostBounds.width > hostBounds.height
+    }
+
+    @MainActor
+    private static func interfaceOrientationIsLandscape() -> Bool {
+        guard let orientation = activeInterfaceOrientation() else { return false }
+        return orientation == .landscapeLeft || orientation == .landscapeRight
+    }
+
+    /// Resolves capture rotation from interface orientation, host layout, and device sensors.
+    /// UIDevice often still reports portrait when a landscape call UI is already on screen.
+    @MainActor
+    private static func resolvedVideoRotation(
+        deviceOrientation: UIDeviceOrientation = UIDevice.current.orientation,
+        hostBounds: CGRect = .zero
+    ) -> VideoRotation {
+        let hostLandscape = hostBoundsIndicateLandscape(hostBounds)
+        let interfaceLandscape = interfaceOrientationIsLandscape()
+
+        if isConcreteDeviceOrientation(deviceOrientation) {
+            let devicePortrait = deviceOrientation == .portrait || deviceOrientation == .portraitUpsideDown
+            let deviceLandscape = deviceOrientation == .landscapeLeft || deviceOrientation == .landscapeRight
+
+            if devicePortrait && (interfaceLandscape || hostLandscape) {
+                // Stale portrait reading while UI/layout is already landscape — fall through.
+            } else if deviceLandscape || devicePortrait,
+                      let rotation = videoRotation(for: deviceOrientation) {
+                return rotation
+            }
+        }
+
+        if let interfaceOrientation = activeInterfaceOrientation(),
+           let rotation = videoRotation(forInterfaceOrientation: interfaceOrientation) {
+            return rotation
+        }
+
+        if hostLandscape {
+            return .landscapeRight
+        }
+        return .portrait
+    }
+
+    @MainActor
+    private static func initialVideoRotation(hostBounds: CGRect = .zero) -> VideoRotation {
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        return resolvedVideoRotation(hostBounds: hostBounds)
+    }
+
+    private func applyInitialVideoRotation(to connection: AVCaptureConnection) async {
+        let rotation = await MainActor.run { Self.initialVideoRotation(hostBounds: self.bounds) }
+        await MainActor.run { updateDeviceOrientationState(for: rotation) }
+        let angle = rotation.angle
+        if connection.isVideoRotationAngleSupported(angle) {
+            connection.videoRotationAngle = angle
+        }
+    }
+
+    @MainActor
+    private static func activeInterfaceOrientation() -> UIInterfaceOrientation? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first(where: { $0.activationState == .foregroundActive })?
+            .interfaceOrientation
+    }
+
+    private static func videoRotation(for orientation: UIDeviceOrientation) -> VideoRotation? {
+        switch orientation {
+        case .portrait:
+            return .portrait
+        case .portraitUpsideDown:
+            return .portraitUpsideDown
+        case .landscapeLeft:
+            return .landscapeLeft
+        case .landscapeRight:
+            return .landscapeRight
+        default:
+            return nil
+        }
+    }
+
+    @MainActor
     func handleOrientation(connection: AVCaptureConnection, rtcVideoRotation: RTCVideoRotation? = nil) -> RTCVideoRotation? {
         func setVideoRotation(for connection: AVCaptureConnection, rotation: VideoRotation) -> RTCVideoRotation? {
             let angle = rotation.angle
@@ -508,39 +670,37 @@ actor PreviewViewRender: RendererDelegate {
             }
             return rotation.rtcRotation
         }
-            let currentOrientation = UIDevice.current.orientation
-            switch currentOrientation {
-            case .portrait:
-                return setVideoRotation(for: connection, rotation: .portrait)
-                
-            case .portraitUpsideDown:
-                return setVideoRotation(for: connection, rotation: .portraitUpsideDown)
-                
-            case .landscapeLeft:
-                deviceOrientationState = .wasLandscapeLeft
-                return setVideoRotation(for: connection, rotation: .landscapeLeft)
-                
-            case .landscapeRight:
-                deviceOrientationState = .wasLandscapeRight
-                return setVideoRotation(for: connection, rotation: .landscapeRight)
-                
-            case .faceUp:
-                let isLandscape = UIScreen.main.bounds.width > UIScreen.main.bounds.height
-                let rotation: VideoRotation
-                switch deviceOrientationState {
-                case .wasLandscapeLeft:
-                    rotation = isLandscape ? .faceUp(.wasLandscapeLeft) : .faceUp(.none)
-                case .wasLandscapeRight:
-                    rotation = isLandscape ? .faceUp(.wasLandscapeRight) : .faceUp(.none)
-                case .none:
-                    rotation = .faceUp(.none)
-                }
-               return setVideoRotation(for: connection, rotation: rotation)
-                
-            default:
-                deviceOrientationState = .none
-                return setVideoRotation(for: connection, rotation: .portrait) // Default to portrait
+
+        let currentOrientation = UIDevice.current.orientation
+        switch currentOrientation {
+        case .faceUp:
+            let isLandscape = Self.interfaceOrientationIsLandscape() || Self.hostBoundsIndicateLandscape(bounds)
+            let rotation: VideoRotation
+            switch deviceOrientationState {
+            case .wasLandscapeLeft:
+                rotation = isLandscape ? .faceUp(.wasLandscapeLeft) : .faceUp(.none)
+            case .wasLandscapeRight:
+                rotation = isLandscape ? .faceUp(.wasLandscapeRight) : .faceUp(.none)
+            case .none:
+                rotation = isLandscape
+                    ? Self.resolvedVideoRotation(hostBounds: bounds)
+                    : .faceUp(.none)
             }
+            return setVideoRotation(for: connection, rotation: rotation)
+
+        case .unknown:
+            let rotation = Self.resolvedVideoRotation(hostBounds: bounds)
+            updateDeviceOrientationState(for: rotation)
+            return setVideoRotation(for: connection, rotation: rotation)
+
+        default:
+            let rotation = Self.resolvedVideoRotation(
+                deviceOrientation: currentOrientation,
+                hostBounds: bounds
+            )
+            updateDeviceOrientationState(for: rotation)
+            return setVideoRotation(for: connection, rotation: rotation)
+        }
     }
 #endif
 
@@ -565,9 +725,23 @@ actor PreviewViewRender: RendererDelegate {
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(packet.sampleBuffer) else { return }
             guard let session = self.layer.session else { return }
 
+            var capturePixelBuffer = pixelBuffer
+            if PQSRTCCallUIPreferences.resolvedVideoAppearanceSofteningEnabled() {
+                do {
+                    capturePixelBuffer = try await metalProcessor.applyAppearanceSoftening(to: pixelBuffer)
+                } catch {
+                    if PQSRTCDiagnostics.criticalBugLoggingEnabled {
+                        self.logger.log(
+                            level: .debug,
+                            message: "Appearance softening failed; using raw camera frame: \(error.localizedDescription)"
+                        )
+                    }
+                }
+            }
+
             if let wrapper = rtcVideoCaptureWrapper {
                 wrapper.passCapture(
-                    pixelBuffer: pixelBuffer,
+                    pixelBuffer: capturePixelBuffer,
                     captureSession: session,
                     sampleBuffer: packet.sampleBuffer,
                     connection: packet.connection,
@@ -600,33 +774,32 @@ actor PreviewViewRender: RendererDelegate {
             var scaleMode: ScaleMode = .none
 
             if shouldRenderOnMetal {
+                let renderBounds = await resolveRenderableBounds()
 #if os(iOS)
-                // Match the historical preview-layer behavior (`resizeAspectFill`) so the local tile
-                // does not get letterboxed or stretched when using the Metal preview path.
+                // Match `PreviewCaptureView` / AVCaptureVideoPreviewLayer (`.resizeAspectFill`).
                 scaleMode = .aspectFill
 #elseif os(macOS)
-                scaleMode = .aspectFitHorizontal
+                scaleMode = renderBounds.width >= renderBounds.height ? .aspectFitHorizontal : .aspectFitVertical
 #endif
-                let renderBounds = await resolveRenderableBounds()
                 let aspectRatio = await metalProcessor.getAspectRatio(
-                    width: CGFloat(pixelBuffer.width),
-                    height: CGFloat(pixelBuffer.height))
+                    width: CGFloat(capturePixelBuffer.width),
+                    height: CGFloat(capturePixelBuffer.height))
                 let scaleInfo = await metalProcessor.createSize(
                     for: scaleMode,
-                    originalSize: .init(width: pixelBuffer.width, height: pixelBuffer.height),
+                    originalSize: .init(width: capturePixelBuffer.width, height: capturePixelBuffer.height),
                     desiredSize: renderBounds,
                     aspectRatio: aspectRatio)
                 if didLogFirstLocalMetalScale == false {
                     didLogFirstLocalMetalScale = true
-                    let srcFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
-                    let srcPlanes = CVPixelBufferGetPlaneCount(pixelBuffer)
+                    let srcFormat = CVPixelBufferGetPixelFormatType(capturePixelBuffer)
+                    let srcPlanes = CVPixelBufferGetPlaneCount(capturePixelBuffer)
                     logger.log(
                         level: .info,
-                        message: "Local preview Metal conversion srcFormat=\(srcFormat) planes=\(srcPlanes) srcSize=\(pixelBuffer.width)x\(pixelBuffer.height) renderBounds=\(renderBounds) scaleMode=\(scaleMode) scaleX=\(scaleInfo.scaleX) scaleY=\(scaleInfo.scaleY)"
+                        message: "Local preview Metal conversion srcFormat=\(srcFormat) planes=\(srcPlanes) srcSize=\(capturePixelBuffer.width)x\(capturePixelBuffer.height) renderBounds=\(renderBounds) scaleMode=\(scaleMode) scaleX=\(scaleInfo.scaleX) scaleY=\(scaleInfo.scaleY)"
                     )
                 }
                 let info = try await metalProcessor.createMetalImage(
-                    fromPixelBuffer: pixelBuffer,
+                    fromPixelBuffer: capturePixelBuffer,
                     parentBounds: renderBounds,
                     scaleInfo: scaleInfo,
                     aspectRatio: aspectRatio)

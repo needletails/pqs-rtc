@@ -140,5 +140,17 @@ struct RTCConnectionManagerTests {
         #expect(byHash?.peerConnection === conn.peerConnection)
         #expect(byStripped?.peerConnection === conn.peerConnection)
     }
+
+    @Test
+    func findConnectionMatchesSlugWireRouteToBareRoomUUID() async throws {
+        let manager = RTCConnectionManager(logger: NeedleTailLogger("[test]"))
+        let roomUUID = "493b6051-39f0-493d-aace-7683f2bfa9e2"
+        let conn = try await makeConnection(id: roomUUID, recipient: "sfu")
+
+        await manager.addConnection(conn)
+
+        let byWireRoute = await manager.findConnection(with: "#broken_\(roomUUID)")
+        #expect(byWireRoute?.peerConnection === conn.peerConnection)
+    }
 }
 #endif

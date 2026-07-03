@@ -14,8 +14,7 @@ struct KeyManagerTests {
         #expect(identity.connectionId == "conn-1")
 
         let fetched = try await keyManager.fetchCallKeyBundle()
-        #expect(fetched != nil)
-        #expect(fetched?.connectionId == "conn-1")
+        #expect(fetched.connectionId == "conn-1")
 
         let props = await identity.sessionIdentity.props(symmetricKey: identity.symmetricKey)
         #expect(props != nil)
