@@ -784,6 +784,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         }
         pendingSharedKey = key
         pendingSharedKeyIndex = index
+        // Do NOT hold `lock` past this point: the key installation below can block on the main
+        // looper (latch), and the main thread may itself be waiting on this lock.
+        lock.unlock()
 
         // Reflection-only Android path to avoid SwiftJNI method-ID traps.
         // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
@@ -828,9 +831,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
         // SKIP INSERT:   }
         // SKIP INSERT: }
-
-        // Clear any pending shared key; this call is now authoritative.
-        lock.unlock()
     }
 
     /// Ratchet-salt-aware variant that ensures the Android key provider exists.
@@ -850,6 +850,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
         pendingSharedKey = key
         pendingSharedKeyIndex = index
+        // Do NOT hold `lock` past this point: the key installation below can block on the main
+        // looper (latch), and the main thread may itself be waiting on this lock.
+        lock.unlock()
 
         // Reflection-only Android path to avoid SwiftJNI method-ID traps.
         // SKIP INSERT: val keyProvider = this@AndroidRTCClient.keyProvider
@@ -894,7 +897,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
         // SKIP INSERT:   }
         // SKIP INSERT: }
-        lock.unlock()
     }
 
     /// Ensures `PeerConnectionFactory.initialize` has run before any FrameCryptor JNI entry points.
@@ -1009,6 +1011,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     }
         // SKIP INSERT: }
 
+        // Release the lock before applying the pending key: the application below can block on
+        // the main looper (latch), and the main thread may itself be waiting on this lock.
+        lock.unlock()
+
         // If we stashed a key earlier, apply it now that a provider exists. JNI requires main thread.
         // SKIP INSERT: val pendingKey = this@AndroidRTCClient.pendingSharedKey
         // SKIP INSERT: val pendingIndex = this@AndroidRTCClient.pendingSharedKeyIndex
@@ -1038,8 +1044,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
         // SKIP INSERT:   }
         // SKIP INSERT: }
-
-        lock.unlock()
     }
 
     /// Ensures a key provider exists in the requested mode.
@@ -1336,10 +1340,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
     /// Updates the current shared media key (manual re-key / ratchet advance).
     private func ratchetAdvanced(with newKey: Data, index: Int, participant: String) {
+        // Only read state under the lock; the key update below can block on the main looper
+        // (latch), and the main thread may itself be waiting on this lock.
         lock.lock()
-        defer { lock.unlock() }
+        let closed = isClosed
+        lock.unlock()
 
-        guard !isClosed else {
+        guard !closed else {
             // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Cannot advance ratchet: AndroidRTCClient has been closed")
             return
         }
@@ -1900,21 +1907,33 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
     /// Stops the screen capturer and releases screen-specific resources.
     public func stopScreenCapture() {
-        lock.lock()
-        defer { lock.unlock() }
+        // Snapshot and clear state under the lock, then perform capturer/track teardown outside
+        // it. `stopCapture`, `dispose`, and `setEnabled` block on WebRTC internal threads, and the
+        // signaling thread takes this same lock in `triggerRTCEvent` — holding it here can
+        // deadlock the whole client.
+        let capturerToStop: org.webrtc.VideoCapturer?
+        let helperToDispose: org.webrtc.SurfaceTextureHelper?
+        let trackToDisable: RTCVideoTrack?
 
-        // SKIP INSERT: (screenCapturer as? org.webrtc.ScreenCapturerAndroid)?.stopCapture()
-        // SKIP INSERT: (screenCapturer as? org.webrtc.ScreenCapturerAndroid)?.dispose()
+        lock.lock()
+        capturerToStop = screenCapturer
+        helperToDispose = screenSurfaceTextureHelper
+        trackToDisable = screenVideoTrack
         screenCapturer = nil
         screenCaptureLifecycleObserver = nil
         screenCaptureStartedHandler = nil
         screenProjectionStoppedHandler = nil
-
-        screenSurfaceTextureHelper?.dispose()
         screenSurfaceTextureHelper = nil
+        lock.unlock()
+
+        // SKIP INSERT: (capturerToStop as? org.webrtc.ScreenCapturerAndroid)?.stopCapture()
+        // SKIP INSERT: (capturerToStop as? org.webrtc.ScreenCapturerAndroid)?.dispose()
+        let _ = capturerToStop
+
+        helperToDispose?.dispose()
         frameCryptorSupport.disposeScreenSender()
 
-        screenVideoTrack?._isEnabled = false
+        trackToDisable?._isEnabled = false
 
         // SKIP INSERT: AndroidMediaProjectionResultHolder.clear()
         // SKIP INSERT: AndroidScreenCaptureForeground.stopIfRunning()
@@ -1922,10 +1941,14 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
     /// Enables or disables the local screen video track.
     public func setScreenVideoEnabled(_ enabled: Bool) {
+        // Snapshot under the lock, mutate outside it: `MediaStreamTrack.setEnabled` is a
+        // synchronous proxy onto the WebRTC signaling thread, and that thread re-enters
+        // `triggerRTCEvent` (which takes this lock) during renegotiation callbacks.
+        // Holding the lock across the proxied call deadlocks the whole client (ANR).
         lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed else { return }
-        screenVideoTrack?._isEnabled = enabled
+        let track = isClosed ? nil : screenVideoTrack
+        lock.unlock()
+        track?._isEnabled = enabled
     }
 
     /// Returns the first remote screen video track by finding a transceiver whose track ID starts with `screen_`.
@@ -1942,18 +1965,20 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
     /// Enables or disables the local audio track.
     public func setAudioEnabled(_ enabled: Bool) {
+        // See setScreenVideoEnabled: never hold `lock` across the proxied setEnabled call.
         lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed else { return }
-        localAudioTrack?._setEnabled(enabled)
+        let track = isClosed ? nil : localAudioTrack
+        lock.unlock()
+        track?._setEnabled(enabled)
     }
     
     /// Enables or disables the local video track.
     public func setVideoEnabled(_ enabled: Bool) {
+        // See setScreenVideoEnabled: never hold `lock` across the proxied setEnabled call.
         lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed else { return }
-        localVideoTrack?._setEnabled(enabled)
+        let track = isClosed ? nil : localVideoTrack
+        lock.unlock()
+        track?._setEnabled(enabled)
     }
 
     // MARK: - Adaptive sender control helpers
@@ -1962,9 +1987,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
     // They are used by `RTCSession` for SFU/group calls so the sender doesn't overshoot uplink,
     // and can ramp up quality on good internet.
     public func setVideoSenderEncodings(maxBitrateBps: Int, maxFramerate: Int, scaleResolutionDownBy: Double) {
+        // `pc.senders` / `sender.parameters` are synchronous proxies onto the WebRTC signaling
+        // thread. Never hold `lock` across them: the signaling thread takes this same lock in
+        // `triggerRTCEvent`, so holding it here deadlocks the client (main-thread ANR at end call).
         lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed else { return }
+        let closed = isClosed
+        lock.unlock()
+        guard !closed else { return }
         // SKIP INSERT: val pc = this@AndroidRTCClient.peerConnection?.platformPeerConnection ?: return
         // SKIP INSERT: val senders = pc.senders
         // SKIP INSERT: val videoSender = senders.firstOrNull { it.track()?.kind() == "video" } ?: return
@@ -2131,12 +2160,22 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// competes with Firebase broadcast handling, EglRenderer, audio, and encrypted signaling during
     /// the fragile `connecting` window.
     public func startLocalVideoCaptureIfNeeded(fps: Int = 15, useFrontCamera: Bool = true) {
+        // `track.enabled()` is a proxied WebRTC call; read it outside the lock (see
+        // setScreenVideoEnabled for the deadlock this avoids).
         lock.lock()
         guard !isClosed,
               videoCapturer == nil,
               !localVideoCaptureStartInFlight,
-              let localVideoTrack = localVideoTrack,
-              localVideoTrack._isEnabled else {
+              let localVideoTrack = localVideoTrack else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        guard localVideoTrack._isEnabled else { return }
+
+        lock.lock()
+        guard !isClosed, videoCapturer == nil, !localVideoCaptureStartInFlight else {
             lock.unlock()
             return
         }
@@ -2307,18 +2346,27 @@ public final class AndroidRTCClient: @unchecked Sendable {
     
     /// Stops camera capture and releases capture-related resources.
     public func stopLocalVideo() {
+        // Snapshot under the lock, tear down outside it: `stopCapture` blocks on the camera
+        // thread and `SurfaceTextureHelper.dispose` blocks on its handler thread. The WebRTC
+        // signaling thread takes this same lock in `triggerRTCEvent`, so blocking while holding
+        // it can deadlock the whole client.
+        let capturerToStop: org.webrtc.Camera2Capturer?
+        let helperToDispose: org.webrtc.SurfaceTextureHelper?
+
         lock.lock()
-        defer { lock.unlock() }
-        
-        guard !isClosed else { return }
-        
-        if let capturer = videoCapturer {
-            capturer.stopCapture()
-            videoCapturer = nil
+        if isClosed {
+            lock.unlock()
+            return
         }
-        localVideoCaptureStartInFlight = false
-        surfaceTextureHelper?.dispose()
+        capturerToStop = videoCapturer
+        helperToDispose = surfaceTextureHelper
+        videoCapturer = nil
         surfaceTextureHelper = nil
+        localVideoCaptureStartInFlight = false
+        lock.unlock()
+
+        capturerToStop?.stopCapture()
+        helperToDispose?.dispose()
     }
     
     /// Ensures a local video track exists, creating a source/track if needed.

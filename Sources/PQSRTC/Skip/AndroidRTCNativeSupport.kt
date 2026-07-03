@@ -469,6 +469,43 @@ object AndroidRTCViewSupport {
         }
     }
 
+    private val rendererAspectFitContainers =
+        WeakHashMap<SurfaceViewRenderer, android.widget.FrameLayout>()
+
+    /// EglRenderer always crops the frame to the renderer view's layout aspect ratio, so a
+    /// SurfaceViewRenderer measured EXACTLY (Compose fillMaxSize) aspect-fills regardless of
+    /// setScalingType(SCALE_ASPECT_FIT). Hosting the renderer wrap-content + centered inside a
+    /// black container lets VideoLayoutMeasure size the view to the rotated frame aspect
+    /// (SurfaceViewRenderer requestLayouts on onFrameResolutionChanged), producing letterboxed
+    /// remote tiles that match Apple's aspect-fit policy. One container per renderer, reused
+    /// across Compose remounts.
+    fun aspectFitContainer(renderer: SurfaceViewRenderer): android.widget.FrameLayout {
+        val container = synchronized(rendererAspectFitContainers) {
+            rendererAspectFitContainers[renderer] ?: android.widget.FrameLayout(
+                renderer.context
+            ).also { created ->
+                created.setBackgroundColor(android.graphics.Color.BLACK)
+                rendererAspectFitContainers[renderer] = created
+            }
+        }
+        if (renderer.parent !== container) {
+            detachFromParent(renderer)
+            container.addView(
+                renderer,
+                android.widget.FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    android.view.Gravity.CENTER
+                )
+            )
+        }
+        return container
+    }
+
+    fun aspectFitContainerOrNull(renderer: SurfaceViewRenderer): android.widget.FrameLayout? {
+        return synchronized(rendererAspectFitContainers) { rendererAspectFitContainers[renderer] }
+    }
+
     fun clearRendererImage(renderer: SurfaceViewRenderer) {
         try {
             renderer.clearImage()
@@ -1248,6 +1285,10 @@ class AndroidSampleCaptureViewNative(
         val applyVisibility = {
             val previous = surfaceViewRenderer.visibility
             surfaceViewRenderer.visibility = targetVisibility
+            // The aspect-fit host container is opaque black; leaving it visible while the
+            // renderer is hidden would paint a black box over the app when call chrome minimizes.
+            AndroidRTCViewSupport.aspectFitContainerOrNull(surfaceViewRenderer)?.visibility =
+                targetVisibility
             Log.d(
                 "AndroidSampleCaptureView",
                 "[CallChromeMinimize] setHidden hidden=$hidden target=$targetVisibility previous=$previous " +

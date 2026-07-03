@@ -911,15 +911,12 @@ public final class VideoCallViewController: UICollectionViewController {
     }
 
     private func participantCameraPrefersAspectFit() -> Bool {
-        if activeRemoteScreenShareParticipantId != nil { return true }
-        if hasVisibleScreenShareForPiP() { return true }
         // Letterbox remote camera tiles so portrait phone senders are not cropped to fill a
-        // landscape tablet/phone receiver. macOS 1:1 uses the same policy.
-        if shouldUseParticipantCameraTiles() {
-            let remoteCameraTiles = videoViews.views.filter(isParticipantCameraModel).count
-            return remoteCameraTiles > 1
-        }
-        return true
+        // landscape tablet/phone receiver. This must also hold when a group call shrinks to a
+        // single remote (e.g. Mac leaves and only Android remains): aspect-filling that lone
+        // tile crops the sender's orientation across the whole screen. macOS 1:1 uses the
+        // same policy.
+        true
     }
 
     /// Applies aspect-fit to remote camera tiles so portrait senders keep their orientation

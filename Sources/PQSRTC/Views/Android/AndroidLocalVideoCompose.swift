@@ -121,8 +121,11 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
                     renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
                     captureView.rendererDidInitialize()
                     AndroidRTCViewSupport.applyRoundedOutline(view: renderer, radiusDp: Float(12))
-                    AndroidRTCViewSupport.detachFromParent(view: renderer)
-                    renderer
+                    // Wrap-content host so the renderer measures to the sender's rotated frame
+                    // aspect (letterbox) instead of Compose fillMaxSize forcing a center crop.
+                    let container = AndroidRTCViewSupport.aspectFitContainer(renderer: renderer)
+                    AndroidRTCViewSupport.detachFromParent(view: container)
+                    container
                 },
                 modifier: Modifier.fillMaxSize(),
                 update: { _ in
@@ -168,8 +171,10 @@ public struct AndroidScreenShareCompose: ContentComposer {
                 factory: { ctx in
                     _ = client.safelyInitializeSurfaceRenderer(renderer, mirror: false)
                     renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
-                    AndroidRTCViewSupport.detachFromParent(view: renderer)
-                    renderer
+                    // Shared screens must letterbox, not crop: aspect-fit host container.
+                    let container = AndroidRTCViewSupport.aspectFitContainer(renderer: renderer)
+                    AndroidRTCViewSupport.detachFromParent(view: container)
+                    container
                 },
                 modifier: Modifier.fillMaxSize(),
                 update: { _ in }
@@ -289,8 +294,13 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                                             view: view.surfaceViewRenderer,
                                             radiusDp: Float(tileCornerRadiusDp)
                                         )
-                                        AndroidRTCViewSupport.detachFromParent(view: view.surfaceViewRenderer)
-                                        view.surfaceViewRenderer
+                                        // Wrap-content host so each grid tile letterboxes to the
+                                        // sender's rotated frame aspect like Apple tiles.
+                                        let container = AndroidRTCViewSupport.aspectFitContainer(
+                                            renderer: view.surfaceViewRenderer
+                                        )
+                                        AndroidRTCViewSupport.detachFromParent(view: container)
+                                        container
                                     },
                                     modifier: Modifier.fillMaxSize(),
                                     update: { _ in
