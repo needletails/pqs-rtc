@@ -216,6 +216,10 @@ public struct AndroidRemoteGridCompose: ContentComposer {
     private let raisedHandFlags: [Bool]
     private let prefersAspectFit: Bool
     private let cleanupOnDispose: Bool
+    /// When true, participant tiles live in the short camera strip below/beside an active
+    /// screen share. On phones this selects the horizontal 16:9 collection; full-screen
+    /// conference keeps the vertical grid.
+    private let usesCompactParticipantStrip: Bool
     private let onDispose: () -> Void
     
     public init(
@@ -224,6 +228,7 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         raisedHandFlags: [Bool] = [],
         prefersAspectFit: Bool = true,
         cleanupOnDispose: Bool = true,
+        usesCompactParticipantStrip: Bool = false,
         onDispose: @escaping () -> Void
     ) {
         self.client = client
@@ -231,6 +236,7 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         self.raisedHandFlags = raisedHandFlags
         self.prefersAspectFit = prefersAspectFit
         self.cleanupOnDispose = cleanupOnDispose
+        self.usesCompactParticipantStrip = usesCompactParticipantStrip
         self.onDispose = onDispose
     }
     
@@ -265,81 +271,147 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                 itemCount: itemCount
             )
             let tileCornerRadiusDp = conferenceTileCornerRadiusDp(for: itemCount)
-            let grid = conferenceGridDimensions(for: itemCount, isPortrait: isPortrait)
-            let rows = chunked(flaggedViews, size: grid.columns)
-            Column(
-                modifier: Modifier.fillMaxSize().padding(contentPaddingDp.dp),
-                verticalArrangement: Arrangement.spacedBy(tileSpacingDp.dp)
-            ) {
-                for row in rows {
-                    Row(
-                        modifier: Modifier.weight(Float(1.0)).fillMaxWidth(),
-                        horizontalArrangement: Arrangement.spacedBy(tileSpacingDp.dp)
-                    ) {
-                        for (view, showRaisedHand) in row {
-                            let scalingType = org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT
-                            let rendererSlotKey = Int(view.surfaceViewRenderer.hashCode())
-                            androidx.compose.runtime.key(rendererSlotKey) {
-                            Box(
+            let isPhoneLayout = min(configuration.screenWidthDp, configuration.screenHeightDp) < 600
+            // Horizontal participant collection is only for the screen-share camera strip on
+            // phones. Full-screen conference view keeps the vertical 16:9 grid.
+            let useScreenSharePhoneHorizontalStrip =
+                usesCompactParticipantStrip && isPhoneLayout && itemCount > 1
+
+            if useScreenSharePhoneHorizontalStrip {
+                Row(
+                    modifier: Modifier
+                        .fillMaxSize()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(contentPaddingDp.dp),
+                    horizontalArrangement: Arrangement.spacedBy(tileSpacingDp.dp),
+                    verticalAlignment: androidx.compose.ui.Alignment.CenterVertically
+                ) {
+                    for (view, showRaisedHand) in flaggedViews {
+                        let rendererSlotKey = Int(view.surfaceViewRenderer.hashCode())
+                        androidx.compose.runtime.key(rendererSlotKey) {
+                            ConferenceTile(
+                                view: view,
+                                showRaisedHand: showRaisedHand,
+                                cornerRadiusDp: tileCornerRadiusDp,
                                 modifier: Modifier
-                                    .weight(Float(1.0))
-                                    .fillMaxWidth()
                                     .fillMaxHeight()
-                                    .clip(RoundedCornerShape(tileCornerRadiusDp.dp))
-                                    .background(androidx.compose.ui.graphics.Color.Black)
-                            ) {
-                                androidx.compose.ui.viewinterop.AndroidView(
-                                    factory: { _ in
-                                        _ = client.safelyInitializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
-                                        view.surfaceViewRenderer.setScalingType(scalingType)
-                                        view.rendererDidInitialize()
-                                        // Wrap-content host so each grid tile letterboxes to the
-                                        // sender's rotated frame aspect like Apple tiles. Round the
-                                        // container (the visible tile), not the letterboxed renderer,
-                                        // so tile corners are uniform.
-                                        let container = AndroidRTCViewSupport.aspectFitContainer(
-                                            renderer: view.surfaceViewRenderer
+                                    .aspectRatio(Float(16.0 / 9.0))
+                            )
+                        }
+                    }
+                }
+            } else {
+                let grid = conferenceGridDimensions(for: itemCount, isPortrait: isPortrait)
+                let rows = chunked(flaggedViews, size: grid.columns)
+                Column(
+                    modifier: Modifier.fillMaxSize().padding(contentPaddingDp.dp),
+                    verticalArrangement: Arrangement.spacedBy(tileSpacingDp.dp)
+                ) {
+                    for row in rows {
+                        Row(
+                            modifier: Modifier.weight(Float(1.0)).fillMaxWidth(),
+                            horizontalArrangement: Arrangement.spacedBy(tileSpacingDp.dp)
+                        ) {
+                            for (view, showRaisedHand) in row {
+                                let rendererSlotKey = Int(view.surfaceViewRenderer.hashCode())
+                                androidx.compose.runtime.key(rendererSlotKey) {
+                                    if itemCount == 1 {
+                                        // Solo tile keeps the full-bleed layout.
+                                        ConferenceTile(
+                                            view: view,
+                                            showRaisedHand: showRaisedHand,
+                                            cornerRadiusDp: tileCornerRadiusDp,
+                                            modifier: Modifier
+                                                .weight(Float(1.0))
+                                                .fillMaxHeight()
                                         )
-                                        AndroidRTCViewSupport.clearRoundedOutline(
-                                            view: view.surfaceViewRenderer
-                                        )
-                                        AndroidRTCViewSupport.applyRoundedOutline(
-                                            view: container,
-                                            radiusDp: Float(tileCornerRadiusDp)
-                                        )
-                                        AndroidRTCViewSupport.detachFromParent(view: container)
-                                        container
-                                    },
-                                    modifier: Modifier.fillMaxSize(),
-                                    update: { _ in
-                                        view.rendererDidUpdateLayoutFromCompose()
+                                    } else {
+                                        // Equal grid cell hosting a centered uniform 16:9 tile so
+                                        // every participant container has the same width/height.
+                                        Box(
+                                            modifier: Modifier
+                                                .weight(Float(1.0))
+                                                .fillMaxHeight(),
+                                            contentAlignment: androidx.compose.ui.Alignment.Center
+                                        ) {
+                                            ConferenceTile(
+                                                view: view,
+                                                showRaisedHand: showRaisedHand,
+                                                cornerRadiusDp: tileCornerRadiusDp,
+                                                modifier: Modifier.aspectRatio(Float(16.0 / 9.0))
+                                            )
+                                        }
                                     }
-                                )
-                                if showRaisedHand {
-                                    androidx.compose.material3.Text(
-                                        text: "✋",
-                                        modifier: Modifier
-                                            .align(androidx.compose.ui.Alignment.TopEnd)
-                                            .padding(8.dp)
-                                    )
                                 }
                             }
-                            }
-                        }
-                        let missingColumns = max(0, grid.columns - row.count)
-                        if missingColumns > 0 {
-                            for _ in 0..<missingColumns {
-                                Spacer(modifier: Modifier.weight(Float(1.0)).fillMaxHeight())
+                            let missingColumns = max(0, grid.columns - row.count)
+                            if missingColumns > 0 {
+                                for _ in 0..<missingColumns {
+                                    Spacer(modifier: Modifier.weight(Float(1.0)).fillMaxHeight())
+                                }
                             }
                         }
                     }
-                }
-                let missingRows = max(0, grid.rows - rows.count)
-                if missingRows > 0 {
-                    for _ in 0..<missingRows {
-                        Spacer(modifier: Modifier.weight(Float(1.0)).fillMaxWidth())
+                    let missingRows = max(0, grid.rows - rows.count)
+                    if missingRows > 0 {
+                        for _ in 0..<missingRows {
+                            Spacer(modifier: Modifier.weight(Float(1.0)).fillMaxWidth())
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// One participant tile: black 16:9 (or full-bleed) container with rounded corners hosting
+    /// the aspect-fit renderer container, so the video letterboxes to the sender's orientation
+    /// while the visible tile stays uniform.
+    @Composable
+    private func ConferenceTile(
+        view: AndroidSampleCaptureView,
+        showRaisedHand: Bool,
+        cornerRadiusDp: Int,
+        modifier: Modifier
+    ) {
+        Box(
+            modifier: modifier
+                .clip(RoundedCornerShape(cornerRadiusDp.dp))
+                .background(androidx.compose.ui.graphics.Color.Black)
+        ) {
+            androidx.compose.ui.viewinterop.AndroidView(
+                factory: { _ in
+                    _ = client.safelyInitializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
+                    view.surfaceViewRenderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                    view.rendererDidInitialize()
+                    // Wrap-content host so each grid tile letterboxes to the
+                    // sender's rotated frame aspect like Apple tiles. Round the
+                    // container (the visible tile), not the letterboxed renderer,
+                    // so tile corners are uniform.
+                    let container = AndroidRTCViewSupport.aspectFitContainer(
+                        renderer: view.surfaceViewRenderer
+                    )
+                    AndroidRTCViewSupport.clearRoundedOutline(
+                        view: view.surfaceViewRenderer
+                    )
+                    AndroidRTCViewSupport.applyRoundedOutline(
+                        view: container,
+                        radiusDp: Float(cornerRadiusDp)
+                    )
+                    AndroidRTCViewSupport.detachFromParent(view: container)
+                    container
+                },
+                modifier: Modifier.fillMaxSize(),
+                update: { _ in
+                    view.rendererDidUpdateLayoutFromCompose()
+                }
+            )
+            if showRaisedHand {
+                androidx.compose.material3.Text(
+                    text: "✋",
+                    modifier: Modifier
+                        .align(androidx.compose.ui.Alignment.TopEnd)
+                        .padding(8.dp)
+                )
             }
         }
     }
@@ -614,6 +686,7 @@ public struct AndroidRemoteGrid: View {
     private let raisedHandFlags: [Bool]
     private let prefersAspectFit: Bool
     private let cleanupOnDispose: Bool
+    private let usesCompactParticipantStrip: Bool
     private let onDispose: () -> Void
     
     public init(
@@ -622,6 +695,7 @@ public struct AndroidRemoteGrid: View {
         raisedHandFlags: [Bool] = [],
         prefersAspectFit: Bool = true,
         cleanupOnDispose: Bool = true,
+        usesCompactParticipantStrip: Bool = false,
         onDispose: @escaping () -> Void
     ) {
         self.client = client
@@ -629,6 +703,7 @@ public struct AndroidRemoteGrid: View {
         self.raisedHandFlags = raisedHandFlags
         self.prefersAspectFit = prefersAspectFit
         self.cleanupOnDispose = cleanupOnDispose
+        self.usesCompactParticipantStrip = usesCompactParticipantStrip
         self.onDispose = onDispose
     }
     
@@ -640,6 +715,7 @@ public struct AndroidRemoteGrid: View {
                 raisedHandFlags: raisedHandFlags,
                 prefersAspectFit: prefersAspectFit,
                 cleanupOnDispose: cleanupOnDispose,
+                usesCompactParticipantStrip: usesCompactParticipantStrip,
                 onDispose: onDispose
             )
         }
@@ -812,6 +888,7 @@ public struct AndroidVideoCallView: View {
                                     raisedHandFlags: raisedHandFlags(for: remotes, allViews: displayedRemoteCaptureViews),
                                     prefersAspectFit: true,
                                     cleanupOnDispose: false,
+                                    usesCompactParticipantStrip: hasActiveRemoteScreenShare,
                                     onDispose: {}
                                 )
                                 .tag(idx)
@@ -837,6 +914,7 @@ public struct AndroidVideoCallView: View {
                             raisedHandFlags: raisedHandFlags(for: displayedRemoteCaptureViews, allViews: displayedRemoteCaptureViews),
                             prefersAspectFit: true,
                             cleanupOnDispose: false,
+                            usesCompactParticipantStrip: hasActiveRemoteScreenShare,
                             onDispose: {}
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
