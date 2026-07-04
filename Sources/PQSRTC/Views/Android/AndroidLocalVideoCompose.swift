@@ -147,40 +147,45 @@ public struct AndroidScreenShareCompose: ContentComposer {
     private let client: AndroidRTCClient
     private let captureView: AndroidSampleCaptureView
     private let presenterName: String
+    private let onSurfaceLayout: () -> Void
 
     public init(
         client: AndroidRTCClient,
         captureView: AndroidSampleCaptureView,
-        presenterName: String = "Presenting"
+        presenterName: String = "Presenting",
+        onSurfaceLayout: @escaping () -> Void = {}
     ) {
         self.client = client
         self.captureView = captureView
         self.presenterName = presenterName
+        self.onSurfaceLayout = onSurfaceLayout
     }
 
     @Composable
     public func Compose(context: ComposeContext) {
         let renderer = captureView.surfaceViewRenderer
 
+        // The screen renderer is pooled for the whole call; do not release it when Compose
+        // recomposes during layout changes or screen-share visibility toggles.
         androidx.compose.runtime.DisposableEffect(renderer) {
-            onDispose {
-                client.removeRenderer(renderer)
-                client.safeReleaseRenderer(renderer)
-            }
+            onDispose { }
         }
 
-        Box(modifier: context.modifier.fillMaxSize()) {
+        Box(modifier = context.modifier.fillMaxSize()) {
             androidx.compose.ui.viewinterop.AndroidView(
                 factory: { ctx in
                     _ = client.safelyInitializeSurfaceRenderer(renderer, mirror: false)
                     renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
-                    // Shared screens must letterbox, not crop: aspect-fit host container.
+                    captureView.rendererDidInitialize()
                     let container = AndroidRTCViewSupport.aspectFitContainer(renderer: renderer)
                     AndroidRTCViewSupport.detachFromParent(view: container)
                     container
                 },
                 modifier: Modifier.fillMaxSize(),
-                update: { _ in }
+                update: { _ in
+                    captureView.rendererDidUpdateLayoutFromCompose()
+                    onSurfaceLayout()
+                }
             )
 
             // "Presenting" badge overlay
@@ -278,9 +283,12 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                 usesCompactParticipantStrip && isPhoneLayout && itemCount > 1
 
             if useScreenSharePhoneHorizontalStrip {
+                let callControlsInsetDp = 112
                 Row(
                     modifier: Modifier
                         .fillMaxSize()
+                        .padding(bottom: callControlsInsetDp.dp)
+                        .navigationBarsPadding()
                         .horizontalScroll(rememberScrollState())
                         .padding(contentPaddingDp.dp),
                     horizontalArrangement: Arrangement.spacedBy(tileSpacingDp.dp),
@@ -727,15 +735,18 @@ public struct AndroidScreenShareView: View {
     private let client: AndroidRTCClient
     private let captureView: AndroidSampleCaptureView
     private let presenterName: String
+    private let onSurfaceLayout: () -> Void
 
     public init(
         client: AndroidRTCClient,
         captureView: AndroidSampleCaptureView,
-        presenterName: String = "Presenting"
+        presenterName: String = "Presenting",
+        onSurfaceLayout: @escaping () -> Void = {}
     ) {
         self.client = client
         self.captureView = captureView
         self.presenterName = presenterName
+        self.onSurfaceLayout = onSurfaceLayout
     }
 
     public var body: some View {
@@ -743,7 +754,8 @@ public struct AndroidScreenShareView: View {
             AndroidScreenShareCompose(
                 client: client,
                 captureView: captureView,
-                presenterName: presenterName
+                presenterName: presenterName,
+                onSurfaceLayout: onSurfaceLayout
             )
         }
     }
@@ -861,7 +873,12 @@ public struct AndroidVideoCallView: View {
                     if hasActiveRemoteScreenShare {
                         AndroidScreenShareView(
                             client: session.rtcClient,
-                            captureView: resources.screenCaptureView
+                            captureView: resources.screenCaptureView,
+                            onSurfaceLayout: {
+                                Task { @MainActor in
+                                    await resources.controller.setScreenView(resources.screenCaptureView)
+                                }
+                            }
                         )
                         .frame(maxWidth: .infinity)
                         .frame(height: geo.size.height * screenShareHeightFraction)
@@ -929,11 +946,10 @@ public struct AndroidVideoCallView: View {
                 )
                     .frame(width: localViewSize.width, height: localViewSize.height)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .clipped()
                     .zIndex(1)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                     .padding(.trailing, 20)
-                    .padding(.bottom, 128)
+                    .padding(.bottom, localPreviewBottomPadding(in: geo))
                     .onAppear {
                         NeedleTailLogger().log(level: .debug, message: "GEO SIZE \(geo.size)")
                         localViewSize = setSize(size: geo.size)
@@ -1129,6 +1145,14 @@ public struct AndroidVideoCallView: View {
     }
     
     // MARK: - Size Management
+    /// Bottom inset for the local preview so rounded corners stay above call controls
+    /// and the Android system navigation bar (especially during screen share).
+    private func localPreviewBottomPadding(in geo: GeometryProxy) -> CGFloat {
+        let callControlsInset: CGFloat = 128
+        let screenShareStripInset: CGFloat = hasActiveRemoteScreenShare ? 16 : 0
+        return callControlsInset + geo.safeAreaInsets.bottom + screenShareStripInset
+    }
+
     /// Computes an appropriate overlay size for the local preview based on container size.
     func setSize(size: CGSize) -> CGSize {
         let screenWidth = size.width

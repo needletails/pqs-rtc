@@ -274,7 +274,8 @@ public struct CollectionViewSections {
     private static func conferenceCustomItems(
         itemCount: Int,
         containerSize: CGSize,
-        insets: NSDirectionalEdgeInsets
+        insets: NSDirectionalEdgeInsets,
+        preferVerticalStack: Bool = false
     ) -> [NSCollectionLayoutGroupCustomItem] {
         guard itemCount > 0 else { return [] }
 
@@ -299,11 +300,14 @@ public struct CollectionViewSections {
         }()
 
         // Phones lay participants out as a single horizontal collection (not a vertical
-        // stack); tiles stay uniform 16:9 and shrink to fit the row.
+        // stack) during screen share on the bottom strip; tall sidebars stay vertical.
         let isPhoneShape = min(containerSize.width, containerSize.height) < 600
+        let useHorizontalPhoneRow = !preferVerticalStack && isPhoneShape && itemCount <= 4
         let grid: (columns: Int, rows: Int)
-        if isPhoneShape, itemCount <= 4 {
+        if useHorizontalPhoneRow {
             grid = (columns: itemCount, rows: 1)
+        } else if preferVerticalStack {
+            grid = (columns: 1, rows: itemCount)
         } else {
             grid = bestConferenceGrid(
                 itemCount: itemCount,
@@ -658,7 +662,8 @@ public struct CollectionViewSections {
         func cameraStripGroup(
             cameraTileCount: Int,
             stripSize: CGSize?,
-            layoutSize: NSCollectionLayoutSize
+            layoutSize: NSCollectionLayoutSize,
+            preferVerticalStack: Bool
         ) -> NSCollectionLayoutGroup {
             let baseInsets = conferenceContentInsets(
                 base: Self.defaultContentInsets,
@@ -676,9 +681,24 @@ public struct CollectionViewSections {
                 return Self.conferenceCustomItems(
                     itemCount: cameraTileCount,
                     containerSize: CGSize(width: width, height: height),
-                    insets: baseInsets
+                    insets: baseInsets,
+                    preferVerticalStack: preferVerticalStack
                 )
             }
+        }
+
+        /// Wide layouts place participants in a tall sidebar — one 16:9 tile per row.
+        func verticalSidebarCameraStripGroup(
+            cameraTileCount: Int,
+            stripSize: CGSize?,
+            layoutSize: NSCollectionLayoutSize
+        ) -> NSCollectionLayoutGroup {
+            cameraStripGroup(
+                cameraTileCount: cameraTileCount,
+                stripSize: stripSize,
+                layoutSize: layoutSize,
+                preferVerticalStack: true
+            )
         }
 
         let outerSize = outerLayoutSize(for: groupAbsoluteExtent)
@@ -721,7 +741,7 @@ public struct CollectionViewSections {
                 )
             }
             let screenGroup = NSCollectionLayoutGroup.horizontal(layoutSize: screenSize, subitems: [screenItem])
-            let cameraGroup = cameraStripGroup(
+            let cameraGroup = verticalSidebarCameraStripGroup(
                 cameraTileCount: visibleCameraCount,
                 stripSize: cameraStripSize,
                 layoutSize: cameraSize
@@ -768,10 +788,12 @@ public struct CollectionViewSections {
                 )
             }
             let screenGroup = NSCollectionLayoutGroup.horizontal(layoutSize: screenSize, subitems: [screenItem])
+            let preferVerticalStack = cameraStripSize.map { $0.height > $0.width * 1.08 } ?? false
             let cameraGroup = cameraStripGroup(
                 cameraTileCount: visibleCameraCount,
                 stripSize: cameraStripSize,
-                layoutSize: cameraSize
+                layoutSize: cameraSize,
+                preferVerticalStack: preferVerticalStack
             )
             outerGroup = NSCollectionLayoutGroup.vertical(layoutSize: outerSize, subitems: [screenGroup, cameraGroup])
         }
