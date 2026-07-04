@@ -18,16 +18,39 @@ import NeedleTailLogger
 @MainActor
 public final class AndroidVideoCallActionBridge: CallActionDelegate, @unchecked Sendable {
     private static let logger = NeedleTailLogger()
+    private static weak var activeBridge: AndroidVideoCallActionBridge?
     private var controller: AndroidVideoCallController?
 
     public init() {}
 
     public func bind(_ controller: AndroidVideoCallController) {
         self.controller = controller
+        Self.activeBridge = self
     }
 
     public func clearBinding() {
         controller = nil
+        if Self.activeBridge === self {
+            Self.activeBridge = nil
+        }
+    }
+
+    /// Hides or restores native video surfaces for the active in-call bridge (minimize/browse).
+    public static func setActiveCallVideoSurfacesHidden(_ hidden: Bool) async {
+        await activeBridge?.setVideoSurfacesHidden(hidden)
+    }
+
+    /// Rebinds live tracks after Android recreates SurfaceViews on app foreground.
+    public static func reconcileActiveCallVideoSurfacesAfterForeground() async {
+        await activeBridge?.reconcileVideoSurfacesAfterAppForeground()
+    }
+
+    public func setVideoSurfacesHidden(_ hidden: Bool) async {
+        await controller?.setVideoSurfacesHidden(hidden)
+    }
+
+    public func reconcileVideoSurfacesAfterAppForeground() async {
+        await controller?.reconcileVideoSurfacesAfterAppForeground()
     }
 
     public func endCall() async {

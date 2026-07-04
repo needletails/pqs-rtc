@@ -170,17 +170,21 @@ extension RTCSession {
 
         // A stale timer can race after ICE already connected but before call-state propagation.
         // If the live peer is already connected, suppress relay retry.
-#if canImport(WebRTC) && !os(Android)
-        if let liveConnection = await connectionManager.findConnection(with: connectionId) {
-            let iceState = liveConnection.peerConnection.iceConnectionState
-            let pcState = liveConnection.peerConnection.connectionState
-            if iceState == .connected || iceState == .completed || pcState == .connected {
-                cancelRelayFallbackTimer(connectionId: connectionId)
-                logger.log(level: .info, message: "Skipping relay fallback for connection=\(connectionId) because peer is already connected (ice=\(iceState.rawValue) pc=\(pcState.rawValue))")
-                return false
-            }
+        if await peerTransportIsEstablished(for: connectionId) {
+            cancelRelayFallbackTimer(connectionId: connectionId)
+            logger.log(
+                level: .info,
+                message: "Skipping relay fallback for connection=\(connectionId) because peer transport is already established")
+            return false
         }
-#endif
+
+        if reason == "ice_timeout", case .connected = await callState.currentState {
+            cancelRelayFallbackTimer(connectionId: connectionId)
+            logger.log(
+                level: .info,
+                message: "Skipping relay fallback for connection=\(connectionId) because call is already connected (stale ice_timeout)")
+            return false
+        }
 
         existing.hasRetriedToRelay = true
         existing.currentPolicy = .relay
@@ -217,6 +221,22 @@ extension RTCSession {
             await finishEndConnection(currentCall: existing.latestCall)
             return false
         }
+    }
+
+    private func peerTransportIsEstablished(for connectionId: String) async -> Bool {
+        let key = normalizedFallbackConnectionId(for: connectionId)
+        guard let liveConnection = await connectionManager.findConnection(with: key) else {
+            return false
+        }
+#if canImport(WebRTC) && !os(Android)
+        let iceState = liveConnection.peerConnection.iceConnectionState
+        let pcState = liveConnection.peerConnection.connectionState
+        return iceState == .connected || iceState == .completed || pcState == .connected
+#elseif os(Android)
+        return rtcClient.peerConnectionTransportIsEstablished(liveConnection.peerConnection)
+#else
+        return false
+#endif
     }
 
     private func resendOfferForRelayFallback(call: Call) async throws -> Call {

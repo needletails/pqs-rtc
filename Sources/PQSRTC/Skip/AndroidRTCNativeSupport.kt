@@ -262,6 +262,27 @@ object AndroidRTCViewSupport {
         }
     }
 
+    /// Hides a view during call-chrome minimize without destroying its SurfaceView holder.
+    /// `View.GONE` tears down surfaces; off-screen translation does not move SurfaceView layers.
+    /// `INVISIBLE` keeps EGL sinks live while removing the layer from the screen.
+    fun setViewHiddenForCallChromeMinimize(view: android.view.View, hidden: Boolean, logTag: String) {
+        view.translationX = 0f
+        view.translationY = 0f
+        if (hidden) {
+            view.alpha = 0f
+            view.visibility = android.view.View.INVISIBLE
+        } else {
+            view.alpha = 1f
+            view.visibility = android.view.View.VISIBLE
+            view.requestLayout()
+        }
+        Log.d(
+            logTag,
+            "[CallChromeMinimize] setViewHiddenForCallChromeMinimize hidden=$hidden " +
+                "visibility=${view.visibility} alpha=${view.alpha}"
+        )
+    }
+
     fun isSurfaceReady(renderer: SurfaceViewRenderer): Boolean {
         return try {
             val surface = renderer.holder?.surface
@@ -1147,24 +1168,21 @@ class AndroidPreviewCaptureViewNative(
     }
 
     // SurfaceViews composite on their own window layer, so Compose alpha/size/offset modifiers
-    // cannot hide them. Toggling View visibility is the only reliable hide (e.g. while the call
-    // chrome is minimized to browse the app). Track sinks stay attached; rendering resumes when
-    // the surface is recreated on VISIBLE.
+    // cannot hide them during call-chrome minimize. Park native views off-screen instead of
+    // GONE so Surface holders and track sinks stay live (Apple-style browse-while-in-call).
     fun setHidden(hidden: Boolean) {
-        val targetVisibility = if (hidden) android.view.View.GONE else android.view.View.VISIBLE
         val onMainThread = Looper.myLooper() == Looper.getMainLooper()
-        val applyVisibility = {
-            val previous = surfaceViewRenderer.visibility
-            surfaceViewRenderer.visibility = targetVisibility
-            Log.d(
-                "AndroidPreviewCaptureView",
-                "[CallChromeMinimize] setHidden hidden=$hidden target=$targetVisibility previous=$previous onMainThread=$onMainThread"
+        val applyHidden = {
+            AndroidRTCViewSupport.setViewHiddenForCallChromeMinimize(
+                view = surfaceViewRenderer,
+                hidden = hidden,
+                logTag = "AndroidPreviewCaptureView"
             )
         }
         if (onMainThread) {
-            applyVisibility()
+            applyHidden()
         } else {
-            Handler(Looper.getMainLooper()).post { applyVisibility() }
+            Handler(Looper.getMainLooper()).post { applyHidden() }
         }
     }
 
@@ -1285,29 +1303,32 @@ class AndroidSampleCaptureViewNative(
     }
 
     // SurfaceViews composite on their own window layer, so Compose alpha/size/offset modifiers
-    // cannot hide them. Toggling View visibility is the only reliable hide (e.g. while the call
-    // chrome is minimized to browse the app). Track sinks stay attached; rendering resumes when
-    // the surface is recreated on VISIBLE.
+    // cannot hide them during call-chrome minimize. Park native views off-screen instead of
+    // GONE so Surface holders and track sinks stay live (Apple-style browse-while-in-call).
     fun setHidden(hidden: Boolean) {
-        val targetVisibility = if (hidden) android.view.View.GONE else android.view.View.VISIBLE
         val onMainThread = Looper.myLooper() == Looper.getMainLooper()
-        val applyVisibility = {
-            val previous = surfaceViewRenderer.visibility
-            surfaceViewRenderer.visibility = targetVisibility
-            // The aspect-fit host container is opaque black; leaving it visible while the
-            // renderer is hidden would paint a black box over the app when call chrome minimizes.
-            AndroidRTCViewSupport.aspectFitContainerOrNull(surfaceViewRenderer)?.visibility =
-                targetVisibility
+        val applyHidden = {
+            AndroidRTCViewSupport.setViewHiddenForCallChromeMinimize(
+                view = surfaceViewRenderer,
+                hidden = hidden,
+                logTag = "AndroidSampleCaptureView"
+            )
+            AndroidRTCViewSupport.aspectFitContainerOrNull(surfaceViewRenderer)?.let { container ->
+                AndroidRTCViewSupport.setViewHiddenForCallChromeMinimize(
+                    view = container,
+                    hidden = hidden,
+                    logTag = "AndroidSampleCaptureView"
+                )
+            }
             Log.d(
                 "AndroidSampleCaptureView",
-                "[CallChromeMinimize] setHidden hidden=$hidden target=$targetVisibility previous=$previous " +
-                    "onMainThread=$onMainThread participant=$rendererParticipantLabel"
+                "[CallChromeMinimize] setHidden hidden=$hidden participant=$rendererParticipantLabel onMainThread=$onMainThread"
             )
         }
         if (onMainThread) {
-            applyVisibility()
+            applyHidden()
         } else {
-            Handler(Looper.getMainLooper()).post { applyVisibility() }
+            Handler(Looper.getMainLooper()).post { applyHidden() }
         }
     }
 
@@ -2772,15 +2793,52 @@ object AndroidWebRTCTrackResolver {
     }
 
     /**
+     * Native `getTransceivers()` SIGSEGVs once signaling/connection state is CLOSED. Call this
+     * before any transceiver lookup (including cached snapshots) during teardown races.
+     */
+    fun peerConnectionIsUsableForTransceiverLookup(peerConnection: PeerConnection): Boolean {
+        return try {
+            when (peerConnection.signalingState()) {
+                PeerConnection.SignalingState.CLOSED -> false
+                else -> when (peerConnection.connectionState()) {
+                    PeerConnection.PeerConnectionState.CLOSED -> false
+                    else -> true
+                }
+            }
+        } catch (_: IllegalStateException) {
+            false
+        }
+    }
+
+    /** True when ICE/DTLS transport is already up; used to suppress stale relay-fallback retries. */
+    fun peerConnectionTransportIsEstablished(peerConnection: PeerConnection): Boolean {
+        if (!peerConnectionIsUsableForTransceiverLookup(peerConnection)) return false
+        return try {
+            when (peerConnection.iceConnectionState()) {
+                PeerConnection.IceConnectionState.CONNECTED,
+                PeerConnection.IceConnectionState.COMPLETED -> true
+                else -> peerConnection.connectionState() == PeerConnection.PeerConnectionState.CONNECTED
+            }
+        } catch (_: IllegalStateException) {
+            false
+        }
+    }
+
+    /**
      * Cached transceiver list for this peer connection. Refreshing disposes wrappers from the
      * previous refresh, so this must remain the only `getTransceivers()` call site.
      */
     @Synchronized
     fun transceivers(peerConnection: PeerConnection): List<RtpTransceiver> {
+        if (!peerConnectionIsUsableForTransceiverLookup(peerConnection)) {
+            invalidateTransceiverSnapshot(peerConnection)
+            return emptyList()
+        }
         transceiverSnapshots[peerConnection]?.let { return it }
         val fresh = try {
             peerConnection.getTransceivers().toList()
         } catch (_: IllegalStateException) {
+            invalidateTransceiverSnapshot(peerConnection)
             return emptyList()
         }
         transceiverSnapshots[peerConnection] = fresh

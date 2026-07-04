@@ -524,15 +524,13 @@ fileprivate final class AndroidVideoCallCoordinator: VideoCallDelegate {
     }
 
     public func screenShareDidChange(isSharing: Bool) async {
-        Task { @MainActor in
-            await Task.yield()
+        await MainActor.run {
             isScreenSharing?.wrappedValue = isSharing
         }
     }
 
     public func remoteScreenShareDidChange(participantId: String, isSharing: Bool) async {
-        Task { @MainActor in
-            await Task.yield()
+        await MainActor.run {
             hasActiveRemoteScreenShare?.wrappedValue = isSharing
         }
     }
@@ -553,7 +551,9 @@ fileprivate final class AndroidVideoCallResources {
     /// Whether video surfaces are hidden (call chrome minimized to browse the app).
     private(set) var videoSurfacesHidden = false
     private var _screenCaptureView: AndroidSampleCaptureView?
+    private var videoRenderersReleased = false
     private static let minimizeLogger = NeedleTailLogger()
+    private static let lifecycleLogger = NeedleTailLogger()
     /// Lazily created view for rendering a remote screen share.
     var screenCaptureView: AndroidSampleCaptureView {
         if let existing = _screenCaptureView { return existing }
@@ -581,6 +581,36 @@ fileprivate final class AndroidVideoCallResources {
             for view in added { view.setHidden(true) }
         }
         remoteCaptureViews.append(contentsOf: added)
+    }
+
+    /// Stops WebRTC `EglRenderer` stats threads by releasing every pooled call renderer.
+    /// Remote grid uses `cleanupOnDispose: false` during the call, so this must run on end.
+    func releaseAllVideoRenderers() {
+        guard !videoRenderersReleased else { return }
+        videoRenderersReleased = true
+        let remoteCount = remoteCaptureViews.count
+        let hadScreenView = _screenCaptureView != nil
+        Self.lifecycleLogger.log(
+            level: .info,
+            message: """
+            Releasing Android call video renderers remoteCount=\(remoteCount) \
+            hasScreenView=\(hadScreenView)
+            """
+        )
+        releaseRenderer(localCaptureView.surfaceViewRenderer)
+        for view in remoteCaptureViews {
+            releaseRenderer(view.surfaceViewRenderer)
+        }
+        if let screenView = _screenCaptureView {
+            releaseRenderer(screenView.surfaceViewRenderer)
+        }
+        _screenCaptureView = nil
+    }
+
+    private func releaseRenderer(_ renderer: org.webrtc.SurfaceViewRenderer) {
+        _client.removeRenderer(renderer)
+        AndroidRTCViewSupport.clearRendererImage(renderer: renderer)
+        _client.safeReleaseRenderer(renderer)
     }
 
     /// SurfaceViews ignore Compose alpha/size/offset modifiers, so hiding the call chrome must
@@ -636,6 +666,7 @@ fileprivate enum AndroidVideoCallResourceStore {
     }
 
     static func remove(for key: String) {
+        storage[key]?.releaseAllVideoRenderers()
         storage.removeValue(forKey: key)
     }
 }
@@ -876,23 +907,18 @@ public struct AndroidVideoCallView: View {
                             captureView: resources.screenCaptureView,
                             onSurfaceLayout: {
                                 Task { @MainActor in
-                                    await resources.controller.setScreenView(resources.screenCaptureView)
+                                    guard hasActiveRemoteScreenShare else { return }
+                                    let screenView = resources.screenCaptureView
+                                    guard screenView.rendererLayoutNeedsSinkReconcile()
+                                        || !screenView.hasActiveSink() else {
+                                        return
+                                    }
+                                    await resources.controller.setScreenView(screenView)
                                 }
                             }
                         )
                         .frame(maxWidth: .infinity)
                         .frame(height: geo.size.height * screenShareHeightFraction)
-                        .onAppear {
-                            Task { @MainActor in
-                                await resources.controller.setScreenView(resources.screenCaptureView)
-                            }
-                        }
-                        .onChange(of: hasActiveRemoteScreenShare) { _, isSharing in
-                            guard isSharing else { return }
-                            Task { @MainActor in
-                                await resources.controller.setScreenView(resources.screenCaptureView)
-                            }
-                        }
                         .background(Color.black)
                     }
 
@@ -968,6 +994,15 @@ public struct AndroidVideoCallView: View {
             }
             currentRemotePage = min(currentRemotePage, newCount - 1)
         }
+        .task(id: hasActiveRemoteScreenShare) {
+            let controller = resources.controller
+            let isSharing = hasActiveRemoteScreenShare
+            let screenCaptureView = resources.screenCaptureView
+            await controller.scheduleParticipantVideoReconcileAfterScreenShareLayoutChange(isSharing: isSharing)
+            if isSharing {
+                await controller.setScreenView(screenCaptureView)
+            }
+        }
         .onChange(of: hidesVideoSurfaces) { _, hidden in
             Self.minimizeLogger.log(
                 level: .info,
@@ -1006,10 +1041,13 @@ public struct AndroidVideoCallView: View {
                 await refreshVisibleRemoteCaptureViews(resources: updatedResources)
             }
         }
-        .onChange(of: callState) { _, _ in
+        .onChange(of: callState) { _, newState in
             Task { @MainActor in
+                if isTerminalCallState(newState) {
+                    resources.releaseAllVideoRenderers()
+                }
                 let slotCount = effectiveRemoteCount
-                guard slotCount > 1 else { return }
+                guard slotCount > 1, !isTerminalCallState(newState) else { return }
                 let updatedResources = AndroidVideoCallResourceStore.resources(
                     for: resourceKey,
                     session: session,
@@ -1020,15 +1058,31 @@ public struct AndroidVideoCallView: View {
                 await refreshVisibleRemoteCaptureViews(resources: updatedResources)
             }
         }
+        .onChange(of: endedCall) { _, ended in
+            guard ended else { return }
+            Task { @MainActor in
+                resources.releaseAllVideoRenderers()
+            }
+        }
         .task(id: raisedHandsRefreshToken) {
             await refreshGridRaisedHandFlags(resources: resources)
         }
         .onDisappear {
             Task { @MainActor in
                 actionBridge?.clearBinding()
+                resources.releaseAllVideoRenderers()
                 await resources.controller.stop()
                 AndroidVideoCallResourceStore.remove(for: resourceKey)
             }
+        }
+    }
+
+    private func isTerminalCallState(_ state: CallStateMachine.State) -> Bool {
+        switch state {
+        case .ended, .failed, .callAnsweredAuxDevice:
+            return true
+        default:
+            return false
         }
     }
 
@@ -1093,7 +1147,7 @@ public struct AndroidVideoCallView: View {
         )
         if gridLayoutChanged {
             for view in visibleRemoteCaptureViews {
-                view.rendererDidUpdateLayout()
+                view.rendererDidUpdateLayoutFromCompose()
             }
             await resources.controller.reattachAssignedParticipantVideoIfNeeded()
         }

@@ -116,7 +116,9 @@ enum AndroidGroupPostRenegotiationAttachCoordinator {
              "coordinator-finalize-media-ready",
              "coordinator-finalize-pending-wrapper",
              "coordinator-finalize-post-wait-wrapper-sync",
-             "late-participant-assignment":
+             "late-participant-assignment",
+             "screen-share-layout-reattach",
+             "screen-share-stop-layout-reattach":
             return false
         default:
             return true
@@ -473,6 +475,7 @@ enum AndroidGroupParticipantRendererAttachPolicy {
         "post-renegotiation-grid-layout",
         "participant-track-refresh",
         "coordinator-settlement",
+        "grid-layout-reattach",
     ]
 
     /// Prefer the connection-map track for reasons that must not rotate peer-connection wrappers.

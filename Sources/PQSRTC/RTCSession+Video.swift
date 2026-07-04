@@ -832,6 +832,16 @@ extension RTCSession {
             return false
         }
 
+#if os(Android)
+        guard rtcClient.peerConnectionIsUsableForTrackResolution(connection.peerConnection) else {
+            logger.log(
+                level: .info,
+                message: "Skipping Android participant renderer attach — peer connection closed participant=\(participantId) connection=\(normalizedId)"
+            )
+            return false
+        }
+#endif
+
         if isGroupCallConnection(normalizedId),
            shouldDeferSfuGroupParticipantVideoAttach(for: normalizedId) {
             logger.log(
@@ -1190,7 +1200,6 @@ extension RTCSession {
     @discardableResult
     func renderRemoteScreenVideo(to view: AndroidSampleCaptureView, connectionId: String, participantId: String) async -> Bool {
         let normalizedId = connectionId.normalizedConnectionId
-        logger.log(level: .info, message: "Rendering remote screen video for connection=\(connectionId) participant=\(participantId)")
         let manager = connectionManager as RTCConnectionManager
 
         guard var connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
@@ -1218,6 +1227,13 @@ extension RTCSession {
         }
 
         if let screenTrack {
+            if view.hasActiveSink(),
+               view.attachedTrackIsLive(),
+               view.attachedTrackSharesRendererSink(with: screenTrack),
+               !view.rendererLayoutNeedsSinkReconcile() {
+                return true
+            }
+            logger.log(level: .info, message: "Rendering remote screen video for connection=\(connectionId) participant=\(participantId)")
             _ = view.attach(screenTrack)
             logger.log(level: .info, message: "Remote screen renderer attached for participant=\(participantId)")
             return true

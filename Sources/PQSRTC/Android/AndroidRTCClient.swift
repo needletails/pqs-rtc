@@ -2556,6 +2556,16 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///
     /// This uses transceivers (Unified Plan) and returns the receiver's track if present.
     /// For 1:1 calls only — group calls should use ``getRemoteVideoTrackById``.
+    public func peerConnectionIsUsableForTrackResolution(_ peerConnection: RTCPeerConnection) -> Bool {
+        guard let pc = peerConnection.platformPeerConnection else { return false }
+        return AndroidWebRTCTrackResolver.peerConnectionIsUsableForTransceiverLookup(peerConnection: pc)
+    }
+
+    public func peerConnectionTransportIsEstablished(_ peerConnection: RTCPeerConnection) -> Bool {
+        guard let pc = peerConnection.platformPeerConnection else { return false }
+        return AndroidWebRTCTrackResolver.peerConnectionTransportIsEstablished(peerConnection: pc)
+    }
+
     public func getRemoteVideoTrack(peerConnection: RTCPeerConnection) -> RTCVideoTrack? {
         lock.lock()
         let isClosedCheck = isClosed
@@ -2564,6 +2574,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         guard !isClosedCheck else { return nil }
         
         guard let pc = peerConnection.platformPeerConnection else { return nil }
+        guard AndroidWebRTCTrackResolver.peerConnectionIsUsableForTransceiverLookup(peerConnection: pc) else {
+            return nil
+        }
         return AndroidWebRTCTrackResolver.firstRemoteCameraTrack(peerConnection: pc)
     }
 
@@ -2578,6 +2591,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
         guard !isClosedCheck else { return nil }
         guard let pc = peerConnection.platformPeerConnection else { return nil }
+        guard AndroidWebRTCTrackResolver.peerConnectionIsUsableForTransceiverLookup(peerConnection: pc) else {
+            return nil
+        }
         return AndroidWebRTCTrackResolver.remoteCameraTrackById(peerConnection: pc, trackId: trackId)
     }
 
@@ -2599,6 +2615,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
         guard !isClosedCheck else { return nil }
         guard let pc = peerConnection.platformPeerConnection else { return nil }
+        guard AndroidWebRTCTrackResolver.peerConnectionIsUsableForTransceiverLookup(peerConnection: pc) else {
+            return nil
+        }
         return AndroidWebRTCTrackResolver.remoteCameraTrackByMid(peerConnection: pc, mid: mid)
     }
 

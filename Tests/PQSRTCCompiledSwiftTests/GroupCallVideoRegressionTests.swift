@@ -279,6 +279,12 @@ struct GroupCallVideoRegressionTests {
             "grid-layout-reattach",
             episodeActive: true))
         #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldSuppressParticipantVideoAttachReason(
+            "screen-share-layout-reattach",
+            episodeActive: true) == false)
+        #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldSuppressParticipantVideoAttachReason(
+            "screen-share-stop-layout-reattach",
+            episodeActive: true) == false)
+        #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldSuppressParticipantVideoAttachReason(
             "post-renegotiation-coordinator",
             episodeActive: true) == false)
         #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldSuppressParticipantVideoAttachReason(

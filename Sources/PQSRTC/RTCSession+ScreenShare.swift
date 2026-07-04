@@ -477,6 +477,7 @@ extension RTCSession {
     /// Removes the screen share track and stops capture.
     public func removeScreenTrackFromStream(connectionId: String) async {
         let normalizedId = connectionId.normalizedConnectionId
+        cancelRelayFallbackTimer(connectionId: normalizedId)
 #if canImport(WebRTC) && !os(Android)
         await endSystemAudioShareEgressIfNeeded(connectionId: normalizedId)
 #endif
