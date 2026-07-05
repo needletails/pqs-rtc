@@ -474,7 +474,11 @@ extension RTCSession {
         let callId = resolvedCall.sharedCommunicationId.stableUUIDConnectionId
         pendingAnswerCallId = callId
         if callAnswerStatesById[callId] == nil {
-            callAnswerStatesById[callId] = .pending
+            // Seed from the session-level answer state instead of `.pending`. `answerCall` may
+            // have already accepted this call via `setCanAnswer(true)` before a per-call entry
+            // existed; seeding `.pending` here would shadow that acceptance and make the
+            // inbound `call_cipher` guard treat the active answerer as a non-active sibling.
+            callAnswerStatesById[callId] = callAnswerState
         }
 
         try await receiveCiphertext(

@@ -343,6 +343,18 @@ actor TaskProcessor {
             throw RTCErrors.invalidConfiguration("Remote props not found for roomId=\(outboundTask.roomId)")
         }
 
+        // Diagnostic (opt-in via SFU_DEBUG_CRYPTO_WIRING): prove which identities this
+        // frame is encrypted with (public-key digest prefixes only; no key material).
+        // Compare `remotePropsFp` with the SFU's logged room identity fingerprint, and
+        // `localPropsFp` with the fingerprint the SFU stored at negotiation, to pin any
+        // decrypt mismatch.
+        if KeyFingerprint.isEnabled {
+            let localPropsFp = await KeyFingerprint.localIdentity(connectionIdentity)
+            logger.log(
+                level: .info,
+                message: "SFU encrypt outbound flag=\(outboundTask.flag) room=\(identityLookupId) sessionId=\(identity.id.uuidString) remotePropsFp=\(KeyFingerprint.props(remoteProps)) localPropsFp=\(localPropsFp)")
+        }
+
         // Call senderInitialization before encrypt
         try await ratchetManager.senderInitialization(
             sessionIdentity: identity,

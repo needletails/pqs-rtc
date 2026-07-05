@@ -165,6 +165,13 @@ extension RTCSession {
         try await createStateStream(with: call)
         await setConnectingIfReady(call: call, callDirection: .inbound(call.supportsVideo ? .video : .voice))
         
+        // Register the answered state under this call's stable id, not only the global flag.
+        // The inbound `call_cipher` sibling-device guard reads
+        // `callAnswerStatesById[callId] ?? callAnswerState`; if only the global flag is set,
+        // `finishCryptoSessionCreation` later seeds the per-call entry and can shadow the
+        // answered intent, leaving the direct 1:1 answerer stuck with `answerState=pending`
+        // (cipher ignored → no PC → no offer ever reaches the server).
+        pendingAnswerCallId = call.sharedCommunicationId.stableUUIDConnectionId
         setCanAnswer(true)
 
         // Stop ringing on this user's other devices the moment this device commits to answering.

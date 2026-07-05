@@ -597,6 +597,7 @@ fileprivate final class AndroidVideoCallResources {
             hasScreenView=\(hadScreenView)
             """
         )
+#if SKIP
         releaseRenderer(localCaptureView.surfaceViewRenderer)
         for view in remoteCaptureViews {
             releaseRenderer(view.surfaceViewRenderer)
@@ -604,15 +605,18 @@ fileprivate final class AndroidVideoCallResources {
         if let screenView = _screenCaptureView {
             releaseRenderer(screenView.surfaceViewRenderer)
         }
+#endif
         _screenCaptureView = nil
     }
 
+#if SKIP
     private func releaseRenderer(_ renderer: org.webrtc.SurfaceViewRenderer) {
         _client.removeRenderer(renderer)
         AndroidRTCViewSupport.clearRendererImage(renderer: renderer)
         _client.safeReleaseRenderer(renderer)
     }
-
+#endif
+    
     /// SurfaceViews ignore Compose alpha/size/offset modifiers, so hiding the call chrome must
     /// toggle native View visibility on every renderer. Sinks stay attached; restoring is instant.
     func setVideoSurfacesHidden(_ hidden: Bool, source: String = "unknown") {

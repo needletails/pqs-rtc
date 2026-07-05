@@ -231,6 +231,11 @@ extension RTCSession {
         guard call.signalingIdentityProps != nil else {
             throw EncryptionErrors.missingProps
         }
+        if KeyFingerprint.isEnabled {
+            logger.log(
+                level: .info,
+                message: "SFU negotiation outbound localPropsFp=\(KeyFingerprint.props(call.signalingIdentityProps)) room=\(normalizedConnectionId) callId=\(call.id.uuidString)")
+        }
 
         // Create Group call with needed metadata (key by normalized ID).
         let group = createGroupCall(
@@ -329,6 +334,11 @@ extension RTCSession {
         // before registration and create a room-scoped signaling identity with the peer's props; if
         // we keep that provisional identity, the next `.offer` / `.candidate` is encrypted to the
         // peer instead of the SFU and the server rejects it with `maxSkippedHeadersExceeded`.
+        if KeyFingerprint.isEnabled {
+            logger.log(
+                level: .info,
+                message: "SFU registration inbound sfuPropsFp=\(KeyFingerprint.props(props)) room=\(connId) callId=\(call.id.uuidString) deviceId=\(deviceId.uuidString)")
+        }
         _ = try await pcKeyManager.createSFUSignalingRecipientIdentity(
             roomId: call.sharedCommunicationId,
             deviceId: deviceId,
