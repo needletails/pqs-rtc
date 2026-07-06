@@ -1,5 +1,9 @@
 # PQSRTC
 
+[![Swift](https://img.shields.io/badge/Swift-6.3-orange.svg)](https://swift.org)
+[![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B%20%7C%20Android%2012%2B-blue.svg)](https://developer.apple.com)
+[![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE.txt)
+
 PQSRTC is a cross-platform real-time communications (RTC) core designed for Apple platforms (Swift) and Android (Kotlin) via [Skip](https://skip.tools).
 
 It provides WebRTC session orchestration, call state/state-machine helpers, and optional frame-level end-to-end encryption (E2EE) primitives.
