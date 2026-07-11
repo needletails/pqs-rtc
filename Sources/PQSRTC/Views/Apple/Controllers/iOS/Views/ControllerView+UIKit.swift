@@ -20,13 +20,14 @@ import UIKit
 
 // MARK: - Voice call backdrop (audio-only)
 
-/// Full-screen ambient chrome for voice calls: gradient field + monogram, aligned with premium VoIP apps.
+/// Full-screen ambient chrome for voice calls: gradient field + avatar/monogram, aligned with premium VoIP apps.
 @MainActor
 private final class VoiceCallChromeView: UIView {
     private let gradientLayer = CAGradientLayer()
     private let pulseRing = UIView()
     private let avatarCircle = UIView()
     private let monogramLabel = UILabel()
+    private let avatarImageView = UIImageView()
     private let iconView = UIImageView()
 
     override init(frame: CGRect) {
@@ -57,7 +58,14 @@ private final class VoiceCallChromeView: UIView {
         avatarCircle.layer.cornerRadius = 64
         avatarCircle.layer.borderWidth = 1.5
         avatarCircle.layer.borderColor = UIColor.white.withAlphaComponent(0.28).cgColor
+        avatarCircle.clipsToBounds = true
         addSubview(avatarCircle)
+
+        avatarImageView.translatesAutoresizingMaskIntoConstraints = false
+        avatarImageView.contentMode = .scaleAspectFill
+        avatarImageView.clipsToBounds = true
+        avatarImageView.isHidden = true
+        avatarCircle.addSubview(avatarImageView)
 
         monogramLabel.translatesAutoresizingMaskIntoConstraints = false
         monogramLabel.font = .systemFont(ofSize: 40, weight: .semibold)
@@ -86,6 +94,11 @@ private final class VoiceCallChromeView: UIView {
             avatarCircle.widthAnchor.constraint(equalToConstant: 128),
             avatarCircle.heightAnchor.constraint(equalToConstant: 128),
 
+            avatarImageView.topAnchor.constraint(equalTo: avatarCircle.topAnchor),
+            avatarImageView.leadingAnchor.constraint(equalTo: avatarCircle.leadingAnchor),
+            avatarImageView.bottomAnchor.constraint(equalTo: avatarCircle.bottomAnchor),
+            avatarImageView.trailingAnchor.constraint(equalTo: avatarCircle.trailingAnchor),
+
             monogramLabel.centerXAnchor.constraint(equalTo: avatarCircle.centerXAnchor),
             monogramLabel.centerYAnchor.constraint(equalTo: avatarCircle.centerYAnchor),
             monogramLabel.leadingAnchor.constraint(greaterThanOrEqualTo: avatarCircle.leadingAnchor, constant: 8),
@@ -107,9 +120,18 @@ private final class VoiceCallChromeView: UIView {
         gradientLayer.frame = bounds
     }
 
-    func configure(monogram: String) {
-        let trimmed = monogram.trimmingCharacters(in: .whitespacesAndNewlines)
-        monogramLabel.text = trimmed.isEmpty ? "?" : trimmed.uppercased()
+    func configure(monogram: String, avatarImage: UIImage? = nil) {
+        if let avatarImage {
+            avatarImageView.image = avatarImage
+            avatarImageView.isHidden = false
+            monogramLabel.isHidden = true
+        } else {
+            avatarImageView.image = nil
+            avatarImageView.isHidden = true
+            monogramLabel.isHidden = false
+            let trimmed = monogram.trimmingCharacters(in: .whitespacesAndNewlines)
+            monogramLabel.text = trimmed.isEmpty ? "?" : trimmed.uppercased()
+        }
     }
 
     func startAmbientMotion() {
@@ -349,7 +371,7 @@ class ControllerView: UIView {
 
     // MARK: - Voice call chrome (audio-only)
     /// Shows or hides the full-screen voice backdrop behind video layers and SwiftUI controls.
-    func setVoiceCallChromeVisible(_ visible: Bool, monogram: String = "") {
+    func setVoiceCallChromeVisible(_ visible: Bool, monogram: String = "", avatarImage: UIImage? = nil) {
         if visible {
             let chrome = voiceCallChrome ?? VoiceCallChromeView()
             if voiceCallChrome == nil {
@@ -363,7 +385,7 @@ class ControllerView: UIView {
                     chrome.trailingAnchor.constraint(equalTo: trailingAnchor)
                 ])
             }
-            chrome.configure(monogram: monogram)
+            chrome.configure(monogram: monogram, avatarImage: avatarImage)
             chrome.isHidden = false
             chrome.startAmbientMotion()
         } else {

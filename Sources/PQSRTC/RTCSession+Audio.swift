@@ -328,16 +328,24 @@ extension RTCSession {
 #endif
     
 #if os(macOS)
-    public func startRingtone() async {
-        if let url = Bundle.main.url(forResource: "ringtone", withExtension: "mp3") {
-            do {
-                audioPlayer = try AVAudioPlayer(contentsOf: url)
-                audioPlayer?.volume = 0.5
-                audioPlayer?.prepareToPlay()
-                audioPlayer?.play()
-            } catch {
-                logger.log(level: .error, message: "Error initializing player: \(error.localizedDescription)")
-            }
+    public func startRingtone(resourceURL: URL? = nil) async {
+        let url = resourceURL
+            ?? Bundle.main.url(forResource: "ringtone", withExtension: "wav")
+            ?? Bundle.main.url(forResource: "ringtone", withExtension: "mp3")
+            ?? Bundle.allBundles.lazy.compactMap { $0.url(forResource: "ringtone", withExtension: "wav") }.first
+            ?? Bundle.allBundles.lazy.compactMap { $0.url(forResource: "ringtone", withExtension: "mp3") }.first
+        guard let url else {
+            logger.log(level: .error, message: "Ringtone resource ringtone.wav/mp3 not found")
+            return
+        }
+        do {
+            audioPlayer = try AVAudioPlayer(contentsOf: url)
+            audioPlayer?.numberOfLoops = -1
+            audioPlayer?.volume = 0.5
+            audioPlayer?.prepareToPlay()
+            audioPlayer?.play()
+        } catch {
+            logger.log(level: .error, message: "Error initializing player: \(error.localizedDescription)")
         }
     }
     
@@ -345,6 +353,7 @@ extension RTCSession {
         if audioPlayer?.isPlaying == true {
             audioPlayer?.stop()
         }
+        audioPlayer = nil
     }
 #endif
 }

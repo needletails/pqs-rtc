@@ -153,18 +153,36 @@ public struct CollectionViewSections {
     
     #if os(iOS)
     private func createFullScreenLayout() -> NSCollectionLayoutSection {
+        createFullScreenLayout(groupAbsoluteExtent: nil)
+    }
+
+    private func createFullScreenLayout(groupAbsoluteExtent: CGSize?) -> NSCollectionLayoutSection {
         let itemSize = NSCollectionLayoutSize(
             widthDimension: .fractionalWidth(1.0),
             heightDimension: .fractionalHeight(1.0))
         let item = NSCollectionLayoutItem(layoutSize: itemSize)
-        
-        let group = NSCollectionLayoutGroup.horizontal(
-            layoutSize: NSCollectionLayoutSize(
+
+        let groupLayoutSize: NSCollectionLayoutSize
+        if let g = groupAbsoluteExtent, g.width >= 1, g.height >= 1 {
+            groupLayoutSize = NSCollectionLayoutSize(
+                widthDimension: .absolute(max(1, g.width)),
+                heightDimension: .absolute(max(1, g.height)))
+        } else {
+            groupLayoutSize = NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1.0),
-                heightDimension: .fractionalHeight(1.0)),
+                heightDimension: .fractionalHeight(1.0))
+        }
+
+        let group = NSCollectionLayoutGroup.horizontal(
+            layoutSize: groupLayoutSize,
             subitems: [item])
-        
+
         return NSCollectionLayoutSection(group: group)
+    }
+
+    /// Pins the solo remote tile to the live collection bounds (critical after landscape rotation).
+    public func fullScreenItem(groupAbsoluteExtent: CGSize) -> NSCollectionLayoutSection {
+        createFullScreenLayout(groupAbsoluteExtent: groupAbsoluteExtent)
     }
     #endif
     

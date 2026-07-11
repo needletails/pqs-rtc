@@ -46,6 +46,10 @@ public final class VideoCallViewController: UICollectionViewController {
     /// Held **strongly** so the SwiftUI `Coordinator` is not released while this controller is alive
     /// (`weak` here caused `localMuteDisplayDidChange` to no-op after layout cycles). Cleared in ``tearDownCall()``.
     public var videoCallDelegate: VideoCallDelegate?
+    /// Optional host-provided remote display name (contact list / chat title) for voice chrome.
+    public var remotePartyNameOverride: String = ""
+    /// Optional host-provided remote profile image bytes for voice chrome (preferred over monogram).
+    public var remotePartyAvatarData: Data?
     private let logger = NeedleTailLogger("[VideoCallViewController]")
     private let controllerView = ControllerView()
     private let videoViews = VideoViews()
@@ -94,6 +98,8 @@ public final class VideoCallViewController: UICollectionViewController {
     private let conferencePageIndicatorLabel = UILabel()
     private var lastConferencePageIndicatorSignature = ""
     private var lastConferenceLayoutBoundsSize: CGSize = .zero
+    /// Last collection bounds used to invalidate fullscreen/conference layout on rotation.
+    private var lastVideoLayoutBoundsSize: CGSize = .zero
     /// Tracks whether the current snapshot includes a screen-share tile (local or remote).
     private var hasVisibleScreenShareInCollection = false
     /// Last non-zero compositional container size; used when the layout environment briefly reports `.zero`.
@@ -529,11 +535,15 @@ public final class VideoCallViewController: UICollectionViewController {
     public override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let boundsSize = collectionView.bounds.size
-        if currentSectionType == .conference,
-           abs(boundsSize.width - lastConferenceLayoutBoundsSize.width) > 0.5 ||
-            abs(boundsSize.height - lastConferenceLayoutBoundsSize.height) > 0.5 {
+        let sizeChanged = abs(boundsSize.width - lastVideoLayoutBoundsSize.width) > 0.5
+            || abs(boundsSize.height - lastVideoLayoutBoundsSize.height) > 0.5
+        if sizeChanged, boundsSize.width >= 1, boundsSize.height >= 1 {
+            lastVideoLayoutBoundsSize = boundsSize
             lastConferenceLayoutBoundsSize = boundsSize
             collectionView.collectionViewLayout.invalidateLayout()
+            Task { @MainActor [weak self] in
+                await self?.syncParticipantCameraTileAspectModes()
+            }
         }
         updateConferencePageIndicator()
     }
@@ -547,8 +557,26 @@ public final class VideoCallViewController: UICollectionViewController {
             controllerView.setVoiceCallChromeVisible(false)
             return
         }
-        let mono = Self.voiceMonogram(for: state)
-        controllerView.setVoiceCallChromeVisible(true, monogram: mono)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.shouldPresentVoiceChrome(for: self.currentCallState) else {
+                self.controllerView.setVoiceCallChromeVisible(false)
+                return
+            }
+            let localId = await self.resolveLocalParticipantSecretName()
+            let mono = Self.voiceMonogram(
+                for: self.currentCallState,
+                localSecretName: localId,
+                nameOverride: self.remotePartyNameOverride
+            )
+            let avatarImage = self.remotePartyAvatarData.flatMap { UIImage(data: $0) }
+            self.controllerView.setVoiceCallChromeVisible(true, monogram: mono, avatarImage: avatarImage)
+        }
+    }
+
+    /// Re-applies voice chrome when host-provided name/avatar overrides change.
+    public func refreshVoiceCallChromeIfNeeded() {
+        syncVoiceCallChrome(with: currentCallState)
     }
 
     private func shouldPresentVoiceChrome(for state: CallStateMachine.State) -> Bool {
@@ -563,7 +591,25 @@ public final class VideoCallViewController: UICollectionViewController {
         }
     }
 
-    private static func voiceMonogram(for state: CallStateMachine.State) -> String {
+    private func resolveLocalParticipantSecretName() async -> String? {
+        let connectionId: String
+        if let existing = currentCall?.sharedCommunicationId
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !existing.isEmpty {
+            connectionId = existing
+        } else if let fallback = await session.fallbackConnectionIdForMuteControls() {
+            connectionId = fallback
+        } else {
+            return nil
+        }
+        return await session.localParticipantId(forCallConnectionId: connectionId)
+    }
+
+    private static func voiceMonogram(
+        for state: CallStateMachine.State,
+        localSecretName: String?,
+        nameOverride: String
+    ) -> String {
         let call: Call
         let direction: CallStateMachine.CallDirection?
         switch state {
@@ -582,11 +628,26 @@ public final class VideoCallViewController: UICollectionViewController {
         default:
             return ""
         }
-        let name = remoteDisplayName(call: call, direction: direction)
+        let fromCall = remoteDisplayName(
+            call: call,
+            direction: direction,
+            localSecretName: localSecretName
+        )
+        let override = nameOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = !fromCall.isEmpty ? fromCall : override
         return initials(from: name)
     }
 
-    private static func remoteDisplayName(call: Call, direction: CallStateMachine.CallDirection?) -> String {
+    private static func remoteDisplayName(
+        call: Call,
+        direction: CallStateMachine.CallDirection?,
+        localSecretName: String?
+    ) -> String {
+        let fromLocalAware = call.remoteDisplayName(localSecretName: localSecretName)
+        if !fromLocalAware.isEmpty {
+            return fromLocalAware
+        }
+        // Fallback when the connection is not ready yet (no local id).
         let participant: Call.Participant?
         if let direction {
             switch direction {
@@ -814,8 +875,7 @@ public final class VideoCallViewController: UICollectionViewController {
             await applyMainRemoteTileInboundExpectation(connectionId: connectionId)
             if let remoteView = videoViews.views.first(where: { $0.videoView.contextName == "sample" })?.videoView,
                let remoteRenderer = remoteView.renderer as? SampleBufferViewRenderer {
-                remoteView.setPrefersAspectFit(true)
-                await remoteRenderer.setPrefersAspectFit(true)
+                await applyRemoteCameraAspectPolicy(to: remoteView, renderer: remoteRenderer)
                 startRemoteVideoTrackPolling()
                 startRemoteRendererRecoveryIfNeeded(renderer: remoteRenderer, connectionId: connectionId)
             } else {
@@ -834,14 +894,14 @@ public final class VideoCallViewController: UICollectionViewController {
             logger.log(level: .error, message: "Failed to create sample view: \(error)")
             return
         }
-        remoteVideoView.setPrefersAspectFit(true)
+        await applyRemoteCameraAspectPolicy(to: remoteVideoView)
         videoViews.views.append(.init(videoView: remoteVideoView))
         await performQuery(removePreview: true)
         scheduleConnectedLocalPreviewStyleReapply()
         
         await remoteVideoView.startRendering()
         guard let remoteRenderer = remoteVideoView.renderer as? SampleBufferViewRenderer else { return }
-        await remoteRenderer.setPrefersAspectFit(true)
+        await applyRemoteCameraAspectPolicy(to: remoteVideoView, renderer: remoteRenderer)
         pipDelegate = remoteRenderer
         await self.session.renderRemoteVideo(
             to: remoteRenderer.rtcVideoRenderWrapper,
@@ -910,23 +970,46 @@ public final class VideoCallViewController: UICollectionViewController {
         return true
     }
 
+    /// Remote camera tiles in a multi-remote grid letterbox so portrait senders are not cropped.
+    /// A solo fullscreen remote fills only when the remote upright orientation matches the local
+    /// device viewport (portrait↔portrait or landscape↔landscape); mismatched pairs aspect-fit.
     private func participantCameraPrefersAspectFit() -> Bool {
-        // Letterbox remote camera tiles so portrait phone senders are not cropped to fill a
-        // landscape tablet/phone receiver. This must also hold when a group call shrinks to a
-        // single remote (e.g. Mac leaves and only Android remains): aspect-filling that lone
-        // tile crops the sender's orientation across the whole screen. macOS 1:1 uses the
-        // same policy.
-        true
+        remoteCameraTileCountForAspectPolicy() > 1
     }
 
-    /// Applies aspect-fit to remote camera tiles so portrait senders keep their orientation
-    /// and are not cropped into a landscape-looking tile.
+    private func participantCameraFillsWhenOrientationMatches() -> Bool {
+        remoteCameraTileCountForAspectPolicy() == 1 && !hasVisibleScreenShareInCollection
+    }
+
+    private func remoteCameraTileCountForAspectPolicy() -> Int {
+        videoViews.views.filter { isParticipantCameraModel($0) || isOneToOneRemoteCameraModel($0) }.count
+    }
+
+    @MainActor
+    private func applyRemoteCameraAspectPolicy(
+        to view: NTMTKView,
+        renderer: SampleBufferViewRenderer? = nil
+    ) async {
+        let prefersFit = participantCameraPrefersAspectFit()
+        let matchFill = participantCameraFillsWhenOrientationMatches()
+        view.setPrefersAspectFit(prefersFit)
+        view.setFillsWhenOrientationMatches(matchFill)
+        if let renderer {
+            await renderer.setPrefersAspectFit(prefersFit)
+            await renderer.setFillsWhenOrientationMatches(matchFill)
+        }
+    }
+
+    /// Syncs remote camera scale mode after roster/layout changes (fit in grids, match-fill when solo).
     private func syncParticipantCameraTileAspectModes() async {
         let prefersFit = participantCameraPrefersAspectFit()
+        let matchFill = participantCameraFillsWhenOrientationMatches()
         for model in videoViews.views where isParticipantCameraModel(model) || isOneToOneRemoteCameraModel(model) {
             model.videoView.setPrefersAspectFit(prefersFit)
+            model.videoView.setFillsWhenOrientationMatches(matchFill)
             if let renderer = model.videoView.renderer as? SampleBufferViewRenderer {
                 await renderer.setPrefersAspectFit(prefersFit)
+                await renderer.setFillsWhenOrientationMatches(matchFill)
             }
         }
     }
@@ -1155,8 +1238,7 @@ public final class VideoCallViewController: UICollectionViewController {
         if videoViews.views.contains(where: { $0.videoView.contextName == contextName }) {
             if let existingView = videoViews.views.first(where: { $0.videoView.contextName == contextName })?.videoView,
                let existingRenderer = existingView.renderer as? SampleBufferViewRenderer {
-                existingView.setPrefersAspectFit(participantCameraPrefersAspectFit())
-                await existingRenderer.setPrefersAspectFit(participantCameraPrefersAspectFit())
+                await applyRemoteCameraAspectPolicy(to: existingView, renderer: existingRenderer)
                 let didAttach = await session.renderRemoteVideoForParticipant(
                     to: existingRenderer.rtcVideoRenderWrapper,
                     connectionId: connectionId,
@@ -1181,7 +1263,7 @@ public final class VideoCallViewController: UICollectionViewController {
             logger.log(level: .error, message: "Failed to create participant camera view: \(error)")
             return
         }
-        cameraView.setPrefersAspectFit(participantCameraPrefersAspectFit())
+        await applyRemoteCameraAspectPolicy(to: cameraView)
 
         let model = VideoViewModel(
             videoView: cameraView,
@@ -1210,7 +1292,7 @@ public final class VideoCallViewController: UICollectionViewController {
             logger.log(level: .error, message: "Participant camera renderer unavailable, removing orphan tile for participant=\(participantId)")
             return
         }
-        await cameraRenderer.setPrefersAspectFit(participantCameraPrefersAspectFit())
+        await applyRemoteCameraAspectPolicy(to: cameraView, renderer: cameraRenderer)
 
         let didAttach = await session.renderRemoteVideoForParticipant(
             to: cameraRenderer.rtcVideoRenderWrapper,
@@ -1720,8 +1802,10 @@ public final class VideoCallViewController: UICollectionViewController {
 
     /// Updates the preview layout when the interface rotates.
     public override func viewWillTransition(to size: CGSize, with coordinator: any UIViewControllerTransitionCoordinator) {
+        collectionView.collectionViewLayout.invalidateLayout()
         Task { @MainActor [weak self] in
             guard let self else { return }
+            await self.syncParticipantCameraTileAspectModes()
             if await session.callState._callType == .video {
                 guard let localView = localPreviewView() else { return }
                 // Disable our own animation here; UIKit already animates alongside rotation via coordinator.
@@ -2046,7 +2130,7 @@ public final class VideoCallViewController: UICollectionViewController {
                     itemCount: resolvedItemCount,
                     containerSize: effective)
             }
-            return Self.sections.fullScreenItem()
+            return Self.sections.fullScreenItem(groupAbsoluteExtent: effective)
         }
     }
 

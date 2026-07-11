@@ -326,6 +326,16 @@ public actor RTCSession {
         }
         return raw.normalizedConnectionId
     }
+
+    /// Local participant secret name for call chrome (name / avatar resolution).
+    public func localParticipantId(forCallConnectionId connectionId: String) async -> String? {
+        let normalized = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard !normalized.isEmpty,
+              let connection = await connectionManager.findConnection(with: normalized)
+        else { return nil }
+        let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return local.isEmpty ? nil : local
+    }
     
     /// Legacy/global peer-connection state (kept for compatibility).
     ///

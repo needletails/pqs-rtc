@@ -118,6 +118,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
     private let initialLocalAudioMuted: Bool
     private let conferenceRaisedHands: [String: Bool]
     private let conferenceRaisedHandBadgeTopClearance: CGFloat
+    private let remotePartyNameOverride: String
+    private let remotePartyAvatarData: Data?
     private let controlsView: AnyView?
 
     /// Creates a representable that hosts a `VideoCallViewController`.
@@ -153,6 +155,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         conferenceRaisedHandBadgeTopClearance: CGFloat = 0,
         initialLocalVideoMuted: Bool = false,
         initialLocalAudioMuted: Bool = false,
+        remotePartyNameOverride: String = "",
+        remotePartyAvatarData: Data? = nil,
         controlsView: AnyView? = nil
     ) {
         self.session = session
@@ -171,6 +175,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         self.initialLocalAudioMuted = initialLocalAudioMuted
         self.conferenceRaisedHands = conferenceRaisedHands
         self.conferenceRaisedHandBadgeTopClearance = conferenceRaisedHandBadgeTopClearance
+        self.remotePartyNameOverride = remotePartyNameOverride
+        self.remotePartyAvatarData = remotePartyAvatarData
         self.controlsView = controlsView
     }
     
@@ -191,6 +197,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
         conferenceRaisedHandBadgeTopClearance: CGFloat = 0,
         initialLocalVideoMuted: Bool = false,
         initialLocalAudioMuted: Bool = false,
+        remotePartyNameOverride: String = "",
+        remotePartyAvatarData: Data? = nil,
         @ViewBuilder controlsView: () -> Controls
     ) {
         self.init(
@@ -210,6 +218,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
             conferenceRaisedHandBadgeTopClearance: conferenceRaisedHandBadgeTopClearance,
             initialLocalVideoMuted: initialLocalVideoMuted,
             initialLocalAudioMuted: initialLocalAudioMuted,
+            remotePartyNameOverride: remotePartyNameOverride,
+            remotePartyAvatarData: remotePartyAvatarData,
             controlsView: AnyView(controlsView())
         )
     }
@@ -223,6 +233,8 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
             delegate = vc
         }
         vc.videoCallDelegate = context.coordinator
+        vc.remotePartyNameOverride = remotePartyNameOverride
+        vc.remotePartyAvatarData = remotePartyAvatarData
         vc.applyInitialLocalMuteDisplayState(
             videoMuted: initialLocalVideoMuted,
             audioMuted: initialLocalAudioMuted
@@ -253,10 +265,13 @@ public struct VideoCallViewControllerRepresentable: UIViewControllerRepresentabl
             delegate = uiViewController
         }
         uiViewController.videoCallDelegate = context.coordinator
+        uiViewController.remotePartyNameOverride = remotePartyNameOverride
+        uiViewController.remotePartyAvatarData = remotePartyAvatarData
         uiViewController.updateConferenceRaisedHands(
             conferenceRaisedHands,
             topClearance: conferenceRaisedHandBadgeTopClearance
         )
+        uiViewController.refreshVoiceCallChromeIfNeeded()
     }
 
     public func makeCoordinator() -> Coordinator {
@@ -399,6 +414,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
     private let initialLocalAudioMuted: Bool
     private let conferenceRaisedHands: [String: Bool]
     private let conferenceRaisedHandBadgeTopClearance: CGFloat
+    private let remotePartyNameOverride: String
+    private let remotePartyAvatarData: Data?
     private let controlsView: AnyView?
 
     /// Creates a representable that hosts a `VideoCallViewController`.
@@ -434,6 +451,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         conferenceRaisedHandBadgeTopClearance: CGFloat = 0,
         initialLocalVideoMuted: Bool = false,
         initialLocalAudioMuted: Bool = false,
+        remotePartyNameOverride: String = "",
+        remotePartyAvatarData: Data? = nil,
         controlsView: AnyView? = nil
     ) {
         self.session = session
@@ -452,6 +471,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         self.initialLocalAudioMuted = initialLocalAudioMuted
         self.conferenceRaisedHands = conferenceRaisedHands
         self.conferenceRaisedHandBadgeTopClearance = conferenceRaisedHandBadgeTopClearance
+        self.remotePartyNameOverride = remotePartyNameOverride
+        self.remotePartyAvatarData = remotePartyAvatarData
         self.controlsView = controlsView
     }
     
@@ -472,6 +493,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         conferenceRaisedHandBadgeTopClearance: CGFloat = 0,
         initialLocalVideoMuted: Bool = false,
         initialLocalAudioMuted: Bool = false,
+        remotePartyNameOverride: String = "",
+        remotePartyAvatarData: Data? = nil,
         @ViewBuilder controlsView: () -> Controls
     ) {
         self.init(
@@ -491,6 +514,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
             conferenceRaisedHandBadgeTopClearance: conferenceRaisedHandBadgeTopClearance,
             initialLocalVideoMuted: initialLocalVideoMuted,
             initialLocalAudioMuted: initialLocalAudioMuted,
+            remotePartyNameOverride: remotePartyNameOverride,
+            remotePartyAvatarData: remotePartyAvatarData,
             controlsView: AnyView(controlsView())
         )
     }
@@ -504,6 +529,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
         }
         vc.usesEmbeddedControls = true
         vc.videoCallDelegate = context.coordinator
+        vc.remotePartyNameOverride = remotePartyNameOverride
+        vc.remotePartyAvatarData = remotePartyAvatarData
         vc.applyInitialLocalMuteDisplayState(
             videoMuted: initialLocalVideoMuted,
             audioMuted: initialLocalAudioMuted
@@ -532,6 +559,8 @@ public struct VideoCallViewControllerRepresentable: NSViewControllerRepresentabl
             delegate = nsViewController
         }
         nsViewController.videoCallDelegate = context.coordinator
+        nsViewController.remotePartyNameOverride = remotePartyNameOverride
+        nsViewController.remotePartyAvatarData = remotePartyAvatarData
         nsViewController.updateConferenceRaisedHands(
             conferenceRaisedHands,
             topClearance: conferenceRaisedHandBadgeTopClearance

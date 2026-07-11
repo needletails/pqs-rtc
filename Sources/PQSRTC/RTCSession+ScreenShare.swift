@@ -455,8 +455,24 @@ extension RTCSession {
         call: Call,
         permissions: ConferencePermissions
     ) -> Bool {
+        // True 1:1 SFU relay (wire present) never uses conference chrome.
         if Self.isTrueOneToOneSfuRoom(call: call) {
             return false
+        }
+        // UUID-shaped 1:1 (P2P or SFU Call copy missing wire) must stay on CallView controls
+        // even if an SFU roster briefly populates participantRoles.
+        if Self.isLikelyOneToOneSfuRoom(call: call), call.conferencePassword == nil {
+            let wire = (call.resolvedChannelWireId ?? call.channelWireId)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if wire.isEmpty {
+                return false
+            }
+            let commNorm = call.sharedCommunicationId
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .normalizedConnectionId
+            if wire.normalizedConnectionId == commNorm {
+                return false
+            }
         }
         if call.conferencePassword != nil {
             return true

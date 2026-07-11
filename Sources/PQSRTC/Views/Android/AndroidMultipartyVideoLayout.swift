@@ -1100,6 +1100,8 @@ enum AndroidMultipartyVideoLayout {
     /// Uses the renderer pool prefix (not assigned-only filtering) so tile surfaces stay mounted while
     /// participants assign. When two remotes are expected, reserve a 2-up layout before the second
     /// assignment lands so the first tile does not flash fullscreen (`1080×2520`) and back.
+    /// A true 2-person call (only one remote in the roster) mounts a single fullscreen slot so
+    /// remote video can aspect-fill the device orientation.
     static func multipartyGridSlotCount(
         assignedParticipantCount: Int,
         rosterRemoteSlotCount: Int,
@@ -1109,7 +1111,7 @@ enum AndroidMultipartyVideoLayout {
         if assignedParticipantCount >= 2 {
             return min(assignedParticipantCount, poolSize)
         }
-        if assignedParticipantCount > 0, poolSize >= 2 {
+        if assignedParticipantCount > 0, rosterRemoteSlotCount >= 2, poolSize >= 2 {
             return 2
         }
         if rosterRemoteSlotCount >= 2 {

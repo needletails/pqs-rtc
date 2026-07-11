@@ -435,6 +435,7 @@ object AndroidRTCViewSupport {
 
                 override fun onFrameResolutionChanged(width: Int, height: Int, rotation: Int) {
                     Log.d(logTag, "Renderer resolution: ${width}x${height}, rot=${rotation}")
+                    noteRendererFrameResolution(renderer, width, height, rotation)
                 }
             }
         )
@@ -502,6 +503,147 @@ object AndroidRTCViewSupport {
     private val rendererAspectFitContainers =
         WeakHashMap<SurfaceViewRenderer, android.widget.FrameLayout>()
 
+    private data class RemoteCameraScaleState(
+        var forceAspectFit: Boolean = true,
+        var fillWhenOrientationMatches: Boolean = false,
+        var cornerRadiusDp: Float = 0f,
+        var frameWidth: Int = 0,
+        var frameHeight: Int = 0,
+        var frameRotation: Int = 0,
+        var lastAppliedPreferFit: Boolean? = null,
+        var lastAppliedLocalWidth: Int = 0,
+        var lastAppliedLocalHeight: Int = 0,
+    )
+
+    private val rendererCameraScaleState =
+        WeakHashMap<SurfaceViewRenderer, RemoteCameraScaleState>()
+    private val rendererHostLayoutListenerInstalled =
+        WeakHashMap<android.widget.FrameLayout, Boolean>()
+    private val rendererHostLastLayoutSize =
+        WeakHashMap<android.widget.FrameLayout, Pair<Int, Int>>()
+
+    private fun uprightFrameDimensions(width: Int, height: Int, rotation: Int): Pair<Int, Int> {
+        val rot = ((rotation % 360) + 360) % 360
+        return if (rot == 90 || rot == 270) {
+            Pair(height, width)
+        } else {
+            Pair(width, height)
+        }
+    }
+
+    /// Mirrors ``RemoteCameraAspectPolicy.prefersAspectFit`` for the native renderer path.
+    private fun prefersAspectFitForState(
+        state: RemoteCameraScaleState,
+        localWidth: Int,
+        localHeight: Int,
+    ): Boolean {
+        if (state.forceAspectFit) return true
+        if (!state.fillWhenOrientationMatches) return false
+        val (upW, upH) = uprightFrameDimensions(
+            state.frameWidth,
+            state.frameHeight,
+            state.frameRotation
+        )
+        if (upW <= 0 || upH <= 0 || localWidth <= 0 || localHeight <= 0) {
+            return true
+        }
+        val remoteLandscape = upW > upH
+        val localLandscape = localWidth > localHeight
+        return remoteLandscape != localLandscape
+    }
+
+    private fun localViewportSizeForRenderer(
+        renderer: SurfaceViewRenderer,
+        container: android.widget.FrameLayout,
+    ): Pair<Int, Int> {
+        if (container.width > 0 && container.height > 0) {
+            return Pair(container.width, container.height)
+        }
+        if (renderer.width > 0 && renderer.height > 0) {
+            return Pair(renderer.width, renderer.height)
+        }
+        val metrics = renderer.resources.displayMetrics
+        return Pair(metrics.widthPixels, metrics.heightPixels)
+    }
+
+    private fun ensureRemoteCameraHostContainer(
+        renderer: SurfaceViewRenderer,
+    ): android.widget.FrameLayout {
+        val container = synchronized(rendererAspectFitContainers) {
+            rendererAspectFitContainers[renderer] ?: android.widget.FrameLayout(
+                renderer.context
+            ).also { created ->
+                created.setBackgroundColor(android.graphics.Color.BLACK)
+                rendererAspectFitContainers[renderer] = created
+            }
+        }
+        container.layoutParams = (container.layoutParams ?: ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )).also {
+            it.width = ViewGroup.LayoutParams.MATCH_PARENT
+            it.height = ViewGroup.LayoutParams.MATCH_PARENT
+        }
+        if (rendererHostLayoutListenerInstalled[container] != true) {
+            rendererHostLayoutListenerInstalled[container] = true
+            container.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                val host = v as? android.widget.FrameLayout ?: return@addOnLayoutChangeListener
+                val newW = host.width
+                val newH = host.height
+                if (newW <= 0 || newH <= 0) return@addOnLayoutChangeListener
+                val previous = rendererHostLastLayoutSize[host]
+                if (previous != null && previous.first == newW && previous.second == newH) {
+                    return@addOnLayoutChangeListener
+                }
+                rendererHostLastLayoutSize[host] = Pair(newW, newH)
+                val latest = synchronized(rendererCameraScaleState) {
+                    rendererCameraScaleState[renderer]
+                } ?: return@addOnLayoutChangeListener
+                applyRemoteCameraScaleState(renderer, latest)
+            }
+        }
+        return container
+    }
+
+    private fun applyRemoteCameraScaleState(
+        renderer: SurfaceViewRenderer,
+        state: RemoteCameraScaleState,
+    ): android.widget.FrameLayout {
+        // Host container is always match-parent so landscape/portrait parents fill the screen;
+        // only the SurfaceViewRenderer inside switches wrap-content (fit) vs match-parent (fill).
+        val container = ensureRemoteCameraHostContainer(renderer)
+        val (localW, localH) = localViewportSizeForRenderer(renderer, container)
+        val preferFit = prefersAspectFitForState(state, localW, localH)
+        if (state.lastAppliedPreferFit == preferFit
+            && state.lastAppliedLocalWidth == localW
+            && state.lastAppliedLocalHeight == localH
+            && renderer.parent === container
+        ) {
+            return container
+        }
+        state.lastAppliedPreferFit = preferFit
+        state.lastAppliedLocalWidth = localW
+        state.lastAppliedLocalHeight = localH
+        val scalingType = if (preferFit) {
+            RendererCommon.ScalingType.SCALE_ASPECT_FIT
+        } else {
+            RendererCommon.ScalingType.SCALE_ASPECT_FILL
+        }
+        renderer.setScalingType(scalingType)
+        if (preferFit) {
+            aspectFitContainer(renderer)
+        } else {
+            aspectFillContainer(renderer)
+        }
+        clearRoundedOutline(view = renderer)
+        if (state.cornerRadiusDp > 0f) {
+            applyRoundedOutline(view = container, radiusDp = state.cornerRadiusDp)
+        } else {
+            clearRoundedOutline(view = container)
+        }
+        return container
+    }
+
     /// EglRenderer always crops the frame to the renderer view's layout aspect ratio, so a
     /// SurfaceViewRenderer measured EXACTLY (Compose fillMaxSize) aspect-fills regardless of
     /// setScalingType(SCALE_ASPECT_FIT). Hosting the renderer wrap-content + centered inside a
@@ -528,12 +670,120 @@ object AndroidRTCViewSupport {
                     android.view.Gravity.CENTER
                 )
             )
+        } else {
+            (renderer.layoutParams as? android.widget.FrameLayout.LayoutParams)?.let { params ->
+                if (params.width != ViewGroup.LayoutParams.WRAP_CONTENT
+                    || params.height != ViewGroup.LayoutParams.WRAP_CONTENT
+                ) {
+                    params.width = ViewGroup.LayoutParams.WRAP_CONTENT
+                    params.height = ViewGroup.LayoutParams.WRAP_CONTENT
+                    params.gravity = android.view.Gravity.CENTER
+                    renderer.layoutParams = params
+                }
+            }
         }
         return container
     }
 
     fun aspectFitContainerOrNull(renderer: SurfaceViewRenderer): android.widget.FrameLayout? {
         return synchronized(rendererAspectFitContainers) { rendererAspectFitContainers[renderer] }
+    }
+
+    /// Solo fullscreen remote: match-parent host so EglRenderer aspect-fills the device
+    /// orientation. Multi-remote tiles keep [aspectFitContainer] letterboxing.
+    fun aspectFillContainer(renderer: SurfaceViewRenderer): android.widget.FrameLayout {
+        val container = synchronized(rendererAspectFitContainers) {
+            rendererAspectFitContainers[renderer] ?: android.widget.FrameLayout(
+                renderer.context
+            ).also { created ->
+                created.setBackgroundColor(android.graphics.Color.BLACK)
+                rendererAspectFitContainers[renderer] = created
+            }
+        }
+        // Match-parent host must itself fill the Compose tile / screen.
+        container.layoutParams = container.layoutParams?.apply {
+            width = ViewGroup.LayoutParams.MATCH_PARENT
+            height = ViewGroup.LayoutParams.MATCH_PARENT
+        } ?: ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        if (renderer.parent !== container) {
+            detachFromParent(renderer)
+            container.addView(
+                renderer,
+                android.widget.FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.Gravity.CENTER
+                )
+            )
+        } else {
+            (renderer.layoutParams as? android.widget.FrameLayout.LayoutParams)?.let { params ->
+                if (params.width != ViewGroup.LayoutParams.MATCH_PARENT
+                    || params.height != ViewGroup.LayoutParams.MATCH_PARENT
+                ) {
+                    params.width = ViewGroup.LayoutParams.MATCH_PARENT
+                    params.height = ViewGroup.LayoutParams.MATCH_PARENT
+                    params.gravity = android.view.Gravity.CENTER
+                    renderer.layoutParams = params
+                }
+            }
+        }
+        return container
+    }
+
+    /// Shared host for remote camera Compose tiles.
+    ///
+    /// - `prefersAspectFit`: multi-remote grids always letterbox.
+    /// - `fillWhenOrientationMatches`: solo fullscreen fills only when remote upright
+    ///   orientation matches the local viewport (otherwise letterbox).
+    fun remoteCameraHostContainer(
+        renderer: SurfaceViewRenderer,
+        prefersAspectFit: Boolean,
+        cornerRadiusDp: Float,
+        fillWhenOrientationMatches: Boolean = !prefersAspectFit,
+    ): android.widget.FrameLayout {
+        val state = synchronized(rendererCameraScaleState) {
+            rendererCameraScaleState.getOrPut(renderer) { RemoteCameraScaleState() }.also {
+                val nextForceFit = prefersAspectFit
+                val nextMatchFill = fillWhenOrientationMatches && !prefersAspectFit
+                if (it.forceAspectFit != nextForceFit
+                    || it.fillWhenOrientationMatches != nextMatchFill
+                    || it.cornerRadiusDp != cornerRadiusDp
+                ) {
+                    it.lastAppliedPreferFit = null
+                }
+                it.forceAspectFit = nextForceFit
+                it.fillWhenOrientationMatches = nextMatchFill
+                it.cornerRadiusDp = cornerRadiusDp
+            }
+        }
+        return applyRemoteCameraScaleState(renderer, state)
+    }
+
+    private fun noteRendererFrameResolution(
+        renderer: SurfaceViewRenderer,
+        width: Int,
+        height: Int,
+        rotation: Int,
+    ) {
+        val state = synchronized(rendererCameraScaleState) {
+            rendererCameraScaleState[renderer]
+        } ?: return
+        val orientationChanged =
+            state.frameWidth != width
+                || state.frameHeight != height
+                || state.frameRotation != rotation
+        state.frameWidth = width
+        state.frameHeight = height
+        state.frameRotation = rotation
+        if (orientationChanged) {
+            state.lastAppliedPreferFit = null
+        }
+        postToMainThread {
+            applyRemoteCameraScaleState(renderer, state)
+        }
     }
 
     fun clearRendererImage(renderer: SurfaceViewRenderer) {

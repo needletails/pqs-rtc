@@ -88,6 +88,10 @@ public final class VideoCallViewController: NSViewController {
     /// Delegate that receives high-level UI events (call state updates, window sizing, etc.).
     /// Strong so SwiftUI `Coordinator` survives for mute/state callbacks; cleared in ``tearDownCall()``.
     public var videoCallDelegate: VideoCallDelegate?
+    /// Optional host-provided remote display name for call chrome labels.
+    public var remotePartyNameOverride: String = ""
+    /// Optional host-provided remote profile image bytes for voice chrome.
+    public var remotePartyAvatarData: Data?
     private let logger = NeedleTailLogger("[VideoCallViewController]")
     /// Task observing local screen-share state changes from the session.
     private var localScreenShareStateTask: Task<Void, Never>?
@@ -530,8 +534,30 @@ public final class VideoCallViewController: NSViewController {
     
     private func applyConnectingChrome(for currentCall: Call) {
         let controllerView = self.view as! ControllerView
-        if controllerView.calleeLabel.stringValue.isEmpty {
-            controllerView.calleeLabel.stringValue = currentCall.sender.secretName
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let localId = await self.session.localParticipantId(
+                forCallConnectionId: currentCall.sharedCommunicationId
+            )
+            let override = self.remotePartyNameOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name: String
+            if !override.isEmpty {
+                name = override
+            } else {
+                let resolved = currentCall.remoteDisplayName(localSecretName: localId)
+                if !resolved.isEmpty {
+                    name = resolved
+                } else {
+                    name = currentCall.recipients.first?.secretName
+                        ?? currentCall.sender.secretName
+                }
+            }
+            if controllerView.calleeLabel.stringValue.isEmpty || controllerView.calleeLabel.stringValue == currentCall.sender.secretName {
+                controllerView.calleeLabel.stringValue = name
+            }
+            if let avatarData = self.remotePartyAvatarData {
+                controllerView.voiceImageData = avatarData
+            }
         }
         controllerView.statusLabel.stringValue = "Connecting secure video..."
         controllerView.statusLabel.fadeInOutLoop(duration: 1.5)

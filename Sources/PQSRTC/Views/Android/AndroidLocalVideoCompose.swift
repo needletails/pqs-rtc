@@ -118,20 +118,25 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
             androidx.compose.ui.viewinterop.AndroidView(
                 factory: { ctx in
                     _ = client.safelyInitializeSurfaceRenderer(renderer, mirror: false)
-                    renderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
                     captureView.rendererDidInitialize()
-                    // Wrap-content host so the renderer measures to the sender's rotated frame
-                    // aspect (letterbox) instead of Compose fillMaxSize forcing a center crop.
-                    // Round the container (the visible tile), not the renderer: rounding only the
-                    // letterboxed renderer leaves mixed rounded/squared corners on the tile.
-                    let container = AndroidRTCViewSupport.aspectFitContainer(renderer: renderer)
-                    AndroidRTCViewSupport.clearRoundedOutline(view: renderer)
-                    AndroidRTCViewSupport.applyRoundedOutline(view: container, radiusDp: Float(12))
+                    // Solo remote: fill only when remote upright orientation matches local viewport.
+                    let container = AndroidRTCViewSupport.remoteCameraHostContainer(
+                        renderer: renderer,
+                        prefersAspectFit: false,
+                        cornerRadiusDp: Float(0),
+                        fillWhenOrientationMatches: true
+                    )
                     AndroidRTCViewSupport.detachFromParent(view: container)
                     container
                 },
                 modifier: Modifier.fillMaxSize(),
                 update: { _ in
+                    _ = AndroidRTCViewSupport.remoteCameraHostContainer(
+                        renderer: renderer,
+                        prefersAspectFit: false,
+                        cornerRadiusDp: Float(0),
+                        fillWhenOrientationMatches: true
+                    )
                     captureView.rendererDidUpdateLayoutFromCompose()
                 }
             )
@@ -371,9 +376,10 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         }
     }
 
-    /// One participant tile: black 16:9 (or full-bleed) container with rounded corners hosting
-    /// the aspect-fit renderer container, so the video letterboxes to the sender's orientation
-    /// while the visible tile stays uniform.
+    /// One participant tile. Multi-remote grids letterbox (`prefersAspectFit`) so portrait
+    /// senders keep their orientation inside uniform tiles. A solo fullscreen remote
+    /// (`prefersAspectFit == false`) fills only when remote upright orientation matches the
+    /// local viewport; mismatched portrait/landscape pairs stay letterboxed.
     @Composable
     private func ConferenceTile(
         view: AndroidSampleCaptureView,
@@ -389,27 +395,24 @@ public struct AndroidRemoteGridCompose: ContentComposer {
             androidx.compose.ui.viewinterop.AndroidView(
                 factory: { _ in
                     _ = client.safelyInitializeSurfaceRenderer(view.surfaceViewRenderer, mirror: false)
-                    view.surfaceViewRenderer.setScalingType(org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT)
                     view.rendererDidInitialize()
-                    // Wrap-content host so each grid tile letterboxes to the
-                    // sender's rotated frame aspect like Apple tiles. Round the
-                    // container (the visible tile), not the letterboxed renderer,
-                    // so tile corners are uniform.
-                    let container = AndroidRTCViewSupport.aspectFitContainer(
-                        renderer: view.surfaceViewRenderer
+                    let host = AndroidRTCViewSupport.remoteCameraHostContainer(
+                        renderer: view.surfaceViewRenderer,
+                        prefersAspectFit: prefersAspectFit,
+                        cornerRadiusDp: Float(cornerRadiusDp),
+                        fillWhenOrientationMatches: !prefersAspectFit
                     )
-                    AndroidRTCViewSupport.clearRoundedOutline(
-                        view: view.surfaceViewRenderer
-                    )
-                    AndroidRTCViewSupport.applyRoundedOutline(
-                        view: container,
-                        radiusDp: Float(cornerRadiusDp)
-                    )
-                    AndroidRTCViewSupport.detachFromParent(view: container)
-                    container
+                    AndroidRTCViewSupport.detachFromParent(view: host)
+                    host
                 },
                 modifier: Modifier.fillMaxSize(),
                 update: { _ in
+                    _ = AndroidRTCViewSupport.remoteCameraHostContainer(
+                        renderer: view.surfaceViewRenderer,
+                        prefersAspectFit: prefersAspectFit,
+                        cornerRadiusDp: Float(cornerRadiusDp),
+                        fillWhenOrientationMatches: !prefersAspectFit
+                    )
                     view.rendererDidUpdateLayoutFromCompose()
                 }
             )
@@ -897,6 +900,9 @@ public struct AndroidVideoCallView: View {
         let remotePageSize = hasActiveRemoteScreenShare ? 8 : 12
         let remotePages = paginateRemotes(displayedRemoteCaptureViews, pageSize: remotePageSize)
         let activeRemoteCount = displayedRemoteCaptureViews.count
+        // Solo fullscreen remote fills when orientations match; multi-remote grids (and the
+        // screen-share camera strip) keep aspect-fit letterboxing inside tiles.
+        let remotePrefersAspectFit = activeRemoteCount > 1 || hasActiveRemoteScreenShare
         let screenShareHeightFraction: CGFloat = {
             guard hasActiveRemoteScreenShare else { return 0 }
             return activeRemoteCount <= 1 ? 0.64 : 0.68
@@ -933,7 +939,7 @@ public struct AndroidVideoCallView: View {
                                     client: session.rtcClient,
                                     remoteCaptureViews: remotes,
                                     raisedHandFlags: raisedHandFlags(for: remotes, allViews: displayedRemoteCaptureViews),
-                                    prefersAspectFit: true,
+                                    prefersAspectFit: remotePrefersAspectFit,
                                     cleanupOnDispose: false,
                                     usesCompactParticipantStrip: hasActiveRemoteScreenShare,
                                     onDispose: {}
@@ -959,7 +965,7 @@ public struct AndroidVideoCallView: View {
                             client: session.rtcClient,
                             remoteCaptureViews: displayedRemoteCaptureViews,
                             raisedHandFlags: raisedHandFlags(for: displayedRemoteCaptureViews, allViews: displayedRemoteCaptureViews),
-                            prefersAspectFit: true,
+                            prefersAspectFit: remotePrefersAspectFit,
                             cleanupOnDispose: false,
                             usesCompactParticipantStrip: hasActiveRemoteScreenShare,
                             onDispose: {}
@@ -968,6 +974,7 @@ public struct AndroidVideoCallView: View {
                         .background(Color.black.opacity(hasActiveRemoteScreenShare ? 0.92 : 1.0))
                     }
                 }
+                .frame(width: geo.size.width, height: geo.size.height)
                 
                 AndroidLocalVideoView(
                     client: session.rtcClient,
@@ -989,8 +996,10 @@ public struct AndroidVideoCallView: View {
                         localViewSize = setSize(size: newValue)
                     }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .ignoresSafeArea()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea(.all)
         .onChange(of: remotePages.count) { _, newCount in
             guard newCount > 0 else {
                 currentRemotePage = 0

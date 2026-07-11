@@ -169,6 +169,43 @@ struct CallConferenceTests {
         #expect(RTCSession.shouldEnforceScreenShareConferencePermissions(call: call, permissions: permissions) == true)
     }
 
+    @Test("1:1 SFU relay with roster roles still uses 1:1 call chrome")
+    func oneToOneSfuWithRolesSkipsConferenceChrome() throws {
+        let sender = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: "d1")
+        let recipient = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "d2")
+        let roomId = UUID().uuidString
+        let call = try Call(
+            sharedCommunicationId: roomId,
+            channelWireId: roomId,
+            sender: sender,
+            recipients: [recipient]
+        )
+        let permissions = ConferencePermissions(
+            localRole: .presenter,
+            participantRoles: ["alice": .presenter, "bob": .presenter]
+        )
+
+        #expect(RTCSession.isTrueOneToOneSfuRoom(call: call) == true)
+        #expect(RTCSession.shouldEnforceScreenShareConferencePermissions(call: call, permissions: permissions) == false)
+    }
+
+    @Test("1:1 P2P with leaked roles still uses 1:1 call chrome")
+    func oneToOneP2PWithRolesSkipsConferenceChrome() throws {
+        let sender = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: "d1")
+        let recipient = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "d2")
+        let call = try Call(
+            sharedCommunicationId: UUID().uuidString,
+            sender: sender,
+            recipients: [recipient]
+        )
+        let permissions = ConferencePermissions(
+            localRole: .presenter,
+            participantRoles: ["alice": .presenter, "bob": .presenter]
+        )
+
+        #expect(RTCSession.shouldEnforceScreenShareConferencePermissions(call: call, permissions: permissions) == false)
+    }
+
     @Test("screen share participant ids normalize add and remove keys")
     func screenShareParticipantIdsNormalizeAddAndRemoveKeys() {
         #expect(RTCSession.resolvedScreenShareParticipantId(

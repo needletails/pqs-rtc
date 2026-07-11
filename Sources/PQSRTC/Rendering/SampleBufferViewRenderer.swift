@@ -100,6 +100,10 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     private let rendersScreenShare: Bool
     /// When true, camera tiles letterbox inside the tile instead of cropping (used during screen share).
     private var prefersAspectFit = false
+    /// Solo fullscreen: aspect-fill only when remote upright orientation matches the local viewport.
+    private var fillsWhenOrientationMatches = false
+    /// Last upright source size used for orientation-matched scale decisions.
+    private var lastUprightSourceSize: CGSize = .zero
     /// Last frame processed for Metal; re-scaled when host bounds change while ingress is stalled (frozen tile).
     private var lastMetalDisplayPixelBuffer: CVPixelBuffer?
     @MainActor var bounds: CGRect
@@ -192,8 +196,15 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         logger.log(level: .info, message: "SampleBufferViewRenderer initialized with bounds: \(bounds) rendersScreenShare=\(rendersScreenShare)")
     }
 
-    private var usesAspectFitRendering: Bool {
-        rendersScreenShare || prefersAspectFit
+    private func usesAspectFitRendering(sourceSize: CGSize, destinationSize: CGSize) -> Bool {
+        RemoteCameraAspectPolicy.prefersAspectFit(
+            forceFit: rendersScreenShare || prefersAspectFit,
+            fillWhenOrientationMatches: fillsWhenOrientationMatches,
+            remoteWidth: Double(sourceSize.width),
+            remoteHeight: Double(sourceSize.height),
+            localWidth: Double(destinationSize.width),
+            localHeight: Double(destinationSize.height)
+        )
     }
 
     func setPrefersAspectFit(_ enabled: Bool) {
@@ -201,6 +212,14 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         prefersAspectFit = enabled
         if changed {
             Task { await self.reprocessCachedMetalFrameIfNeeded(reason: "prefersAspectFit") }
+        }
+    }
+
+    func setFillsWhenOrientationMatches(_ enabled: Bool) {
+        let changed = fillsWhenOrientationMatches != enabled
+        fillsWhenOrientationMatches = enabled
+        if changed {
+            Task { await self.reprocessCachedMetalFrameIfNeeded(reason: "fillsWhenOrientationMatches") }
         }
     }
 
@@ -842,19 +861,19 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 height: CGFloat(pixelBuffer.height)
             )
             
-            let scaleMode: ScaleMode
             let originalSize = CGSize(width: pixelBuffer.width, height: pixelBuffer.height)
+            lastUprightSourceSize = originalSize
             let scaleInfo: MetalProcessor.ScaledInfo
-            if usesAspectFitRendering {
+            if usesAspectFitRendering(sourceSize: originalSize, destinationSize: renderBounds) {
                 scaleInfo = Self.aspectFitScaleInfo(
                     sourceSize: originalSize,
                     destinationSize: renderBounds
                 )
             } else {
 #if os(iOS)
-                scaleMode = .aspectFill
+                let scaleMode: ScaleMode = .aspectFill
 #else
-                scaleMode = .aspectFitHorizontal
+                let scaleMode: ScaleMode = .aspectFitHorizontal
 #endif
                 scaleInfo = await metalProcessor.createSize(
                     for: scaleMode,
@@ -1094,20 +1113,19 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 width: CGFloat(buffer.width),
                 height: CGFloat(buffer.height)
             )
-            let scaleMode: ScaleMode
             let originalSize = CGSize(width: CGFloat(buffer.width), height: CGFloat(buffer.height))
+            lastUprightSourceSize = originalSize
             let scaleInfo: MetalProcessor.ScaledInfo
-            if usesAspectFitRendering {
-                scaleMode = .none
+            if usesAspectFitRendering(sourceSize: originalSize, destinationSize: renderBounds) {
                 scaleInfo = Self.aspectFitScaleInfo(
                     sourceSize: originalSize,
                     destinationSize: renderBounds
                 )
             } else {
 #if os(iOS)
-                scaleMode = .aspectFill
+                let scaleMode: ScaleMode = .aspectFill
 #else
-                scaleMode = .aspectFitHorizontal
+                let scaleMode: ScaleMode = .aspectFitHorizontal
 #endif
                 scaleInfo = await metalProcessor.createSize(
                     for: scaleMode,
@@ -1118,9 +1136,10 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             }
             if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogFirstRemoteMetalScale == false {
                 didLogFirstRemoteMetalScale = true
+                let fit = usesAspectFitRendering(sourceSize: originalSize, destinationSize: renderBounds)
                 logger.log(
                     level: .trace,
-                    message: "Remote I420 Metal conversion srcSize=\(buffer.width)x\(buffer.height) renderBounds=\(renderBounds) scaleMode=\(scaleMode) scaleX=\(scaleInfo.scaleX) scaleY=\(scaleInfo.scaleY)"
+                    message: "Remote I420 Metal conversion srcSize=\(buffer.width)x\(buffer.height) renderBounds=\(renderBounds) aspectFit=\(fit) scaleX=\(scaleInfo.scaleX) scaleY=\(scaleInfo.scaleY)"
                 )
             }
 

@@ -553,6 +553,38 @@ public struct Call: Sendable, Codable, Equatable {
         case failed = "failed"
     }
 
+    /// Remote party for 1:1 call chrome (name / avatar).
+    ///
+    /// Inbound SFU answer rewrites `sender` to the local user and moves the peer into
+    /// `recipients`, so direction-only lookup (`inbound → sender`) shows the callee on both
+    /// sides. Prefer any participant that is not `localSecretName`.
+    ///
+    /// When `localSecretName` is unknown, returns `nil` so callers can apply direction-based
+    /// fallback. Do **not** default to `recipients.first` — on inbound offers that slot is the
+    /// local callee.
+    public func remotePartyForDisplay(localSecretName: String?) -> Participant? {
+        let local = localSecretName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !local.isEmpty else { return nil }
+        if sender.secretName.caseInsensitiveCompare(local) != .orderedSame {
+            return sender
+        }
+        if let peer = recipients.first(where: {
+            $0.secretName.caseInsensitiveCompare(local) != .orderedSame
+        }) {
+            return peer
+        }
+        return nil
+    }
+
+    /// Display name for ``remotePartyForDisplay(localSecretName:)``.
+    public func remoteDisplayName(localSecretName: String?) -> String {
+        guard let participant = remotePartyForDisplay(localSecretName: localSecretName) else {
+            return ""
+        }
+        let nickname = participant.nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        return nickname.isEmpty ? participant.secretName : nickname
+    }
+
     /// Canonical channel wire identity when this call is channel-scoped.
     ///
     /// Returns `nil` for ephemeral 1:1 SFU relay rooms (`#<uuid>`) regardless of

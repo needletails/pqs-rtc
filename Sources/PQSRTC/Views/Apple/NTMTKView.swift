@@ -97,6 +97,7 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     /// resulting in "track attached, but no frames rendered".
     var renderer: RendererDelegate?
     @MainActor private(set) var prefersAspectFit = false
+    @MainActor private(set) var fillsWhenOrientationMatches = false
     
     /// Letterboxes video inside its tile instead of cropping. Participant camera tiles opt in via
     /// ``setPrefersAspectFit(_:)`` so remote video preserves the sender's aspect ratio.
@@ -105,12 +106,31 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         guard type == .sample, !contextName.hasPrefix("screen_") else { return }
         guard prefersAspectFit != enabled else { return }
         prefersAspectFit = enabled
-        if let layer = captureView?.layer as? AVSampleBufferDisplayLayer {
-            layer.videoGravity = enabled ? .resizeAspect : .resizeAspectFill
-        }
+        refreshSampleLayerVideoGravity()
         if let sampleRenderer = renderer as? SampleBufferViewRenderer {
             Task { await sampleRenderer.setPrefersAspectFit(enabled) }
         }
+    }
+
+    /// Solo fullscreen remote: fill only when remote upright orientation matches the local viewport.
+    @MainActor
+    public func setFillsWhenOrientationMatches(_ enabled: Bool) {
+        guard type == .sample, !contextName.hasPrefix("screen_") else { return }
+        guard fillsWhenOrientationMatches != enabled else { return }
+        fillsWhenOrientationMatches = enabled
+        refreshSampleLayerVideoGravity()
+        if let sampleRenderer = renderer as? SampleBufferViewRenderer {
+            Task { await sampleRenderer.setFillsWhenOrientationMatches(enabled) }
+        }
+    }
+
+    @MainActor
+    private func refreshSampleLayerVideoGravity() {
+        guard let layer = captureView?.layer as? AVSampleBufferDisplayLayer else { return }
+        // Match-orientation fill is decided per frame in Metal; the layer path letterboxes until
+        // orientations are known to agree (avoids cropping a portrait sender on a landscape phone).
+        let useFit = prefersAspectFit || fillsWhenOrientationMatches
+        layer.videoGravity = useFit ? .resizeAspect : .resizeAspectFill
     }
     
     lazy var renderPipelineState: MTLRenderPipelineState? = {
@@ -474,7 +494,7 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
 #endif
             let layer = view.layer as! AVSampleBufferDisplayLayer
             let rendersScreenShare = contextName.hasPrefix("screen_")
-            layer.videoGravity = (rendersScreenShare || prefersAspectFit) ? .resizeAspect : .resizeAspectFill
+            layer.videoGravity = (rendersScreenShare || prefersAspectFit || fillsWhenOrientationMatches) ? .resizeAspect : .resizeAspectFill
             let layerBox = SampleBufferDisplayLayerBox(layer: layer)
             let renderer = SampleBufferViewRenderer(
                 layerBox: layerBox,

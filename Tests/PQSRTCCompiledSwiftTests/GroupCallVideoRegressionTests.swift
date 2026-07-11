@@ -403,10 +403,11 @@ struct GroupCallVideoRegressionTests {
             assignedParticipantCount: 1,
             rosterRemoteSlotCount: 2,
             poolSize: 3) == 2)
+        // True 2-person call (one remote in roster): single fullscreen slot, not a reserved 2-up.
         #expect(AndroidMultipartyVideoLayout.multipartyGridSlotCount(
             assignedParticipantCount: 1,
             rosterRemoteSlotCount: 1,
-            poolSize: 3) == 2)
+            poolSize: 3) == 1)
         #expect(AndroidMultipartyVideoLayout.multipartyGridSlotCount(
             assignedParticipantCount: 0,
             rosterRemoteSlotCount: 2,
