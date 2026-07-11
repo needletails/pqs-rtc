@@ -8,61 +8,128 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-26
+            required_macos_major: '26'
+            required_xcode_major: '26'
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Xcode version
+        if: ${{ runner.os == 'macOS' }}
         run: xcodebuild -version
 
-      - name: Require macOS 26
+      - name: Require macOS 26 (macOS)
+        if: ${{ runner.os == 'macOS' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "Expecting macOS major: 26"
+          echo "Expecting macOS major: ${{ matrix.required_macos_major }}"
           MACOS_VERSION=$(sw_vers -productVersion)
           echo "macOS $MACOS_VERSION"
           MACOS_MAJOR=$(echo "$MACOS_VERSION" | cut -d. -f1)
-          if [[ "$MACOS_MAJOR" != "26" ]]; then
-            echo "macOS 26 is required on this runner. Found: macOS $MACOS_VERSION" >&2
+          if [[ "$MACOS_MAJOR" != "${{ matrix.required_macos_major }}" ]]; then
+            echo "macOS ${{ matrix.required_macos_major }} is required on this runner. Found: macOS $MACOS_VERSION" >&2
             exit 1
           fi
 
-      - name: Require Xcode 26
+      - name: Require Xcode 26 (macOS)
+        if: ${{ runner.os == 'macOS' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "Expecting Xcode major: 26"
+          echo "Expecting Xcode major: ${{ matrix.required_xcode_major }}"
           XCODE_VERSION_LINE=$(xcodebuild -version | head -n 1)
           echo "$XCODE_VERSION_LINE"
           XCODE_MAJOR=$(echo "$XCODE_VERSION_LINE" | awk '{print $2}' | cut -d. -f1)
-          if [[ "$XCODE_MAJOR" != "26" ]]; then
-            echo "Xcode 26 is required on this runner. Found: $XCODE_VERSION_LINE" >&2
+          if [[ "$XCODE_MAJOR" != "${{ matrix.required_xcode_major }}" ]]; then
+            echo "Xcode ${{ matrix.required_xcode_major }} is required on this runner. Found: $XCODE_VERSION_LINE" >&2
             exit 1
           fi
 
-      - name: Swift version
+      - name: Swift version (macOS)
+        if: ${{ runner.os == 'macOS' }}
         run: |
           swift --version
           xcrun swift --version
 
-      - name: Install Skip.tools
+      - name: Install Swift 6.3.0 with Swiftly (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -O https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz
+          tar zxf swiftly-$(uname -m).tar.gz
+          ./swiftly init --quiet-shell-followup
+          source ~/.local/share/swiftly/env.sh
+          swiftly install --use 6.3.0
+
+          echo "Looking for Swift in toolchains directory..."
+          ls -la "$HOME/.local/share/swiftly/toolchains/" || true
+
+          SWIFT_PATH=$(find "$HOME/.local/share/swiftly/toolchains/6.3.0" -name "swift" -type f 2>/dev/null | head -1)
+          if [ -n "$SWIFT_PATH" ]; then
+            SWIFT_PATH=$(dirname "$SWIFT_PATH")
+          else
+            echo "Swift not found in toolchains, using bin directory..."
+            SWIFT_PATH="$HOME/.local/share/swiftly/bin"
+          fi
+
+          echo "SWIFT_PATH=$SWIFT_PATH" >> "$GITHUB_ENV"
+          echo "$SWIFT_PATH" >> "$GITHUB_PATH"
+
+      - name: Swift version (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: swift --version
+
+      - name: Install Skip.tools (macOS)
+        if: ${{ runner.os == 'macOS' }}
         run: |
           brew install skiptools/skip/skip
           skip version
+
+      - name: Install Swift Android SDK (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'y\n' | skip android sdk install
 
       - name: Cache Swift build artifacts
         uses: actions/cache@v4
         with:
           path: .build
-          key: "macos-swift-${{ hashFiles('Package.swift', 'Package.resolved') }}"
+          key: ${{ runner.os }}-swift-${{ hashFiles('Package.swift') }}
           restore-keys: |
-            macos-swift-
+            ${{ runner.os }}-swift-
 
-      - name: Build
+      - name: Xcode version (pre-build)
+        if: ${{ runner.os == 'macOS' }}
+        run: xcodebuild -version
+
+      - name: Build (Release)
         run: swift build --configuration release
 
-      - name: Test
+      - name: Test (Linux)
+        if: ${{ runner.os == 'Linux' }}
         run: swift test
+
+      - name: Test (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: swift test
+
+      - name: Build Android (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: skip android build
+
+      - name: Build Android test targets (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: skip android build --build-tests
