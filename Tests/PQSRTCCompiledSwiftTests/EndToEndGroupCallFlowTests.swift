@@ -302,12 +302,11 @@ struct EndToEndGroupCallFlowTests {
         let localDeviceId = try #require(UUID(uuidString: "2D4087FD-0E8A-4D96-B558-33142F345AD2"))
         let local = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: localDeviceId.uuidString)
         let bob = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: "bob-device")
-        let carol = try Call.Participant(secretName: "carol", nickname: "Carol", deviceId: "carol-device")
         let call = try Call(
             sharedCommunicationId: sharedCommunicationId,
             channelWireId: channelWireId,
             sender: local,
-            recipients: [bob, carol],
+            recipients: [bob],
             supportsVideo: false
         )
 

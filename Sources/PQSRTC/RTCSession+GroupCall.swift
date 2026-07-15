@@ -344,7 +344,7 @@ extension RTCSession {
         // Call.id until merge) still partition the signaling ratchet the same way as the caller.
         // Channel-backed group rooms keep `call.id` so reused channel rooms isolate per attempt.
         let sessionContext: String
-        if Self.isLikelyOneToOneSfuRoom(call: call) {
+        if Self.isTrueOneToOneSfuRoom(call: call) {
             sessionContext = call.sharedCommunicationId.stableUUIDConnectionId.uuidString
         } else {
             sessionContext = call.id.uuidString
@@ -463,7 +463,7 @@ extension RTCSession {
                 ?? UUID(uuidString: mediaCall.sender.deviceId)
             if let props = retainedRoomProps, let deviceId {
                 let sessionContext: String
-                if Self.isLikelyOneToOneSfuRoom(call: mediaCall) {
+                if Self.isTrueOneToOneSfuRoom(call: mediaCall) {
                     sessionContext = mediaCall.sharedCommunicationId.stableUUIDConnectionId.uuidString
                 } else {
                     sessionContext = mediaCall.id.uuidString
