@@ -88,7 +88,8 @@ extension RTCSession {
     ///   - call: The incoming call with SDP offer in metadata
     ///   - deferTransportAnswered: When `true`, prepares local state and acceptance gating but does
     ///     not send `call_answered` yet. The host app should call ``sendCallAnsweredNotifications(for:)``
-    ///     after inbound SFU media bootstrap (PeerConnection creation) completes.
+    ///     when ready. Prefer deferring only CallKit-gated media bootstrap — not `call_answered` —
+    ///     for inbound 1:1 SFU relay, so the caller can proceed after SFU registration.
     ///     `call_answered_aux_device` is **not** deferred: sibling devices must stop ringing the
     ///     moment this device commits to answering, independent of media/audio bootstrap.
     public func answerCall(_ call: Call, deferTransportAnswered: Bool = false) async throws {

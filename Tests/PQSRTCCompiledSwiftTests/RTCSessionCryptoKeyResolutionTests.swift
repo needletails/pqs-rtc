@@ -360,11 +360,22 @@ struct RTCSessionCryptoKeyResolutionTests {
             remoteParticipantId: channelId,
             localParticipantId: "frank"
         ))
-        #expect(RTCSession.shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
+        // `broken_<roomId>` normalizes to publisher-style `broken` (strip connection suffix), so it
+        // is no longer treated as an unstable room/placeholder id — same as `audio_echo_<roomId>`.
+        #expect(!RTCSession.shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
             enableEncryption: true,
             isGroupCallConnection: true,
             frameEncryptionKeyMode: .perParticipant,
             participantIdOverride: channelId,
+            connectionId: roomId,
+            remoteParticipantId: channelId,
+            localParticipantId: "frank"
+        ))
+        #expect(RTCSession.shouldSkipReceiverFrameCryptorBindingForUnstableGroupParticipantId(
+            enableEncryption: true,
+            isGroupCallConnection: true,
+            frameEncryptionKeyMode: .perParticipant,
+            participantIdOverride: roomId,
             connectionId: roomId,
             remoteParticipantId: channelId,
             localParticipantId: "frank"

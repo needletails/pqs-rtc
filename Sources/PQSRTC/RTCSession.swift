@@ -538,6 +538,33 @@ public actor RTCSession {
     /// check and create duplicate Android PeerConnections/camera capture pipelines for one room.
     var sfuGroupMediaBootstrapInFlightConnectionIds: Set<String> = []
 
+    /// Genuine SFU ROOM signaling props retained from the SFU `.registration` response, keyed by
+    /// normalized room/connection id (and room aliases).
+    ///
+    /// The SFU registration RESPONSE carries the ROOM's public keys; outbound SFU signaling must be
+    /// encrypted toward these. The re-seed path in
+    /// ``beginGroupCallMediaAfterSfuRegistrationIfNeeded`` must only ever restore the SFU signaling
+    /// identity from these retained props — never from the locally-stored `Call.signalingIdentityProps`,
+    /// which hold this client's OWN local props and would make the client encrypt toward its own keys
+    /// (server rejects with `maxSkippedHeadersExceeded`).
+    var sfuRoomSignalingPropsByConnectionId: [String: SessionIdentity.UnwrappedProps] = [:]
+
+    /// Normalized keys under which ``sfuRoomSignalingPropsByConnectionId`` stashes the room props.
+    func sfuRoomSignalingPropsKeys(
+        roomId: String,
+        sfuRecipientId: String,
+        resolvedWireId: String?
+    ) -> [String] {
+        var keys: [String] = []
+        var seen = Set<String>()
+        for raw in [roomId, sfuRecipientId, resolvedWireId ?? ""] {
+            let key = teardownConnectionIdKey(raw)
+            guard !key.isEmpty, seen.insert(key).inserted else { continue }
+            keys.append(key)
+        }
+        return keys
+    }
+
     /// Normalized connection ids whose peer `call_cipher` has installed the receive frame key.
     ///
     /// True 1:1-over-SFU calls must not bind receiver FrameCryptors until this is set. Binding

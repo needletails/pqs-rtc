@@ -35,6 +35,11 @@ actor TaskProcessor {
     var sequenceId = 0
     var logger: NeedleTailLogger
     var isRunning = false
+
+    /// Job currently inside ``process(_:)``. It has been popped from the deque but is still in
+    /// `jobs` (removed only on completion), so cache reloads must not re-enqueue it — a second
+    /// pass over the same StreamTask advances the ratchet twice and fails decrypt.
+    private var inFlightJobId: String?
     
     /// Ratchet messages already successfully applied for `.handshakeComplete` (per connection).
     private var processedPostCipherHandshakes: Set<ProcessedPostCipherHandshakeKey> = []
@@ -116,7 +121,12 @@ actor TaskProcessor {
         
         createJob(job)
 
-        try await startProcessingIfNeeded()
+        // Insert directly into the consumer deque (sequence-ordered, id-deduped) and kick the
+        // processor. Jobs fed while the loop is mid-run must not sit only in `jobs` until a
+        // drain-reload: that stranded the inbound SFU `.answer` while later `.candidate`s ran.
+        // Do not spin-wait for this job here: waiting on the TaskProcessor actor while a peer
+        // loop is mid-pause/drain starves inbound SFU handling ("giving up wait after 201 yields").
+        try await loadTasks(job)
     }
 
     public func loadTasks(_ job: Job? = nil) async throws {
@@ -124,7 +134,7 @@ actor TaskProcessor {
         if let job {
             try await jobConsumer.loadAndOrganizeTasks(job)
         } else {
-            for job in jobs {
+            for job in jobs where job.id != inFlightJobId {
                 try await jobConsumer.loadAndOrganizeTasks(job)
             }
         }
@@ -192,7 +202,9 @@ actor TaskProcessor {
                 case let .success(job):
                     do {
                         
+                        inFlightJobId = job.id
                         let outcome = try await process(job)
+                        inFlightJobId = nil
 
                         if outcome == .paused {
                             consecutivePauses += 1
@@ -211,10 +223,17 @@ actor TaskProcessor {
                             consecutivePauses = 0
                         }
                         if await jobConsumer.deque.isEmpty {
+                            // Mid-flight `feedTask` can land jobs in `jobs` after the deque drained.
+                            // Returning here strands them until a later feed (e.g. inbound SFU
+                            // `.answer` stranded while `.candidate` decrypts out of order).
+                            if !jobs.isEmpty {
+                                break
+                            }
                             await jobConsumer.gracefulShutdown()
                             return
                         }
                     } catch {
+                        inFlightJobId = nil
                         await jobConsumer.gracefulShutdown()
                         throw error
                     }
@@ -230,7 +249,7 @@ actor TaskProcessor {
     // MARK: - Cache loading
 
     private func loadFromCache() async throws {
-        for job in jobs {
+        for job in jobs where job.id != inFlightJobId {
             try await jobConsumer.loadAndOrganizeTasks(job)
         }
     }
@@ -512,7 +531,15 @@ extension NeedleTailAsyncConsumer {
         guard let typedJob = job as? T else {
             throw TaskProcessor.Errors.invalidType
         }
-        
+
+        // A job can reach here twice: fed directly by `feedTask` AND reloaded from the `jobs`
+        // cache by `loadFromCache` after a pause/drain. Processing the same StreamTask twice
+        // advances the ratchet twice and the second decrypt fails with a core-crypto error,
+        // so dedup by job id before inserting.
+        if deque.contains(where: { ($0.item as? Job)?.id == job.id }) {
+            return
+        }
+
         let taskJob = TaskJob(item: typedJob, priority: .standard)
         
         // Always use sequence-based insertion to ensure FIFO ordering and prevent race conditions

@@ -469,8 +469,8 @@ struct ScreenShareRenegotiationTests {
         #expect(!events.contains { $0.participantId == "echo" && $0.isActive == true })
     }
 
-    @Test("SDP reconcile preserves relay-style restarted screen share without screen_ msid")
-    func reconcilePreservesRelayStyleRestartedShare() async throws {
+    @Test("SDP reconcile clears relay-style restarted screen share without screen_ msid")
+    func reconcileClearsRelayStyleRestartedShareWithoutScreenMsid() async throws {
         let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
         defer { Task { await session.shutdown(with: nil) } }
         await configureGroupSession(session)
@@ -488,9 +488,11 @@ struct ScreenShareRenegotiationTests {
             )
         }
 
+        // UUID-only relay video is ambiguous in group rooms and is no longer treated as screen
+        // share (contract requires `screen_` identifiers). Existing mappings must be cleared.
         let updated = await session.connectionManager.findConnection(with: conferenceConnectionId)
-        #expect(updated?.remoteScreenTracksByParticipantId["nudge"] != nil)
-        #expect(events.isEmpty)
+        #expect(updated?.remoteScreenTracksByParticipantId["nudge"] == nil)
+        #expect(events.contains { $0.participantId == "nudge" && $0.isActive == false })
     }
 
     @Test("streamId-prefixed screen msid resumes sharing for the same participant")

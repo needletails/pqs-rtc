@@ -15,11 +15,14 @@ struct GroupCallVideoRegressionTests {
         defer { Task { await session.shutdown(with: nil) } }
 
         #expect(roomUUID.isGroupCall == false)
-        #expect(session.testing_usesGroupCallAnswerSdpPolicy(for: roomUUID) == false)
+        let beforeConfigure = await session.testing_usesGroupCallAnswerSdpPolicy(for: roomUUID)
+        #expect(beforeConfigure == false)
 
         await session.testing_configureGroupSessionForTests(activeConnectionId: roomUUID)
-        #expect(session.testing_usesGroupCallAnswerSdpPolicy(for: roomUUID))
-        #expect(session.testing_usesGroupCallAnswerSdpPolicy(for: "#\(roomUUID)"))
+        let afterBare = await session.testing_usesGroupCallAnswerSdpPolicy(for: roomUUID)
+        let afterPrefixed = await session.testing_usesGroupCallAnswerSdpPolicy(for: "#\(roomUUID)")
+        #expect(afterBare)
+        #expect(afterPrefixed)
     }
 
     // MARK: - Inactive relay mid preservation
@@ -102,7 +105,8 @@ struct GroupCallVideoRegressionTests {
         )
 
         #expect(SDPTestHelpers.videoDirection(forMid: "2", in: processed) == "inactive")
-        #expect(SDPTestHelpers.videoDirection(forMid: "3", in: processed) == "recvonly")
+        // mid=3 is the SFU audio placeholder in this fixture; only mids 2/4 are video relays.
+        #expect(SDPTestHelpers.videoDirection(forMid: "3", in: processed) == nil)
         #expect(SDPTestHelpers.videoDirection(forMid: "4", in: processed) == "recvonly")
     }
 
@@ -864,7 +868,7 @@ struct GroupCallVideoRegressionTests {
             ),
             rendererHadConfirmedFirstFrameSinceSinkAttach: true,
             rendererEverConfirmedFirstFrameForAttachedTrack: true,
-            rendererFramesStaleWhileBound: false) == false)
+            rendererFramesStaleWhileBound: false))
         #expect(AndroidGroupPostRenegotiationAttachCoordinator.participantNeedsLiveWrapperSinkRebind(
             attachedTrackId: "track-a",
             mappedLiveTrackId: "track-a",
@@ -1019,7 +1023,7 @@ struct GroupCallVideoRegressionTests {
             rendererLayoutNeedsSinkReconcile: false,
             rendererHadConfirmedFirstFrameSinceSinkAttach: true,
             rendererFramesStaleWhileBound: false,
-            forceLiveWrapperRecovery: true) == false)
+            forceLiveWrapperRecovery: true))
         #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldRebindParticipantSinkAfterCoordinatorPass(
             fullAttachedThisCoordinatorPass: false,
             attachedTrackId: "track-a",
@@ -1337,7 +1341,6 @@ struct GroupCallVideoRegressionTests {
             hasActiveSink: true,
             boundTrackSharesRendererSinkWithTarget: true,
             rendererHadConfirmedFirstFrameSinceSinkAttach: true,
-            rendererEverConfirmedFirstFrameForAttachedTrack: true,
             rendererFramesStaleWhileBound: false) == false)
         #expect(AndroidGroupParticipantRendererAttachPolicy.isParticipantRendererSmoothlyRendering(
             attachedTrackIsLive: true,

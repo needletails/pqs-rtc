@@ -126,14 +126,38 @@ enum GroupCallVideoRegressionFixtures {
 }
 
 enum SDPTestHelpers {
+    /// Parses `a=` direction for a video section with the given mid. Kept local so tests do not
+    /// depend on ``RTCSdpDiagnostics`` (which may be unavailable under Skip transpile / non-WebRTC builds).
     static func videoDirection(forMid mid: String, in sdp: String) -> String? {
-        let summary = RTCSdpDiagnostics.summary(sdp)
-        for section in summary.split(separator: ";") {
-            let text = String(section)
-            guard text.hasPrefix("video(mid=\(mid),") else { continue }
-            guard let dirRange = text.range(of: "dir=") else { return nil }
-            let afterDir = text[dirRange.upperBound...]
-            return afterDir.split(separator: ",").first.map(String.init)
+        let normalized = sdp
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalized.components(separatedBy: "\n")
+
+        var currentKind: String?
+        var currentMid: String?
+        var currentDirection: String?
+        for line in lines {
+            if line.hasPrefix("m=") {
+                let body = line.dropFirst("m=".count)
+                currentKind = body.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init)
+                currentMid = nil
+                currentDirection = nil
+                continue
+            }
+            if line.hasPrefix("a=mid:") {
+                currentMid = String(line.dropFirst("a=mid:".count))
+                continue
+            }
+            switch line {
+            case "a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive":
+                currentDirection = String(line.dropFirst("a=".count))
+            default:
+                break
+            }
+            if currentKind == "video", currentMid == mid, let currentDirection {
+                return currentDirection
+            }
         }
         return nil
     }

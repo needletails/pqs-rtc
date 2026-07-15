@@ -865,6 +865,12 @@ extension RTCSession {
 
         if let connectionId, let callForTeardown = currentCall {
             await taskProcessor.removeJobs(forConnectionId: connectionId)
+            for key in sfuRoomSignalingPropsKeys(
+                roomId: callForTeardown.sharedCommunicationId,
+                sfuRecipientId: callForTeardown.resolvedChannelWireId ?? callForTeardown.sharedCommunicationId,
+                resolvedWireId: callForTeardown.channelWireId) {
+                sfuRoomSignalingPropsByConnectionId.removeValue(forKey: key)
+            }
 #if canImport(WebRTC)
             stopInboundVideoFlowProbe(connectionId: connectionId)
             stopOutboundVideoFlowProbe(connectionId: connectionId)

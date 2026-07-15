@@ -51,6 +51,11 @@ the host app must deliver exactly these fields to the remote `receiveCiphertext`
 - `ciphertext`: opaque PQXDH bootstrap bytes; do not parse or transform
 - `call`: the ``Call`` payload with current identity props
 
+If the host does not persist `call_cipher` as a user-visible message, it must keep the outbound
+control payload in a bounded recent-replay store. After transport-ratchet reestablishment, PQS
+requests the exact failed shared id again; replay must re-encrypt the preserved `call_cipher`
+through the repaired transport ratchet without changing its media-bootstrap ciphertext or ``Call``.
+
 The concrete wire format is host-defined. For example, a host can serialize:
 
 ```swift

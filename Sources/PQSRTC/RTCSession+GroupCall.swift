@@ -339,12 +339,33 @@ extension RTCSession {
                 level: .info,
                 message: "SFU registration inbound sfuPropsFp=\(KeyFingerprint.props(props)) room=\(connId) callId=\(call.id.uuidString) deviceId=\(deviceId.uuidString)")
         }
+        // Ephemeral 1:1 SFU rooms are `#<uuid>` derived from the caller's CallKit UUID. Prefer the
+        // room stem for sessionContext so push-reported callees (who may keep a different local
+        // Call.id until merge) still partition the signaling ratchet the same way as the caller.
+        // Channel-backed group rooms keep `call.id` so reused channel rooms isolate per attempt.
+        let sessionContext: String
+        if Self.isLikelyOneToOneSfuRoom(call: call) {
+            sessionContext = call.sharedCommunicationId.stableUUIDConnectionId.uuidString
+        } else {
+            sessionContext = call.id.uuidString
+        }
         _ = try await pcKeyManager.createSFUSignalingRecipientIdentity(
             roomId: call.sharedCommunicationId,
             deviceId: deviceId,
-            sessionContext: call.id.uuidString,
+            sessionContext: sessionContext,
             props: props,
             aliases: [connId, sfuRecipientId, call.resolvedChannelWireId ?? ""])
+
+        // Retain the genuine SFU ROOM props at the one moment they are authoritatively known (the
+        // registration RESPONSE). The re-seed path in
+        // `beginGroupCallMediaAfterSfuRegistrationIfNeeded` must only ever restore the room signaling
+        // identity from these props, never from local `Call.signalingIdentityProps`.
+        for key in sfuRoomSignalingPropsKeys(
+            roomId: call.sharedCommunicationId,
+            sfuRecipientId: sfuRecipientId,
+            resolvedWireId: call.resolvedChannelWireId) {
+            sfuRoomSignalingPropsByConnectionId[key] = props
+        }
 
         // Provisional media ratchet bootstrap: `keyManager` + `ratchetManager`.
         //
@@ -400,20 +421,97 @@ extension RTCSession {
         // Registration + identity provisioning can race app-layer answer flow.
         // Do not fail the call action when identities are still settling; callers
         // will invoke this entrypoint again on registration/call_answered retries.
-        do {
-            _ = try await keyManager.fetchConnectionIdentity(connection: connId)
-            _ = try await pcKeyManager.fetchConnectionIdentity(connection: connId)
-        } catch let error as RTCErrors {
-            if case .invalidConfiguration(let message) = error {
-                let lower = message.lowercased()
-                if lower.contains("missing connection identity") || lower.contains("missing local connection identity") {
-                    logger.log(
-                        level: .warning,
-                        message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: identities not ready yet for room=\(normalizedLookup), delaying media bootstrap (\(message))")
-                    return
-                }
+        //
+        // Signaling (`pcKeyManager`) is required to encrypt the initial SFU offer.
+        // Frame (`keyManager`) provisional room identity is only a bootstrap placeholder for
+        // 1:1 SFU — `call_cipher` replaces it — so missing frame identity must not block the
+        // answerer's SFU offer (that hang leaves the call "connecting" forever).
+        let signalingLookupIds = [
+            mediaCall.sharedCommunicationId,
+            mediaCall.resolvedChannelWireId ?? "",
+            mediaCall.channelWireId ?? "",
+            connId,
+            normalizedLookup,
+            sfuRecipientId
+        ]
+        var signalingReady = false
+        var lastSignalingMiss = ""
+        for lookupId in signalingLookupIds {
+            let trimmed = lookupId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if (try? await pcKeyManager.fetchConnectionIdentity(connection: trimmed)) != nil {
+                signalingReady = true
+                break
             }
-            throw error
+            lastSignalingMiss = trimmed
+        }
+        if !signalingReady {
+            // Registration created the identity, but a later teardown/alias miss can leave
+            // bootstrap unable to find it. Recovery may ONLY use the room props retained from the
+            // SFU registration response (``createSFUIdentity``). `mediaCall.signalingIdentityProps`
+            // holds OUR OWN local props here (set in `groupCallNegotiation` to send to the server);
+            // seeding the room identity from those makes this client encrypt SDP/ICE toward its own
+            // keys and the SFU rejects every packet with `maxSkippedHeadersExceeded`.
+            let retainedRoomProps = sfuRoomSignalingPropsKeys(
+                roomId: mediaCall.sharedCommunicationId,
+                sfuRecipientId: sfuRecipientId,
+                resolvedWireId: mediaCall.resolvedChannelWireId)
+                .compactMap { sfuRoomSignalingPropsByConnectionId[$0] }
+                .first
+            let deviceId =
+                (sessionParticipant.flatMap { UUID(uuidString: $0.deviceId) })
+                ?? UUID(uuidString: mediaCall.sender.deviceId)
+            if let props = retainedRoomProps, let deviceId {
+                let sessionContext: String
+                if Self.isLikelyOneToOneSfuRoom(call: mediaCall) {
+                    sessionContext = mediaCall.sharedCommunicationId.stableUUIDConnectionId.uuidString
+                } else {
+                    sessionContext = mediaCall.id.uuidString
+                }
+                _ = try await pcKeyManager.createSFUSignalingRecipientIdentity(
+                    roomId: mediaCall.sharedCommunicationId,
+                    deviceId: deviceId,
+                    sessionContext: sessionContext,
+                    props: props,
+                    aliases: [connId, normalizedLookup, sfuRecipientId, mediaCall.resolvedChannelWireId ?? ""])
+                signalingReady = true
+                logger.log(
+                    level: .warning,
+                    message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: re-seeded SFU signaling identity for room=\(normalizedLookup) from retained registration props after lookup miss")
+            } else if retainedRoomProps == nil {
+                logger.log(
+                    level: .warning,
+                    message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: no retained SFU room props for room=\(normalizedLookup); refusing to re-seed from local props")
+            }
+        }
+        if !signalingReady {
+            logger.log(
+                level: .warning,
+                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: SFU signaling identity not ready yet for room=\(normalizedLookup), delaying media bootstrap (Missing connection identity for ID: \(lastSignalingMiss))")
+            return
+        }
+
+        if (try? await keyManager.fetchConnectionIdentity(connection: connId)) == nil {
+            // `setMessageKey` / offer paths resolve by `connection.id` (often `#<uuid>`). Always
+            // seed a room-scoped frame recipient identity here. For 1:1 SFU, prefer peer
+            // `frameIdentityProps` from `call_answered` when present; otherwise use SFU/local
+            // props as a provisional placeholder that `call_cipher` replaces.
+            let seedProps =
+                mediaCall.frameIdentityProps
+                ?? mediaCall.signalingIdentityProps
+            if let seedProps {
+                _ = try await keyManager.createRecipientIdentity(
+                    connectionId: mediaCall.sharedCommunicationId,
+                    props: seedProps)
+                logger.log(
+                    level: .info,
+                    message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: seeded frame recipient identity for room=\(normalizedLookup)")
+            } else {
+                logger.log(
+                    level: .warning,
+                    message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: identities not ready yet for room=\(normalizedLookup), delaying media bootstrap (Missing connection identity for ID: \(connId))")
+                return
+            }
         }
 
         let frameLocalIdentity: ConnectionLocalIdentity

@@ -370,12 +370,18 @@ extension RTCSession {
                 props: remoteFrameProps)
         }
 
-        do {
-            _ = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
-        } catch {
-            _ = try await pcKeyManager.createRecipientIdentity(
-                connectionId: call.sharedCommunicationId,
-                props: remoteSignalingProps)
+        // 1:1 SFU: room-scoped `pcKeyManager` identity is owned by SFU registration
+        // (`createSFUSignalingRecipientIdentity`). Never seed it from peer signaling props —
+        // that poisons SDP/ICE encrypt so the SFU rejects later packets with
+        // `maxSkippedHeadersExceeded`.
+        if !Self.isLikelyOneToOneSfuRoom(call: call) {
+            do {
+                _ = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+            } catch {
+                _ = try await pcKeyManager.createRecipientIdentity(
+                    connectionId: call.sharedCommunicationId,
+                    props: remoteSignalingProps)
+            }
         }
 
         let frameLocalIdentity: ConnectionLocalIdentity
@@ -602,8 +608,41 @@ extension RTCSession {
                 return resolvedCall
             }
         } else {
+            // Answerer (`shouldOffer == false`): `call_cipher` may create the PeerConnection when
+            // inbound media bootstrap failed earlier. Each SFU participant still needs its own
+            // encrypted `.offer` leg — without it ICE never starts and the UI hangs "connecting".
+            try await ensureOneToOneSfuAnswererInitialOfferAfterCipherIfNeeded(call: resolvedCall)
             return resolvedCall
         }
+    }
+
+    /// Sends the answerer's initial SFU offer when registration/audio bootstrap did not.
+    ///
+    /// Event trigger: inbound `call_cipher` completed on a 1:1 SFU answerer whose room PC exists
+    /// but ``initialSfuGroupMediaOfferSentConnectionIds`` does not yet include the room.
+    private func ensureOneToOneSfuAnswererInitialOfferAfterCipherIfNeeded(call: Call) async throws {
+        let roleCall = await callForOneToOneSfuRoleDetection(call)
+        guard Self.isLikelyOneToOneSfuRoom(call: roleCall) else { return }
+        let bootstrapKey = teardownConnectionIdKey(roleCall.sharedCommunicationId)
+        guard !initialSfuGroupMediaOfferSentConnectionIds.contains(bootstrapKey) else { return }
+        guard !sfuGroupMediaBootstrapInFlightConnectionIds.contains(bootstrapKey) else {
+            logger.log(
+                level: .info,
+                message: "1:1 SFU answerer: media bootstrap already in flight after call_cipher; not duplicating offer connId=\(roleCall.sharedCommunicationId)"
+            )
+            return
+        }
+        guard await connectionManager.findConnection(with: roleCall.sharedCommunicationId) != nil else { return }
+
+        let route = (roleCall.resolvedChannelWireId ?? roleCall.sharedCommunicationId).ensureIRCChannel
+        logger.log(
+            level: .info,
+            message: "1:1 SFU answerer: initial SFU offer missing after call_cipher; starting media bootstrap connId=\(roleCall.sharedCommunicationId)"
+        )
+        try await beginGroupCallMediaAfterSfuRegistrationIfNeeded(
+            sfuRecipientId: route,
+            updatedCall: roleCall,
+            sendInitialOffer: true)
     }
 
     private func frameCryptorKeyRingIndex(_ ratchetIndex: Int) -> Int {
@@ -2069,7 +2108,21 @@ extension RTCSession {
     ) async throws -> (Data, Int) {
         var connection = await connectionManager.findConnection(with: connection.id) ?? connection
 
-        let remoteConnectionIdentity = try await keyManager.fetchConnectionIdentity(connection: connection.id)
+        let remoteConnectionIdentity: ConnectionSessionIdentity
+        if let existing = try? await keyManager.fetchConnectionIdentity(connection: connection.id) {
+            remoteConnectionIdentity = existing
+        } else if let frameProps = call.frameIdentityProps {
+            // `call_answered` / `call_cipher` can carry peer frame props before a room-scoped
+            // keyManager entry exists (e.g. registration only provisioned pcKeyManager).
+            remoteConnectionIdentity = try await keyManager.createRecipientIdentity(
+                connectionId: connection.id,
+                props: frameProps)
+            logger.log(
+                level: .info,
+                message: "Seeded frame recipient identity from call props before sender ratchet connId=\(connection.id)")
+        } else {
+            throw RTCErrors.invalidConfiguration("Missing connection identity for ID: \(connection.id)")
+        }
         guard let storedRemoteProps = await remoteConnectionIdentity.sessionIdentity.props(symmetricKey: remoteConnectionIdentity.symmetricKey) else {
             throw RTCErrors.invalidConfiguration("Remote peer did not provide a valid connection identity")
         }
@@ -2352,9 +2405,17 @@ extension RTCSession {
             return
         }
 
-        guard let remoteSignalingProps = call.signalingIdentityProps else {
-            logger.log(level: .error, message: "Call will not proceed the session identity for sender is missing, Call will not proceed the signalling session identity for sender is missing, Call: \(call)")
-            return
+        let roleCallForSignaling = await callForOneToOneSfuRoleDetection(call)
+        let isOneToOneSfu = Self.isLikelyOneToOneSfuRoom(call: roleCallForSignaling)
+        let remoteSignalingProps: SessionIdentity.UnwrappedProps?
+        if isOneToOneSfu {
+            remoteSignalingProps = nil
+        } else {
+            guard let props = call.signalingIdentityProps else {
+                logger.log(level: .error, message: "Call will not proceed the session identity for sender is missing, Call will not proceed the signalling session identity for sender is missing, Call: \(call)")
+                return
+            }
+            remoteSignalingProps = props
         }
         let remoteFrameIdentityFingerprint = frameIdentityPropsFingerprint(remoteFrameProps)
         let previousSenderRemoteFingerprint = senderFrameKeyIdentityFingerprintByConnectionId[normalizedCallCipherConnectionId]
@@ -2362,18 +2423,29 @@ extension RTCSession {
             previousSenderRemoteFingerprint != nil &&
             previousSenderRemoteFingerprint != remoteFrameIdentityFingerprint
 
-        // `call_cipher` is the authoritative peer frame identity exchange. Replace any provisional
-        // room bootstrap identity before deriving receive keys or refreshing our sender key.
+        // `call_cipher` is the authoritative peer *frame* identity exchange. Replace any provisional
+        // room bootstrap identity in `keyManager` before deriving receive keys or refreshing our
+        // sender key. Do not touch `pcKeyManager` for 1:1 SFU rooms — that store holds the SFU
+        // signaling ratchet from registration; writing peer props there makes later `.offer` /
+        // `.handshakeComplete` / `.candidate` encrypt against the peer instead of the SFU.
         _ = try await keyManager.createRecipientIdentity(
             connectionId: call.sharedCommunicationId,
             props: remoteFrameProps)
 
-        do {
-            _ = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
-        } catch {
-            _ = try await pcKeyManager.createRecipientIdentity(
-                connectionId: call.sharedCommunicationId,
-                props: remoteSignalingProps)
+        if isOneToOneSfu {
+            if await (try? pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)) == nil {
+                logger.log(
+                    level: .warning,
+                    message: "1:1 SFU call_cipher: SFU signaling identity missing for \(call.sharedCommunicationId); leaving pcKeyManager untouched (registration owns signaling)")
+            }
+        } else if let remoteSignalingProps {
+            do {
+                _ = try await pcKeyManager.fetchConnectionIdentity(connection: call.sharedCommunicationId)
+            } catch {
+                _ = try await pcKeyManager.createRecipientIdentity(
+                    connectionId: call.sharedCommunicationId,
+                    props: remoteSignalingProps)
+            }
         }
 
         let localFrameIdentity: ConnectionLocalIdentity

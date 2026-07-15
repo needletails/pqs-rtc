@@ -221,8 +221,12 @@ public actor KeyManager: SessionIdentityDelegate {
         let otpkId = UUID()
         let kemId = UUID()
         
-        // Store one-time key
+        // Store the one-time private key so DoubleRatchetKit delegate hydration
+        // (`fetchOneTimePrivateKey(header.oneTimeKeyId)`) can resolve it after the in-state copy
+        // is consumed; without this the dictionary is always empty and the first inbound message
+        // of a re-handshake fails to decrypt (BoringSSL CIPHER BAD_DECRYPT).
         let oneTimeKey = try CurvePrivateKey(id: otpkId, otpk.rawRepresentation)
+        storeOneTimeKey(oneTimeKey, id: otpkId)
         
         let localKeys = LocalKeys(
             longTerm: try CurvePrivateKey(id: ltpkId, ltpk.rawRepresentation),
@@ -446,15 +450,19 @@ public actor KeyManager: SessionIdentityDelegate {
 
         append(trimmed)
         append(trimmed.lowercased())
+        append(trimmed.uppercased())
         append(noChannelPrefix)
         append(noChannelPrefix.lowercased())
+        append(noChannelPrefix.uppercased())
         append("#\(noChannelPrefix)")
         append("#\(noChannelPrefix.lowercased())")
+        append("#\(noChannelPrefix.uppercased())")
         append(normalized)
         append("#\(normalized)")
         append("conf-\(normalized)")
         append("#conf-\(normalized)")
         append(sessionId.uuidString)
+        append(sessionId.uuidString.lowercased())
         return keys
     }
 }

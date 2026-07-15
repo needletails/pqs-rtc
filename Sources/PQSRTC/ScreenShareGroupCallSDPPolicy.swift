@@ -225,18 +225,21 @@ public enum ScreenShareGroupCallSDPPolicy: Sendable {
 
     /// Video mids in an inbound SFU offer whose first RTP SSRC duplicates the camera mid SSRC.
     public static func relayVideoMidsWithPlaceholderDuplicateCameraSsrc(in remoteOfferSdp: String) -> Set<String> {
+        let cameraMid = ScreenShareGroupCallContract.MediaMid.camera.rawValue
         guard let cameraSsrc = firstRtpSsrc(
-            forMid: ScreenShareGroupCallContract.MediaMid.camera.rawValue,
+            forMid: cameraMid,
             in: remoteOfferSdp
         ),
         cameraSsrc > 0 else {
             return []
         }
 
-        let relayMids = RTCSession.sfuRelayIncomingScreenShareVideoMids(in: remoteOfferSdp)
+        // Placeholder offers often lack `screen_` msids. Detect any non-camera *sending* video mid
+        // that reuses the camera SSRC — independent of the retired UUID-only screen mid parsers.
+        let candidateMids = RTCSession.remoteSendingVideoMids(in: remoteOfferSdp)
             .union(RTCSession.activeScreenShareVideoMids(in: remoteOfferSdp))
-        return Set(relayMids.compactMap { mid -> String? in
-            guard mid != ScreenShareGroupCallContract.MediaMid.camera.rawValue,
+        return Set(candidateMids.compactMap { mid -> String? in
+            guard mid != cameraMid,
                   let relaySsrc = firstRtpSsrc(forMid: mid, in: remoteOfferSdp),
                   relaySsrc > 0,
                   relaySsrc == cameraSsrc else {
