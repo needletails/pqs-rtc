@@ -341,7 +341,8 @@ extension RTCSession {
         do {
             audioPlayer = try AVAudioPlayer(contentsOf: url)
             audioPlayer?.numberOfLoops = -1
-            audioPlayer?.volume = 0.5
+            // Full relative gain so system output volume is the sole level control.
+            audioPlayer?.volume = 1.0
             audioPlayer?.prepareToPlay()
             audioPlayer?.play()
         } catch {

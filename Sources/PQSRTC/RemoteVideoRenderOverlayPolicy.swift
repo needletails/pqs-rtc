@@ -2,7 +2,7 @@
 //  RemoteVideoRenderOverlayPolicy.swift
 //  pqs-rtc
 //
-//  Signal-like remote tile UX: hold the last decoded frame during brief gaps and
+//  Remote tile UX: hold the last decoded frame during brief gaps and
 //  only show the pause overlay when inbound video has genuinely stopped flowing.
 //
 

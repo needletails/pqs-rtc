@@ -37,7 +37,14 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
     public init() {}
 
     public func endCall() async {
-        await viewController?.endCall()
+        guard let viewController else {
+            NeedleTailLogger("[VideoCallActionBridge]").log(
+                level: .warning,
+                message: "endCall ignored; VideoCallViewController not bound"
+            )
+            return
+        }
+        await viewController.endCall()
     }
 
     public func muteAudio() async {
@@ -338,7 +345,14 @@ public final class VideoCallActionBridge: CallActionDelegate, @unchecked Sendabl
     public init() {}
 
     public func endCall() async {
-        await viewController?.endCall()
+        guard let viewController else {
+            NeedleTailLogger("[VideoCallActionBridge]").log(
+                level: .warning,
+                message: "endCall ignored; VideoCallViewController not bound"
+            )
+            return
+        }
+        await viewController.endCall()
     }
 
     public func muteAudio() async {

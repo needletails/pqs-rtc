@@ -22,7 +22,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5"),
         .package(url: "https://github.com/needletails/needletail-media-kit.git", from: "1.1.0"),
-        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "3.0.0"),
+        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "3.1.0"),
     ],
     targets: [
         .target(
