@@ -119,6 +119,8 @@ public final class VideoCallViewController: UICollectionViewController {
     nonisolated(unsafe) private var didEnterBackgroundPiPObserver: NSObjectProtocol?
 
     private var remoteVideoTrackPollTask: Task<Void, Never>?
+    private var inboundVideoFlowStreamTask: Task<Void, Never>?
+    private var lastInboundVideoFlowStateForDecodeStall: InboundVideoFlowState?
     private var remoteRendererRecoveryTask: Task<Void, Never>?
     private var remoteRendererRecoveryConnectionId: String?
     private var remoteRendererRecoveryRendererId: ObjectIdentifier?
@@ -2582,20 +2584,23 @@ public final class VideoCallViewController: UICollectionViewController {
                         message: "iOS participant camera decoder stalled with current renderer binding; refreshing receiver/media readiness participant=\(trimmedParticipantId) connectionId=\(normalizedConnectionId)"
                     )
                     self.lastParticipantRendererRecoveryUptimeNsByKey[key] = now
-                    await self.session.recoverInboundRemoteParticipantVideoDecoderAfterMatchedBindingStall(
+                    let recoveryKind = await self.session.recoverInboundRemoteParticipantVideoDecoderAfterMatchedBindingStall(
                         connectionId: normalizedConnectionId,
                         participantId: trimmedParticipantId
                     )
-                    await renderer.clearCachedMetalDisplayFrame()
                     await renderer.startStream()
-                    let didAttach = await self.session.renderRemoteVideoForParticipant(
-                        to: renderer.rtcVideoRenderWrapper,
-                        connectionId: normalizedConnectionId,
-                        participantId: trimmedParticipantId,
-                        forceParticipantRendererRebind: true
-                    )
-                    if didAttach {
-                        await renderer.setRemoteVideoInboundExpected(true)
+                    // PLI-first: keep the current binding; only force rebind when cryptor path ran.
+                    if recoveryKind == .fullCryptorAndRendererRecovery {
+                        await renderer.clearCachedMetalDisplayFrame()
+                        let didAttach = await self.session.renderRemoteVideoForParticipant(
+                            to: renderer.rtcVideoRenderWrapper,
+                            connectionId: normalizedConnectionId,
+                            participantId: trimmedParticipantId,
+                            forceParticipantRendererRebind: true
+                        )
+                        if didAttach {
+                            await renderer.setRemoteVideoInboundExpected(true)
+                        }
                     }
                     continue
                 }
@@ -2634,6 +2639,7 @@ public final class VideoCallViewController: UICollectionViewController {
         Task { [session] in
             await session.startInboundVideoFlowSamplerIfNeeded(connectionId: connectionId)
         }
+        startInboundVideoFlowDecodeStallObservation(connectionId: connectionId)
         remoteVideoTrackPollTask = Task { @MainActor [weak self] in
             guard let self else { return }
             var lastMainOverlay: RemoteVideoTileOverlay?
@@ -2662,9 +2668,70 @@ public final class VideoCallViewController: UICollectionViewController {
         }
     }
 
+    /// Event-driven first shot: transition into decodeStalled with packets advancing.
+    /// Shares session 15s cooldown with the participant recovery poll (no double PLI).
+    private func startInboundVideoFlowDecodeStallObservation(connectionId: String) {
+        inboundVideoFlowStreamTask?.cancel()
+        lastInboundVideoFlowStateForDecodeStall = nil
+        let normalizedConnectionId = connectionId.normalizedConnectionId
+        inboundVideoFlowStreamTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let stream = await self.session.inboundVideoFlowUpdateStream()
+            for await flow in stream {
+                guard !Task.isCancelled else { break }
+                let previous = self.lastInboundVideoFlowStateForDecodeStall
+                self.lastInboundVideoFlowStateForDecodeStall = flow.state
+                guard self.shouldUseParticipantCameraTiles() else { continue }
+                guard flow.isDecodeStalledWithAdvancingPackets else { continue }
+                guard previous != .decodeStalled else { continue }
+                await self.handleDecodeStalledTransition(connectionId: normalizedConnectionId)
+            }
+        }
+    }
+
+    private func handleDecodeStalledTransition(connectionId: String) async {
+        for model in videoViews.views.filter(isParticipantCameraModel) {
+            let participantId = model.participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !participantId.isEmpty else { continue }
+            guard let renderer = model.videoView.renderer as? SampleBufferViewRenderer else { continue }
+            let bindingIsCurrent = await session.participantCameraRendererBindingIsCurrent(
+                connectionId: connectionId,
+                participantId: participantId,
+                renderer: renderer.rtcVideoRenderWrapper
+            )
+            guard bindingIsCurrent else { continue }
+            let key = participantRendererRecoveryKey(connectionId: connectionId, participantId: participantId)
+            lastParticipantRendererRecoveryUptimeNsByKey[key] = DispatchTime.now().uptimeNanoseconds
+            logger.log(
+                level: .warning,
+                message: "iOS decodeStalled transition; PLI-first matched-binding recovery participant=\(participantId) connectionId=\(connectionId)"
+            )
+            let recoveryKind = await session.recoverInboundRemoteParticipantVideoDecoderAfterMatchedBindingStall(
+                connectionId: connectionId,
+                participantId: participantId
+            )
+            await renderer.startStream()
+            if recoveryKind == .fullCryptorAndRendererRecovery {
+                await renderer.clearCachedMetalDisplayFrame()
+                let didAttach = await session.renderRemoteVideoForParticipant(
+                    to: renderer.rtcVideoRenderWrapper,
+                    connectionId: connectionId,
+                    participantId: participantId,
+                    forceParticipantRendererRebind: true
+                )
+                if didAttach {
+                    await renderer.setRemoteVideoInboundExpected(true)
+                }
+            }
+        }
+    }
+
     private func stopRemoteVideoTrackPolling() {
         remoteVideoTrackPollTask?.cancel()
         remoteVideoTrackPollTask = nil
+        inboundVideoFlowStreamTask?.cancel()
+        inboundVideoFlowStreamTask = nil
+        lastInboundVideoFlowStateForDecodeStall = nil
         if let raw = currentCall?.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
             Task { [session] in
                 await session.stopInboundVideoFlowSampler(connectionId: raw)

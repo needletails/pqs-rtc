@@ -21,21 +21,32 @@ enum RTCAdaptiveVideoTargets {
     static let survivalBitrateBps = 120_000
     static let survivalFramerate = 7
     static let survivalScaleResolutionDownBy = 4.0
+    /// Enter survival when RTT is high and inbound path looks congested.
+    static let survivalRttSeconds = 0.35
+    static let survivalIncomingBitrateBps = 150_000.0
+    static let survivalInboundLossFraction = 0.30
 
     /// Computes adaptive sender targets from WebRTC candidate-pair bandwidth.
     ///
     /// TURN/relay paths often report pessimistic `availableOutgoingBitrate` while audio and video
     /// are otherwise stable. For 1:1 SFU calls we apply a conservative floor so steady camera calls
     /// are not capped at slideshow fps when the link is usable.
+    ///
+    /// When RTT is high **and** inbound looks bad (low `availableIncomingBitrate` or high recent
+    /// inbound video loss), enter survival to stop flooding a shared congested path.
     static func compute(
         cfg: RTCVideoQualityProfile.AdaptiveConfig,
         isOneToOneSfu: Bool,
         reportedAvailableOutgoingBps: Double,
-        currentRttSeconds: Double?
+        currentRttSeconds: Double?,
+        availableIncomingBitrateBps: Double? = nil,
+        inboundVideoLossFraction: Double? = nil
     ) -> AdaptiveVideoTargets {
         if shouldUseSurvivalMode(
             reportedAvailableOutgoingBps: reportedAvailableOutgoingBps,
-            currentRttSeconds: currentRttSeconds
+            currentRttSeconds: currentRttSeconds,
+            availableIncomingBitrateBps: availableIncomingBitrateBps,
+            inboundVideoLossFraction: inboundVideoLossFraction
         ) {
             return survivalTargets(cfg: cfg)
         }
@@ -44,7 +55,7 @@ enum RTCAdaptiveVideoTargets {
         if let rtt = currentRttSeconds {
             if rtt >= 0.70 {
                 headroom = min(headroom, 0.55)
-            } else if rtt >= 0.35 {
+            } else if rtt >= survivalRttSeconds {
                 headroom = min(headroom, 0.65)
             }
         }
@@ -95,13 +106,30 @@ enum RTCAdaptiveVideoTargets {
         )
     }
 
-    private static func shouldUseSurvivalMode(
+    static func shouldUseSurvivalMode(
         reportedAvailableOutgoingBps: Double,
-        currentRttSeconds: Double?
+        currentRttSeconds: Double?,
+        availableIncomingBitrateBps: Double? = nil,
+        inboundVideoLossFraction: Double? = nil
     ) -> Bool {
         if reportedAvailableOutgoingBps < 80_000 { return true }
-        if reportedAvailableOutgoingBps < 150_000, (currentRttSeconds ?? 0.35) >= 0.35 { return true }
-        if reportedAvailableOutgoingBps <= 300_000, let rtt = currentRttSeconds, rtt >= 0.35 { return true }
+        if reportedAvailableOutgoingBps < 150_000, (currentRttSeconds ?? survivalRttSeconds) >= survivalRttSeconds {
+            return true
+        }
+        if reportedAvailableOutgoingBps <= 300_000, let rtt = currentRttSeconds, rtt >= survivalRttSeconds {
+            return true
+        }
+        // Shared-bottleneck heuristic: high RTT plus bad inbound → cap this device's outbound.
+        if let rtt = currentRttSeconds, rtt >= survivalRttSeconds {
+            if let incoming = availableIncomingBitrateBps,
+               incoming > 0,
+               incoming < survivalIncomingBitrateBps {
+                return true
+            }
+            if let loss = inboundVideoLossFraction, loss >= survivalInboundLossFraction {
+                return true
+            }
+        }
         return false
     }
 
@@ -109,10 +137,10 @@ enum RTCAdaptiveVideoTargets {
         reportedAvailableOutgoingBps: Double,
         currentRttSeconds: Double?
     ) -> Bool {
-        if reportedAvailableOutgoingBps < 150_000, (currentRttSeconds ?? 0) >= 0.35 {
+        if reportedAvailableOutgoingBps < 150_000, (currentRttSeconds ?? 0) >= survivalRttSeconds {
             return false
         }
-        if let rtt = currentRttSeconds, rtt >= 0.35 {
+        if let rtt = currentRttSeconds, rtt >= survivalRttSeconds {
             return false
         }
         return true

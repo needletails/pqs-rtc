@@ -94,6 +94,43 @@ public struct RemoteParticipantTrackEvent: Sendable {
     }
 }
 
+/// Fired by ``RTCSession/e2eeStateStream()`` when frame encryption fails or recovers.
+public struct E2EEStateEvent: Sendable {
+    public enum Kind: String, Sendable {
+        case senderCryptorFailed
+        case senderCryptorReady
+        /// Receiver cryptor exceeded the decrypt failure tolerance (H1); media from
+        /// `participantId` is being discarded until a fresh key is installed.
+        case receiverDecryptionFailed
+        /// Receiver cryptor has no key for `participantId` while encrypted media arrives.
+        case receiverMissingKey
+        /// Receiver cryptor returned to OK after a failure state.
+        case receiverRecovered
+    }
+
+    public let connectionId: String
+    public let kind: Kind
+    /// Media leg, e.g. `"audio"`, `"video"`, `"screen"`, or `"sender"`.
+    public let mediaKind: String
+    public let reason: String
+    /// Remote participant whose cryptor changed state (receiver kinds only).
+    public let participantId: String
+
+    public init(
+        connectionId: String,
+        kind: Kind,
+        mediaKind: String,
+        reason: String = "",
+        participantId: String = ""
+    ) {
+        self.connectionId = connectionId
+        self.kind = kind
+        self.mediaKind = mediaKind
+        self.reason = reason
+        self.participantId = participantId
+    }
+}
+
 /// One coordinated Android tile-attach episode after SFU renegotiation settles.
 ///
 /// Emitted once per rebound batch so the call UI can bind every affected participant from live

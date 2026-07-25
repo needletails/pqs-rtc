@@ -611,7 +611,7 @@ extension RTCSession {
             try await self.rtcClient.prepareAudioSendRecv(id: connection.id)
             // Mirror Apple: attach sender FrameCryptors as soon as track is added (E2EE).
             if enableEncryption && rtcClient.isFrameKeyProviderReady() {
-                rtcClient.createSenderEncryptedFrame(participant: connection.localParticipantId, connectionId: connection.id)
+                try await createEncryptedFrame(connection: connection)
             } else if enableEncryption {
                 logger.log(level: .debug, message: "Skipping early audio sender cryptor attach until Android key provider is ready")
             }
@@ -679,7 +679,7 @@ extension RTCSession {
             }
             // Mirror Apple: attach sender FrameCryptors as soon as track is added (E2EE).
             if enableEncryption && rtcClient.isFrameKeyProviderReady() {
-                rtcClient.createSenderEncryptedFrame(participant: connection.localParticipantId, connectionId: connection.id)
+                try await createEncryptedFrame(connection: updatedConnection)
             } else if enableEncryption {
                 logger.log(level: .debug, message: "Skipping early video sender cryptor attach until Android key provider is ready")
             }
@@ -1115,6 +1115,12 @@ extension RTCSession {
             task.cancel()
         }
         inboundVideoFlowSamplerTasksByConnectionId.removeAll()
+        inboundVideoFlowSamplerActiveByConnectionId.removeAll()
+        inboundVideoFlowSamplerGenerationByConnectionId.removeAll()
+        e2eeSenderFailedConnectionIds.removeAll()
+        requiresExternalAudioActivation = false
+        externalAudioActivationOpen = false
+        pendingCallCipherPeerConnectionBootstrapByConnectionId.removeAll()
 #if os(Android)
         lastInboundVideoCountersByConnectionId.removeAll()
 #endif

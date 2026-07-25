@@ -250,7 +250,7 @@ extension RTCSession {
                 let sharerOfferPending = connection.localScreenTrack != nil
                     || offerInFlightConnectionIds.contains(renegotiationNormId)
                 if sharerOfferPending, isGroupCallConnection(connection.id) {
-                    pendingDeferredSfuRenegotiationOffers[renegotiationNormId] = (sdp, call)
+                    stashDeferredSfuRenegotiationOffer(sdp, call: call, normalizedId: renegotiationNormId)
                     logger.log(
                         level: .info,
                         message: "Deferring inbound SFU renegotiation offer while local screen-share offer is in flight connId=\(renegotiationNormId)"
@@ -285,7 +285,7 @@ extension RTCSession {
                ScreenShareGroupCallSDPPolicy.sfuRelayScreenOfferUsesPlaceholderDuplicateSsrc(
                    remoteOfferSdp: sanitizedRemoteOfferSdp
                ) {
-                pendingDeferredSfuRenegotiationOffers[renegotiationNormId] = (sdp, call)
+                stashDeferredSfuRenegotiationOffer(sdp, call: call, normalizedId: renegotiationNormId)
                 logger.log(
                     level: .info,
                     message: "Deferring SFU placeholder screen relay offer (duplicate camera/screen SSRC) connId=\(renegotiationNormId)"
@@ -381,6 +381,23 @@ extension RTCSession {
         return answered
     }
 
+    /// M2 (audited, intentional): the deferred slot is last-wins per room. SFU renegotiation
+    /// offers carry the room's full current SDP state, so a newer offer always supersedes an
+    /// older deferred one; replaying stale offers would thrash transceiver state. Flush is
+    /// bounded by the events in `processDeferredSfuRenegotiationOfferIfNeeded`.
+    func stashDeferredSfuRenegotiationOffer(
+        _ sdp: SessionDescription,
+        call: Call,
+        normalizedId: String
+    ) {
+        if pendingDeferredSfuRenegotiationOffers[normalizedId] != nil {
+            logger.log(
+                level: .info,
+                message: "Deferred SFU renegotiation offer superseded by newer offer (last-wins) connId=\(normalizedId)")
+        }
+        pendingDeferredSfuRenegotiationOffers[normalizedId] = (sdp, call)
+    }
+
     /// Processes a queued inbound SFU renegotiation offer once signaling is stable.
     func processDeferredSfuRenegotiationOfferIfNeeded(for call: Call) async {
         let normId = teardownConnectionIdKey(call.sharedCommunicationId)
@@ -411,7 +428,7 @@ extension RTCSession {
     func completeSfuRenegotiationOfferHandling(sdp: SessionDescription, call: Call) async throws {
         let normId = teardownConnectionIdKey(call.sharedCommunicationId)
         if sfuRenegotiationInFlightConnectionIds.contains(normId) {
-            pendingDeferredSfuRenegotiationOffers[normId] = (sdp, call)
+            stashDeferredSfuRenegotiationOffer(sdp, call: call, normalizedId: normId)
             logger.log(
                 level: .info,
                 message: "Deferring duplicate SFU renegotiation offer while prior answer is in flight connId=\(normId)"

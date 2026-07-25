@@ -19,15 +19,29 @@
 import WebRTC
 import NeedleTailLogger
 
-final class FrameCryptorDelegate: NSObject, RTCFrameCryptorDelegate {
+final class FrameCryptorDelegate: NSObject, RTCFrameCryptorDelegate, @unchecked Sendable {
     private let logger: NeedleTailLogger
-    
+    private let stateHandlerLock = NSLock()
+    private var stateHandler: (@Sendable (String, RTCFrameCryptorState) -> Void)?
+
     init(logger: NeedleTailLogger = NeedleTailLogger("[FrameCryptor]")) {
         self.logger = logger
         super.init()
     }
+
+    /// Forwards state changes (H1: surface decrypt failures instead of log-only).
+    func setStateChangeHandler(_ handler: (@Sendable (String, RTCFrameCryptorState) -> Void)?) {
+        stateHandlerLock.lock()
+        stateHandler = handler
+        stateHandlerLock.unlock()
+    }
+
     var lastOkLogTime: [String: Date] = [:]
     func frameCryptor(_ frameCryptor: RTCFrameCryptor, didStateChangeWithParticipantId participantId: String, with stateChanged: RTCFrameCryptorState) {
+        stateHandlerLock.lock()
+        let handler = stateHandler
+        stateHandlerLock.unlock()
+        handler?(participantId, stateChanged)
         
         let stateDescription: String
         switch stateChanged {

@@ -902,6 +902,8 @@ class AndroidFrameCryptorSupport {
     private var keyProvider: FrameCryptorKeyProvider? = null
     private var generation: Long = 0
     var videoReceiverFrameCryptorReadyHandler: ((String) -> Unit)? = null
+    // H1: forwards (tag, participantId, stateDescription) so decrypt failures surface as events.
+    var frameCryptorStateHandler: ((String, String, String) -> Unit)? = null
 
     private var videoSenderCryptor: FrameCryptor? = null
     private var audioSenderCryptor: FrameCryptor? = null
@@ -960,6 +962,7 @@ class AndroidFrameCryptorSupport {
         audioReceiverTrackIdsByParticipantId.clear()
         screenReceiverTrackIdsByParticipantId.clear()
         videoReceiverFrameCryptorReadyHandler = null
+        frameCryptorStateHandler = null
     }
 
     @Synchronized
@@ -1359,7 +1362,10 @@ class AndroidFrameCryptorSupport {
                     Log.e("AndroidRTCClient", "[$tag] ⚠️ Missing key for '$participantId'")
                 } else if (newState == FrameCryptor.FrameCryptionState.INTERNALERROR) {
                     Log.e("AndroidRTCClient", "[$tag] ❌ Internal error for '$participantId'")
+                } else if (newState == FrameCryptor.FrameCryptionState.DECRYPTIONFAILED) {
+                    Log.e("AndroidRTCClient", "[$tag] ❌ Decryption failed for '$participantId' (failure tolerance exceeded)")
                 }
+                frameCryptorStateHandler?.invoke(tag, participantId, stateDescription)
             }
         })
     }

@@ -72,6 +72,44 @@ struct RTCAdaptiveVideoTargetsTests {
 #endif
     }
 
+    @Test("High RTT with inbound loss enters survival even when outgoing looks OK")
+    func survivalFromHighRttAndInboundLoss() {
+        let cfg = RTCVideoQualityProfile.standard.adaptiveConfig
+        let targets = RTCAdaptiveVideoTargets.compute(
+            cfg: cfg,
+            isOneToOneSfu: false,
+            reportedAvailableOutgoingBps: 900_000,
+            currentRttSeconds: 0.40,
+            availableIncomingBitrateBps: nil,
+            inboundVideoLossFraction: 0.45
+        )
+        #expect(targets.maxBitrateBps <= RTCAdaptiveVideoTargets.survivalBitrateBps)
+        #expect(targets.maxFramerate <= RTCAdaptiveVideoTargets.survivalFramerate)
+    }
+
+    @Test("High RTT with low incoming bitrate enters survival")
+    func survivalFromHighRttAndLowIncoming() {
+        let cfg = RTCVideoQualityProfile.standard.adaptiveConfig
+        #expect(RTCAdaptiveVideoTargets.shouldUseSurvivalMode(
+            reportedAvailableOutgoingBps: 900_000,
+            currentRttSeconds: 0.40,
+            availableIncomingBitrateBps: 80_000,
+            inboundVideoLossFraction: nil
+        ))
+        #expect(!RTCAdaptiveVideoTargets.shouldUseSurvivalMode(
+            reportedAvailableOutgoingBps: 900_000,
+            currentRttSeconds: 0.40,
+            availableIncomingBitrateBps: 400_000,
+            inboundVideoLossFraction: 0.05
+        ))
+        #expect(!RTCAdaptiveVideoTargets.shouldUseSurvivalMode(
+            reportedAvailableOutgoingBps: 900_000,
+            currentRttSeconds: 0.20,
+            availableIncomingBitrateBps: 80_000,
+            inboundVideoLossFraction: 0.50
+        ))
+    }
+
     @Test("shouldApply avoids thrashing on small bitrate changes")
     func shouldApplyThreshold() {
         let targets = AdaptiveVideoTargets(maxBitrateBps: 700_000, maxFramerate: 24, scaleResolutionDownBy: 1.0)

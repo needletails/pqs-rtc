@@ -4708,7 +4708,11 @@ extension RTCSession {
 #if os(Android)
                 // Mirror Apple: attach sender FrameCryptors when stream is added (fallback if not already created in addAudioToStream/addVideoToStream).
                 if enableEncryption && rtcClient.isFrameKeyProviderReady() {
-                    rtcClient.createSenderEncryptedFrame(participant: connection.localParticipantId, connectionId: connection.id)
+                    do {
+                        try await createEncryptedFrame(connection: connection)
+                    } catch {
+                        self.logger.log(level: .error, message: "Android addedStream sender FrameCryptor failed (fail-closed): \(error)")
+                    }
                     if let localScreenTrack = connection.localScreenTrack {
                         rtcClient.createScreenSenderEncryptedFrame(
                             participant: connection.localParticipantId,

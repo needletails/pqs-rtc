@@ -27,8 +27,16 @@ import NeedleTailLogger
 public actor KeyManager: SessionIdentityDelegate {
 
     private var connectionLocalIdentity: ConnectionLocalIdentity?
-    
-    private var connectionIdentities: [String: ConnectionSessionIdentity] = [:]
+
+    /// M4: every alias key shares one boxed identity so a ratchet update writes once and
+    /// all aliases observe the same state. Per-alias struct copies previously drifted and
+    /// re-wrote ~16 entries per ratchet step (identity churn that never settled).
+    private final class IdentityBox {
+        var identity: ConnectionSessionIdentity
+        init(_ identity: ConnectionSessionIdentity) { self.identity = identity }
+    }
+
+    private var connectionIdentities: [String: IdentityBox] = [:]
     
     /// Temporary storage for ciphertext received before a recipient identity exists.
     private var pendingCiphertext: [String: Data] = [:]
@@ -49,17 +57,15 @@ public actor KeyManager: SessionIdentityDelegate {
     // MARK: - SessionIdentityDelegate
     
     public func updateSessionIdentity(_ identity: DoubleRatchetKit.SessionIdentity) async throws {
-        var updatedCount = 0
-        for connectionId in Array(connectionIdentities.keys) {
-            guard var connIdentity = connectionIdentities[connectionId] else { continue }
-            guard connIdentity.sessionIdentity.id == identity.id || connectionId == identity.id.uuidString else { continue }
-            connIdentity.sessionIdentity = identity
-            connectionIdentities[connectionId] = connIdentity
-            updatedCount += 1
+        var updatedBoxes = Set<ObjectIdentifier>()
+        for (connectionId, box) in connectionIdentities {
+            guard box.identity.sessionIdentity.id == identity.id || connectionId == identity.id.uuidString else { continue }
+            guard updatedBoxes.insert(ObjectIdentifier(box)).inserted else { continue }
+            box.identity.sessionIdentity = identity
         }
 
-        if updatedCount > 0 {
-            logger.log(level: .info, message: "Updated session identity: \(identity.id) for \(updatedCount) cached connection lookup keys")
+        if !updatedBoxes.isEmpty {
+            logger.log(level: .debug, message: "Updated session identity: \(identity.id) for \(updatedBoxes.count) cached identity(ies)")
             return
         }
 
@@ -95,7 +101,7 @@ public actor KeyManager: SessionIdentityDelegate {
     /// Removes a session identity.
     /// - Parameter id: The session identity ID
     public func removeSessionIdentity(_ id: UUID) {
-        connectionIdentities = connectionIdentities.filter { $0.value.sessionIdentity.id != id }
+        connectionIdentities = connectionIdentities.filter { $0.value.identity.sessionIdentity.id != id }
         logger.log(level: .info, message: "Removed session identity: \(id)")
     }
     
@@ -146,8 +152,8 @@ public actor KeyManager: SessionIdentityDelegate {
     public func fetchConnectionIdentity(connection id: String) throws -> ConnectionSessionIdentity {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         for key in identityLookupKeys(for: trimmed) {
-            if let connectionIdentity = connectionIdentities[key] {
-                return connectionIdentity
+            if let box = connectionIdentities[key] {
+                return box.identity
             }
         }
 
@@ -155,7 +161,7 @@ public actor KeyManager: SessionIdentityDelegate {
     }
 
     public func fetchConnectionIdentity(_ id: UUID) -> ConnectionSessionIdentity? {
-        connectionIdentities[id.uuidString] ?? connectionIdentities.first { $0.value.sessionIdentity.id == id }?.value
+        (connectionIdentities[id.uuidString] ?? connectionIdentities.first { $0.value.identity.sessionIdentity.id == id }?.value)?.identity
     }
 
     public func fetchConnectionIdentityByConnectionId(_ connectionId: String) -> ConnectionSessionIdentity? {
@@ -175,11 +181,9 @@ public actor KeyManager: SessionIdentityDelegate {
     ///   - ciphertext: The ciphertext to store
     public func storeCiphertext(connectionId: String, ciphertext: Data) {
         if let identityKey = identityLookupKeys(for: connectionId).first(where: { connectionIdentities[$0] != nil }),
-           var identity = connectionIdentities[identityKey] {
-            identity.ciphertext = ciphertext
-            for key in identityLookupKeys(for: connectionId) where connectionIdentities[key] != nil {
-                connectionIdentities[key] = identity
-            }
+           let box = connectionIdentities[identityKey] {
+            // All aliases share the box, so one write is visible to every lookup key.
+            box.identity.ciphertext = ciphertext
             logger.log(level: .info, message: "Stored ciphertext for connection: \(connectionId)")
         } else {
             // Store temporarily until identity is created
@@ -194,7 +198,7 @@ public actor KeyManager: SessionIdentityDelegate {
     public func fetchCiphertext(connectionId: String) -> Data? {
         // First check if identity exists and has ciphertext
         for key in identityLookupKeys(for: connectionId) {
-            if let identity = connectionIdentities[key], let ciphertext = identity.ciphertext {
+            if let box = connectionIdentities[key], let ciphertext = box.identity.ciphertext {
                 return ciphertext
             }
         }
@@ -296,7 +300,7 @@ public actor KeyManager: SessionIdentityDelegate {
         let sessionId = normalizedConnectionId.stableUUIDConnectionId
         let lookupKeys = identityLookupKeys(for: connectionId)
         let existingCiphertext = lookupKeys.compactMap { key -> Data? in
-            if let ciphertext = connectionIdentities[key]?.ciphertext {
+            if let ciphertext = connectionIdentities[key]?.identity.ciphertext {
                 return ciphertext
             }
             return pendingCiphertext[key]
@@ -317,9 +321,10 @@ public actor KeyManager: SessionIdentityDelegate {
             }
             logger.log(level: .info, message: "Attached pending ciphertext to newly created identity for connection: \(connectionId)")
         }
-        
+
+        let box = IdentityBox(identity)
         for key in lookupKeys {
-            connectionIdentities[key] = identity
+            connectionIdentities[key] = box
         }
         logger.log(level: .info, message: "Created new recipient identity \(identity) on connection identity \(connectionId)")
         return identity
@@ -360,7 +365,7 @@ public actor KeyManager: SessionIdentityDelegate {
             compositeConnectionId: compositeConnectionId,
             aliases: aliases)
         let existingCiphertext = lookupKeys.compactMap { key -> Data? in
-            if let ciphertext = connectionIdentities[key]?.ciphertext {
+            if let ciphertext = connectionIdentities[key]?.identity.ciphertext {
                 return ciphertext
             }
             return pendingCiphertext[key]
@@ -382,8 +387,9 @@ public actor KeyManager: SessionIdentityDelegate {
             logger.log(level: .info, message: "Attached pending ciphertext to newly created SFU identity for key=\(compositeConnectionId)")
         }
 
+        let box = IdentityBox(identity)
         for key in lookupKeys {
-            connectionIdentities[key] = identity
+            connectionIdentities[key] = box
         }
         logger.log(level: .info, message: "Created new SFU signaling recipient identity \(identity) on connection identity \(compositeConnectionId) with sessionId: \(sessionId) sessionContext=\(sessionContext ?? "<none>")")
         return identity

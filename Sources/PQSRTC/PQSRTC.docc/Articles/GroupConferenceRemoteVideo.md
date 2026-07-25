@@ -170,6 +170,10 @@ callbacks—not polling attach loops:
 - **Decode advancing, tile stalled:** ``recoverInboundRemoteVideoAfterDecodeStall`` or participant
   re-attach with `forceParticipantRendererRebind`.
 - **Decoder stalled with current binding:** ``recoverInboundRemoteParticipantVideoDecoderAfterMatchedBindingStall``.
+  When the inbound FrameCryptor is healthy, this is **PLI-first** (pulse track + re-send SFU
+  `mediaReady` so the SFU emits a throttled keyframe PLI). Full cryptor/renderer rebind runs only
+  when the cryptor is missing, disabled, or reporting failure. Poll and decodeStalled transition
+  share a 15s single-flight cooldown.
 - **Overlay / expectation updates:** driven by flow state and tile overlay policy.
 
 ``AndroidGroupParticipantRendererRecoveryPolicy`` in `AndroidMultipartyVideoLayout.swift` mirrors

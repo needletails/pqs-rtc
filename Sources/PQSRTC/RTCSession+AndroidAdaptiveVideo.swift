@@ -34,14 +34,24 @@ extension RTCSession {
                 let isOneToOneSfu = Self.isTrueOneToOneSfuRoom(call: current.call)
                 let cfg = await self.sfuAdaptiveConfig(for: current.call)
 
-                let available = await self.rtcClient.getAvailableOutgoingBitrateBps()
+                let network = await self.rtcClient.getAdaptiveNetworkStats()
+                let previousInbound = await self.adaptiveInboundVideoRtpTotals(for: normalizedId)
+                let inboundLoss = await self.updateAdaptiveInboundVideoLossFraction(
+                    connectionId: normalizedId,
+                    packetsReceived: network.inboundVideoPacketsReceived,
+                    packetsLost: network.inboundVideoPacketsLost,
+                    previous: previousInbound
+                )
+
                 let targets: AdaptiveVideoTargets
-                if let available, available > 0 {
+                if let available = network.availableOutgoingBitrateBps, available > 0 {
                     targets = RTCAdaptiveVideoTargets.compute(
                         cfg: cfg,
                         isOneToOneSfu: isOneToOneSfu,
                         reportedAvailableOutgoingBps: available,
-                        currentRttSeconds: nil
+                        currentRttSeconds: network.currentRttSeconds,
+                        availableIncomingBitrateBps: network.availableIncomingBitrateBps,
+                        inboundVideoLossFraction: inboundLoss
                     )
                 } else {
                     targets = RTCAdaptiveVideoTargets.conservativeStartupTargets(
@@ -67,12 +77,12 @@ extension RTCSession {
                     )
                     self.logger.log(
                         level: .debug,
-                        message: "Adaptive video send applied (Android, connId=\(normalizedId) oneToOne=\(isOneToOneSfu)): maxBitrateBps=\(targets.maxBitrateBps) maxFramerate=\(targets.maxFramerate) scaleResolutionDownBy=\(targets.scaleResolutionDownBy) reportedAvailableBps=\(available.map { String(Int($0)) } ?? "nil")"
+                        message: "Adaptive video send applied (Android, connId=\(normalizedId) oneToOne=\(isOneToOneSfu)): maxBitrateBps=\(targets.maxBitrateBps) maxFramerate=\(targets.maxFramerate) scaleResolutionDownBy=\(targets.scaleResolutionDownBy) reportedAvailableBps=\(network.availableOutgoingBitrateBps.map { String(Int($0)) } ?? "nil") rttMs=\(network.currentRttSeconds.map { String(Int($0 * 1000)) } ?? "nil") inboundLoss=\(inboundLoss.map { String(format: "%.2f", $0) } ?? "nil")"
                     )
                 }
 
                 let quality: RTCNetworkQuality
-                if let available {
+                if let available = network.availableOutgoingBitrateBps {
                     if available < 150_000 {
                         quality = .veryPoor
                     } else if available < 300_000 {
@@ -91,8 +101,9 @@ extension RTCSession {
                 await self.emitNetworkQualityUpdateIfNeeded(
                     connectionId: normalizedId,
                     quality: quality,
-                    availableOutgoingBitrateBps: available.map { Int($0) },
-                    rttMs: nil,
+                    availableOutgoingBitrateBps: network.availableOutgoingBitrateBps.map { Int($0) },
+                    availableIncomingBitrateBps: network.availableIncomingBitrateBps.map { Int($0) },
+                    rttMs: network.currentRttSeconds.map { Int($0 * 1000.0) },
                     appliedVideoMaxBitrateBps: targets.maxBitrateBps,
                     appliedVideoMaxFramerate: targets.maxFramerate,
                     nowUptimeNs: DispatchTime.now().uptimeNanoseconds
@@ -111,10 +122,35 @@ extension RTCSession {
             task.cancel()
         }
         adaptiveVideoLastAppliedByConnectionId.removeValue(forKey: normalizedId)
+        adaptiveInboundVideoRtpTotalsByConnectionId.removeValue(forKey: normalizedId)
     }
 
     private func setAdaptiveVideoLastApplied(connectionId: String, bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double) {
         adaptiveVideoLastAppliedByConnectionId[connectionId] = (bitrateBps, framerate, scaleResolutionDownBy)
+    }
+
+    private func adaptiveInboundVideoRtpTotals(
+        for connectionId: String
+    ) -> (packetsReceived: Int64, packetsLost: Int64)? {
+        adaptiveInboundVideoRtpTotalsByConnectionId[connectionId]
+    }
+
+    private func updateAdaptiveInboundVideoLossFraction(
+        connectionId: String,
+        packetsReceived: Int64,
+        packetsLost: Int64,
+        previous: (packetsReceived: Int64, packetsLost: Int64)?
+    ) -> Double? {
+        adaptiveInboundVideoRtpTotalsByConnectionId[connectionId] = (
+            packetsReceived: packetsReceived,
+            packetsLost: packetsLost
+        )
+        guard let previous else { return nil }
+        let deltaReceived = max(Int64(0), packetsReceived - previous.packetsReceived)
+        let deltaLost = max(Int64(0), packetsLost - previous.packetsLost)
+        let denom = deltaReceived + deltaLost
+        guard denom > 0 else { return nil }
+        return Double(deltaLost) / Double(denom)
     }
 }
 #endif

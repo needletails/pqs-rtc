@@ -26,10 +26,41 @@ extension RTCSession {
     /// The full ``InboundVideoFlowCheck`` type is WebRTC-only; Android recovery uses this
     /// snapshot shape via ``inboundVideoFlowUpdateStream()``.
     struct InboundVideoFlowSnapshot: Sendable {
+        let state: InboundVideoFlowState
         let deltaFramesDecoded: Int64
         let deltaPacketsReceived: Int64
 
-        static let inactive = InboundVideoFlowSnapshot(deltaFramesDecoded: 0, deltaPacketsReceived: 0)
+        static let inactive = InboundVideoFlowSnapshot(
+            state: .noTraffic,
+            deltaFramesDecoded: 0,
+            deltaPacketsReceived: 0
+        )
+
+        /// True when RTP is still arriving but decode is not advancing — PLI refresh candidate.
+        var isDecodeStalledWithAdvancingPackets: Bool {
+            state == .decodeStalled && deltaPacketsReceived > 0 && deltaFramesDecoded <= 0
+        }
+    }
+
+    /// Matched-binding decode-stall recovery: PLI/mediaReady first when cryptor is healthy.
+    public enum MatchedBindingDecodeStallRecoveryKind: String, Sendable {
+        case pliFirstMediaReadyRefresh
+        case fullCryptorAndRendererRecovery
+    }
+
+    /// Chooses PLI-first vs full cryptor/renderer recovery for a matched-binding decode stall.
+    static func matchedBindingDecodeStallRecoveryKind(
+        encryptionExpected: Bool,
+        hasEnabledReceiverCryptor: Bool,
+        receiverCryptorReportingFailure: Bool
+    ) -> MatchedBindingDecodeStallRecoveryKind {
+        if receiverCryptorReportingFailure {
+            return .fullCryptorAndRendererRecovery
+        }
+        if encryptionExpected && !hasEnabledReceiverCryptor {
+            return .fullCryptorAndRendererRecovery
+        }
+        return .pliFirstMediaReadyRefresh
     }
 }
 
@@ -85,6 +116,13 @@ extension RTCSession {
         prolongedStallThresholdMs: Int64 = 12_000
     ) -> Bool {
         let effectiveStallAgeMs = callbackAgeMs >= 0 ? callbackAgeMs : expectationAgeMs
+        // Never-attached renderer with an expected remote tile: recover independently of flow stats.
+        // Flow can be nil when the inbound sampler exited before the connection existed (C1/H2).
+        if !hasAnyCallbacks,
+           inboundFlow == nil,
+           expectationAgeMs >= prolongedStallThresholdMs {
+            return true
+        }
         if let flow = inboundFlow {
             switch flow.state {
             case .decodeStalled:
@@ -284,9 +322,15 @@ extension RTCSession {
     func startInboundVideoFlowSamplerIfNeeded(connectionId: String) {
         let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
         guard !normalizedId.isEmpty else { return }
-        if let existing = inboundVideoFlowSamplerTasksByConnectionId[normalizedId], !existing.isCancelled {
+        // Do not use Task.isCancelled alone: a finished sampler leaves isCancelled==false and
+        // used to permanently block restart. Track active state explicitly (C1).
+        if inboundVideoFlowSamplerActiveByConnectionId[normalizedId] == true {
             return
         }
+
+        let generation = (inboundVideoFlowSamplerGenerationByConnectionId[normalizedId] ?? 0) + 1
+        inboundVideoFlowSamplerGenerationByConnectionId[normalizedId] = generation
+        inboundVideoFlowSamplerActiveByConnectionId[normalizedId] = true
 
         let task = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
@@ -300,6 +344,10 @@ extension RTCSession {
                 }
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
             }
+            // Self-cleanup so a completed sampler does not permanently occupy the task map (C1).
+            await self.clearInboundVideoFlowSamplerTaskIfCurrent(
+                connectionId: normalizedId,
+                generation: generation)
         }
         inboundVideoFlowSamplerTasksByConnectionId[normalizedId] = task
     }
@@ -319,6 +367,7 @@ extension RTCSession {
         cachedInboundVideoFlowByConnectionId[normalizedId] = flow
         publishInboundVideoFlowUpdate(
             InboundVideoFlowSnapshot(
+                state: flow.state,
                 deltaFramesDecoded: flow.deltaFramesDecoded,
                 deltaPacketsReceived: flow.deltaPacketsReceived
             )
@@ -332,6 +381,10 @@ extension RTCSession {
 
     func stopInboundVideoFlowSampler(connectionId: String) {
         let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        // Invalidate any in-flight sampler so its exit path cannot clear a future restart.
+        let generation = (inboundVideoFlowSamplerGenerationByConnectionId[normalizedId] ?? 0) + 1
+        inboundVideoFlowSamplerGenerationByConnectionId[normalizedId] = generation
+        inboundVideoFlowSamplerActiveByConnectionId[normalizedId] = false
         if let task = inboundVideoFlowSamplerTasksByConnectionId.removeValue(forKey: normalizedId) {
             task.cancel()
         }
@@ -1041,7 +1094,23 @@ extension RTCSession {
                 var availableOutgoingBps: Double?
                 var availableIncomingBps: Double?
                 var currentRttSeconds: Double?
+                var inboundVideoPacketsReceived: Int64 = 0
+                var inboundVideoPacketsLost: Int64 = 0
                 for (_, stat) in report.statistics {
+                    if stat.type == "inbound-rtp" {
+                        let kind = ((stat.values["kind"] as? String) ?? (stat.values["mediaType"] as? String) ?? "")
+                            .lowercased()
+                        guard kind == "video" else { continue }
+                        if let received = (stat.values["packetsReceived"] as? NSNumber)?.int64Value
+                            ?? (stat.values["packetsReceived"] as? Int64) {
+                            inboundVideoPacketsReceived += received
+                        }
+                        if let lost = (stat.values["packetsLost"] as? NSNumber)?.int64Value
+                            ?? (stat.values["packetsLost"] as? Int64) {
+                            inboundVideoPacketsLost += max(0, lost)
+                        }
+                        continue
+                    }
                     guard stat.type == "candidate-pair" else { continue }
                     let selected = (stat.values["selected"] as? Bool) ?? (stat.values["selected"] as? NSNumber)?.boolValue ?? false
                     let nominated = (stat.values["nominated"] as? Bool) ?? (stat.values["nominated"] as? NSNumber)?.boolValue ?? false
@@ -1056,9 +1125,16 @@ extension RTCSession {
                         if let rtt = double(stat.values["currentRoundTripTime"]) ?? double(stat.values["totalRoundTripTime"]) {
                             currentRttSeconds = rtt
                         }
-                        break
                     }
                 }
+
+                let previousInbound = await self.adaptiveInboundVideoRtpTotals(for: normalizedId)
+                let inboundVideoLossFraction = await self.updateAdaptiveInboundVideoLossFraction(
+                    connectionId: normalizedId,
+                    packetsReceived: inboundVideoPacketsReceived,
+                    packetsLost: inboundVideoPacketsLost,
+                    previous: previousInbound
+                )
 
                 let targets: AdaptiveVideoTargets
                 let reportedAvailableBps: Int?
@@ -1067,7 +1143,9 @@ extension RTCSession {
                         cfg: cfg,
                         isOneToOneSfu: isOneToOneSfu,
                         reportedAvailableOutgoingBps: available,
-                        currentRttSeconds: currentRttSeconds
+                        currentRttSeconds: currentRttSeconds,
+                        availableIncomingBitrateBps: availableIncomingBps,
+                        inboundVideoLossFraction: inboundVideoLossFraction
                     )
                     reportedAvailableBps = Int(available)
                 } else {
@@ -1162,6 +1240,7 @@ extension RTCSession {
             task.cancel()
         }
         adaptiveVideoLastAppliedByConnectionId.removeValue(forKey: normalizedId)
+        adaptiveInboundVideoRtpTotalsByConnectionId.removeValue(forKey: normalizedId)
 #if os(iOS)
         adaptiveVideoThermalStateByConnectionId.removeValue(forKey: normalizedId)
 #endif
@@ -1169,6 +1248,30 @@ extension RTCSession {
 
     private func setAdaptiveVideoLastApplied(connectionId: String, bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double) {
         adaptiveVideoLastAppliedByConnectionId[connectionId] = (bitrateBps, framerate, scaleResolutionDownBy)
+    }
+
+    private func adaptiveInboundVideoRtpTotals(
+        for connectionId: String
+    ) -> (packetsReceived: Int64, packetsLost: Int64)? {
+        adaptiveInboundVideoRtpTotalsByConnectionId[connectionId]
+    }
+
+    private func updateAdaptiveInboundVideoLossFraction(
+        connectionId: String,
+        packetsReceived: Int64,
+        packetsLost: Int64,
+        previous: (packetsReceived: Int64, packetsLost: Int64)?
+    ) -> Double? {
+        adaptiveInboundVideoRtpTotalsByConnectionId[connectionId] = (
+            packetsReceived: packetsReceived,
+            packetsLost: packetsLost
+        )
+        guard let previous else { return nil }
+        let deltaReceived = max(Int64(0), packetsReceived - previous.packetsReceived)
+        let deltaLost = max(Int64(0), packetsLost - previous.packetsLost)
+        let denom = deltaReceived + deltaLost
+        guard denom > 0 else { return nil }
+        return Double(deltaLost) / Double(denom)
     }
 
 #if os(iOS)

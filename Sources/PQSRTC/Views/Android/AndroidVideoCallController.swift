@@ -69,6 +69,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
     /// Participants whose tile bind was settled by the post-renegotiation coordinator.
     private var participantCoordinatorSettledKeys: Set<String> = []
     private var inboundVideoFlowStreamTask: Task<Void, Never>?
+    private var lastInboundVideoFlowStateForDecodeStall: InboundVideoFlowState?
     private var postRenegotiationAttachEpisodeStreamTask: Task<Void, Never>?
     private var screenShareLayoutReconcileTask: Task<Void, Never>?
     /// Bumped on every remote screen-share stop so stale layout-recovery / pending-activation work aborts.
@@ -1214,6 +1215,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private func stopInboundVideoFlowObservation() {
         inboundVideoFlowStreamTask?.cancel()
         inboundVideoFlowStreamTask = nil
+        lastInboundVideoFlowStateForDecodeStall = nil
         if let raw = currentCall?.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
             Task { [session] in
                 await session.stopInboundVideoFlowSampler(connectionId: raw)
@@ -4323,6 +4325,11 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return
         }
 
+        let previousFlowState = lastInboundVideoFlowStateForDecodeStall
+        lastInboundVideoFlowStateForDecodeStall = inboundFlow.state
+        let decodeStallTransition = inboundFlow.isDecodeStalledWithAdvancingPackets
+            && previousFlowState != .decodeStalled
+
         await applyPostCoordinatorDeferredPendingWrapperRebinds(connectionId: connectionId)
 
         for (participantId, view) in participantViewAssignments {
@@ -4350,6 +4357,27 @@ public actor AndroidVideoCallController: CallActionDelegate {
             ) {
                 participantRendererRecoveryIssuedKeys.remove(recoveryKey)
                 continue
+            }
+
+            // Decode stalled with RTP still arriving: ask SFU for throttled PLI via mediaReady.
+            // Skip renderer/cryptor thrash when the tile binding looks current.
+            if inboundFlow.isDecodeStalledWithAdvancingPackets,
+               probe.hasActiveSink,
+               probe.boundTrackSharesRendererSinkWithTarget,
+               probe.attachedTrackIsLive,
+               (decodeStallTransition || view.rendererFramesStaleWhileBound()) {
+                let recoveryKind = await session.recoverInboundRemoteParticipantVideoDecoderAfterMatchedBindingStall(
+                    connectionId: connectionId,
+                    participantId: participantId
+                )
+                if recoveryKind == .pliFirstMediaReadyRefresh {
+                    participantRendererRecoveryIssuedKeys.insert(recoveryKey)
+                    logger.log(
+                        level: .info,
+                        message: "Android PLI-first matched-binding decode stall recovery participant=\(participantId) dPackets=\(inboundFlow.deltaPacketsReceived) dDecoded=\(inboundFlow.deltaFramesDecoded)"
+                    )
+                    continue
+                }
             }
             if view.hasPendingLiveWrapperRebind(),
                await applyPendingLiveWrapperRebindIfEligible(

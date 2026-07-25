@@ -396,6 +396,8 @@ public actor RTCSession {
     // Mirrors the Apple implementation but uses `org.webrtc.PeerConnection.getStats`.
     var adaptiveVideoSendTasksByConnectionId: [String: Task<Void, Never>] = [:]
     var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double)] = [:]
+    /// Prior inbound video RTP totals for recent loss-fraction in adaptive survival.
+    var adaptiveInboundVideoRtpTotalsByConnectionId: [String: (packetsReceived: Int64, packetsLost: Int64)] = [:]
     /// Last inbound video counters snapshot per connection (Android renderer recovery sampler).
     var lastInboundVideoCountersByConnectionId: [String: AndroidInboundVideoCounters] = [:]
 #endif
@@ -436,6 +438,8 @@ public actor RTCSession {
     // - good bandwidth: raise bitrate/fps automatically for better quality
     var adaptiveVideoSendTasksByConnectionId: [String: Task<Void, Never>] = [:]
     var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double)] = [:]
+    /// Prior inbound video RTP totals for recent loss-fraction in adaptive survival.
+    var adaptiveInboundVideoRtpTotalsByConnectionId: [String: (packetsReceived: Int64, packetsLost: Int64)] = [:]
 #if os(iOS)
     var adaptiveVideoThermalStateByConnectionId: [String: String] = [:]
 #endif
@@ -503,8 +507,35 @@ public actor RTCSession {
     /// Continuations for inbound video flow sampler updates (Android renderer recovery).
     private var inboundVideoFlowUpdateContinuations: [UUID: AsyncStream<InboundVideoFlowSnapshot>.Continuation] = [:]
 
+    /// Single-flight cooldown for matched-binding decode-stall PLI/mediaReady recovery (poll + event).
+    var lastMatchedBindingDecodeStallRecoveryUptimeNsByKey: [String: UInt64] = [:]
+    static let matchedBindingDecodeStallRecoveryCooldownNs: UInt64 = 15_000_000_000
+
     /// Shared inbound-flow sampler tasks keyed by connection id.
     var inboundVideoFlowSamplerTasksByConnectionId: [String: Task<Void, Never>] = [:]
+
+    /// True while a sampler loop is active for the connection (survives finished Task.isCancelled==false).
+    var inboundVideoFlowSamplerActiveByConnectionId: [String: Bool] = [:]
+
+    /// Monotonic generation so a finishing sampler cannot clear a newer replacement's map entry.
+    var inboundVideoFlowSamplerGenerationByConnectionId: [String: UInt64] = [:]
+
+    /// When true, inbound CallKit answers must wait for external audio activation before PeerConnection creation (C4).
+    var requiresExternalAudioActivation = false
+
+    /// Opened by ``markExternalAudioActivationComplete()`` after CallKit `didActivate`.
+    var externalAudioActivationOpen = false
+
+    /// Latest deferred `call_cipher` bootstrap per connection while the CallKit audio gate is closed.
+    var pendingCallCipherPeerConnectionBootstrapByConnectionId: [String: PendingCallCipherPeerConnectionBootstrap] = [:]
+
+    /// Removes the sampler map entry only when this finishing generation is still current.
+    func clearInboundVideoFlowSamplerTaskIfCurrent(connectionId: String, generation: UInt64) {
+        let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        guard inboundVideoFlowSamplerGenerationByConnectionId[normalizedId] == generation else { return }
+        inboundVideoFlowSamplerActiveByConnectionId[normalizedId] = false
+        inboundVideoFlowSamplerTasksByConnectionId.removeValue(forKey: normalizedId)
+    }
 
     /// Last known SDP signaling stability for SFU group rooms (`false` while offer/answer is settling).
     var sfuGroupSignalingIsStableByConnectionId: [String: Bool] = [:]
@@ -819,6 +850,102 @@ public actor RTCSession {
     private var remoteParticipantTrackContinuations: [UUID: AsyncStream<RemoteParticipantTrackEvent>.Continuation] = [:]
     private var postSfuRenegotiationAttachEpisodeContinuations: [UUID: AsyncStream<PostSfuRenegotiationAttachEpisode>.Continuation] = [:]
     private var sfuGroupSignalingStableContinuations: [UUID: AsyncStream<String>.Continuation] = [:]
+    private var e2eeStateContinuations: [UUID: AsyncStream<E2EEStateEvent>.Continuation] = [:]
+
+    /// Connection ids where outbound E2EE sender cryptor setup failed (fail-closed; media egress disabled).
+    var e2eeSenderFailedConnectionIds: Set<String> = []
+
+    /// Returns an async stream of outbound E2EE state changes (fail-closed / recovered).
+    public func e2eeStateStream() -> AsyncStream<E2EEStateEvent> {
+        let id = UUID()
+        return AsyncStream { [weak self] continuation in
+            guard let self else {
+                continuation.finish()
+                return
+            }
+            Task { await self.storeE2EEStateContinuation(id, continuation: continuation) }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                Task { await self.removeE2EEStateContinuation(id) }
+            }
+        }
+    }
+
+    private func storeE2EEStateContinuation(_ id: UUID, continuation: AsyncStream<E2EEStateEvent>.Continuation) {
+        e2eeStateContinuations[id] = continuation
+    }
+
+    private func removeE2EEStateContinuation(_ id: UUID) {
+        e2eeStateContinuations.removeValue(forKey: id)
+    }
+
+    func notifyE2EEState(_ event: E2EEStateEvent) {
+        for (_, continuation) in e2eeStateContinuations {
+            continuation.yield(event)
+        }
+    }
+
+    /// Last receiver-cryptor event kind emitted per participant, to emit only transitions (H1).
+    var lastReceiverCryptorEventKindByParticipantId: [String: E2EEStateEvent.Kind] = [:]
+
+    /// Emits receiver-cryptor state transitions on `e2eeStateStream()` (H1).
+    /// Failure kinds mean media from `participantId` is currently being discarded;
+    /// recovery happens when a fresh key is installed via `setKey` (event-driven, no retries).
+    func handleReceiverCryptorStateDescription(
+        participantId: String,
+        stateDescription: String,
+        mediaKind: String
+    ) {
+        let kind: E2EEStateEvent.Kind
+        switch stateDescription {
+        case "decryptionFailed", "internalError":
+            kind = .receiverDecryptionFailed
+        case "missingKey":
+            kind = .receiverMissingKey
+        case "ok", "keyRatcheted":
+            // Only meaningful as a recovery after a failure was reported.
+            guard lastReceiverCryptorEventKindByParticipantId[participantId] != nil,
+                  lastReceiverCryptorEventKindByParticipantId[participantId] != .receiverRecovered else { return }
+            kind = .receiverRecovered
+        default:
+            return
+        }
+        guard lastReceiverCryptorEventKindByParticipantId[participantId] != kind else { return }
+        lastReceiverCryptorEventKindByParticipantId[participantId] = kind
+        if kind == .receiverRecovered {
+            lastReceiverCryptorEventKindByParticipantId.removeValue(forKey: participantId)
+        }
+        let connectionId = activeConnectionId ?? ""
+        logger.log(
+            level: kind == .receiverRecovered ? .info : .error,
+            message: "E2EE receiver cryptor \(kind.rawValue) participant=\(participantId) media=\(mediaKind) connId=\(connectionId)")
+        notifyE2EEState(
+            E2EEStateEvent(
+                connectionId: connectionId,
+                kind: kind,
+                mediaKind: mediaKind,
+                reason: "FrameCryptor state: \(stateDescription)",
+                participantId: participantId))
+    }
+
+#if canImport(WebRTC)
+    /// Apple delegate entry point: maps `RTCFrameCryptorState` to the shared transition handler.
+    func handleFrameCryptorStateTransition(participantId: String, state: RTCFrameCryptorState) {
+        let description: String
+        switch state {
+        case .decryptionFailed: description = "decryptionFailed"
+        case .missingKey: description = "missingKey"
+        case .internalError: description = "internalError"
+        case .ok: description = "ok"
+        case .keyRatcheted: description = "keyRatcheted"
+        default: return
+        }
+        handleReceiverCryptorStateDescription(
+            participantId: participantId,
+            stateDescription: description,
+            mediaKind: "receiver")
+    }
+#endif
 
     /// Returns an async stream that yields events whenever a remote participant's camera
     /// video track is added or removed. The Android controller subscribes to assign
@@ -1478,6 +1605,14 @@ public actor RTCSession {
         let ciphertext: Data
     }
 
+    /// Stashed inbound `call_cipher` work that must wait for CallKit audio activation before PC create (C4).
+    struct PendingCallCipherPeerConnectionBootstrap: Sendable {
+        let recipient: String
+        let ciphertext: Data
+        let call: Call
+        let localFrameIdentity: ConnectionLocalIdentity
+    }
+
     /// `call_cipher` payloads currently being processed by this actor.
     var inboundCallCiphertextsInFlight: Set<InboundCallCiphertextKey> = []
 
@@ -1968,6 +2103,14 @@ public actor RTCSession {
         logger.log(level: .trace, message: "Created RTCSession")
 #if os(Android)
         installAndroidVideoReceiverFrameCryptorReadyHandler()
+        installAndroidFrameCryptorFailureHandler()
+#endif
+#if canImport(WebRTC)
+        // H1: forward cryptor state transitions into e2eeStateStream instead of log-only.
+        frameCryptorDelegate.setStateChangeHandler { [weak self] participantId, state in
+            guard let self else { return }
+            Task { await self.handleFrameCryptorStateTransition(participantId: participantId, state: state) }
+        }
 #endif
     }
 
@@ -1980,12 +2123,16 @@ public actor RTCSession {
         if keyProvider != nil { return }
         
         logger.log(level: .debug, message: "Creating FrameCryptorKeyProvider (mode: \(frameEncryptionKeyMode))")
+        // H1: bounded failure tolerance so persistent decrypt failures surface as
+        // DECRYPTIONFAILED (delegate event) instead of silently dropping frames forever.
+        // 32 consecutive failures ≈ 1s of video; explicit setKey always recovers.
+        // ratchetWindowSize 8 lets the receiver catch up when a sender ratchets forward.
         keyProvider = RTCFrameCryptorKeyProvider(
             ratchetSalt: ratchetSalt,
-            ratchetWindowSize: 0,
+            ratchetWindowSize: 8,
             sharedKeyMode: frameEncryptionKeyMode == .shared,
             uncryptedMagicBytes: "PQSRTCMagicBytes".data(using: .utf8)!,
-            failureTolerance: -1,
+            failureTolerance: 32,
             keyRingSize: 16,
             discardFrameWhenCryptorNotReady: true)
     }
@@ -1999,6 +2146,53 @@ public actor RTCSession {
         let (notificationStream, notificationContinuation) = AsyncStream<PeerConnectionNotifications?>.makeStream()
         self.peerConnectionNotificationsStream = notificationStream
         self.peerConnectionNotificationsContinuation = notificationContinuation
+    }
+
+    /// Enables the CallKit audio-activation gate for cipher-driven PeerConnection creation (C4).
+    ///
+    /// When enabled, inbound `call_cipher` will stash PC creation until
+    /// ``markExternalAudioActivationComplete()`` runs. Defaults to off so macOS/Android/non-CallKit
+    /// paths are unchanged.
+    public func setRequiresExternalAudioActivation(_ required: Bool) {
+        requiresExternalAudioActivation = required
+        if !required {
+            externalAudioActivationOpen = false
+            pendingCallCipherPeerConnectionBootstrapByConnectionId.removeAll()
+        } else if !externalAudioActivationOpen {
+            // Gate stays closed until CallKit activates audio.
+            externalAudioActivationOpen = false
+        }
+    }
+
+    /// Opens the CallKit audio gate and flushes any stashed `call_cipher` PeerConnection bootstraps.
+    public func markExternalAudioActivationComplete() async {
+        externalAudioActivationOpen = true
+        let pending = pendingCallCipherPeerConnectionBootstrapByConnectionId
+        pendingCallCipherPeerConnectionBootstrapByConnectionId.removeAll()
+        guard !pending.isEmpty else { return }
+        for (normalizedId, bootstrap) in pending {
+            logger.log(
+                level: .info,
+                message: "Flushing deferred call_cipher PeerConnection bootstrap after CallKit audio activation connId=\(normalizedId)"
+            )
+            do {
+                try await receiveCiphertext(
+                    recipient: bootstrap.recipient,
+                    ciphertext: bootstrap.ciphertext,
+                    call: bootstrap.call)
+            } catch {
+                logger.log(
+                    level: .error,
+                    message: "Failed flushing deferred call_cipher bootstrap connId=\(normalizedId): \(error)"
+                )
+            }
+        }
+    }
+
+    /// Clears a stashed cipher bootstrap when the call ends or becomes stale.
+    public func clearPendingCallCipherPeerConnectionBootstrap(connectionId: String) {
+        let normalizedId = connectionId.normalizedConnectionId
+        pendingCallCipherPeerConnectionBootstrapByConnectionId.removeValue(forKey: normalizedId)
     }
 
     // MARK: - Internal transport helpers
@@ -2124,6 +2318,8 @@ public enum RTCErrors: Error, LocalizedError, Sendable {
     case deferredSfuRenegotiationOffer(String)
     /// An operation was denied due to insufficient conference permissions.
     case permissionDenied(String)
+    /// Outbound frame encryption could not be established; media must not leak in plaintext.
+    case encryptionFailed(String)
     /// Human-readable description suitable for logging/UX.
     public var errorDescription: String? {
         switch self {
@@ -2153,6 +2349,8 @@ public enum RTCErrors: Error, LocalizedError, Sendable {
             return "Deferred SFU renegotiation offer for \(connectionId)"
         case .permissionDenied(let message):
             return "Permission denied: \(message)"
+        case .encryptionFailed(let message):
+            return "Encryption failed: \(message)"
         }
     }
 }

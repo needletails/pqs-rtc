@@ -1487,7 +1487,11 @@ extension RTCSession {
         ensureFrameKeyProviderIfNeeded()
         guard let keyProvider else {
             logger.log(level: .error, message: "❌ FrameCryptorKeyProvider is nil; cannot create FrameCryptor (enableEncryption=true)")
-            return
+            try await failClosedSenderEncryption(
+                connection: connection,
+                sender: nil,
+                mediaKind: "sender",
+                reason: "FrameCryptorKeyProvider is nil while enableEncryption=true")
         }
         var connection = connection
         switch kind {
@@ -1518,11 +1522,16 @@ extension RTCSession {
 
             guard let videoFrameCryptor else {
                 logger.log(level: .error, message: "❌ Failed to create video FrameCryptor")
-                return
+                try await failClosedSenderEncryption(
+                    connection: connection,
+                    sender: sender,
+                    mediaKind: "video",
+                    reason: "Failed to create video sender FrameCryptor")
             }
 
             enableAppleFrameCryptor(videoFrameCryptor, participantId: connection.localParticipantId)
             connection.videoSenderCryptor = videoFrameCryptor
+            await markSenderEncryptionReady(connection: &connection, mediaKind: "video", sender: sender)
         case .videoReceiver(let receiver):
             let receiverParticipantId = receiverFrameCryptorParticipantId(
                 connection: connection,
@@ -1581,11 +1590,16 @@ extension RTCSession {
 
             guard let audioCryptor else {
                 logger.log(level: .error, message: "Failed to create audio FrameCryptor")
-                return
+                try await failClosedSenderEncryption(
+                    connection: connection,
+                    sender: sender,
+                    mediaKind: "audio",
+                    reason: "Failed to create audio sender FrameCryptor")
             }
 
             enableAppleFrameCryptor(audioCryptor, participantId: connection.localParticipantId)
             connection.audioSenderCryptor = audioCryptor
+            await markSenderEncryptionReady(connection: &connection, mediaKind: "audio", sender: sender)
         case .audioReceiver(let receiver):
             let receiverParticipantId = receiverFrameCryptorParticipantId(
                 connection: connection,
@@ -1652,7 +1666,11 @@ extension RTCSession {
 
             guard let screenCryptor else {
                 logger.log(level: .error, message: "Failed to create screen sender FrameCryptor")
-                return
+                try await failClosedSenderEncryption(
+                    connection: connection,
+                    sender: sender,
+                    mediaKind: "screen",
+                    reason: "Failed to create screen sender FrameCryptor")
             }
 
             enableAppleFrameCryptor(screenCryptor, participantId: connection.localParticipantId)
@@ -1667,6 +1685,7 @@ extension RTCSession {
                 level: .info,
                 message: "Created sender FrameCryptor kind=screen participantId=\(connection.localParticipantId) connId=\(connection.id) trackId=\(sender.track?.trackId ?? "nil") senderId=\(String(describing: ObjectIdentifier(sender))) keyIndex=\(appleFrameCryptorKeyIndex(for: connection.localParticipantId))"
             )
+            await markSenderEncryptionReady(connection: &connection, mediaKind: "screen", sender: sender)
         case .screenReceiver(let receiver):
             let receiverParticipantId = receiverFrameCryptorParticipantId(
                 connection: connection,
@@ -1716,6 +1735,75 @@ extension RTCSession {
         await connectionManager.updateConnection(id: connection.id, with: connection)
     }
 
+    /// Stops outbound media and surfaces an E2EE failure so swallowing callers cannot leak plaintext (C2).
+    private func failClosedSenderEncryption(
+        connection: RTCConnection,
+        sender: RTCRtpSender?,
+        mediaKind: String,
+        reason: String
+    ) async throws -> Never {
+        var connection = connection
+        if let track = sender?.track {
+            track.isEnabled = false
+        }
+        switch mediaKind {
+        case "audio":
+            connection.localAudioTrack?.isEnabled = false
+        case "video":
+            connection.localVideoTrack?.isEnabled = false
+        case "screen":
+            connection.localScreenTrack?.isEnabled = false
+        default:
+            connection.localAudioTrack?.isEnabled = false
+            connection.localVideoTrack?.isEnabled = false
+            connection.localScreenTrack?.isEnabled = false
+        }
+        let normalizedId = connection.id.normalizedConnectionId
+        e2eeSenderFailedConnectionIds.insert(normalizedId)
+        await connectionManager.updateConnection(id: connection.id, with: connection)
+        notifyE2EEState(
+            E2EEStateEvent(
+                connectionId: connection.id,
+                kind: .senderCryptorFailed,
+                mediaKind: mediaKind,
+                reason: reason)
+        )
+        throw RTCErrors.encryptionFailed(reason)
+    }
+
+    /// Clears fail-closed state after a sender cryptor binds successfully (late-bind recovery).
+    private func markSenderEncryptionReady(
+        connection: inout RTCConnection,
+        mediaKind: String,
+        sender: RTCRtpSender
+    ) async {
+        let normalizedId = connection.id.normalizedConnectionId
+        let wasFailed = e2eeSenderFailedConnectionIds.contains(normalizedId)
+        e2eeSenderFailedConnectionIds.remove(normalizedId)
+        if wasFailed {
+            if let track = sender.track {
+                track.isEnabled = true
+            }
+            switch mediaKind {
+            case "audio":
+                connection.localAudioTrack?.isEnabled = true
+            case "video":
+                connection.localVideoTrack?.isEnabled = true
+            case "screen":
+                connection.localScreenTrack?.isEnabled = true
+            default:
+                break
+            }
+            notifyE2EEState(
+                E2EEStateEvent(
+                    connectionId: connection.id,
+                    kind: .senderCryptorReady,
+                    mediaKind: mediaKind,
+                    reason: "Sender FrameCryptor bound after prior failure")
+            )
+        }
+    }
+
 #elseif os(Android)
     public func ratchetFrameEncryptionKey(index: Int, for participantId: String) async -> Data {
         if frameEncryptionKeyMode == .shared {
@@ -1735,10 +1823,35 @@ extension RTCSession {
     func createEncryptedFrame(connection: RTCConnection) async throws {
         // On Android, the shared key is set at derivation time (see `setMessageKey`).
         // Here we only attach sender cryptors via the AndroidRTCClient bridge.
-        rtcClient.createSenderEncryptedFrame(
+        guard enableEncryption else { return }
+        let attached = rtcClient.createSenderEncryptedFrame(
             participant: connection.localParticipantId,
             connectionId: connection.id
         )
+        if !attached {
+            logger.log(level: .error, message: "❌ Android sender FrameCryptor attach failed connId=\(connection.id)")
+            rtcClient.setAudioEnabled(false)
+            rtcClient.setVideoEnabled(false)
+            let normalizedId = connection.id.normalizedConnectionId
+            e2eeSenderFailedConnectionIds.insert(normalizedId)
+            notifyE2EEState(
+                E2EEStateEvent(
+                    connectionId: connection.id,
+                    kind: .senderCryptorFailed,
+                    mediaKind: "sender",
+                    reason: "Android sender FrameCryptor attach failed")
+            )
+            throw RTCErrors.encryptionFailed("Android sender FrameCryptor attach failed")
+        }
+        if e2eeSenderFailedConnectionIds.remove(connection.id.normalizedConnectionId) != nil {
+            notifyE2EEState(
+                E2EEStateEvent(
+                    connectionId: connection.id,
+                    kind: .senderCryptorReady,
+                    mediaKind: "sender",
+                    reason: "Android sender FrameCryptor bound after prior failure")
+            )
+        }
     }
 #endif
 
@@ -2478,6 +2591,21 @@ extension RTCSession {
         call.signalingIdentityProps = signalingProps
 
         if await !hasConnection(id: call.sharedCommunicationId) {
+            // C4: CallKit inbound answers must not create the PeerConnection (and audio graph)
+            // before `provider(_:didActivate:)`. Stash and re-enter after activation.
+            if requiresExternalAudioActivation, !externalAudioActivationOpen {
+                pendingCallCipherPeerConnectionBootstrapByConnectionId[normalizedCallCipherConnectionId] =
+                    PendingCallCipherPeerConnectionBootstrap(
+                        recipient: recipient,
+                        ciphertext: ciphertext,
+                        call: call,
+                        localFrameIdentity: localFrameIdentity)
+                logger.log(
+                    level: .info,
+                    message: "Deferring call_cipher PeerConnection create until CallKit audio activation connId=\(call.sharedCommunicationId)"
+                )
+                return
+            }
 
             // Default `willFinishNegotiation: false` so `setMessageKey` runs at PC creation,
             // matching the b368e83-era timing for SFU receiver-bootstrap PCs.

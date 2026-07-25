@@ -106,6 +106,19 @@ extension RTCSession {
         }
     }
 
+    /// H1: bridges Android FrameCryptor state changes into `e2eeStateStream()`.
+    func installAndroidFrameCryptorFailureHandler() {
+        rtcClient.setFrameCryptorStateHandler { [weak self] tag, participantId, state in
+            guard let self else { return }
+            Task {
+                await self.handleReceiverCryptorStateDescription(
+                    participantId: participantId,
+                    stateDescription: state,
+                    mediaKind: tag)
+            }
+        }
+    }
+
     private func handleAndroidVideoReceiverFrameCryptorReady(participantId: String) async {
         let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -541,6 +554,8 @@ extension RTCSession {
             }
             logger.log(level: .info, message: "Found remote video track, attaching renderer - trackId: \(videoTrack.trackId)")
             _ = view.attach(videoTrack)
+            // Event-driven re-arm: connection/renderer now exist (C1 sampler may have exited earlier).
+            startInboundVideoFlowSamplerIfNeeded(connectionId: normalizedId)
             if !Self.isTrueOneToOneSfuRoom(call: connection.call) {
                 pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: normalizedId)
             }
@@ -1082,6 +1097,8 @@ extension RTCSession {
                 participantId: participantId,
                 liveTrack: attachTrack
             )
+            // Event-driven re-arm: connection/renderer now exist (C1 sampler may have exited earlier).
+            startInboundVideoFlowSamplerIfNeeded(connectionId: normalizedId)
             logger.log(level: .info, message: "Attached renderer to participant=\(participantId) trackId=\(attachTrackId)")
             return true
         }
@@ -1429,6 +1446,9 @@ extension RTCSession {
                 message: "Remote renderer attached connection=\(normalizedId) trackId=\(videoTrack.trackId) readyState=\(videoTrack.readyState.rawValue) enabled=\(videoTrack.isEnabled)"
             )
 
+            // Event-driven re-arm: connection/renderer now exist (C1 sampler may have exited earlier).
+            startInboundVideoFlowSamplerIfNeeded(connectionId: normalizedId)
+
             // One-shot stats snapshot shortly after attaching the renderer.
             // This tells us definitively whether:
             // - video RTP is arriving (packetsReceived > 0)
@@ -1562,6 +1582,7 @@ extension RTCSession {
         trackForRender.add(renderer)
         remoteParticipantVideoRendererAttachedTrackIdByKey[attachmentKey] = attachmentValue
         logger.log(level: .info, message: "Remote camera renderer attached for participant=\(participantId) mappedKey=\(mappedKey) trackId=\(trackForRender.trackId) binding=\(await participantCameraRendererBindingDiagnostics(connectionId: normalizedId, participantId: participantId, renderer: renderer))")
+        startInboundVideoFlowSamplerIfNeeded(connectionId: normalizedId)
 #else
         let attachmentValue = "\(videoTrack.trackId)|\(ObjectIdentifier(videoTrack))|\(ObjectIdentifier(renderer))"
         if remoteParticipantVideoRendererAttachedTrackIdByKey[attachmentKey] == attachmentValue {
@@ -1576,6 +1597,7 @@ extension RTCSession {
         videoTrack.add(renderer)
         remoteParticipantVideoRendererAttachedTrackIdByKey[attachmentKey] = attachmentValue
         logger.log(level: .info, message: "Remote camera renderer attached for participant=\(participantId) mappedKey=\(mappedKey) trackId=\(videoTrack.trackId) connection=\(normalizedId)")
+        startInboundVideoFlowSamplerIfNeeded(connectionId: normalizedId)
 #endif
         #if canImport(WebRTC)
         logRtpStatsSnapshotOnce(
@@ -2303,6 +2325,8 @@ extension RTCSession {
         guard await isConnectionStillActiveForRecovery(connectionId) else { return }
         let norm = connectionId.normalizedConnectionId
         guard var connection = await connectionManager.findConnection(with: norm) else { return }
+        // Stall recovery proves the connection exists — re-arm sampler if it exited early (C1).
+        startInboundVideoFlowSamplerIfNeeded(connectionId: norm)
         pulseInboundRemoteCameraTracksForDecodeRecovery(connection: &connection)
         await connectionManager.updateConnection(id: connection.id, with: connection)
         clearRemoteParticipantVideoRendererAttachments(connectionId: connectionId)
@@ -2314,74 +2338,6 @@ extension RTCSession {
             connectionId: connectionId,
             forceParticipantSinkRefreshWhenTrackIdentityMatches: true
         )
-#endif
-    }
-
-    /// Handles an Apple receiver decoder stall when diagnostics prove the UI renderer is already
-    /// bound to the live receiver. Repeating a renderer detach/attach in that state does not move
-    /// decode counters; refresh the receiver/key/SFU readiness path instead.
-    public func recoverInboundRemoteParticipantVideoDecoderAfterMatchedBindingStall(
-        connectionId: String,
-        participantId: String
-    ) async {
-#if canImport(WebRTC) && !os(Android)
-        guard await isConnectionStillActiveForRecovery(connectionId) else { return }
-        let norm = connectionId.normalizedConnectionId
-        let trimmedParticipantId = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedParticipantId.isEmpty,
-              var connection = await connectionManager.findConnection(with: norm) else {
-            return
-        }
-
-        if refreshGroupParticipantCameraTrackBindingIfNeeded(
-            connection: &connection,
-            participantId: trimmedParticipantId
-        ) {
-            await connectionManager.updateConnection(id: connection.id, with: connection)
-            if let updated = await connectionManager.findConnection(with: norm) {
-                connection = updated
-            }
-        }
-        pulseInboundRemoteCameraTracksForDecodeRecovery(
-            connection: &connection,
-            participantId: trimmedParticipantId
-        )
-        await connectionManager.updateConnection(id: connection.id, with: connection)
-        clearRemoteParticipantVideoRendererAttachment(
-            connectionId: norm,
-            participantId: trimmedParticipantId
-        )
-        await reconcileAppleReceiverFrameCryptorsAfterSfuRenegotiation(connectionId: norm)
-        await rebindGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(
-            connectionId: norm,
-            forceParticipantSinkRefreshWhenTrackIdentityMatches: true
-        )
-
-        if isGroupCallConnection(connection.id) {
-            do {
-                try await sendSfuGroupMediaReady(
-                    sourceParticipantId: trimmedParticipantId,
-                    roomId: connection.call.sharedCommunicationId,
-                    call: connection.call
-                )
-                logger.log(
-                    level: .info,
-                    message: "Re-sent SFU media readiness after matched-binding decode stall participant=\(trimmedParticipantId) connection=\(norm)"
-                )
-            } catch {
-                logger.log(
-                    level: .warning,
-                    message: "Failed to send SFU media readiness for decode stall participant=\(trimmedParticipantId) connection=\(norm): \(error.localizedDescription)"
-                )
-            }
-        }
-
-        logRtpStatsSnapshotOnce(
-            connectionId: norm,
-            delayNanoseconds: 2_000_000_000,
-            reason: "afterMatchedBindingParticipantDecodeStallRecovery:\(trimmedParticipantId)"
-        )
-        startInboundVideoFlowProbe(connectionId: norm)
 #endif
     }
 
@@ -2928,6 +2884,184 @@ extension RTCSession {
     }
     
 #endif
+
+    /// Handles a receiver decoder stall when the UI renderer is already bound to the live track.
+    ///
+    /// Shared Apple + Android entry point (must stay outside the `#if os(Android)` / Apple `#else`
+    /// split above). When the inbound FrameCryptor is healthy, rebinding cannot invent frames under
+    /// packet loss — pulse the track (Apple) and re-send SFU `mediaReady` so the SFU emits a
+    /// throttled PLI. Full cryptor/renderer recovery runs only when the cryptor is missing,
+    /// disabled, or failing.
+    @discardableResult
+    public func recoverInboundRemoteParticipantVideoDecoderAfterMatchedBindingStall(
+        connectionId: String,
+        participantId: String
+    ) async -> MatchedBindingDecodeStallRecoveryKind? {
+        guard await isConnectionStillActiveForRecovery(connectionId) else { return nil }
+        let norm = connectionId.normalizedConnectionId
+        let trimmedParticipantId = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedParticipantId.isEmpty,
+              var connection = await connectionManager.findConnection(with: norm) else {
+            return nil
+        }
+
+        guard beginMatchedBindingDecodeStallRecoveryIfAllowed(
+            connectionId: norm,
+            participantId: trimmedParticipantId
+        ) else {
+            logger.log(
+                level: .debug,
+                message: "Matched-binding decode stall recovery skipped (cooldown) participant=\(trimmedParticipantId) connection=\(norm)"
+            )
+            return nil
+        }
+
+        let recoveryKind = Self.matchedBindingDecodeStallRecoveryKind(
+            encryptionExpected: isGroupCallConnection(connection.id),
+            hasEnabledReceiverCryptor: inboundVideoReceiverCryptorIsEnabled(
+                connection: connection,
+                participantId: trimmedParticipantId
+            ),
+            receiverCryptorReportingFailure: inboundVideoReceiverCryptorIsReportingFailure(
+                participantId: trimmedParticipantId
+            )
+        )
+
+#if canImport(WebRTC) && !os(Android)
+        if refreshGroupParticipantCameraTrackBindingIfNeeded(
+            connection: &connection,
+            participantId: trimmedParticipantId
+        ) {
+            await connectionManager.updateConnection(id: connection.id, with: connection)
+            if let updated = await connectionManager.findConnection(with: norm) {
+                connection = updated
+            }
+        }
+        pulseInboundRemoteCameraTracksForDecodeRecovery(
+            connection: &connection,
+            participantId: trimmedParticipantId
+        )
+        await connectionManager.updateConnection(id: connection.id, with: connection)
+
+        switch recoveryKind {
+        case .pliFirstMediaReadyRefresh:
+            logger.log(
+                level: .info,
+                message: "PLI-first matched-binding decode stall recovery (cryptor OK) participant=\(trimmedParticipantId) connection=\(norm)"
+            )
+        case .fullCryptorAndRendererRecovery:
+            clearRemoteParticipantVideoRendererAttachment(
+                connectionId: norm,
+                participantId: trimmedParticipantId
+            )
+            await reconcileAppleReceiverFrameCryptorsAfterSfuRenegotiation(connectionId: norm)
+            await rebindGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(
+                connectionId: norm,
+                forceParticipantSinkRefreshWhenTrackIdentityMatches: true
+            )
+            logger.log(
+                level: .info,
+                message: "Full matched-binding decode stall recovery (cryptor unhealthy) participant=\(trimmedParticipantId) connection=\(norm)"
+            )
+        }
+#else
+        logger.log(
+            level: .info,
+            message: "Matched-binding decode stall recovery kind=\(recoveryKind.rawValue) participant=\(trimmedParticipantId) connection=\(norm)"
+        )
+#endif
+
+        if isGroupCallConnection(connection.id) {
+            do {
+                try await sendSfuGroupMediaReady(
+                    sourceParticipantId: trimmedParticipantId,
+                    roomId: connection.call.sharedCommunicationId,
+                    call: connection.call
+                )
+                logger.log(
+                    level: .info,
+                    message: "Re-sent SFU media readiness after matched-binding decode stall participant=\(trimmedParticipantId) connection=\(norm)"
+                )
+            } catch {
+                logger.log(
+                    level: .warning,
+                    message: "Failed to send SFU media readiness for decode stall participant=\(trimmedParticipantId) connection=\(norm): \(error.localizedDescription)"
+                )
+            }
+        }
+
+#if canImport(WebRTC) && !os(Android)
+        logRtpStatsSnapshotOnce(
+            connectionId: norm,
+            delayNanoseconds: 2_000_000_000,
+            reason: "afterMatchedBindingParticipantDecodeStallRecovery:\(trimmedParticipantId)"
+        )
+        startInboundVideoFlowProbe(connectionId: norm)
+#endif
+        return recoveryKind
+    }
+
+    /// Shared 15s single-flight for poll + event-driven decode-stall recovery.
+    func beginMatchedBindingDecodeStallRecoveryIfAllowed(
+        connectionId: String,
+        participantId: String
+    ) -> Bool {
+        let key = "\(connectionId.normalizedConnectionId)|\(Self.conferenceParticipantIdentityKey(participantId))"
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let last = lastMatchedBindingDecodeStallRecoveryUptimeNsByKey[key],
+           last > 0,
+           now >= last,
+           now - last < Self.matchedBindingDecodeStallRecoveryCooldownNs {
+            return false
+        }
+        lastMatchedBindingDecodeStallRecoveryUptimeNsByKey[key] = now
+        return true
+    }
+
+#if canImport(WebRTC) && !os(Android)
+    private func inboundVideoReceiverCryptorIsEnabled(
+        connection: RTCConnection,
+        participantId: String
+    ) -> Bool {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let exact = connection.videoReceiverCryptorsByParticipantId[trimmed] {
+            return exact.enabled
+        }
+        if let key = connection.videoReceiverCryptorsByParticipantId.keys.first(where: {
+            $0.caseInsensitiveCompare(trimmed) == .orderedSame
+                || Self.conferenceParticipantIdentityKey($0) == Self.conferenceParticipantIdentityKey(trimmed)
+        }),
+           let cryptor = connection.videoReceiverCryptorsByParticipantId[key] {
+            return cryptor.enabled
+        }
+        return false
+    }
+#else
+    private func inboundVideoReceiverCryptorIsEnabled(
+        connection: RTCConnection,
+        participantId: String
+    ) -> Bool {
+        // Android FrameCryptor readiness is tracked via e2ee state / native ready callbacks.
+        // Absence of a failure event is treated as healthy for PLI-first recovery.
+        _ = connection
+        return !inboundVideoReceiverCryptorIsReportingFailure(participantId: participantId)
+    }
+#endif
+
+    private func inboundVideoReceiverCryptorIsReportingFailure(participantId: String) -> Bool {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let kind = lastReceiverCryptorEventKindByParticipantId[trimmed]
+            ?? lastReceiverCryptorEventKindByParticipantId.first(where: {
+                $0.key.caseInsensitiveCompare(trimmed) == .orderedSame
+                    || Self.conferenceParticipantIdentityKey($0.key) == Self.conferenceParticipantIdentityKey(trimmed)
+            })?.value
+        switch kind {
+        case .receiverDecryptionFailed, .receiverMissingKey:
+            return true
+        default:
+            return false
+        }
+    }
     
     /// Attaches buffered remote renderers once the 1:1 SFU receive frame key is installed.
     func flushPendingOneToOneSfuRemoteVideoRenderersIfNeeded(connectionId: String) async {

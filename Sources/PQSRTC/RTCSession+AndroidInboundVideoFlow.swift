@@ -12,9 +12,15 @@ extension RTCSession {
     func startInboundVideoFlowSamplerIfNeeded(connectionId: String) {
         let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
         guard !normalizedId.isEmpty else { return }
-        if let existing = inboundVideoFlowSamplerTasksByConnectionId[normalizedId], !existing.isCancelled {
+        // Do not use Task.isCancelled alone: a finished sampler leaves isCancelled==false and
+        // used to permanently block restart. Track active state explicitly (C1).
+        if inboundVideoFlowSamplerActiveByConnectionId[normalizedId] == true {
             return
         }
+
+        let generation = (inboundVideoFlowSamplerGenerationByConnectionId[normalizedId] ?? 0) + 1
+        inboundVideoFlowSamplerGenerationByConnectionId[normalizedId] = generation
+        inboundVideoFlowSamplerActiveByConnectionId[normalizedId] = true
 
         let task = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
@@ -25,12 +31,18 @@ extension RTCSession {
                 }
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
             }
+            await self.clearInboundVideoFlowSamplerTaskIfCurrent(
+                connectionId: normalizedId,
+                generation: generation)
         }
         inboundVideoFlowSamplerTasksByConnectionId[normalizedId] = task
     }
 
     func stopInboundVideoFlowSampler(connectionId: String) {
         let normalizedId = connectionId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        let generation = (inboundVideoFlowSamplerGenerationByConnectionId[normalizedId] ?? 0) + 1
+        inboundVideoFlowSamplerGenerationByConnectionId[normalizedId] = generation
+        inboundVideoFlowSamplerActiveByConnectionId[normalizedId] = false
         if let task = inboundVideoFlowSamplerTasksByConnectionId.removeValue(forKey: normalizedId) {
             task.cancel()
         }
@@ -48,7 +60,18 @@ extension RTCSession {
 
         let deltaPackets = counters.packetsReceived - (previous?.packetsReceived ?? counters.packetsReceived)
         let deltaDecoded = counters.framesDecoded - (previous?.framesDecoded ?? counters.framesDecoded)
+        let state: InboundVideoFlowState
+        if deltaPackets > 0 && deltaDecoded <= 0 {
+            state = .decodeStalled
+        } else if deltaPackets > 0 || deltaDecoded > 0 {
+            state = .advancingIngress
+        } else if counters.packetsReceived > 0 {
+            state = .stalledIngress
+        } else {
+            state = .noTraffic
+        }
         return InboundVideoFlowSnapshot(
+            state: state,
             deltaFramesDecoded: deltaDecoded,
             deltaPacketsReceived: deltaPackets
         )

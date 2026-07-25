@@ -750,6 +750,54 @@ struct RTCSessionCryptoKeyResolutionTests {
             inboundFlow: nil,
             callbackAgeMs: 12_000,
             hasAnyCallbacks: true))
+        // H2: never-attached + expected remote tile + nil flow must recover (sampler may be dead).
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: nil,
+            callbackAgeMs: -1,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 12_000))
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: nil,
+            callbackAgeMs: -1,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 3_000) == false)
+    }
+
+    @Test("matched-binding decode stall prefers PLI-first when cryptor is healthy")
+    func matchedBindingDecodeStallRecoveryKindPolicy() {
+        #expect(RTCSession.matchedBindingDecodeStallRecoveryKind(
+            encryptionExpected: true,
+            hasEnabledReceiverCryptor: true,
+            receiverCryptorReportingFailure: false
+        ) == .pliFirstMediaReadyRefresh)
+        #expect(RTCSession.matchedBindingDecodeStallRecoveryKind(
+            encryptionExpected: true,
+            hasEnabledReceiverCryptor: false,
+            receiverCryptorReportingFailure: false
+        ) == .fullCryptorAndRendererRecovery)
+        #expect(RTCSession.matchedBindingDecodeStallRecoveryKind(
+            encryptionExpected: true,
+            hasEnabledReceiverCryptor: true,
+            receiverCryptorReportingFailure: true
+        ) == .fullCryptorAndRendererRecovery)
+        #expect(RTCSession.matchedBindingDecodeStallRecoveryKind(
+            encryptionExpected: false,
+            hasEnabledReceiverCryptor: false,
+            receiverCryptorReportingFailure: false
+        ) == .pliFirstMediaReadyRefresh)
+
+        let stalled = RTCSession.InboundVideoFlowSnapshot(
+            state: .decodeStalled,
+            deltaFramesDecoded: 0,
+            deltaPacketsReceived: 12
+        )
+        #expect(stalled.isDecodeStalledWithAdvancingPackets)
+        let advancing = RTCSession.InboundVideoFlowSnapshot(
+            state: .advancingIngress,
+            deltaFramesDecoded: 4,
+            deltaPacketsReceived: 12
+        )
+        #expect(!advancing.isDecodeStalledWithAdvancingPackets)
     }
 
     @Test("screen renderer recovery uses per-mid flow and recovers sooner on decode stall")

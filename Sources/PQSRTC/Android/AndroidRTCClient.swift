@@ -647,6 +647,24 @@ public final class AndroidRTCClient: @unchecked Sendable {
         handler?(participantId)
     }
 
+    /// H1: forwards FrameCryptor state changes (tag, participantId, stateDescription) so
+    /// decrypt failures surface as `E2EEStateEvent`s instead of Android-log-only noise.
+    public func setFrameCryptorStateHandler(_ handler: (@Sendable (String, String, String) -> Void)?) {
+        lock.lock()
+        frameCryptorStateHandler = handler
+        lock.unlock()
+        frameCryptorSupport.frameCryptorStateHandler = { [weak self] tag, participantId, state in
+            self?.dispatchFrameCryptorState(tag, participantId, state)
+        }
+    }
+
+    private func dispatchFrameCryptorState(_ tag: String, _ participantId: String, _ state: String) {
+        lock.lock()
+        let handler = frameCryptorStateHandler
+        lock.unlock()
+        handler?(tag, participantId, state)
+    }
+
     private func dispatchScreenCaptureStarted(_ success: Bool) {
         lock.lock()
         let handler = screenCaptureStartedHandler
@@ -753,6 +771,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     private var screenCaptureStartedHandler: (@Sendable (Bool) -> Void)?
     private var screenProjectionStoppedHandler: (@Sendable () -> Void)?
     private var videoReceiverFrameCryptorReadyHandler: (@Sendable (String) -> Void)?
+    private var frameCryptorStateHandler: (@Sendable (String, String, String) -> Void)?
     
     // Track active surface renderers for proper cleanup
     private var activeSurfaceRenderers: Set<org.webrtc.SurfaceViewRenderer> = []
@@ -961,10 +980,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: }
 
         // Match RTCSession.ensureFrameKeyProviderIfNeeded() (PBKDF2 = WebRTC default when Apple omits keyDerivationAlgorithm).
-        // SKIP INSERT: val ratchetWindowSize = 0
+        // H1: bounded failureTolerance (32) + ratchetWindowSize (8) mirror the Apple provider.
+        // SKIP INSERT: val ratchetWindowSize = 8
         // SKIP INSERT: val sharedKeyMode = true
         // SKIP INSERT: val uncryptedMagicBytes: ByteArray? = "PQSRTCMagicBytes".encodeToByteArray()
-        // SKIP INSERT: val failureTolerance = -1
+        // SKIP INSERT: val failureTolerance = 32
         // SKIP INSERT: val keyRingSize = 16
         // SKIP INSERT: val discardFrameWhenCryptorNotReady = true
 
@@ -1069,10 +1089,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   return
         // SKIP INSERT: }
 
-        // SKIP INSERT: val ratchetWindowSize = 0
+        // H1: bounded failureTolerance (32) + ratchetWindowSize (8) mirror the Apple provider.
+        // SKIP INSERT: val ratchetWindowSize = 8
         // SKIP INSERT: val sharedKeyModeK = false
         // SKIP INSERT: val uncryptedMagicBytes: ByteArray? = "PQSRTCMagicBytes".encodeToByteArray()
-        // SKIP INSERT: val failureTolerance = -1
+        // SKIP INSERT: val failureTolerance = 32
         // SKIP INSERT: val keyRingSize = 16
         // SKIP INSERT: val discardFrameWhenCryptorNotReady = true
 
@@ -1286,19 +1307,23 @@ public final class AndroidRTCClient: @unchecked Sendable {
     }
 
     /// Attaches FrameCryptor encryptors to current RTP senders (audio/video) on the active PeerConnection.
-    public func createSenderEncryptedFrame(participant: String, connectionId: String) {
+    /// - Returns: `true` when cryptors were attached (or already attachable), `false` when encryption
+    ///   was required but the FrameCryptor stack could not attach (fail-closed).
+    @discardableResult
+    public func createSenderEncryptedFrame(participant: String, connectionId: String) -> Bool {
         lock.lock()
         let canAttach = !isClosed && !frameCryptorUnavailable && keyProviderReady
         let currentPeerConnection = peerConnection?.platformPeerConnection
         let currentFactory = factory
         lock.unlock()
 
-        guard canAttach, let currentPeerConnection, let currentFactory else { return }
+        guard canAttach, let currentPeerConnection, let currentFactory else { return false }
         frameCryptorSupport.attachSenderCryptors(
             factory: currentFactory,
             peerConnection: currentPeerConnection,
             participant: participant
         )
+        return true
     }
 
     /// Attaches a dedicated FrameCryptor encryptor to the local screen-share RTP sender.
@@ -2008,41 +2033,102 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: videoSender.parameters = params
     }
 
+    /// Selected ICE candidate-pair bandwidth/RTT plus inbound video RTP totals for adaptive survival.
+    public struct AdaptiveNetworkStats: Sendable {
+        public let availableOutgoingBitrateBps: Double?
+        public let availableIncomingBitrateBps: Double?
+        public let currentRttSeconds: Double?
+        public let inboundVideoPacketsReceived: Int64
+        public let inboundVideoPacketsLost: Int64
+
+        public init(
+            availableOutgoingBitrateBps: Double?,
+            availableIncomingBitrateBps: Double?,
+            currentRttSeconds: Double?,
+            inboundVideoPacketsReceived: Int64 = 0,
+            inboundVideoPacketsLost: Int64 = 0
+        ) {
+            self.availableOutgoingBitrateBps = availableOutgoingBitrateBps
+            self.availableIncomingBitrateBps = availableIncomingBitrateBps
+            self.currentRttSeconds = currentRttSeconds
+            self.inboundVideoPacketsReceived = inboundVideoPacketsReceived
+            self.inboundVideoPacketsLost = inboundVideoPacketsLost
+        }
+    }
+
     public func getAvailableOutgoingBitrateBps() async -> Double? {
+        await getAdaptiveNetworkStats().availableOutgoingBitrateBps
+    }
+
+    public func getAdaptiveNetworkStats() async -> AdaptiveNetworkStats {
         var availableOutgoingBitrate: Double? = nil
+        var availableIncomingBitrate: Double? = nil
+        var currentRttSeconds: Double? = nil
+        var inboundVideoPacketsReceived: Int64 = 0
+        var inboundVideoPacketsLost: Int64 = 0
         // SKIP INSERT: lock.lock()
         // SKIP INSERT: val closed = isClosed
         // SKIP INSERT: val pc = peerConnection?.platformPeerConnection
         // SKIP INSERT: lock.unlock()
         // SKIP INSERT: val shouldReadStats = !closed && pc != null
-        // SKIP INSERT: var best: Double? = null
         // SKIP INSERT: if (shouldReadStats) {
         // SKIP INSERT:   val peer = pc!!
         // SKIP INSERT:   val latch = java.util.concurrent.CountDownLatch(1)
         // SKIP INSERT:   peer.getStats { report ->
         // SKIP INSERT:     val statsMap = report.statsMap
+        // SKIP INSERT:     var outBest: Double? = null
+        // SKIP INSERT:     var inBest: Double? = null
+        // SKIP INSERT:     var rttBest: Double? = null
+        // SKIP INSERT:     var videoPackets = 0L
+        // SKIP INSERT:     var videoLost = 0L
+        // SKIP INSERT:     fun asDouble(v: Any?): Double? = when (v) {
+        // SKIP INSERT:       is Double -> v
+        // SKIP INSERT:       is Long -> v.toDouble()
+        // SKIP INSERT:       is Int -> v.toDouble()
+        // SKIP INSERT:       is Number -> v.toDouble()
+        // SKIP INSERT:       else -> null
+        // SKIP INSERT:     }
+        // SKIP INSERT:     fun asLong(v: Any?): Long = when (v) {
+        // SKIP INSERT:       is Long -> v
+        // SKIP INSERT:       is Int -> v.toLong()
+        // SKIP INSERT:       is Number -> v.toLong()
+        // SKIP INSERT:       else -> 0L
+        // SKIP INSERT:     }
         // SKIP INSERT:     for ((_, stat) in statsMap) {
+        // SKIP INSERT:       if (stat.type == "inbound-rtp") {
+        // SKIP INSERT:         val kind = (stat.members["kind"] as? String ?: stat.members["mediaType"] as? String ?: "").lowercase()
+        // SKIP INSERT:         if (kind != "video") continue
+        // SKIP INSERT:         videoPackets += asLong(stat.members["packetsReceived"])
+        // SKIP INSERT:         val lost = asLong(stat.members["packetsLost"])
+        // SKIP INSERT:         if (lost > 0L) videoLost += lost
+        // SKIP INSERT:         continue
+        // SKIP INSERT:       }
         // SKIP INSERT:       if (stat.type != "candidate-pair") continue
         // SKIP INSERT:       val selected = (stat.members["selected"] as? Boolean) ?: false
         // SKIP INSERT:       val nominated = (stat.members["nominated"] as? Boolean) ?: false
         // SKIP INSERT:       val state = (stat.members["state"] as? String)?.lowercase() ?: ""
         // SKIP INSERT:       if (!(selected || (nominated && state == "succeeded"))) continue
-        // SKIP INSERT:       val v = stat.members["availableOutgoingBitrate"]
-        // SKIP INSERT:       val d = when (v) {
-        // SKIP INSERT:         is Double -> v
-        // SKIP INSERT:         is Long -> v.toDouble()
-        // SKIP INSERT:         is Int -> v.toDouble()
-        // SKIP INSERT:         is Number -> v.toDouble()
-        // SKIP INSERT:         else -> null
-        // SKIP INSERT:       }
-        // SKIP INSERT:       if (d != null) { best = d; break }
+        // SKIP INSERT:       asDouble(stat.members["availableOutgoingBitrate"])?.let { outBest = it }
+        // SKIP INSERT:       asDouble(stat.members["availableIncomingBitrate"])?.let { inBest = it }
+        // SKIP INSERT:       asDouble(stat.members["currentRoundTripTime"])?.let { rttBest = it }
+        // SKIP INSERT:         ?: asDouble(stat.members["totalRoundTripTime"])?.let { rttBest = it }
         // SKIP INSERT:     }
+        // SKIP INSERT:     availableOutgoingBitrate = outBest
+        // SKIP INSERT:     availableIncomingBitrate = inBest
+        // SKIP INSERT:     currentRttSeconds = rttBest
+        // SKIP INSERT:     inboundVideoPacketsReceived = videoPackets
+        // SKIP INSERT:     inboundVideoPacketsLost = videoLost
         // SKIP INSERT:     latch.countDown()
         // SKIP INSERT:   }
         // SKIP INSERT:   latch.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
         // SKIP INSERT: }
-        // SKIP INSERT: availableOutgoingBitrate = best
-        return availableOutgoingBitrate
+        return AdaptiveNetworkStats(
+            availableOutgoingBitrateBps: availableOutgoingBitrate,
+            availableIncomingBitrateBps: availableIncomingBitrate,
+            currentRttSeconds: currentRttSeconds,
+            inboundVideoPacketsReceived: inboundVideoPacketsReceived,
+            inboundVideoPacketsLost: inboundVideoPacketsLost
+        )
     }
 
     public func getInboundRemoteVideoCounters() async -> AndroidInboundVideoCounters? {
