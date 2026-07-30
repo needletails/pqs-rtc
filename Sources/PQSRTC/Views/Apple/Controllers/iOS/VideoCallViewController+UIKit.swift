@@ -147,10 +147,13 @@ public final class VideoCallViewController: UICollectionViewController {
     private var localScreenShareStateTask: Task<Void, Never>?
     private var screenTrackStreamTask: Task<Void, Never>?
     private var participantTrackStreamTask: Task<Void, Never>?
+    private var sfuGroupSignalingStableStreamTask: Task<Void, Never>?
     private var hasActiveLocalScreenShare = false
     private var hasActiveRemoteScreenShare = false
     /// Participant id for the remote screen-share tile currently shown (mirrors Android guard).
     private var activeRemoteScreenShareParticipantId: String?
+    /// Activation retained until the session publishes the mapped screen track.
+    private var pendingRemoteScreenShareActivation: RemoteScreenTrackEvent?
     private var remoteScreenShareAttachRetryTask: Task<Void, Never>?
     private var remoteScreenShareAttachRetryKey: String?
     private var conferenceRaisedHands: [String: Bool] = [:]
@@ -417,6 +420,7 @@ public final class VideoCallViewController: UICollectionViewController {
         startLocalScreenShareStateObservation()
         startRemoteScreenTrackObservation()
         startRemoteParticipantTrackObservation()
+        startSfuGroupSignalingStableObservation()
     }
 
     private func startLocalScreenShareStateObservation() {
@@ -450,6 +454,10 @@ public final class VideoCallViewController: UICollectionViewController {
 
     private func handleRemoteScreenTrackEvent(_ event: RemoteScreenTrackEvent) async {
         if !event.isActive {
+            if let pending = pendingRemoteScreenShareActivation,
+               RTCSession.remoteScreenShareParticipantMatches(pending.participantId, event.participantId) {
+                pendingRemoteScreenShareActivation = nil
+            }
             let hasVisibleScreenTiles = videoViews.views.contains(where: isRemoteScreenShareModel)
             let endedActiveShare = RTCSession.shouldAcceptRemoteScreenShareEnd(
                 activeParticipantId: activeRemoteScreenShareParticipantId,
@@ -489,12 +497,14 @@ public final class VideoCallViewController: UICollectionViewController {
             connectionId: event.connectionId,
             participantId: event.participantId
         ) else {
+            pendingRemoteScreenShareActivation = event
             logger.log(
                 level: .info,
-                message: "Ignoring remote screen-share activation with no mapped track for participant=\(event.participantId)"
+                message: "Deferring remote screen-share activation until screen track maps participant=\(event.participantId)"
             )
             return
         }
+        pendingRemoteScreenShareActivation = nil
         await stopPictureInPictureForScreenShareIfNeeded()
         activeRemoteScreenShareParticipantId = event.participantId
         await syncParticipantCameraTileAspectModes()
@@ -524,6 +534,9 @@ public final class VideoCallViewController: UICollectionViewController {
                         connectionId: event.connectionId,
                         participantId: event.participantId
                     )
+                    await self.retryPendingRemoteScreenShareActivationIfNeeded(
+                        connectionId: event.connectionId
+                    )
                 } else {
                     await self.tearDownParticipantCameraView(
                         connectionId: event.connectionId,
@@ -532,6 +545,30 @@ public final class VideoCallViewController: UICollectionViewController {
                 }
             }
         }
+    }
+
+    private func startSfuGroupSignalingStableObservation() {
+        sfuGroupSignalingStableStreamTask?.cancel()
+        sfuGroupSignalingStableStreamTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let stream = await self.session.sfuGroupSignalingStableStream()
+            for await connectionId in stream {
+                guard !Task.isCancelled, self.isRunning else { return }
+                await self.retryPendingRemoteScreenShareActivationIfNeeded(connectionId: connectionId)
+                await self.handleSignalingStableRendererRecovery(connectionId: connectionId)
+            }
+        }
+    }
+
+    private func retryPendingRemoteScreenShareActivationIfNeeded(connectionId: String) async {
+        guard isRunning, let pending = pendingRemoteScreenShareActivation else { return }
+        guard pending.connectionId.normalizedConnectionId == connectionId.normalizedConnectionId else { return }
+        guard await session.hasMappedRemoteScreenTrack(
+            connectionId: pending.connectionId,
+            participantId: pending.participantId
+        ) else { return }
+        pendingRemoteScreenShareActivation = nil
+        await handleRemoteScreenTrackEvent(pending)
     }
 
     public override func viewDidLayoutSubviews() {
@@ -707,6 +744,10 @@ public final class VideoCallViewController: UICollectionViewController {
 
         screenTrackStreamTask?.cancel()
         screenTrackStreamTask = nil
+        sfuGroupSignalingStableStreamTask?.cancel()
+        sfuGroupSignalingStableStreamTask = nil
+        inboundVideoFlowStreamTask?.cancel()
+        inboundVideoFlowStreamTask = nil
         postScreenShareLayoutHealTask?.cancel()
         postScreenShareLayoutHealTask = nil
         stopRemoteScreenShareAttachRetry()
@@ -720,6 +761,7 @@ public final class VideoCallViewController: UICollectionViewController {
         hasActiveRemoteScreenShare = false
         hasVisibleScreenShareInCollection = false
         activeRemoteScreenShareParticipantId = nil
+        pendingRemoteScreenShareActivation = nil
         participantTrackStreamTask?.cancel()
         participantTrackStreamTask = nil
         await tearDownAllParticipantCameraViews()
@@ -1550,14 +1592,12 @@ public final class VideoCallViewController: UICollectionViewController {
         remoteScreenShareAttachRetryTask?.cancel()
         remoteScreenShareAttachRetryTask = nil
         remoteScreenShareAttachRetryKey = nil
+        pendingRemoteScreenShareActivation = nil
     }
 
     private func isRemoteScreenShareAttachRetryPending(for participantId: String) -> Bool {
         guard let retryKey = remoteScreenShareAttachRetryKey,
-              let task = remoteScreenShareAttachRetryTask,
-              !task.isCancelled else {
-            return false
-        }
+              pendingRemoteScreenShareActivation != nil else { return false }
         let participantKey = RTCSession.conferenceParticipantIdentityKey(participantId)
         return retryKey.hasSuffix("|\(participantKey)")
             && RTCSession.remoteScreenShareParticipantMatches(activeRemoteScreenShareParticipantId, participantId)
@@ -1571,35 +1611,17 @@ public final class VideoCallViewController: UICollectionViewController {
         }
         stopRemoteScreenShareAttachRetry()
         remoteScreenShareAttachRetryKey = retryKey
-        remoteScreenShareAttachRetryTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            var attempts = 0
-            while !Task.isCancelled, attempts < 40 {
-                attempts += 1
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                guard !Task.isCancelled else { return }
-                guard RTCSession.remoteScreenShareParticipantMatches(
-                    self.activeRemoteScreenShareParticipantId,
-                    participantId
-                ) else { return }
-                guard await self.session.hasMappedRemoteScreenTrack(
-                    connectionId: connectionId,
-                    participantId: participantId
-                ) else { continue }
-
-                await self.createScreenView(connectionId: connectionId, participantId: participantId)
-                if self.hasActiveRemoteScreenShare,
-                   self.screenShareModel(matching: participantId, allowSingleFallback: false) != nil {
-                    self.stopRemoteScreenShareAttachRetry()
-                    return
-                }
-            }
-            self.remoteScreenShareAttachRetryKey = nil
-            self.logger.log(
-                level: .warning,
-                message: "Remote screen share attach retry exhausted for participant=\(participantId)"
-            )
-        }
+        pendingRemoteScreenShareActivation = RemoteScreenTrackEvent(
+            connectionId: connectionId,
+            participantId: participantId,
+            isActive: true
+        )
+        // Track mapping or signaling-stable emits the concrete event that owns one attach.
+        remoteScreenShareAttachRetryTask = nil
+        logger.log(
+            level: .info,
+            message: "Waiting for mapped remote screen track event participant=\(participantId) connection=\(connectionId)"
+        )
     }
 
     /// Removes a remote screen-share tile and returns to normal layout.
@@ -2331,6 +2353,32 @@ public final class VideoCallViewController: UICollectionViewController {
         lastScreenShareRendererRecoveryUptimeNsByKey.removeAll()
     }
 
+    private func handleSignalingStableRendererRecovery(connectionId: String) async {
+        guard isRunning else { return }
+        if let mainRenderer = videoViews.views.first(where: {
+            $0.videoView.contextName == "sample"
+        })?.videoView.renderer as? SampleBufferViewRenderer {
+            startRemoteRendererRecoveryIfNeeded(renderer: mainRenderer, connectionId: connectionId)
+        }
+        for model in videoViews.views.filter(isParticipantCameraModel) {
+            guard let renderer = model.videoView.renderer as? SampleBufferViewRenderer else { continue }
+            startParticipantRendererRecoveryIfNeeded(
+                renderer: renderer,
+                connectionId: connectionId,
+                participantId: model.participantId
+            )
+        }
+        if let participantId = activeRemoteScreenShareParticipantId,
+           let model = screenShareModel(matching: participantId, allowSingleFallback: false),
+           let renderer = model.videoView.renderer as? SampleBufferViewRenderer {
+            startRemoteScreenShareRendererRecoveryIfNeeded(
+                renderer: renderer,
+                connectionId: connectionId,
+                participantId: participantId
+            )
+        }
+    }
+
     private func startRemoteRendererRecoveryIfNeeded(
         renderer: SampleBufferViewRenderer,
         connectionId: String
@@ -2347,8 +2395,9 @@ public final class VideoCallViewController: UICollectionViewController {
         remoteRendererRecoveryRendererId = rendererId
         remoteRendererRecoveryTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await self.session.startInboundVideoFlowSamplerIfNeeded(connectionId: connectionId)
+            let flowStream = await self.session.inboundVideoFlowUpdateStream()
+            for await _ in flowStream {
                 if Task.isCancelled { return }
                 guard self.isRunning else { continue }
                 guard self.currentCallState != .waiting else { continue }
@@ -2421,8 +2470,9 @@ public final class VideoCallViewController: UICollectionViewController {
 
         screenShareRendererRecoveryTasksByKey[key] = Task { @MainActor [weak self] in
             guard let self else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await self.session.startInboundVideoFlowSamplerIfNeeded(connectionId: normalizedConnectionId)
+            let flowStream = await self.session.inboundVideoFlowUpdateStream()
+            for await _ in flowStream {
                 if Task.isCancelled { return }
                 guard self.isRunning else { continue }
                 guard self.currentCallState != .waiting else { continue }
@@ -2518,8 +2568,9 @@ public final class VideoCallViewController: UICollectionViewController {
 
         participantRendererRecoveryTasksByKey[key] = Task { @MainActor [weak self] in
             guard let self else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await self.session.startInboundVideoFlowSamplerIfNeeded(connectionId: normalizedConnectionId)
+            let flowStream = await self.session.inboundVideoFlowUpdateStream()
+            for await _ in flowStream {
                 if Task.isCancelled { return }
                 guard self.isRunning else { continue }
                 guard self.currentCallState != .waiting else { continue }

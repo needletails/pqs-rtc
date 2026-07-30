@@ -5873,6 +5873,7 @@ extension RTCSession {
                     let connKey = connection.id.normalizedConnectionId
                     iceDequeByConnectionId[connKey] = nil
                     readyForCandidatesByConnectionId[connKey] = nil
+                    cancelBufferedCandidateDrain(connectionId: connKey)
                     if let id = connectionId as String? {
                         cancelRelayFallbackTimer(connectionId: id)
                     }

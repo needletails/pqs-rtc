@@ -270,6 +270,7 @@ extension RTCSession {
         cancelRelayFallbackTimer(connectionId: connectionId)
         readyForCandidatesByConnectionId[connectionId] = nil
         iceDequeByConnectionId[connectionId] = nil
+        cancelBufferedCandidateDrain(connectionId: connectionId)
 #if os(Android)
         pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
         pendingLocalVideoRenderersByConnectionId.removeValue(forKey: connectionId)

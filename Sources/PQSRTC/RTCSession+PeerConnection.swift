@@ -455,6 +455,7 @@ extension RTCSession {
         // while tearing down peer connections.
         shouldOffer = false
         setHandshakeComplete(false)
+        stateTaskGeneration &+= 1
         stateTask?.cancel()
         stateTask = nil
         // Retire peer-notifications consumer. Bump generation and yield a `nil` wake-up so any
@@ -513,6 +514,7 @@ extension RTCSession {
         finishAllRemoteParticipantTrackStreams()
 
         // Clear any session-level pending buffers/caches.
+        cancelAllBufferedCandidateDrains()
         iceDequeByConnectionId.removeAll()
         readyForCandidatesByConnectionId.removeAll()
         pendingRemoteVideoRenderersByConnectionId.removeAll()
@@ -773,12 +775,29 @@ extension RTCSession {
     }
     
     private func handleStateStream() {
-        if stateTask?.isCancelled == false { stateTask?.cancel() }
+        stateTaskGeneration &+= 1
+        let generation = stateTaskGeneration
+        stateTask?.cancel()
         stateTask = Task { [weak self] in
             guard let self else { return }
-            guard let stateStream = await self.callState.currentCallStream.first else { return }
-            try await handleState(stateStream: stateStream)
+            defer {
+                Task { await self.clearStateTaskIfOwned(by: generation) }
+            }
+            do {
+                try Task.checkCancellation()
+                guard let stateStream = await self.callState.currentCallStream.first else { return }
+                try await self.handleState(stateStream: stateStream)
+            } catch is CancellationError {
+                return
+            } catch {
+                self.logger.log(level: .error, message: "State stream handler failed: \(error)")
+            }
         }
+    }
+
+    private func clearStateTaskIfOwned(by generation: UInt64) {
+        guard stateTaskGeneration == generation else { return }
+        stateTask = nil
     }
     
     /// Transitions the call state machine to `.connecting` if the session is currently `.ready`.
@@ -864,6 +883,9 @@ extension RTCSession {
         let connectionId = currentCall?.sharedCommunicationId.normalizedConnectionId
 
         if let connectionId, let callForTeardown = currentCall {
+            readyForCandidatesByConnectionId[connectionId] = nil
+            iceDequeByConnectionId.removeValue(forKey: connectionId)
+            cancelBufferedCandidateDrain(connectionId: connectionId)
             await taskProcessor.removeJobs(forConnectionId: connectionId)
             for key in sfuRoomSignalingPropsKeys(
                 roomId: callForTeardown.sharedCommunicationId,
@@ -1110,6 +1132,7 @@ extension RTCSession {
         // Reset connection state
         pcState = PeerConnectionState.none
         pcStateByConnectionId.removeAll()
+        cancelAllBufferedCandidateDrains()
         readyForCandidatesByConnectionId.removeAll()
         for task in inboundVideoFlowSamplerTasksByConnectionId.values {
             task.cancel()

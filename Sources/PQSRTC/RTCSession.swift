@@ -311,6 +311,12 @@ public actor RTCSession {
     /// Per-connection buffer for ICE candidates generated before the connection is
     /// ready to send them.
     var iceDequeByConnectionId: [String: Deque<IceCandidate>] = [:]
+
+    /// Buffered ICE drains are retained so teardown can cancel blocked encryption sends.
+    var bufferedCandidateDrainTasksByConnectionId: [String: Task<Void, Never>] = [:]
+
+    /// Per-connection ownership generations for buffered ICE drains.
+    var bufferedCandidateDrainGenerationByConnectionId: [String: UInt64] = [:]
     
     /// The connection id considered "active" for the current call.
     ///
@@ -373,6 +379,9 @@ public actor RTCSession {
     
     /// Task that mirrors high-level RTC state into `callState`.
     var stateTask: Task<Void, Error>?
+
+    /// Ownership generation for `stateTask`; prevents a replaced consumer clearing its successor.
+    var stateTaskGeneration: UInt64 = 0
 #if os(iOS)
     /// Shared `RTCAudioSession` wrapper used to integrate with the platform audio stack.
     nonisolated let audioSession = RTCAudioSession.sharedInstance()

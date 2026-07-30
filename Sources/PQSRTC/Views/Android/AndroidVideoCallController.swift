@@ -82,6 +82,9 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var postRenegotiationEpisodeIncludesGridLayout = false
     private var postRenegotiationCoordinatorInFlight = false
     private var postRenegotiationCoordinatorRerunNeeded = false
+    /// Retained coordinator owner; teardown cancels it even while a phase is suspended.
+    private var postRenegotiationCoordinatorTask: Task<Void, Never>?
+    private var postRenegotiationCoordinatorGeneration: UInt64 = 0
     /// Counts coordinator passes within one post-renegotiation episode (rebind runs once on pass 1 only).
     private var postRenegotiationCoordinatorPassIndex = 0
     /// Participants coordinator-bound during the active post-renegotiation episode.
@@ -1345,7 +1348,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
     }
 
     private func requestPostRenegotiationAttachCoordinator(connectionId: String) {
-        guard isGroupCall else { return }
+        guard isRunning, isGroupCall else { return }
         if postRenegotiationCoordinatorInFlight {
             postRenegotiationCoordinatorRerunNeeded = true
             logger.log(
@@ -1355,9 +1358,14 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return
         }
         postRenegotiationCoordinatorInFlight = true
-        Task { [weak self] in
+        postRenegotiationCoordinatorGeneration &+= 1
+        let generation = postRenegotiationCoordinatorGeneration
+        postRenegotiationCoordinatorTask = Task { [weak self] in
             guard let self else { return }
-            await self.runPostRenegotiationAttachCoordinatorTask(connectionId: connectionId)
+            await self.runPostRenegotiationAttachCoordinatorTask(
+                connectionId: connectionId,
+                generation: generation
+            )
         }
     }
 
@@ -1365,14 +1373,28 @@ public actor AndroidVideoCallController: CallActionDelegate {
         requestPostRenegotiationAttachCoordinator(connectionId: connectionId)
     }
 
-    private func runPostRenegotiationAttachCoordinatorTask(connectionId: String) async {
-        defer { postRenegotiationCoordinatorInFlight = false }
+    private func runPostRenegotiationAttachCoordinatorTask(
+        connectionId: String,
+        generation: UInt64
+    ) async {
+        defer {
+            if postRenegotiationCoordinatorGeneration == generation {
+                postRenegotiationCoordinatorInFlight = false
+                postRenegotiationCoordinatorTask = nil
+            }
+        }
         let norm = connectionId.normalizedConnectionId
         repeat {
             repeat {
+                guard !Task.isCancelled,
+                      isRunning,
+                      postRenegotiationCoordinatorGeneration == generation else { return }
                 postRenegotiationCoordinatorRerunNeeded = false
                 postRenegotiationCoordinatorPassIndex += 1
                 await runPostRenegotiationAttachCoordinatorIfReady(connectionId: connectionId)
+                guard !Task.isCancelled,
+                      isRunning,
+                      postRenegotiationCoordinatorGeneration == generation else { return }
                 guard isPostRenegotiationAttachEpisodeActive(for: norm) else { return }
                 if await session.shouldDeferSfuGroupParticipantVideoAttach(for: norm) {
                     logger.log(
@@ -1385,10 +1407,16 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 && isPostRenegotiationAttachEpisodeActive(for: norm)
 
             guard isPostRenegotiationAttachEpisodeActive(for: norm),
+                  !Task.isCancelled,
+                  isRunning,
+                  postRenegotiationCoordinatorGeneration == generation,
                   !(await session.shouldDeferSfuGroupParticipantVideoAttach(for: norm)) else {
                 return
             }
             let episodeCleared = await finalizePostRenegotiationAttachEpisode(connectionId: norm)
+            guard !Task.isCancelled,
+                  isRunning,
+                  postRenegotiationCoordinatorGeneration == generation else { return }
             if episodeCleared {
                 return
             }
@@ -5197,9 +5225,18 @@ public actor AndroidVideoCallController: CallActionDelegate {
 
     // MARK: - Teardown
 
+    private func cancelPostRenegotiationAttachCoordinator() {
+        postRenegotiationCoordinatorGeneration &+= 1
+        postRenegotiationCoordinatorTask?.cancel()
+        postRenegotiationCoordinatorTask = nil
+        postRenegotiationCoordinatorInFlight = false
+        postRenegotiationCoordinatorRerunNeeded = false
+    }
+
     private func markCallEndedLocally() {
         guard isRunning else { return }
         isRunning = false
+        cancelPostRenegotiationAttachCoordinator()
         stopLocalScreenShareStateObservation()
         stopRemoteScreenTrackObservation()
         stopParticipantTrackObservation()
@@ -5226,6 +5263,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private func tearDownCall() async {
         guard isRunning else { return }
         isRunning = false
+        cancelPostRenegotiationAttachCoordinator()
 
         await tearDownPreviewView()
         await tearDownSampleView()

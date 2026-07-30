@@ -763,6 +763,11 @@ extension RTCSession {
         // candidates generated while the drain is in flight take the live send path instead of
         // being appended to the deque and silently discarded when it was set to nil afterwards.
         let buffered = iceDequeByConnectionId.removeValue(forKey: connKey)
+        // A replacement drain may only retire the prior owner after readiness was revoked.
+        // This prevents a late `startSendingCandidates` from cancelling a still-valid drain.
+        if readyForCandidatesByConnectionId[connKey] != true {
+            cancelBufferedCandidateDrain(connectionId: connKey)
+        }
         readyForCandidatesByConnectionId[connKey] = true
         updateFallbackLatestCall(call)
 
@@ -771,9 +776,16 @@ extension RTCSession {
         // blocked `sendGroupCallOffer` — and with it the deferred `call_answered` on inbound 1:1
         // SFU answers — for ~10s. Trickle ICE has no ordering requirement between candidates, and
         // all sends are fed after the offer's write task, so drain on a separate actor task.
-        Task { [weak self] in
+        let generation = (bufferedCandidateDrainGenerationByConnectionId[connKey] ?? 0) &+ 1
+        bufferedCandidateDrainGenerationByConnectionId[connKey] = generation
+        bufferedCandidateDrainTasksByConnectionId[connKey] = Task { [weak self] in
             guard let self else { return }
-            await self.drainBufferedCandidates(buffered, call: call, connKey: connKey)
+            await self.drainBufferedCandidates(
+                buffered,
+                call: call,
+                connKey: connKey,
+                generation: generation
+            )
         }
     }
 
@@ -781,11 +793,19 @@ extension RTCSession {
     private func drainBufferedCandidates(
         _ buffered: Deque<IceCandidate>,
         call: Call,
-        connKey: String
+        connKey: String,
+        generation: UInt64
     ) async {
+        defer {
+            if bufferedCandidateDrainGenerationByConnectionId[connKey] == generation {
+                bufferedCandidateDrainTasksByConnectionId[connKey] = nil
+            }
+        }
         for item in buffered {
             // Stop if the connection was torn down or reset mid-drain.
-            guard readyForCandidatesByConnectionId[connKey] == true else {
+            guard !Task.isCancelled,
+                  bufferedCandidateDrainGenerationByConnectionId[connKey] == generation,
+                  readyForCandidatesByConnectionId[connKey] == true else {
                 logger.log(
                     level: .info,
                     message: "Stopping buffered ICE candidate drain; connection no longer ready connId=\(connKey)")
@@ -797,6 +817,20 @@ extension RTCSession {
                 logger.log(level: .error, message: "Failed to send buffered ICE candidate (id=\(item.id)): \(error)")
             }
         }
+    }
+
+    func cancelBufferedCandidateDrain(connectionId: String) {
+        let key = connectionId.normalizedConnectionId
+        bufferedCandidateDrainGenerationByConnectionId[key] = (bufferedCandidateDrainGenerationByConnectionId[key] ?? 0) &+ 1
+        bufferedCandidateDrainTasksByConnectionId.removeValue(forKey: key)?.cancel()
+    }
+
+    func cancelAllBufferedCandidateDrains() {
+        for task in bufferedCandidateDrainTasksByConnectionId.values {
+            task.cancel()
+        }
+        bufferedCandidateDrainTasksByConnectionId.removeAll()
+        bufferedCandidateDrainGenerationByConnectionId.removeAll()
     }
 
     //MARK: Internal
