@@ -40,6 +40,28 @@ actor TaskProcessor {
     /// `jobs` (removed only on completion), so cache reloads must not re-enqueue it — a second
     /// pass over the same StreamTask advances the ratchet twice and fails decrypt.
     private var inFlightJobId: String?
+
+    // MARK: - Outbound send lane
+    //
+    // Transport delivery is decoupled from the serial crypto pipeline. `handleWriteMessage`
+    // encrypts (ratchet order must stay serial) and then enqueues the packet here; a dedicated
+    // drain task performs the actual `sendEncryptedPacket` network I/O. Without this, a single
+    // send blocked on a congested uplink (SFU websocket backpressure / registration gate)
+    // froze the whole pipeline: inbound `.answer`/`.candidate` decrypts queued behind it for
+    // 60+ seconds, the remote SDP was applied a minute late, and the ICE fallback tore down an
+    // otherwise healthy setup.
+
+    /// One encrypted packet awaiting transport delivery, in encrypt order.
+    private struct OutboundSend {
+        let id = UUID()
+        let packet: RatchetMessagePacket
+        let task: WriteTask
+    }
+
+    private var outboundSends: [OutboundSend] = []
+    private var outboundSenderTask: Task<Void, Never>?
+    /// Terminal: set when this crypto-stack generation is retired; the lane never restarts.
+    private var isOutboundLaneShutdown = false
     
     /// Ratchet messages already successfully applied for `.handshakeComplete` (per connection).
     private var processedPostCipherHandshakes: Set<ProcessedPostCipherHandshakeKey> = []
@@ -101,12 +123,30 @@ actor TaskProcessor {
             processedPostCipherHandshakes.filter { $0.connectionId != normalized }
         )
 
-        if removedCached > 0 || removedQueued > 0 {
+        let beforeSends = outboundSends.count
+        outboundSends.removeAll { $0.task.referencesConnectionId(normalized) }
+        let removedSends = beforeSends - outboundSends.count
+        if removedSends > 0 {
+            // The in-flight send may belong to this (now torn down) connection and could be
+            // parked on a dead transport gate forever, holding the lane hostage. Cancel it;
+            // the drain task's defer restarts a fresh lane for any surviving sends.
+            outboundSenderTask?.cancel()
+        }
+
+        if removedCached > 0 || removedQueued > 0 || removedSends > 0 {
             logger.log(
                 level: .debug,
-                message: "Dropped stale task-processor jobs for connectionId=\(normalized) cached=\(removedCached) queued=\(removedQueued)"
+                message: "Dropped stale task-processor jobs for connectionId=\(normalized) cached=\(removedCached) queued=\(removedQueued) outboundSends=\(removedSends)"
             )
         }
+    }
+
+    /// Terminally shuts down the outbound send lane. Called when this crypto-stack generation
+    /// is retired; queued sends are stale by definition and the lane never restarts.
+    func shutdownOutboundLane() {
+        isOutboundLaneShutdown = true
+        outboundSends.removeAll()
+        outboundSenderTask?.cancel()
     }
 
     // MARK: - Public API
@@ -177,7 +217,28 @@ actor TaskProcessor {
     // MARK: - Core loop
 
     private static let maxPausedRetries = 8
+    /// Essential `.offer`/`.answer` survive brief SFU `channel_inactive` / writer recycle.
+    /// Writer-not-ready uses the same bound; transport-down retries are offer/answer only.
+    private static let maxOutboundTransportRetries = 24
     private static let pausedRetryIntervalNs: UInt64 = 250_000_000 // 250ms
+
+    /// Whether an outbound send failure should stay queued for another transport attempt.
+    static func shouldRetryOutboundTransportSend(
+        flag: PacketFlag,
+        isWriterNotReady: Bool,
+        isTransientTransportFailure: Bool,
+        attempt: Int,
+        maxAttempts: Int = maxOutboundTransportRetries
+    ) -> Bool {
+        guard attempt < maxAttempts else { return false }
+        if isWriterNotReady { return true }
+        // Renegotiation answers encrypted just as SFU recycled were dropped after one
+        // failure — SFU never activated forwarding (one-way / missing remote video).
+        if (flag == .offer || flag == .answer), isTransientTransportFailure {
+            return true
+        }
+        return false
+    }
 
     private func processingLoop() async throws {
 
@@ -282,6 +343,7 @@ actor TaskProcessor {
             }
             removeJob(id: job.id)
             logger.log(level: .error, message: "Job error: \(error)")
+            await escalateTerminalFailureIfEssential(job: job, error: error)
             return .failed
         } catch let error as RatchetError {
             // Ratchet state is out of sync - this can happen if messages arrive out of order
@@ -296,9 +358,24 @@ actor TaskProcessor {
             }
             removeJob(id: job.id)
             logger.log(level: .error, message: "Job error: \(error)")
+            await escalateTerminalFailureIfEssential(job: job, error: error)
             // Keep the job in cache for now (retry semantics are handled elsewhere / future improvements).
             return .failed
         }
+    }
+
+    /// Essential outbound signaling (`.offer`/`.answer`) that fails terminally must fail the
+    /// call loudly: the job is dropped, so the SFU/peer waits forever for an SDP that will
+    /// never arrive and the call sits in "Connecting" with nothing but a log line. RTCSession
+    /// decides whether the call is still establishing (stale jobs racing teardown are ignored).
+    private func escalateTerminalFailureIfEssential(job: Job, error: Error) async {
+        guard case let .writeMessage(task) = job.task else { return }
+        await escalateSendFailureIfEssential(task: task, error: error)
+    }
+
+    private func escalateSendFailureIfEssential(task: WriteTask, error: Error) async {
+        guard task.flag == .offer || task.flag == .answer else { return }
+        await rtcSession.handleTerminalSignalingJobFailure(task: task, error: error)
     }
 
     private func isWriterNotReadyError(_ error: Error) -> Bool {
@@ -307,6 +384,37 @@ actor TaskProcessor {
             return true
         }
         return String(describing: error).localizedCaseInsensitiveContains("writernotset")
+    }
+
+    /// Socket recycle / channel_inactive / non-viable transport — recoverable while the call lives.
+    /// Static so tests can pin the production signatures (e.g. NIO "I/O on closed channel").
+    static func isTransientTransportSendError(_ error: Error) -> Bool {
+        if error is CancellationError { return false }
+        let text: String
+        if let localized = (error as? LocalizedError)?.errorDescription {
+            text = localized
+        } else {
+            text = String(describing: error)
+        }
+        let lowered = text.lowercased()
+        return lowered.contains("writernotset")
+            || lowered.contains("writer not set")
+            || lowered.contains("connectionisnonviable")
+            || lowered.contains("connection is non-viable")
+            || lowered.contains("connection is nonviable")
+            || lowered.contains("channel inactive")
+            || lowered.contains("channel_inactive")
+            // NIO ChannelError.ioOnClosedChannel — the exact error that dropped the
+            // production renegotiation answer during an SFU socket recycle.
+            || lowered.contains("closed channel")
+            || lowered.contains("ioonclosedchannel")
+            // NIOAsyncWriterError after the writer finished during teardown/recycle.
+            || lowered.contains("alreadyfinished")
+            || lowered.contains("already finished")
+            || lowered.contains("not connected")
+            || lowered.contains("socket is not connected")
+            || lowered.contains("broken pipe")
+            || lowered.contains("connection reset")
     }
 
     // MARK: - Job Processing Outcomes
@@ -394,10 +502,75 @@ actor TaskProcessor {
             ratchetMessage: message,
             flag: outboundTask.flag)
         
-        // Send via transport - delegate to RTCSession
-        try await rtcSession.sendEncryptedPacket(
-            packet: encrypted,
-            call: outboundTask.call)
+        // Hand off to the outbound send lane; the crypto pipeline must never await network I/O
+        // (a stalled transport send would block every inbound decrypt queued behind it).
+        enqueueOutboundSend(OutboundSend(packet: encrypted, task: outboundTask))
+    }
+
+    // MARK: - Outbound lane drain
+
+    private func enqueueOutboundSend(_ send: OutboundSend) {
+        guard !isOutboundLaneShutdown else {
+            logger.log(level: .debug, message: "Dropping outbound send after lane shutdown flag=\(send.task.flag) room=\(send.task.roomId)")
+            return
+        }
+        outboundSends.append(send)
+        startOutboundSenderIfNeeded()
+    }
+
+    private func startOutboundSenderIfNeeded() {
+        guard outboundSenderTask == nil, !isOutboundLaneShutdown else { return }
+        outboundSenderTask = Task { await self.drainOutboundSends() }
+    }
+
+    private func drainOutboundSends() async {
+        defer {
+            outboundSenderTask = nil
+            // A purge-cancel leaves surviving sends for other connections queued; restart for them.
+            if !outboundSends.isEmpty, !isOutboundLaneShutdown {
+                startOutboundSenderIfNeeded()
+            }
+        }
+
+        var retryingSendId: UUID?
+        var transportRetries = 0
+
+        while !Task.isCancelled {
+            guard let send = outboundSends.first else { return }
+            if send.id != retryingSendId {
+                retryingSendId = send.id
+                transportRetries = 0
+            }
+            do {
+                try await rtcSession.sendEncryptedPacket(packet: send.packet, call: send.task.call)
+                removeOutboundSend(id: send.id)
+            } catch {
+                // Lane cancelled mid-send (teardown/purge): remaining sends are stale, no escalation.
+                if Task.isCancelled { return }
+                let writerNotReady = isWriterNotReadyError(error)
+                let transientTransport = Self.isTransientTransportSendError(error)
+                if Self.shouldRetryOutboundTransportSend(
+                    flag: send.task.flag,
+                    isWriterNotReady: writerNotReady,
+                    isTransientTransportFailure: transientTransport,
+                    attempt: transportRetries
+                ) {
+                    transportRetries += 1
+                    logger.log(
+                        level: .debug,
+                        message: "Outbound send waiting for transport (attempt \(transportRetries)) flag=\(send.task.flag) writerNotReady=\(writerNotReady) transient=\(transientTransport)")
+                    try? await Task.sleep(nanoseconds: Self.pausedRetryIntervalNs)
+                    continue
+                }
+                removeOutboundSend(id: send.id)
+                logger.log(level: .error, message: "Outbound send failed flag=\(send.task.flag) room=\(send.task.roomId): \(error)")
+                await escalateSendFailureIfEssential(task: send.task, error: error)
+            }
+        }
+    }
+
+    private func removeOutboundSend(id: UUID) {
+        outboundSends.removeAll { $0.id == id }
     }
     
     private func handleStreamMessage(inboundTask: StreamTask) async throws {
@@ -455,14 +628,20 @@ private extension Job {
     func referencesConnectionId(_ normalizedConnectionId: String) -> Bool {
         switch task {
         case .writeMessage(let outboundTask):
-            let room = outboundTask.roomId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
-            let callId = outboundTask.call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
-            return room == normalizedConnectionId || callId == normalizedConnectionId
+            return outboundTask.referencesConnectionId(normalizedConnectionId)
         case .streamMessage(let inboundTask):
             let packetRoom = inboundTask.packet.sfuIdentity.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
             let callId = inboundTask.call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
             return packetRoom == normalizedConnectionId || callId == normalizedConnectionId
         }
+    }
+}
+
+extension WriteTask {
+    func referencesConnectionId(_ normalizedConnectionId: String) -> Bool {
+        let room = roomId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        let callId = call.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines).normalizedConnectionId
+        return room == normalizedConnectionId || callId == normalizedConnectionId
     }
 }
 

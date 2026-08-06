@@ -91,8 +91,9 @@ Tests/PQSRTCTests/debug
 Tests/Caller.txt
 Tests/Callee.txt
 
-# Swift build byproducts occasionally emitted at repo root (e.g. resource bundle accessor)
-resource_bundle_accessor-*.d
-resource_bundle_accessor-*.dia
-resource_bundle_accessor-*.swiftdeps
-resource_bundle_accessor-*.swiftmodule
+# Swift build byproducts occasionally emitted at repo root (resource bundle accessor)
+resource_bundle_accessor*.d
+resource_bundle_accessor*.dia
+resource_bundle_accessor*.o
+resource_bundle_accessor*.swiftdeps
+resource_bundle_accessor*.swiftmodule

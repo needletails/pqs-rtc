@@ -2319,6 +2319,35 @@ extension RTCSession {
 #endif
     }
 
+    /// Light, non-destructive recovery for inbound keyframe starvation on the main remote
+    /// renderer: pulse tracks (drives an immediate decoder keyframe request) and, for group SFU
+    /// rooms, re-signal media readiness so the SFU issues a throttled keyframe request from the
+    /// source. Never touches FrameCryptors, receiver wrappers, or renderer attachments —
+    /// rebinding cannot assemble frames that downlink loss is destroying, and the reset decoder
+    /// just forces another large keyframe through the same lossy path (the 15–20s stall loop).
+    public func nudgeInboundRemoteVideoKeyframeAfterStarvation(connectionId: String) async {
+#if canImport(WebRTC) && !os(Android)
+        guard await isConnectionStillActiveForRecovery(connectionId) else { return }
+        let norm = connectionId.normalizedConnectionId
+        guard var connection = await connectionManager.findConnection(with: norm) else { return }
+        pulseInboundRemoteCameraTracksForDecodeRecovery(connection: &connection)
+        await connectionManager.updateConnection(id: connection.id, with: connection)
+
+        if isGroupCallConnection(connection.id) {
+            let remoteOwner = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? connection.remoteParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !remoteOwner.isEmpty {
+                try? await sendSfuGroupMediaReady(
+                    sourceParticipantId: remoteOwner,
+                    roomId: connection.call.sharedCommunicationId,
+                    call: connection.call
+                )
+            }
+        }
+#endif
+    }
+
     /// Rebinds receiver FrameCryptors and the main remote renderer after decode stalls while RTP ingress continues.
     public func recoverInboundRemoteVideoAfterDecodeStall(connectionId: String) async {
 #if canImport(WebRTC) && !os(Android)

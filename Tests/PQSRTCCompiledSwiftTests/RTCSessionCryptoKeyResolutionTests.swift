@@ -684,7 +684,12 @@ struct RTCSessionCryptoKeyResolutionTests {
             callbackAgeMs: 12_000,
             hasAnyCallbacks: true) == false)
 
-        let decodeStalledWithCallbacks = RTCSession.InboundVideoFlowCheck(
+        // Keyframe starvation: packets advance but complete frames stop assembling (every
+        // assembled frame decodes: framesReceived == framesDecoded). Downlink loss is destroying
+        // keyframes — destructive rebind resets the decoder and loops the stall (production
+        // signature: dVideoPackets=80–159, dFrames=0, ~1 fps slideshow with a 15–20s recovery
+        // cycle). Must never trigger rebind, at any stall age.
+        let keyframeStarvation = RTCSession.InboundVideoFlowCheck(
             state: .decodeStalled,
             likelyCause: "inbound_video_advancing_but_decode_stalled",
             audioPacketsReceived: 10,
@@ -697,16 +702,43 @@ struct RTCSessionCryptoKeyResolutionTests {
             deltaFramesDecoded: 0,
             dtlsState: "connected",
             selectedPairState: "succeeded")
+        #expect(RTCSession.inboundFlowIndicatesKeyframeStarvation(keyframeStarvation))
         #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
-            inboundFlow: decodeStalledWithCallbacks,
+            inboundFlow: keyframeStarvation,
+            callbackAgeMs: 4_000,
+            hasAnyCallbacks: true) == false)
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: keyframeStarvation,
+            callbackAgeMs: 30_000,
+            hasAnyCallbacks: true) == false)
+
+        // True decoder/cryptor wedge: frames assemble but never decode — the case the
+        // destructive rebind actually fixes.
+        let decodeWedgeWithCallbacks = RTCSession.InboundVideoFlowCheck(
+            state: .decodeStalled,
+            likelyCause: "inbound_video_advancing_but_decode_stalled",
+            audioPacketsReceived: 10,
+            packetsReceived: 90,
+            framesReceived: 80,
+            framesDecoded: 75,
+            deltaAudioPacketsReceived: 5,
+            deltaPacketsReceived: 8,
+            deltaFramesReceived: 5,
+            deltaFramesDecoded: 0,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+        #expect(RTCSession.inboundFlowIndicatesKeyframeStarvation(decodeWedgeWithCallbacks) == false)
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: decodeWedgeWithCallbacks,
             callbackAgeMs: 2_000,
             hasAnyCallbacks: true) == false)
         #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
-            inboundFlow: decodeStalledWithCallbacks,
+            inboundFlow: decodeWedgeWithCallbacks,
             callbackAgeMs: 4_000,
             hasAnyCallbacks: true))
 
-        let decodeStalledNoCallbacks = RTCSession.InboundVideoFlowCheck(
+        // Starved ingress on a never-attached renderer: rebind cannot assemble frames either.
+        let starvedNoCallbacks = RTCSession.InboundVideoFlowCheck(
             state: .decodeStalled,
             likelyCause: "inbound_video_advancing_but_decode_stalled",
             audioPacketsReceived: 3,
@@ -720,7 +752,28 @@ struct RTCSessionCryptoKeyResolutionTests {
             dtlsState: "connected",
             selectedPairState: "succeeded")
         #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
-            inboundFlow: decodeStalledNoCallbacks,
+            inboundFlow: starvedNoCallbacks,
+            callbackAgeMs: -1,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 12_000) == false)
+
+        // Frames assembling but never decoded on a never-attached renderer: prolonged-stall
+        // recovery still applies (receiver remap / wedge cases).
+        let decodeWedgeNoCallbacks = RTCSession.InboundVideoFlowCheck(
+            state: .decodeStalled,
+            likelyCause: "inbound_video_advancing_but_decode_stalled",
+            audioPacketsReceived: 3,
+            packetsReceived: 9,
+            framesReceived: 6,
+            framesDecoded: 0,
+            deltaAudioPacketsReceived: 3,
+            deltaPacketsReceived: 9,
+            deltaFramesReceived: 6,
+            deltaFramesDecoded: 0,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+        #expect(RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
+            inboundFlow: decodeWedgeNoCallbacks,
             callbackAgeMs: -1,
             hasAnyCallbacks: false,
             expectationAgeMs: 12_000))
@@ -802,7 +855,10 @@ struct RTCSessionCryptoKeyResolutionTests {
 
     @Test("screen renderer recovery uses per-mid flow and recovers sooner on decode stall")
     func inboundRemoteScreenRendererRecoveryPolicy() {
-        let screenDecodeStalled = RTCSession.InboundVideoFlowCheck(
+        // Screen keyframe starvation (packets advance, no complete frames assemble): rebind
+        // cannot help — same guard as the camera path. Screen keyframes are the largest and
+        // the most starvation-prone under downlink loss.
+        let screenStarved = RTCSession.InboundVideoFlowCheck(
             state: .decodeStalled,
             likelyCause: "inbound_screen_video_advancing_but_decode_stalled",
             audioPacketsReceived: 1,
@@ -812,6 +868,19 @@ struct RTCSessionCryptoKeyResolutionTests {
             deltaAudioPacketsReceived: 1,
             deltaPacketsReceived: 8,
             deltaFramesReceived: 0,
+            deltaFramesDecoded: 0,
+            dtlsState: "connected",
+            selectedPairState: "succeeded")
+        let screenDecodeWedge = RTCSession.InboundVideoFlowCheck(
+            state: .decodeStalled,
+            likelyCause: "inbound_screen_video_advancing_but_decode_stalled",
+            audioPacketsReceived: 1,
+            packetsReceived: 8,
+            framesReceived: 4,
+            framesDecoded: 0,
+            deltaAudioPacketsReceived: 1,
+            deltaPacketsReceived: 8,
+            deltaFramesReceived: 4,
             deltaFramesDecoded: 0,
             dtlsState: "connected",
             selectedPairState: "succeeded")
@@ -830,13 +899,25 @@ struct RTCSessionCryptoKeyResolutionTests {
             selectedPairState: "succeeded")
 
         #expect(RTCSession.shouldAttemptInboundRemoteScreenRendererRecovery(
-            screenFlow: screenDecodeStalled,
+            screenFlow: screenStarved,
+            aggregateFlow: aggregateAdvancing,
+            callbackAgeMs: 4_000,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 4_000) == false)
+        #expect(RTCSession.shouldAttemptInboundRemoteScreenRendererRecovery(
+            screenFlow: screenStarved,
+            aggregateFlow: aggregateAdvancing,
+            callbackAgeMs: -1,
+            hasAnyCallbacks: false,
+            expectationAgeMs: 30_000) == false)
+        #expect(RTCSession.shouldAttemptInboundRemoteScreenRendererRecovery(
+            screenFlow: screenDecodeWedge,
             aggregateFlow: aggregateAdvancing,
             callbackAgeMs: 4_000,
             hasAnyCallbacks: false,
             expectationAgeMs: 4_000))
         #expect(RTCSession.shouldAttemptInboundRemoteScreenRendererRecovery(
-            screenFlow: screenDecodeStalled,
+            screenFlow: screenDecodeWedge,
             aggregateFlow: aggregateAdvancing,
             callbackAgeMs: -1,
             hasAnyCallbacks: false,

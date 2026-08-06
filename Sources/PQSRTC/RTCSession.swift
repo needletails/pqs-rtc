@@ -227,23 +227,94 @@ public actor RTCSession {
     let enableEncryption: Bool
     
     // MARK: - Crypto state
+    //
+    // DoubleRatchetKit managers are single-lifecycle objects: `shutdown()` is terminal — the
+    // session mutation gate closes permanently and every later encrypt/decrypt throws
+    // `CancellationError`. RTC call ratchets are ephemeral per call, so the session owns a
+    // per-call-generation crypto stack: `shutdown(with:)` retires the current generation
+    // (terminal shutdown) and the accessors below transparently build the next generation on
+    // first use. Liveness is enforced at the access point, so no call-start path can forget it.
+    // Without this, the first call after any teardown lost all SFU signaling (offer/candidate
+    // jobs died in `TaskProcessor` as "Job error: CancellationError()"), the SFU never received
+    // an offer, and the call sat in "Connecting" with no media.
     
-    /// Manages frame/media ratchet key state.
-    let ratchetManager: RatchetKeyStateManager<SHA256>
+    private var _ratchetManager: RatchetKeyStateManager<SHA256>
+    private var _pcRatchetManager: DoubleRatchetStateManager<SHA256>
+    /// Created on first access so `self` can be captured after full initialization.
+    private var _taskProcessor: TaskProcessor?
     
-    /// Manages peer-connection/signaling ratchet key state.
-    let pcRatchetManager: DoubleRatchetStateManager<SHA256>
+    /// Set by ``retireCryptoStackGeneration()`` after the current generation was terminally
+    /// shut down. The accessors build a fresh generation on next use unless the session itself
+    /// was destroyed.
+    private var cryptoStackRetired = false
     
-    /// Task processor for handling encryption/decryption tasks.
-    /// Lazy to avoid using self before all stored properties are initialized.
-    lazy var taskProcessor: TaskProcessor = {
-        TaskProcessor(
+    /// Set by ``destroySession()``. Terminal: the crypto stack is never rebuilt and every later
+    /// crypto operation fails, matching DoubleRatchetKit's own post-shutdown semantics.
+    public private(set) var isSessionDestroyed = false
+    
+    /// Manages frame/media ratchet key state for the current call generation.
+    var ratchetManager: RatchetKeyStateManager<SHA256> {
+        rebuildRetiredCryptoStackIfNeeded()
+        return _ratchetManager
+    }
+    
+    /// Manages peer-connection/signaling ratchet key state for the current call generation.
+    var pcRatchetManager: DoubleRatchetStateManager<SHA256> {
+        rebuildRetiredCryptoStackIfNeeded()
+        return _pcRatchetManager
+    }
+    
+    /// Task processor for handling encryption/decryption tasks for the current call generation.
+    var taskProcessor: TaskProcessor {
+        rebuildRetiredCryptoStackIfNeeded()
+        if let existing = _taskProcessor { return existing }
+        let processor = TaskProcessor(
             executor: executor,
             keyManager: pcKeyManager,
             logger: logger,
             rtcSession: self,
-            ratchetManager: pcRatchetManager)
-    }()
+            ratchetManager: _pcRatchetManager)
+        _taskProcessor = processor
+        return processor
+    }
+    
+    private func rebuildRetiredCryptoStackIfNeeded() {
+        guard cryptoStackRetired, !isSessionDestroyed else { return }
+        cryptoStackRetired = false
+        _ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
+        _pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
+        // Recreated lazily on next access so it wires to the new pcRatchetManager.
+        _taskProcessor = nil
+        logger.log(level: .info, message: "Built new crypto stack generation (ratchet managers + task processor) after prior call teardown")
+    }
+    
+    /// Terminally shuts down the current crypto-stack generation and marks it retired.
+    ///
+    /// Called from ``shutdown(with:)`` during per-call teardown. The retired managers satisfy
+    /// DoubleRatchetKit's deinit precondition (terminal shutdown before deallocation); the
+    /// accessors build the next generation when the next call begins.
+    func retireCryptoStackGeneration() async {
+        // Cancel the retired generation's outbound send lane first: an in-flight transport send
+        // parked on a dead connection gate must not outlive its crypto generation.
+        await _taskProcessor?.shutdownOutboundLane()
+        try? await _ratchetManager.shutdown()
+        try? await _pcRatchetManager.shutdown()
+        cryptoStackRetired = true
+    }
+    
+    /// Permanently destroys the session's crypto stack. Call when the `RTCSession` itself is
+    /// being released (logout, call-stack replacement) — not at the end of an individual call.
+    ///
+    /// ``shutdown(with:)`` is per-call: it retires the current crypto-stack generation and a
+    /// fresh one is built when the next call starts. `destroySession()` performs that final
+    /// teardown and then prevents any rebuild, so the last generation is terminally shut down
+    /// before the session deallocates (required by DoubleRatchetKit's deinit precondition).
+    public func destroySession() async {
+        guard !isSessionDestroyed else { return }
+        isSessionDestroyed = true
+        await shutdown(with: nil)
+        logger.log(level: .info, message: "RTCSession destroyed; crypto stack permanently shut down")
+    }
     
     // MARK: - Delegates & callbacks
     
@@ -2097,8 +2168,8 @@ public actor RTCSession {
             level: enableEncryption ? .info : .warning,
             message: "FrameCryptor is \(self.enableEncryption ? "ENABLED" : "DISABLED") for this RTCSession.")
         self.delegate = delegate
-        self.ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
-        self.pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
+        self._ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
+        self._pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
 
 #if canImport(WebRTC)
         // FrameCryptor key provider is created lazily when encryption is enabled.
@@ -2267,6 +2338,51 @@ extension RTCSession {
             (!call.sender.deviceId.isEmpty && call.sender.deviceId == sessionParticipant.deviceId)
 
         return isLocalSender ? .outbound(callType) : .inbound(callType)
+    }
+
+    /// Fails the call bound to an essential outbound signaling job that failed terminally.
+    ///
+    /// `TaskProcessor` drops jobs that fail with non-retryable errors. For `.offer`/`.answer`
+    /// jobs that is fatal: the SFU/peer never receives the SDP, media can never flow, and the
+    /// call previously sat in "Connecting" forever with nothing but a "Job error" log line.
+    /// Surface it through the same `.failed` + `finishEndConnection` path used by fatal
+    /// SDP/ICE errors — but only while this call is still establishing, never for stale jobs
+    /// racing a normal teardown.
+    func handleTerminalSignalingJobFailure(task: WriteTask, error: Error) async {
+        let failedCallId = task.call.sharedCommunicationId.normalizedConnectionId
+        let teardownKey = teardownConnectionIdKey(task.call.sharedCommunicationId)
+        // A teardown in progress (or already finished) for this connection means the job was
+        // stale; cooperative CancellationError during teardown is expected, not a call failure.
+        if finishingConnectionIds.contains(teardownKey) || endedConnectionIds.contains(teardownKey) {
+            return
+        }
+        guard let currentCall = await callState.currentCall,
+              currentCall.sharedCommunicationId.normalizedConnectionId == failedCallId else {
+            logger.log(
+                level: .debug,
+                message: "Ignoring terminal signaling job failure for non-current call \(failedCallId)")
+            return
+        }
+        switch await callState.currentState {
+        case .some(.waiting), .some(.ready), .some(.connecting):
+            break
+        default:
+            // Connected/held calls keep their established media; renegotiation failure is
+            // logged loudly but must not kill working audio/video.
+            logger.log(
+                level: .error,
+                message: "Terminal signaling job failure (flag=\(task.flag)) for call \(failedCallId) outside setup state: \(error)")
+            return
+        }
+        logger.log(
+            level: .error,
+            message: "Essential signaling job (flag=\(task.flag)) failed terminally for call \(failedCallId); failing call: \(error)")
+        await callState.transition(
+            to: .failed(
+                inferredCallDirection(for: currentCall),
+                currentCall,
+                "Signaling failed: \(error.localizedDescription)"))
+        await finishEndConnection(currentCall: currentCall)
     }
 }
 

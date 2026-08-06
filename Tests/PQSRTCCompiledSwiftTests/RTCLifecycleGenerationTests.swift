@@ -62,6 +62,38 @@ struct RTCLifecycleGenerationTests {
         #expect(await session.stateTask == nil)
     }
 
+    @Test("crypto stack generation is rebuilt after per-call teardown and never after destroySession")
+    func cryptoStackGenerationLifecycle() async throws {
+        let session = await makeSession()
+        let originalPcRatchetManager = await session.pcRatchetManager
+        let originalRatchetManager = await session.ratchetManager
+        let originalTaskProcessor = await session.taskProcessor
+
+        // Stable while no teardown has happened.
+        #expect(await session.pcRatchetManager === originalPcRatchetManager)
+
+        // Per-call teardown terminally shuts down both DoubleRatchetKit managers (their session
+        // mutation gate closes permanently). The accessors must transparently provide a fresh
+        // generation afterwards — before this existed, every call after the first in an app
+        // session reused dead managers, all signaling jobs failed with CancellationError, and
+        // the SFU never received an offer.
+        await session.shutdown(with: nil)
+        let rebuiltPcRatchetManager = await session.pcRatchetManager
+        #expect(rebuiltPcRatchetManager !== originalPcRatchetManager)
+        #expect(await session.ratchetManager !== originalRatchetManager)
+        #expect(await session.taskProcessor !== originalTaskProcessor)
+
+        // Stable again until the next teardown.
+        #expect(await session.pcRatchetManager === rebuiltPcRatchetManager)
+
+        // destroySession is terminal: the final generation is shut down (deinit precondition
+        // safety) and the accessors stop rebuilding.
+        await session.destroySession()
+        #expect(await session.isSessionDestroyed)
+        let postDestroyPcRatchetManager = await session.pcRatchetManager
+        #expect(await session.pcRatchetManager === postDestroyPcRatchetManager)
+    }
+
     @Test("candidate drain replacement retires stale generation while replacement continues")
     func candidateDrainReplacementRetiresStaleGeneration() async {
         let session = await makeSession()

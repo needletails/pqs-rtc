@@ -375,4 +375,149 @@ struct EndToEndGroupCallFlowTests {
         await session.shutdown(with: nil)
         try? await sfuRatchet.shutdown()
     }
+
+    /// Transport whose SFU sends never complete (until cancelled), simulating a congested
+    /// uplink / stalled websocket write. Records attempts so ordering can be asserted.
+    actor BlockingSfuTransport: RTCTransportEvents {
+        private(set) var negotiated: [(call: Call, sfuRecipientId: String)] = []
+        private(set) var sendAttempts = 0
+        private var blockedContinuations: [CheckedContinuation<Void, Error>] = []
+
+        func sendCiphertext(recipient: String, connectionId: String, ciphertext: Data, call: Call) async throws {}
+        func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws {
+            sendAttempts += 1
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    blockedContinuations.append(continuation)
+                }
+            } onCancel: {
+                Task { await self.releaseAllBlockedSends() }
+            }
+        }
+        private func releaseAllBlockedSends() {
+            for continuation in blockedContinuations {
+                continuation.resume(throwing: CancellationError())
+            }
+            blockedContinuations.removeAll()
+        }
+        func sendStartCall(_ call: Call) async throws {}
+        func sendCallAnswered(_ call: Call) async throws {}
+        func sendCallAnsweredAuxDevice(_ call: Call) async throws {}
+        func sendOneToOneMessage(_ packet: RatchetMessagePacket, recipient: Call.Participant) async throws {}
+        func didEnd(call: Call, endState: CallStateMachine.EndState) async throws {}
+        func negotiateGroupIdentity(call: Call, sfuRecipientId: String) async throws {
+            negotiated.append((call: call, sfuRecipientId: sfuRecipientId))
+        }
+        func requestInitializeGroupCallRecipient(call: Call, sfuRecipientId: String) async throws {}
+    }
+
+    /// Regression: a transport send blocked on a congested uplink must not stall the crypto
+    /// pipeline. Before the outbound send lane existed, the send was awaited inline inside the
+    /// serial TaskProcessor loop, so one wedged websocket write queued every later job — in
+    /// production the inbound SFU answer decrypted 60+ seconds late, the remote SDP was applied
+    /// after the ICE fallback fired, and the group call tore down a healthy setup.
+    @Test
+    func cryptoPipeline_isNotBlocked_byWedgedTransportSend() async throws {
+        let transport = BlockingSfuTransport()
+        let session = await RTCSession(iceServers: ["stun:stun.l.google.com:19302"], username: "u", password: "p", delegate: transport)
+
+        let sfuRecipientId = "sfu"
+        let localDeviceId = try #require(UUID(uuidString: "2D4087FD-0E8A-4D96-B558-33142F345AD2"))
+        let local = try Call.Participant(secretName: "alice", nickname: "Alice", deviceId: localDeviceId.uuidString)
+        let bob = try Call.Participant(secretName: "bob", nickname: "Bob", deviceId: UUID().uuidString)
+
+        try await session.join(sender: local, participants: [bob], sfuRecipientId: sfuRecipientId, supportsVideo: false)
+        let negotiated = await waitUntil { await transport.negotiated.isEmpty == false }
+        #expect(negotiated, "Expected negotiateGroupIdentity during join()")
+        let negotiatedCall = await transport.negotiated.last!.call
+        let clientProps = try #require(negotiatedCall.signalingIdentityProps)
+
+        let sfuKeyStore = KeyManager()
+        let sfuLocalIdentity = try await sfuKeyStore.generateSenderIdentity(
+            connectionId: sfuRecipientId,
+            secretName: sfuRecipientId
+        )
+        let sfuProps = try #require(await sfuLocalIdentity.sessionIdentity.props(symmetricKey: sfuLocalIdentity.symmetricKey))
+        let serverClientIdentity = try await sfuKeyStore.createSFUSignalingRecipientIdentity(
+            roomId: negotiatedCall.sharedCommunicationId,
+            deviceId: localDeviceId,
+            sessionContext: negotiatedCall.id.uuidString,
+            props: clientProps,
+            aliases: [sfuRecipientId]
+        )
+        let sfuExecutor = RatchetExecutor(queue: DispatchQueue(label: "tests.sfu.blocked-send"))
+        let sfuRatchet = DoubleRatchetStateManager<SHA256>(executor: sfuExecutor)
+
+        var call = negotiatedCall
+        call.signalingIdentityProps = sfuProps
+
+        // Offer is encrypted and handed to the send lane; the transport wedges the send forever.
+        try await session.createSFUIdentity(sfuRecipientId: sfuRecipientId, call: call)
+        try await session.beginGroupCallMediaAfterSfuRegistrationIfNeeded(
+            sfuRecipientId: sfuRecipientId,
+            updatedCall: call)
+        let offerSendAttempted = await waitUntil(timeoutSeconds: 5.0) { await transport.sendAttempts == 1 }
+        #expect(offerSendAttempted, "Expected the encrypted offer send to be attempted (and wedge)")
+
+        // With the offer send wedged, later outbound work must still encrypt (job cache drains;
+        // the packet queues in the lane behind the blocked send).
+        try await session.startSendingCandidates(call: call)
+        await session.peerConnectionNotificationsContinuation.yield(
+            .generatedIceCandidate(sfuRecipientId, "candidate: 1 1 UDP 1234 1.2.3.4 9999 typ host", 0, "0")
+        )
+        let writesDrained = await waitUntil(timeoutSeconds: 5.0) {
+            await session.taskProcessor.jobs.isEmpty
+        }
+        #expect(writesDrained, "Encrypt pipeline stalled behind a wedged transport send (write path)")
+        #expect(await transport.sendAttempts == 1, "Send lane must stay serial: candidate queues behind the wedged offer send")
+
+        // Inbound decrypts must also flow while the send is wedged: SFU encrypts an answer to the
+        // client; the stream job must decrypt and complete (the handler may reject the minimal
+        // SDP — irrelevant here; the job leaving the cache proves the pipeline was not blocked).
+        try await sfuRatchet.senderInitialization(
+            sessionIdentity: serverClientIdentity.sessionIdentity,
+            sessionSymmetricKey: sfuLocalIdentity.symmetricKey,
+            remoteKeys: RemoteKeys(
+                longTerm: CurvePublicKey(clientProps.longTermPublicKey),
+                oneTime: clientProps.oneTimePublicKey,
+                mlKEM: clientProps.mlKEMPublicKey
+            ),
+            localKeys: sfuLocalIdentity.localKeys
+        )
+#if canImport(WebRTC)
+        let rtcAnswer = WebRTC.RTCSessionDescription(type: .answer, sdp: "v=0\ns=-\nt=0 0\n")
+        let answerSdp = try SessionDescription(fromRTC: rtcAnswer)
+#else
+        throw Issue.record("WebRTC not available; cannot construct SessionDescription")
+#endif
+        var sfuAnswerCall = call
+        sfuAnswerCall.metadata = try BinaryEncoder().encode(answerSdp)
+        let sfuAnswerMsg = try await sfuRatchet.ratchetEncrypt(
+            plainText: try BinaryEncoder().encode(sfuAnswerCall),
+            sessionId: serverClientIdentity.sessionIdentity.id
+        )
+        let answerPacket = RatchetMessagePacket(
+            sfuIdentity: sfuRecipientId,
+            header: sfuAnswerMsg.header,
+            ratchetMessage: sfuAnswerMsg,
+            flag: .answer
+        )
+        try await session.taskProcessor.feedTask(
+            task: EncryptableTask(
+                task: .streamMessage(
+                    StreamTask(
+                        senderSecretName: sfuRecipientId,
+                        senderDeviceId: nil,
+                        packet: answerPacket,
+                        call: call)),
+                priority: .urgent))
+        let inboundDrained = await waitUntil(timeoutSeconds: 5.0) {
+            await session.taskProcessor.jobs.isEmpty
+        }
+        #expect(inboundDrained, "Inbound decrypt stalled behind a wedged transport send (the production 60s answer delay)")
+
+        // Teardown cancels the wedged send via the outbound lane shutdown.
+        await session.shutdown(with: nil)
+        try? await sfuRatchet.shutdown()
+    }
 }

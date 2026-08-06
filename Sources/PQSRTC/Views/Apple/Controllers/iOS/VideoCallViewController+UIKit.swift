@@ -2428,6 +2428,18 @@ public final class VideoCallViewController: UICollectionViewController {
                     )
                 }
 
+                if RTCSession.inboundFlowIndicatesKeyframeStarvation(inboundFlow) {
+                    // Downlink loss is destroying (key)frames; a destructive rebind resets the
+                    // decoder and loops the stall. Request a keyframe without touching bindings.
+                    self.logger.log(
+                        level: .warning,
+                        message: "iOS remote video keyframe starvation (packets advancing, frames not assembling); requesting keyframe without rebind connectionId=\(connectionId)"
+                    )
+                    self.lastRemoteRendererRecoveryUptimeNs = now
+                    await self.session.nudgeInboundRemoteVideoKeyframeAfterStarvation(connectionId: connectionId)
+                    continue
+                }
+
                 let shouldRecoverRenderer = RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
                     inboundFlow: inboundFlow,
                     callbackAgeMs: callbackAgeMs,
@@ -2612,7 +2624,10 @@ public final class VideoCallViewController: UICollectionViewController {
                     hasAnyCallbacks: hasAnyCallbacks,
                     expectationAgeMs: expectationAgeMs
                 )
-                guard shouldRecoverRenderer else {
+                // Keyframe starvation must not run the destructive re-attach fallback below, but
+                // the matched-binding branch (PLI-first, cryptor-health-driven) still applies.
+                let keyframeStarvation = RTCSession.inboundFlowIndicatesKeyframeStarvation(inboundFlow)
+                guard shouldRecoverRenderer || keyframeStarvation else {
                     self.logger.log(
                         level: .warning,
                         message: "iOS participant camera recovery skipped: inbound counters not advancing enough; participant=\(trimmedParticipantId) likelyCause=\(inboundFlow?.likelyCause ?? "unknown") connectionId=\(normalizedConnectionId)"

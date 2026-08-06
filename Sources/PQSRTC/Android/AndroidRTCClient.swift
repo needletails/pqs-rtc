@@ -2111,7 +2111,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       asDouble(stat.members["availableOutgoingBitrate"])?.let { outBest = it }
         // SKIP INSERT:       asDouble(stat.members["availableIncomingBitrate"])?.let { inBest = it }
         // SKIP INSERT:       asDouble(stat.members["currentRoundTripTime"])?.let { rttBest = it }
-        // SKIP INSERT:         ?: asDouble(stat.members["totalRoundTripTime"])?.let { rttBest = it }
         // SKIP INSERT:     }
         // SKIP INSERT:     availableOutgoingBitrate = outBest
         // SKIP INSERT:     availableIncomingBitrate = inBest

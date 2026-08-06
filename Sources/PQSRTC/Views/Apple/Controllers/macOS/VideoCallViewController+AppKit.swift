@@ -2405,6 +2405,18 @@ public final class VideoCallViewController: NSViewController {
                     )
                 }
 
+                if RTCSession.inboundFlowIndicatesKeyframeStarvation(inboundFlow) {
+                    // Downlink loss is destroying (key)frames; a destructive rebind resets the
+                    // decoder and loops the stall. Request a keyframe without touching bindings.
+                    self.logger.log(
+                        level: .warning,
+                        message: "Remote video keyframe starvation (packets advancing, frames not assembling); requesting keyframe without rebind connectionId=\(connectionId)"
+                    )
+                    self.lastRemoteRendererRecoveryUptimeNs = now
+                    await self.session.nudgeInboundRemoteVideoKeyframeAfterStarvation(connectionId: connectionId)
+                    continue
+                }
+
                 let shouldRecoverRenderer = RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
                     inboundFlow: inboundFlow,
                     callbackAgeMs: callbackAgeMs,
@@ -2581,6 +2593,22 @@ public final class VideoCallViewController: NSViewController {
                         level: .warning,
                         message: "macOS participant camera stall probe (participant=\(trimmedParticipantId), callbackAgeMs=\(callbackAgeMs), expectationAgeMs=\(expectationAgeMs), binding=\(bindingDiagnostics)) could not read inbound flow stats"
                     )
+                }
+
+                if RTCSession.inboundFlowIndicatesKeyframeStarvation(inboundFlow) {
+                    // Downlink loss is destroying (key)frames; destructive re-attach loops the
+                    // stall. PLI-first matched-binding recovery pulses the track and re-signals
+                    // media readiness, escalating only when the receiver cryptor is unhealthy.
+                    self.logger.log(
+                        level: .warning,
+                        message: "macOS participant camera keyframe starvation (packets advancing, frames not assembling); requesting keyframe without re-attach participant=\(trimmedParticipantId) connectionId=\(normalizedConnectionId)"
+                    )
+                    self.lastParticipantRendererRecoveryUptimeNsByKey[key] = now
+                    _ = await self.session.recoverInboundRemoteParticipantVideoDecoderAfterMatchedBindingStall(
+                        connectionId: normalizedConnectionId,
+                        participantId: trimmedParticipantId
+                    )
+                    continue
                 }
 
                 let shouldRecoverRenderer = RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(

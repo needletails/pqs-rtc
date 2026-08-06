@@ -82,6 +82,12 @@ extension RTCSession {
 
         let connectionIds = await localMediaReleaseConnectionIds(for: call)
         for connectionId in connectionIds {
+            // The call is ending: the ICE relay-only fallback must stand down NOW, before the
+            // (potentially slow) transport end_call notification and full teardown complete.
+            // Otherwise an ICE-failed event during that window "recovers" the ended call —
+            // rebuilding the peer connection and re-activating the audio session (observed in
+            // production as a ~60s zombie call that re-opened the mic after the user hung up).
+            clearFallbackState(connectionId: connectionId)
             await releaseLocalMediaResourcesForCallEnding(connectionId: connectionId)
         }
 
@@ -537,11 +543,11 @@ extension RTCSession {
         outboundRtpStatsTasksByConnectionId.removeAll()
 #endif
 
-        // Shutdown ratchet manager and clear all crypto/key state so the
-        // next call starts from a clean slate (no pending ciphertext/keys).
-        try? await ratchetManager.shutdown()
-        // Group-call/SFU signaling ratchet manager (separate from 1:1 ratchetManager).
-        try? await pcRatchetManager.shutdown()
+        // Retire the current crypto-stack generation (terminal DoubleRatchetKit shutdown) and
+        // clear all crypto/key state so the next call starts from a clean slate. The crypto
+        // accessors build a fresh generation when the next call begins; see the crypto-state
+        // section in RTCSession.swift.
+        await retireCryptoStackGeneration()
         await keyManager.clearAll()
         await pcKeyManager.clearAll()
 

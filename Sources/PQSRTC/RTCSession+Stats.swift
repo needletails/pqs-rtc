@@ -106,6 +106,19 @@ extension RTCSession {
         }
     }
 
+    /// Packets advancing while complete frames stop assembling: the downlink is losing parts of
+    /// (typically large key-) frames. Rebinding receivers/cryptors cannot assemble frames the
+    /// network is destroying — it resets the decoder and forces yet another keyframe through the
+    /// same lossy path, which re-creates the stall (observed in production as a 15–20s destructive
+    /// recovery loop rendering ~1 fps). The remedy is a keyframe request, not binding churn.
+    /// Undecryptable frames are also dropped before the assembled-frame count advances, but
+    /// missing-key recovery is event-driven (receiver FrameCryptor reattach on frame-key install),
+    /// not the stall watchdog's job.
+    static func inboundFlowIndicatesKeyframeStarvation(_ flow: InboundVideoFlowCheck?) -> Bool {
+        guard let flow, case .decodeStalled = flow.state else { return false }
+        return flow.deltaPacketsReceived > 0 && flow.deltaFramesReceived <= 0
+    }
+
     /// Whether a stalled remote renderer should trigger cryptor rebind + track re-attach.
     static func shouldAttemptInboundRemoteVideoRendererRecovery(
         inboundFlow: InboundVideoFlowCheck?,
@@ -126,8 +139,16 @@ extension RTCSession {
         if let flow = inboundFlow {
             switch flow.state {
             case .decodeStalled:
+                // Loss-starved ingress: destructive recovery loops the stall (see
+                // `inboundFlowIndicatesKeyframeStarvation`); callers issue a light keyframe
+                // nudge instead.
+                if inboundFlowIndicatesKeyframeStarvation(flow) {
+                    return false
+                }
+                // Frames are assembling but not decoding: decoder/cryptor pipeline wedge —
+                // the case rebind + track re-attach actually fixes.
                 if effectiveStallAgeMs >= cameraDecodeStallThresholdMs,
-                   flow.deltaPacketsReceived > 0 {
+                   flow.deltaFramesReceived > 0 {
                     if hasAnyCallbacks, flow.deltaFramesDecoded == 0 {
                         return true
                     }
@@ -211,7 +232,12 @@ extension RTCSession {
         if let flow = screenFlow {
             switch flow.state {
             case .decodeStalled:
-                if flow.packetsReceived > 0, flow.framesDecoded == 0,
+                // Same starvation guard as camera recovery: packets without assembled frames
+                // is downlink loss — rebinding cannot help and resets the decoder.
+                if Self.inboundFlowIndicatesKeyframeStarvation(flow) {
+                    return false
+                }
+                if flow.packetsReceived > 0, flow.framesReceived > 0, flow.framesDecoded == 0,
                    effectiveStallAgeMs >= 3_000 {
                     return true
                 }
@@ -1122,7 +1148,9 @@ extension RTCSession {
                         if let v = double(stat.values["availableIncomingBitrate"]) {
                             availableIncomingBps = v
                         }
-                        if let rtt = double(stat.values["currentRoundTripTime"]) ?? double(stat.values["totalRoundTripTime"]) {
+                        // `totalRoundTripTime` is a cumulative sum per the WebRTC stats spec and
+                        // must never be used as an instantaneous RTT; leave nil when no fresh sample.
+                        if let rtt = double(stat.values["currentRoundTripTime"]) {
                             currentRttSeconds = rtt
                         }
                     }
