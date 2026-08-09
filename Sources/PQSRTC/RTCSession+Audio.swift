@@ -137,16 +137,24 @@ extension RTCSession {
     /// Configures the audio session with proper error handling
     /// - Throws: AudioError if configuration fails
     nonisolated public func configureAudioSession() throws {
+        try configureAudioSession(supportsVideo: true)
+    }
+
+    /// Configures the audio session for the active call's media type.
+    /// - Parameter supportsVideo: Whether the call includes video media.
+    /// - Throws: AudioError if configuration fails.
+    nonisolated func configureAudioSession(supportsVideo: Bool) throws {
         do {
             audioSession.lockForConfiguration()
             defer {
                 audioSession.unlockForConfiguration()
             }
             
+            let mode: AVAudioSession.Mode = supportsVideo ? .videoChat : .voiceChat
             try audioSession.setCategory(.playAndRecord)
-            try audioSession.setMode(.videoChat)
+            try audioSession.setMode(mode)
             
-            logger.log(level: .info, message: "Successfully configured audio session")
+            logger.log(level: .info, message: "Successfully configured audio session mode=\(mode.rawValue)")
             
         } catch {
             logger.log(level: .error, message: "Error configuring AVAudioSession category: \(error)")

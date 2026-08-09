@@ -18,7 +18,7 @@ let package = Package(
         .package(url: "https://source.skip.tools/skip-fuse-ui.git", from: "1.10.0"),
         .package(url: "https://github.com/needletails/Specs.git", from: "144.7559.10"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.3.0"),
-        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.5"),
+        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.2.1"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5"),
         .package(url: "https://github.com/needletails/needletail-media-kit.git", from: "1.1.0"),

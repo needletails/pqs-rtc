@@ -218,6 +218,9 @@ public actor RTCSession {
     /// Logger used for all RTCSession-related logging.
     public let logger: NeedleTailLogger
     
+    /// Log level
+    private let logLevel: Level
+    
     /// Salt used when deriving frame-level E2EE keys.
     public let ratchetSalt: Data
     
@@ -283,6 +286,10 @@ public actor RTCSession {
         cryptoStackRetired = false
         _ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
         _pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
+        Task {
+            await _ratchetManager.setLogLevel(logLevel)
+            await _pcRatchetManager.setLogLevel(logLevel)
+        }
         // Recreated lazily on next access so it wires to the new pcRatchetManager.
         _taskProcessor = nil
         logger.log(level: .info, message: "Built new crypto stack generation (ratchet managers + task processor) after prior call teardown")
@@ -2149,6 +2156,7 @@ public actor RTCSession {
         iceTransportPolicyStrategy: RTCIceTransportPolicyStrategy = .allThenRelay(timeoutMilliseconds: 4_000),
         iceDisconnectGracePeriodMs: UInt64 = 8_000,
         logger: NeedleTailLogger = NeedleTailLogger("[RTCSession]"),
+        logLevel: Level = .info,
         cryptorConfig: CryptorConfiguration = .init(),
         delegate: RTCTransportEvents?
     ) async {
@@ -2161,6 +2169,7 @@ public actor RTCSession {
         self.iceTransportPolicyStrategy = iceTransportPolicyStrategy
         self.iceDisconnectGracePeriodMs = iceDisconnectGracePeriodMs
         self.logger = logger
+        self.logLevel = logLevel
         self.ratchetSalt = cryptorConfig.ratchetSalt
         self.frameEncryptionKeyMode = cryptorConfig.mode
         self.enableEncryption = cryptorConfig.mode != .none
@@ -2169,7 +2178,9 @@ public actor RTCSession {
             message: "FrameCryptor is \(self.enableEncryption ? "ENABLED" : "DISABLED") for this RTCSession.")
         self.delegate = delegate
         self._ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
+        await _ratchetManager.setLogLevel(logLevel)
         self._pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
+        await _pcRatchetManager.setLogLevel(logLevel)
 
 #if canImport(WebRTC)
         // FrameCryptor key provider is created lazily when encryption is enabled.

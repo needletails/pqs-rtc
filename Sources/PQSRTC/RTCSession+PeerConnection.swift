@@ -355,7 +355,7 @@ extension RTCSession {
                 message: "Skipping configureAudioSession before tracks (AVAudioSession already active with manual WebRTC audio)")
         } else {
             do {
-                try self.configureAudioSession()
+                try self.configureAudioSession(supportsVideo: call.supportsVideo)
             } catch {
                 logger.log(level: .error, message: "Failed to configure audio session: \(error)")
                 throw RTCErrors.mediaError("Failed to configure audio session: \(error.localizedDescription)")
