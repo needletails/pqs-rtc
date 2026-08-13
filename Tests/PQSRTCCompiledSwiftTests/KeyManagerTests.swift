@@ -46,7 +46,7 @@ struct KeyManagerTests {
 
         let otpk = Curve25519.KeyAgreement.PrivateKey()
         let id = UUID()
-        let stored = try DoubleRatchetKit.CurvePrivateKey(id: id, otpk.rawRepresentation)
+        let stored = try DoubleRatchetKit.X25519PrivateKey(id: id, otpk.rawRepresentation)
         await keyManager.storeOneTimeKey(stored, id: id)
 
         let fetched = try await keyManager.fetchOneTimePrivateKey(id)

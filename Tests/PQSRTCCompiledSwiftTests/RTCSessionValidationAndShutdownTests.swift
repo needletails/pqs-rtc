@@ -60,7 +60,7 @@ struct RTCSessionValidationAndShutdownTests {
 
         let otpk = Curve25519.KeyAgreement.PrivateKey()
         let otpkId = UUID()
-        let stored = try DoubleRatchetKit.CurvePrivateKey(id: otpkId, otpk.rawRepresentation)
+        let stored = try DoubleRatchetKit.X25519PrivateKey(id: otpkId, otpk.rawRepresentation)
         await session.keyManager.storeOneTimeKey(stored, id: otpkId)
 
         await session.keyManager.storeCiphertext(connectionId: "conn-pending", ciphertext: Data([0x01, 0x02, 0x03]))

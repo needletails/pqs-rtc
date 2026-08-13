@@ -101,7 +101,7 @@ struct EndToEndGroupCallFlowTests {
             aliases: [sfuRecipientId]
         )
         let sfuExecutor = RatchetExecutor(queue: DispatchQueue(label: "tests.sfu.ratchet"))
-        let sfuRatchet = DoubleRatchetStateManager<SHA256>(executor: sfuExecutor)
+        let sfuRatchet = MessageRatchet(executor: sfuExecutor)
 
         // Call used to create SFU identity and start the SFU peer connection/offer.
         var call = negotiatedCall
@@ -123,14 +123,14 @@ struct EndToEndGroupCallFlowTests {
         // --- SFU-side decrypt validation (client -> SFU) ---
         // Receiver initializes from header and decrypts the offer payload.
         try await step("SFU decrypt offer") {
-            try await sfuRatchet.recipientInitialization(
+            try await sfuRatchet.respondToSession(
             sessionIdentity: serverClientIdentity.sessionIdentity,
             sessionSymmetricKey: sfuLocalIdentity.symmetricKey,
             header: offerPacket.header,
             localKeys: sfuLocalIdentity.localKeys
             )
         }
-        let decryptedOfferBytes = try await sfuRatchet.ratchetDecrypt(
+        let decryptedOfferBytes = try await sfuRatchet.decrypt(
             offerPacket.ratchetMessage,
             sessionId: serverClientIdentity.sessionIdentity.id
         )
@@ -157,8 +157,8 @@ struct EndToEndGroupCallFlowTests {
         #expect(candidatePacket.ratchetMessage.header.headerCiphertext.isEmpty == false)
         
         // Decrypt the candidate on the SFU side and verify payload contains an IceCandidate.
-        // For subsequent messages, do not re-run recipientInitialization; let the ratchet state advance naturally.
-        let decryptedCandidateBytes = try await sfuRatchet.ratchetDecrypt(
+        // For subsequent messages, do not re-run respondToSession; let the ratchet state advance naturally.
+        let decryptedCandidateBytes = try await sfuRatchet.decrypt(
             candidatePacket.ratchetMessage,
             sessionId: serverClientIdentity.sessionIdentity.id
         )
@@ -172,12 +172,12 @@ struct EndToEndGroupCallFlowTests {
         
         // --- Client-side decrypt validation (SFU -> client) ---
         // Initialize SFU sender state so it can encrypt to the client.
-        try await step("SFU senderInitialization") {
-            try await sfuRatchet.senderInitialization(
+        try await step("SFU initiateSession") {
+            try await sfuRatchet.initiateSession(
             sessionIdentity: serverClientIdentity.sessionIdentity,
             sessionSymmetricKey: sfuLocalIdentity.symmetricKey,
             remoteKeys: RemoteKeys(
-                longTerm: CurvePublicKey(clientProps.longTermPublicKey),
+                longTerm: try X25519PublicKey(clientProps.longTermPublicKey),
                 oneTime: clientProps.oneTimePublicKey,
                 mlKEM: clientProps.mlKEMPublicKey
             ),
@@ -197,7 +197,7 @@ struct EndToEndGroupCallFlowTests {
 #endif
         sfuAnswerCall.metadata = try BinaryEncoder().encode(answerSdp)
         let sfuAnswerPlain = try BinaryEncoder().encode(sfuAnswerCall)
-        let sfuAnswerMsg = try await sfuRatchet.ratchetEncrypt(
+        let sfuAnswerMsg = try await sfuRatchet.encrypt(
             plainText: sfuAnswerPlain,
             sessionId: serverClientIdentity.sessionIdentity.id
         )
@@ -215,14 +215,14 @@ struct EndToEndGroupCallFlowTests {
         }
         let clientBundle = try await session.pcKeyManager.fetchCallKeyBundle()
         try await step("Client decrypt SFU answer") {
-            try await session.pcRatchetManager.recipientInitialization(
+            try await session.pcRatchetManager.respondToSession(
             sessionIdentity: clientSfuIdentity.sessionIdentity,
             sessionSymmetricKey: clientBundle.symmetricKey,
             header: sfuAnswerPacket.header,
             localKeys: clientBundle.localKeys
             )
         }
-        let clientDecryptedAnswer = try await session.pcRatchetManager.ratchetDecrypt(
+        let clientDecryptedAnswer = try await session.pcRatchetManager.decrypt(
             sfuAnswerPacket.ratchetMessage,
             sessionId: clientSfuIdentity.sessionIdentity.id
         )
@@ -236,7 +236,7 @@ struct EndToEndGroupCallFlowTests {
         
         // Explicitly await shutdown to ensure cleanup completes before test returns
         await session.shutdown(with: nil)
-        try? await sfuRatchet.shutdown()
+        try? await sfuRatchet.flushAndClose()
     }
 
     @Test
@@ -328,7 +328,7 @@ struct EndToEndGroupCallFlowTests {
         }
 
         let sfuExecutor = RatchetExecutor(queue: DispatchQueue(label: "tests.sfu.channel-route"))
-        let sfuRatchet = DoubleRatchetStateManager<SHA256>(executor: sfuExecutor)
+        let sfuRatchet = MessageRatchet(executor: sfuExecutor)
 
         let negotiatedCall = await transport.negotiated.last!.call
         guard let clientProps = negotiatedCall.signalingIdentityProps else {
@@ -357,14 +357,14 @@ struct EndToEndGroupCallFlowTests {
         let offerPacket = await transport.sfuMessages.last(where: { $0.packet.flag == .offer })!.packet
         #expect(offerPacket.sfuIdentity == channelWireId)
 
-        try await sfuRatchet.recipientInitialization(
+        try await sfuRatchet.respondToSession(
             sessionIdentity: serverClientIdentity.sessionIdentity,
             sessionSymmetricKey: sfuLocalIdentity.symmetricKey,
             header: offerPacket.header,
             localKeys: sfuLocalIdentity.localKeys
         )
 
-        let decryptedOfferBytes = try await sfuRatchet.ratchetDecrypt(
+        let decryptedOfferBytes = try await sfuRatchet.decrypt(
             offerPacket.ratchetMessage,
             sessionId: serverClientIdentity.sessionIdentity.id
         )
@@ -373,7 +373,7 @@ struct EndToEndGroupCallFlowTests {
         #expect(decryptedOfferCall.channelWireId == channelWireId)
 
         await session.shutdown(with: nil)
-        try? await sfuRatchet.shutdown()
+        try? await sfuRatchet.flushAndClose()
     }
 
     /// Transport whose SFU sends never complete (until cancelled), simulating a congested
@@ -446,7 +446,7 @@ struct EndToEndGroupCallFlowTests {
             aliases: [sfuRecipientId]
         )
         let sfuExecutor = RatchetExecutor(queue: DispatchQueue(label: "tests.sfu.blocked-send"))
-        let sfuRatchet = DoubleRatchetStateManager<SHA256>(executor: sfuExecutor)
+        let sfuRatchet = MessageRatchet(executor: sfuExecutor)
 
         var call = negotiatedCall
         call.signalingIdentityProps = sfuProps
@@ -474,11 +474,11 @@ struct EndToEndGroupCallFlowTests {
         // Inbound decrypts must also flow while the send is wedged: SFU encrypts an answer to the
         // client; the stream job must decrypt and complete (the handler may reject the minimal
         // SDP — irrelevant here; the job leaving the cache proves the pipeline was not blocked).
-        try await sfuRatchet.senderInitialization(
+        try await sfuRatchet.initiateSession(
             sessionIdentity: serverClientIdentity.sessionIdentity,
             sessionSymmetricKey: sfuLocalIdentity.symmetricKey,
             remoteKeys: RemoteKeys(
-                longTerm: CurvePublicKey(clientProps.longTermPublicKey),
+                longTerm: try X25519PublicKey(clientProps.longTermPublicKey),
                 oneTime: clientProps.oneTimePublicKey,
                 mlKEM: clientProps.mlKEMPublicKey
             ),
@@ -492,7 +492,7 @@ struct EndToEndGroupCallFlowTests {
 #endif
         var sfuAnswerCall = call
         sfuAnswerCall.metadata = try BinaryEncoder().encode(answerSdp)
-        let sfuAnswerMsg = try await sfuRatchet.ratchetEncrypt(
+        let sfuAnswerMsg = try await sfuRatchet.encrypt(
             plainText: try BinaryEncoder().encode(sfuAnswerCall),
             sessionId: serverClientIdentity.sessionIdentity.id
         )
@@ -518,6 +518,6 @@ struct EndToEndGroupCallFlowTests {
 
         // Teardown cancels the wedged send via the outbound lane shutdown.
         await session.shutdown(with: nil)
-        try? await sfuRatchet.shutdown()
+        try? await sfuRatchet.flushAndClose()
     }
 }

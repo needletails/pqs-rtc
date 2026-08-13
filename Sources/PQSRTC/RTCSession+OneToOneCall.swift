@@ -28,14 +28,14 @@ extension RTCSession {
         // Get local identity
         let callBundle = try await pcKeyManager.fetchCallKeyBundle()
         
-        try await pcRatchetManager.recipientInitialization(
+        try await pcRatchetManager.respondToSession(
             sessionIdentity: connectionIdentity.sessionIdentity,
             sessionSymmetricKey: callBundle.symmetricKey,
             header: header,
             localKeys: callBundle.localKeys)
         
         // Decrypt
-        let decrypted = try await pcRatchetManager.ratchetDecrypt(
+        let decrypted = try await pcRatchetManager.decrypt(
             ciphertext,
             sessionId: connectionIdentity.sessionIdentity.id)
         

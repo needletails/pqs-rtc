@@ -41,7 +41,7 @@ public actor KeyManager: SessionIdentityDelegate {
     /// Temporary storage for ciphertext received before a recipient identity exists.
     private var pendingCiphertext: [String: Data] = [:]
 
-    private var oneTimeKeys: [UUID: CurvePrivateKey] = [:]
+    private var oneTimeKeys: [UUID: X25519PrivateKey] = [:]
     
     private let dbsk = SymmetricKey(size: .bits256)
     
@@ -77,7 +77,7 @@ public actor KeyManager: SessionIdentityDelegate {
         )
     }
     
-    public func fetchOneTimePrivateKey(_ id: UUID?) async throws -> DoubleRatchetKit.CurvePrivateKey? {
+    public func fetchOneTimePrivateKey(_ id: UUID?) async throws -> DoubleRatchetKit.X25519PrivateKey? {
         guard let id else {
             return nil
         }
@@ -94,7 +94,7 @@ public actor KeyManager: SessionIdentityDelegate {
     /// - Parameters:
     ///   - key: The one-time private key
     ///   - id: The key ID
-    public func storeOneTimeKey(_ key: CurvePrivateKey, id: UUID) {
+    public func storeOneTimeKey(_ key: X25519PrivateKey, id: UUID) {
         oneTimeKeys[id] = key
     }
     
@@ -229,11 +229,11 @@ public actor KeyManager: SessionIdentityDelegate {
         // (`fetchOneTimePrivateKey(header.oneTimeKeyId)`) can resolve it after the in-state copy
         // is consumed; without this the dictionary is always empty and the first inbound message
         // of a re-handshake fails to decrypt (BoringSSL CIPHER BAD_DECRYPT).
-        let oneTimeKey = try CurvePrivateKey(id: otpkId, otpk.rawRepresentation)
+        let oneTimeKey = try X25519PrivateKey(id: otpkId, otpk.rawRepresentation)
         storeOneTimeKey(oneTimeKey, id: otpkId)
         
         let localKeys = LocalKeys(
-            longTerm: try CurvePrivateKey(id: ltpkId, ltpk.rawRepresentation),
+            longTerm: try X25519PrivateKey(id: ltpkId, ltpk.rawRepresentation),
             oneTime: oneTimeKey,
             mlKEM: try MLKEMPrivateKey(id: kemId, kem.encode()))
         
@@ -256,8 +256,8 @@ public actor KeyManager: SessionIdentityDelegate {
             signingPublicKey: spk.publicKey.rawRepresentation,
             // Important: preserve key IDs so the receiver can fetch the matching private one-time keys
             // when a header indicates `oneTimeKeyId` / `mlKEMOneTimeKeyId`.
-            mlKEMPublicKey: MLKEMPublicKey(id: kemId, kem.publicKey.rawRepresentation),
-            oneTimePublicKey: CurvePublicKey(id: otpkId, otpk.publicKey.rawRepresentation),
+            mlKEMPublicKey: try MLKEMPublicKey(id: kemId, kem.publicKey.rawRepresentation),
+            oneTimePublicKey: try X25519PublicKey(id: otpkId, otpk.publicKey.rawRepresentation),
             deviceName: "\(secretName)-rtc",
             isMasterDevice: true)
         
@@ -355,8 +355,8 @@ public actor KeyManager: SessionIdentityDelegate {
             sessionContext: sessionContext)
 
         var remoteProps = props
-        if remoteProps.state != nil {
-            remoteProps.state = nil
+        if remoteProps.hasRatchetState {
+            remoteProps.clearRatchetState()
             logger.log(level: .warning, message: "Dropping imported ratchet state from SFU recipient identity for key=\(compositeConnectionId)")
         }
 

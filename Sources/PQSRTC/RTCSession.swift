@@ -231,7 +231,7 @@ public actor RTCSession {
     
     // MARK: - Crypto state
     //
-    // DoubleRatchetKit managers are single-lifecycle objects: `shutdown()` is terminal — the
+    // DoubleRatchetKit managers are single-lifecycle objects: `flushAndClose()` is terminal — the
     // session mutation gate closes permanently and every later encrypt/decrypt throws
     // `CancellationError`. RTC call ratchets are ephemeral per call, so the session owns a
     // per-call-generation crypto stack: `shutdown(with:)` retires the current generation
@@ -241,8 +241,8 @@ public actor RTCSession {
     // jobs died in `TaskProcessor` as "Job error: CancellationError()"), the SFU never received
     // an offer, and the call sat in "Connecting" with no media.
     
-    private var _ratchetManager: RatchetKeyStateManager<SHA256>
-    private var _pcRatchetManager: DoubleRatchetStateManager<SHA256>
+    private var _ratchetManager: KeyRatchet
+    private var _pcRatchetManager: MessageRatchet
     /// Created on first access so `self` can be captured after full initialization.
     private var _taskProcessor: TaskProcessor?
     
@@ -256,13 +256,13 @@ public actor RTCSession {
     public private(set) var isSessionDestroyed = false
     
     /// Manages frame/media ratchet key state for the current call generation.
-    var ratchetManager: RatchetKeyStateManager<SHA256> {
+    var ratchetManager: KeyRatchet {
         rebuildRetiredCryptoStackIfNeeded()
         return _ratchetManager
     }
     
     /// Manages peer-connection/signaling ratchet key state for the current call generation.
-    var pcRatchetManager: DoubleRatchetStateManager<SHA256> {
+    var pcRatchetManager: MessageRatchet {
         rebuildRetiredCryptoStackIfNeeded()
         return _pcRatchetManager
     }
@@ -284,8 +284,8 @@ public actor RTCSession {
     private func rebuildRetiredCryptoStackIfNeeded() {
         guard cryptoStackRetired, !isSessionDestroyed else { return }
         cryptoStackRetired = false
-        _ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
-        _pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
+        _ratchetManager = KeyRatchet(executor: executor)
+        _pcRatchetManager = MessageRatchet(executor: executor)
         Task {
             await _ratchetManager.setLogLevel(logLevel)
             await _pcRatchetManager.setLogLevel(logLevel)
@@ -304,8 +304,8 @@ public actor RTCSession {
         // Cancel the retired generation's outbound send lane first: an in-flight transport send
         // parked on a dead connection gate must not outlive its crypto generation.
         await _taskProcessor?.shutdownOutboundLane()
-        try? await _ratchetManager.shutdown()
-        try? await _pcRatchetManager.shutdown()
+        try? await _ratchetManager.flushAndClose()
+        try? await _pcRatchetManager.flushAndClose()
         cryptoStackRetired = true
     }
     
@@ -2177,9 +2177,9 @@ public actor RTCSession {
             level: enableEncryption ? .info : .warning,
             message: "FrameCryptor is \(self.enableEncryption ? "ENABLED" : "DISABLED") for this RTCSession.")
         self.delegate = delegate
-        self._ratchetManager = RatchetKeyStateManager<SHA256>(executor: executor)
+        self._ratchetManager = KeyRatchet(executor: executor)
         await _ratchetManager.setLogLevel(logLevel)
-        self._pcRatchetManager = DoubleRatchetStateManager<SHA256>(executor: executor)
+        self._pcRatchetManager = MessageRatchet(executor: executor)
         await _pcRatchetManager.setLogLevel(logLevel)
 
 #if canImport(WebRTC)

@@ -1996,7 +1996,7 @@ extension RTCSession {
             return
         }
 
-        let (messageKey, ratchetIndex) = try await deriveMessageKey(
+        let (messageKey, ratchetIndex) = try await deriveOutboundFrameKey(
             connection: activeConnection,
             call: call,
             force: force)
@@ -2095,7 +2095,7 @@ extension RTCSession {
         remoteTrackOwnerParticipantId: String? = nil
     ) async throws {
         let remoteParticipantId = remoteTrackOwnerParticipantId ?? connection.remoteParticipantId
-        let (messageKey, ratchetIndex) = try await deriveReceivedMessageKey(
+        let (messageKey, ratchetIndex) = try await deriveInboundFrameKey(
             connectionId: connection.id,
             participant: remoteParticipantId,
             localKeys: connection.localKeys,
@@ -2214,7 +2214,7 @@ extension RTCSession {
     /// The ratchet session id is derived from direction, connection id, remote participant id, and
     /// remote frame-identity fingerprint. That makes send-side media keys independent from
     /// receive-side keys and from signaling-ratchet state.
-    private func deriveMessageKey(
+    private func deriveOutboundFrameKey(
         connection: RTCConnection,
         call: Call,
         force: Bool = false
@@ -2266,11 +2266,11 @@ extension RTCSession {
             remoteIdentityFingerprint: remoteIdentityFingerprint)
         senderFrameKeyIdentityFingerprintByConnectionId[connection.id.normalizedConnectionId] = remoteIdentityFingerprint
 
-        try await ratchetManager.senderInitialization(
+        try await ratchetManager.initiateSession(
             sessionIdentity: sendSessionIdentity,
             sessionSymmetricKey: connection.symmetricKey,
             remoteKeys: RemoteKeys(
-                longTerm: CurvePublicKey(remoteProps.longTermPublicKey),
+                longTerm: try X25519PublicKey(remoteProps.longTermPublicKey),
                 oneTime: remoteProps.oneTimePublicKey,
                 mlKEM: remoteProps.mlKEMPublicKey),
             localKeys: connection.localKeys)
@@ -2323,7 +2323,7 @@ extension RTCSession {
         if connection.cipherNegotiationState == .complete {
             logger.log(level: .info, message: "Completed cipher negotiation 🔒")
         }
-        let (messageKey, index) = try await ratchetManager.deriveMessageKey(sessionId: sendSessionIdentity.id)
+        let (messageKey, index) = try await ratchetManager.nextSendKey(sessionId: sendSessionIdentity.id)
         return (messageKey.bytes, index)
     }
 
@@ -2349,7 +2349,7 @@ extension RTCSession {
         // Media keys are derived from PQXDH ciphertexts that are scoped to direction, peer
         // identity, and (for receive) the inbound `call_cipher` ciphertext. Keep this ratchet state
         // local so provisional room bootstrap state cannot be reused for peer media encryption.
-        props.state = nil
+        props.clearRatchetState()
 
         let connectionKey = connectionId
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2386,7 +2386,7 @@ extension RTCSession {
     ///
     /// `participant` must be the remote track owner used by receiver FrameCryptors. For 1:1 SFU
     /// this is the peer `secretName`, not the SFU room id.
-    private func deriveReceivedMessageKey(
+    private func deriveInboundFrameKey(
         connectionId: String,
         participant: String,
         localKeys: LocalKeys,
@@ -2417,18 +2417,18 @@ extension RTCSession {
             remoteIdentityFingerprint: remoteIdentityFingerprint,
             sessionDiscriminator: ciphertextFingerprint)
 
-        try await ratchetManager.recipientInitialization(
+        try await ratchetManager.respondToSession(
             sessionIdentity: receiveSessionIdentity,
             sessionSymmetricKey: symmetricKey,
             localKeys: localKeys,
             remoteKeys: RemoteKeys(
-                longTerm: CurvePublicKey(remoteProps.longTermPublicKey),
+                longTerm: try X25519PublicKey(remoteProps.longTermPublicKey),
                 oneTime: remoteProps.oneTimePublicKey,
                 mlKEM: remoteProps.mlKEMPublicKey),
             ciphertext: ciphertext)
 
-        let (messageKey, index) = try await ratchetManager.deriveReceivedMessageKey(
-            sessionId: receiveSessionIdentity.id,
+        let (messageKey, index) = try await ratchetManager.receiveKey(
+            for: receiveSessionIdentity.id,
             cipherText: ciphertext)
 
         return (messageKey.bytes, index)

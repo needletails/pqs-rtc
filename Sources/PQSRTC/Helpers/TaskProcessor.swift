@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import NeedleTailLogger
 import NeedleTailAsyncSequence
 import Crypto
 import DoubleRatchetKit
@@ -28,7 +29,7 @@ private struct ProcessedPostCipherHandshakeKey: Hashable, Sendable {
 actor TaskProcessor {
     
     let jobConsumer: NeedleTailAsyncConsumer<Job>
-    let ratchetManager: DoubleRatchetStateManager<SHA256>
+    let ratchetManager: MessageRatchet
     let keyManager: KeyManager
     let rtcSession: RTCSession
     
@@ -77,7 +78,7 @@ actor TaskProcessor {
         keyManager: KeyManager,
         logger: NeedleTailLogger,
         rtcSession: RTCSession,
-        ratchetManager: DoubleRatchetStateManager<SHA256>
+        ratchetManager: MessageRatchet
     ) {
         self.executor = executor
         self.keyManager = keyManager
@@ -465,7 +466,7 @@ actor TaskProcessor {
         
         let identity = connectionSessionIdentity.sessionIdentity
         
-        // Get remote props for senderInitialization (unwrap remote identity with the key it was created with)
+        // Get remote props for initiateSession (unwrap remote identity with the key it was created with)
         guard let remoteProps = await identity.props(symmetricKey: connectionSessionIdentity.symmetricKey) else {
             throw RTCErrors.invalidConfiguration("Remote props not found for roomId=\(outboundTask.roomId)")
         }
@@ -482,17 +483,17 @@ actor TaskProcessor {
                 message: "SFU encrypt outbound flag=\(outboundTask.flag) room=\(identityLookupId) sessionId=\(identity.id.uuidString) remotePropsFp=\(KeyFingerprint.props(remoteProps)) localPropsFp=\(localPropsFp)")
         }
 
-        // Call senderInitialization before encrypt
-        try await ratchetManager.senderInitialization(
+        // Call initiateSession before encrypt
+        try await ratchetManager.initiateSession(
             sessionIdentity: identity,
             sessionSymmetricKey: connectionIdentity.symmetricKey,
             remoteKeys: RemoteKeys(
-                longTerm: CurvePublicKey(remoteProps.longTermPublicKey),
+                longTerm: try X25519PublicKey(remoteProps.longTermPublicKey),
                 oneTime: remoteProps.oneTimePublicKey,
                 mlKEM: remoteProps.mlKEMPublicKey),
             localKeys: connectionIdentity.localKeys)
         
-        let message = try await ratchetManager.ratchetEncrypt(plainText: outboundTask.data, sessionId: identity.id)
+        let message = try await ratchetManager.encrypt(plainText: outboundTask.data, sessionId: identity.id)
         
         logger.log(level: .info, message: "Encrypted Message", metadata: ["roomId":"\(outboundTask.roomId)", "flag":"\(outboundTask.flag)"])
         
@@ -599,7 +600,7 @@ actor TaskProcessor {
         let connectionSessionIdentity = try await keyManager.fetchConnectionIdentity(connection: identityLookupId)
         let connectionIdentity = try await keyManager.fetchCallKeyBundle()
         
-        try await ratchetManager.recipientInitialization(
+        try await ratchetManager.respondToSession(
             sessionIdentity: connectionSessionIdentity.sessionIdentity,
             sessionSymmetricKey: connectionIdentity.symmetricKey,
             header: inboundTask.packet.ratchetMessage.header,
@@ -607,7 +608,7 @@ actor TaskProcessor {
         
         let identity = connectionSessionIdentity.sessionIdentity
         
-        let plaintext = try await ratchetManager.ratchetDecrypt(packet.ratchetMessage, sessionId: identity.id)
+        let plaintext = try await ratchetManager.decrypt(packet.ratchetMessage, sessionId: identity.id)
         
         // Delegate to RTCSession to handle the decrypted message
         try await rtcSession.handleDecryptedPacket(
