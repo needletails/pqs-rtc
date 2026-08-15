@@ -1148,6 +1148,17 @@ public actor RTCSession {
 
     func notifyRemoteParticipantTrackChanged(_ event: RemoteParticipantTrackEvent) {
         if let suppressionReason = remoteParticipantTrackSuppressionReason(for: event) {
+            if suppressionReason == .sfuRenegotiationInFlight,
+               GroupSfuVideoAttachPolicy.shouldQueueSuppressedParticipantTrackEventForPostRenegotiationRefresh(
+                kind: event.kind,
+                isActive: event.isActive,
+                renegotiationInFlight: true
+               ) {
+                queueParticipantCameraRendererSinkRefresh(
+                    connectionId: event.connectionId,
+                    participantIds: [event.participantId]
+                )
+            }
             logger.log(
                 level: .info,
                 message: "Suppressed participant track event participant=\(event.participantId) isActive=\(event.isActive) connection=\(event.connectionId) reason=\(suppressionReason.rawValue)"

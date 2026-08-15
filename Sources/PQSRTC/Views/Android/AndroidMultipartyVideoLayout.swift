@@ -58,6 +58,17 @@ enum GroupSfuVideoAttachPolicy {
         renegotiationInFlight || !signalingIsStable
     }
 
+    /// Newly mapped late joiners emit `RemoteParticipantTrackEvent` during SFU renegotiation.
+    /// Those events must be queued for post-settlement refresh: dropping them leaves mapped
+    /// tracks with no UI tile when the live wrapper did not need a rebind.
+    static func shouldQueueSuppressedParticipantTrackEventForPostRenegotiationRefresh(
+        kind: String,
+        isActive: Bool,
+        renegotiationInFlight: Bool
+    ) -> Bool {
+        kind == "video" && isActive && renegotiationInFlight
+    }
+
     /// One tile refresh per rebound participant after SFU renegotiation — not every mapped track.
     /// Resolves a single unmapped SFU receiver candidate when stream/msid evidence is missing.
     /// Audio already used this rule; video must match so a lone UUID relay can bind once a key is provisioned.
@@ -82,6 +93,9 @@ enum GroupSfuVideoAttachPolicy {
         return nil
     }
 
+    /// Rebound wrappers plus participants whose in-flight track events were queued.
+    /// Newly mapped late joiners are usually queued, not rebound — omitting the queue
+    /// leaves them mapped with no tile after settlement.
     static func participantIdsNeedingPostRenegotiationTileRefresh(
         reboundParticipantIds: Set<String>,
         queuedRefreshParticipantIds: Set<String>,

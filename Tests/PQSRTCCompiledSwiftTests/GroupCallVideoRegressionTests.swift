@@ -616,7 +616,7 @@ struct GroupCallVideoRegressionTests {
             staleTrackId: "track-a") == false)
     }
 
-    @Test("SFU post-renegotiation refresh emits only rebound participants")
+    @Test("SFU post-renegotiation refresh emits rebound and queued participants")
     func postRenegotiationTileRefreshTargetsReboundParticipantsOnly() {
         #expect(GroupSfuVideoAttachPolicy.participantIdsNeedingPostRenegotiationTileRefresh(
             reboundParticipantIds: ["nudge"],
@@ -633,6 +633,31 @@ struct GroupCallVideoRegressionTests {
             queuedRefreshParticipantIds: ["nudge"],
             allMappedParticipantIds: ["echo", "nudge"]
         ) == ["echo", "nudge"])
+        #expect(GroupSfuVideoAttachPolicy.participantIdsNeedingPostRenegotiationTileRefresh(
+            reboundParticipantIds: [],
+            queuedRefreshParticipantIds: ["frank"],
+            allMappedParticipantIds: ["echo", "nudge", "frank"]
+        ) == ["frank"])
+    }
+
+    @Test("suppressed in-flight late-joiner track events are queued for post-settlement refresh")
+    func shouldQueueSuppressedLateJoinerTrackEventDuringRenegotiation() {
+        #expect(GroupSfuVideoAttachPolicy.shouldQueueSuppressedParticipantTrackEventForPostRenegotiationRefresh(
+            kind: "video",
+            isActive: true,
+            renegotiationInFlight: true))
+        #expect(GroupSfuVideoAttachPolicy.shouldQueueSuppressedParticipantTrackEventForPostRenegotiationRefresh(
+            kind: "audio",
+            isActive: true,
+            renegotiationInFlight: true) == false)
+        #expect(GroupSfuVideoAttachPolicy.shouldQueueSuppressedParticipantTrackEventForPostRenegotiationRefresh(
+            kind: "video",
+            isActive: false,
+            renegotiationInFlight: true) == false)
+        #expect(GroupSfuVideoAttachPolicy.shouldQueueSuppressedParticipantTrackEventForPostRenegotiationRefresh(
+            kind: "video",
+            isActive: true,
+            renegotiationInFlight: false) == false)
     }
 
     @Test("renderer recovery requests sink refresh when inbound decode advances but tile stalls")

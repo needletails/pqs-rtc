@@ -67,6 +67,23 @@ extension RTCSession {
         sfuRenegotiationReboundParticipantIdsByConnectionId[norm] = rebound
     }
 
+    func queueParticipantCameraRendererSinkRefresh(
+        connectionId: String,
+        participantIds: [String]
+    ) {
+        let norm = connectionId.normalizedConnectionId
+        var pendingIds: [String] = []
+        for participantId in participantIds {
+            let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            pendingIds.append(trimmed)
+        }
+        guard !pendingIds.isEmpty else { return }
+        var queued = pendingParticipantRendererSinkRefreshByConnectionId[norm, default: []]
+        queued.formUnion(pendingIds)
+        pendingParticipantRendererSinkRefreshByConnectionId[norm] = queued
+    }
+
     func notifyParticipantCameraRendererSinkRefreshIfNeeded(
         connectionId: String,
         participantIds: [String]
@@ -80,9 +97,10 @@ extension RTCSession {
         }
         guard !pendingIds.isEmpty else { return }
         if shouldDeferSfuGroupParticipantVideoAttach(for: norm) {
-            var queued = pendingParticipantRendererSinkRefreshByConnectionId[norm, default: []]
-            queued.formUnion(pendingIds)
-            pendingParticipantRendererSinkRefreshByConnectionId[norm] = queued
+            queueParticipantCameraRendererSinkRefresh(
+                connectionId: norm,
+                participantIds: pendingIds
+            )
             return
         }
         for trimmed in pendingIds {
@@ -859,6 +877,10 @@ extension RTCSession {
 
         if isGroupCallConnection(normalizedId),
            shouldDeferSfuGroupParticipantVideoAttach(for: normalizedId) {
+            queueParticipantCameraRendererSinkRefresh(
+                connectionId: normalizedId,
+                participantIds: [participantId]
+            )
             logger.log(
                 level: .info,
                 message: "Deferred Android participant renderer attach during SFU renegotiation participant=\(participantId) connection=\(normalizedId)"
@@ -1504,6 +1526,10 @@ extension RTCSession {
 
         if isGroupCallConnection(normalizedId),
            shouldDeferSfuGroupParticipantVideoAttach(for: normalizedId) {
+            queueParticipantCameraRendererSinkRefresh(
+                connectionId: normalizedId,
+                participantIds: [participantId]
+            )
             logger.log(
                 level: .info,
                 message: "Deferred participant renderer attach during SFU renegotiation participant=\(participantId) connection=\(normalizedId)"

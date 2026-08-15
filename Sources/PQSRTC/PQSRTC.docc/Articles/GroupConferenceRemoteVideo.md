@@ -64,11 +64,15 @@ await session.shouldDeferSfuGroupParticipantVideoAttach(for: connectionId)
 This wraps ``GroupSfuVideoAttachPolicy/shouldDeferParticipantVideoAttach(renegotiationInFlight:signalingIsStable:)``.
 During defer:
 
-- Individual ``RemoteParticipantTrackEvent`` notifications may be suppressed or queued.
-- Android queues rebound ids until settlement; Apple queues sink refresh ids in
-  `pendingParticipantRendererSinkRefreshByConnectionId`.
+- Individual ``RemoteParticipantTrackEvent`` notifications are suppressed **and queued** into
+  `pendingParticipantRendererSinkRefreshByConnectionId`. Dropping them (queue omitted) leaves
+  newly mapped late joiners with session tracks but no tile after settlement, because a first
+  mapping whose live wrapper already matches is not a rebound.
+- Renderer attaches that return during defer also enqueue the same participant ids.
+- Android additionally records rebound ids until settlement.
 
 > Important: Defer ends when renegotiation completes **and** signaling is stable—not on a timer.
+> Signaling-stable also assigns any already-mapped participant who still has no tile.
 
 ### Stage 2 — Session map rebind (shared)
 
@@ -84,7 +88,8 @@ They then emit participant-scoped refresh signals. This is the **authoritative**
 participants need UI work after renegotiation.
 
 ``GroupSfuVideoAttachPolicy/participantIdsNeedingPostRenegotiationTileRefresh(reboundParticipantIds:queuedRefreshParticipantIds:allMappedParticipantIds:)``
-selects the participant id list for the post-settlement episode—rebound participants only, not
+selects the participant id list for the post-settlement episode: rebound wrappers **plus**
+queued refresh ids (late joiners mapped while renegotiation was in flight). It does not refresh
 every mapped track.
 
 ### Stage 3 — Platform UI attach

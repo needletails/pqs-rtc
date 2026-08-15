@@ -163,6 +163,11 @@ struct RTCLifecycleGenerationTests {
             }
             #expect(source.contains("pendingRemoteScreenShareActivation"))
             #expect(source.contains("sfuGroupSignalingStableStream()"))
+            let signalingStable = try sourceBody(of: "startSfuGroupSignalingStableObservation", in: source)
+            #expect(
+                signalingStable.contains("assignExistingParticipantTracks(connectionId: connectionId)"),
+                "\(relativePath) must assign mapped late-joiner tiles when SFU signaling becomes stable"
+            )
             let teardown = try sourceBody(of: "tearDownCall", in: source)
             #expect(teardown.contains("pendingRemoteScreenShareActivation = nil"))
             #expect(teardown.contains("sfuGroupSignalingStableStreamTask?.cancel()"))
@@ -190,6 +195,31 @@ struct RTCLifecycleGenerationTests {
         #expect(cancellation.contains("postRenegotiationCoordinatorTask?.cancel()"))
         let teardown = try sourceBody(of: "markCallEndedLocally", in: source)
         #expect(teardown.contains("cancelPostRenegotiationAttachCoordinator()"))
+        let signalingStable = try sourceBody(of: "handleSfuGroupSignalingBecameStable", in: source)
+        #expect(signalingStable.contains("assignExistingParticipantTracks(connectionId: connectionId)"))
+        #expect(signalingStable.contains("shouldDeferSfuGroupParticipantVideoAttach(for: connectionId)"))
+    }
+
+    @Test("in-flight late-joiner track events are queued for post-settlement refresh")
+    func lateJoinerTrackEventsAreQueuedDuringSfuRenegotiation() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sessionSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/PQSRTC/RTCSession.swift"),
+            encoding: .utf8
+        )
+        let notify = try sourceBody(of: "notifyRemoteParticipantTrackChanged", in: sessionSource)
+        #expect(notify.contains("shouldQueueSuppressedParticipantTrackEventForPostRenegotiationRefresh"))
+        #expect(notify.contains("queueParticipantCameraRendererSinkRefresh("))
+
+        let videoSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/PQSRTC/RTCSession+Video.swift"),
+            encoding: .utf8
+        )
+        let appleRender = try sourceBody(of: "renderRemoteVideoForParticipant", in: videoSource)
+        #expect(appleRender.contains("queueParticipantCameraRendererSinkRefresh("))
     }
 
     private func sourceBody(of functionName: String, in source: String) throws -> String {

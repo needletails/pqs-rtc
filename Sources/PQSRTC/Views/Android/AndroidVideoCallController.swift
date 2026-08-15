@@ -1913,10 +1913,17 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 layoutGeneration: remoteScreenShareLayoutGeneration
             )
         }
-        guard isPostRenegotiationAttachEpisodeActive(for: connectionId) else {
+        if isPostRenegotiationAttachEpisodeActive(for: connectionId) {
+            schedulePostRenegotiationAttachCoordinator(connectionId: connectionId)
             return
         }
-        schedulePostRenegotiationAttachCoordinator(connectionId: connectionId)
+        // Late joiners mapped during renegotiation can miss the post-settlement episode when
+        // their track event was suppressed and the live wrapper did not need a rebind.
+        // Signaling-stable is the event that should assign already-mapped tiles.
+        guard !(await session.shouldDeferSfuGroupParticipantVideoAttach(for: connectionId)) else {
+            return
+        }
+        await assignExistingParticipantTracks(connectionId: connectionId)
     }
 
     /// Session map first, then SFU map refresh + fresh PC when the attached wrapper ENDed during an episode.

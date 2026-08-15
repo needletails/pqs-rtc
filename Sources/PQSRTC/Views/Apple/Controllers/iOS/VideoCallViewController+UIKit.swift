@@ -555,6 +555,7 @@ public final class VideoCallViewController: UICollectionViewController {
             for await connectionId in stream {
                 guard !Task.isCancelled, self.isRunning else { return }
                 await self.retryPendingRemoteScreenShareActivationIfNeeded(connectionId: connectionId)
+                await self.assignExistingParticipantTracks(connectionId: connectionId)
                 await self.handleSignalingStableRendererRecovery(connectionId: connectionId)
             }
         }
