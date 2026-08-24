@@ -258,4 +258,36 @@ struct CallConferenceTests {
         #expect(permissions.participantRoles.keys.filter { RTCSession.conferenceParticipantIdentityKey($0) == "echo" }.count == 1)
         #expect(permissions.timing == timing)
     }
+
+    @Test("delayed authoritative viewer role replaces presenter fallback and revokes sharing")
+    func delayedViewerRoleRevokesPresenterFallback() async {
+        let session = await RTCSession(iceServers: [], username: "u", password: "p", delegate: nil)
+        defer { Task { await session.shutdown(with: nil) } }
+
+        await session.mergeConferenceParticipants(
+            localUsername: "echo",
+            activeRemoteParticipants: ["host"],
+            localDefaultRole: .presenter
+        )
+        #expect(await session.conferencePermissions.localRole == .presenter)
+
+        await session.updateConferenceRoles(
+            localUsername: "echo",
+            participantRoles: ["host": "host", "echo": "viewer"]
+        )
+
+        let permissions = await session.conferencePermissions
+        #expect(permissions.localRole == .viewer)
+        #expect(!permissions.canScreenShare)
+        #expect(RTCSession.shouldStopLocalScreenShareAfterAuthoritativeRoleUpdate(
+            previouslyCouldScreenShare: true,
+            currentlyCanScreenShare: permissions.canScreenShare,
+            hasActiveLocalScreenTrack: true
+        ))
+        #expect(!RTCSession.shouldStopLocalScreenShareAfterAuthoritativeRoleUpdate(
+            previouslyCouldScreenShare: false,
+            currentlyCanScreenShare: false,
+            hasActiveLocalScreenTrack: true
+        ))
+    }
 }

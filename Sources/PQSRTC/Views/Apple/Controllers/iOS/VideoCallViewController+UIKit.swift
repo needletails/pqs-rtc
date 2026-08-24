@@ -89,6 +89,8 @@ public final class VideoCallViewController: UICollectionViewController {
     private var pipAuxiliaryParticipantId: String?
     private var pipStartInFlight = false
     private var pipStopInFlight = false
+    /// Completes when AVKit reports PiP start or failure after `startPictureInPicture()`.
+    private var pipStartWaiters: [CheckedContinuation<Bool, Never>] = []
     private weak var pipDelegate: PiPEventReceiverDelegate?
     private var currentCall: Call?
     private var currentCallState: CallStateMachine.State = .waiting
@@ -430,10 +432,18 @@ public final class VideoCallViewController: UICollectionViewController {
             let stream = await self.session.localScreenShareStateStream()
             for await isSharing in stream {
                 guard !Task.isCancelled else { return }
+                let wasSharing = self.hasActiveLocalScreenShare
                 self.hasActiveLocalScreenShare = isSharing
                 await self.syncParticipantCameraTileAspectModes()
                 if isSharing {
                     await self.stopPictureInPictureForScreenShareIfNeeded()
+                } else if wasSharing {
+                    // Local share has no remote tile teardown event. Run the same collection
+                    // rebuild used by remote share end so the dominant layout cannot stick.
+                    await self.finalizeScreenShareLayoutTransition(
+                        participantId: "",
+                        notifyDelegate: false
+                    )
                 }
                 await self.videoCallDelegate?.screenShareDidChange(isSharing: isSharing)
             }
@@ -740,6 +750,7 @@ public final class VideoCallViewController: UICollectionViewController {
         }
 
         pipController?.stopPictureInPicture()
+        resumePictureInPictureStartWaiters(success: false)
         await dismantlePiPRenderingAndAuxiliaryTrack()
         pipController = nil
 
@@ -3001,22 +3012,22 @@ public final class VideoCallViewController: UICollectionViewController {
     }
 
     /// Starts video-call PiP when the user leaves the app so the remote feed can continue in the system PiP window.
+    ///
+    /// This path is independent of the in-app “PiP when minimized” setting.
     private func startPictureInPictureIfEligibleAfterBackgrounding() async {
         guard isRunning else { return }
         guard isConnected() else { return }
         guard await activeCallAppearsToBeVideo() else { return }
-        guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
-        guard !hasVisibleScreenShareForPiP() else { return }
-        guard !pipStartInFlight, !pipStopInFlight else { return }
-        if let existing = pipController, existing.isPictureInPictureActive { return }
-        guard let pipController = await preparePictureInPictureIfNeeded() else {
-            logger.log(level: .warning, message: "Auto PiP: controller was not ready before backgrounding")
-            return
+        logger.log(level: .info, message: "Auto PiP: app resigning active during video call")
+        await showPip(show: true)
+    }
+
+    private func resumePictureInPictureStartWaiters(success: Bool) {
+        let waiters = pipStartWaiters
+        pipStartWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(returning: success)
         }
-        logger.log(
-            level: .info,
-            message: "Auto PiP background transition observed; prepared controller possible=\(pipController.isPictureInPicturePossible) active=\(pipController.isPictureInPictureActive)"
-        )
     }
 
     private func pictureInPictureLayoutSize() -> CGSize {
@@ -3302,7 +3313,13 @@ extension VideoCallViewController: AVPictureInPictureControllerDelegate, AVPictu
                 }
                 // Defer one run-loop turn so AVKit/Pegasus XPC is not started synchronously from SwiftUI `body` / gesture updates.
                 await Task.yield()
-                pipController.startPictureInPicture()
+                if pipController.isPictureInPictureActive {
+                    return
+                }
+                await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                    self.pipStartWaiters.append(continuation)
+                    pipController.startPictureInPicture()
+                }
             } else {
                 guard !pipStopInFlight else { return }
                 if let pipController, pipController.isPictureInPictureActive {
@@ -3316,6 +3333,7 @@ extension VideoCallViewController: AVPictureInPictureControllerDelegate, AVPictu
         } catch {
             self.logger.log(level: .error, message: "Error showing PIP: \(error.localizedDescription)")
             pipStopInFlight = false
+            resumePictureInPictureStartWaiters(success: false)
             await dismantlePiPRenderingAndAuxiliaryTrack()
             pipController = nil
         }
@@ -3323,8 +3341,10 @@ extension VideoCallViewController: AVPictureInPictureControllerDelegate, AVPictu
     
     nonisolated public func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         Task { @MainActor [weak self] in
-            self?.pipStopInFlight = false
-            self?.logger.log(level: .info, message: "PiP did start")
+            guard let self else { return }
+            self.pipStopInFlight = false
+            self.resumePictureInPictureStartWaiters(success: true)
+            self.logger.log(level: .info, message: "PiP did start")
         }
     }
     nonisolated public func pictureInPictureControllerWillStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
@@ -3340,6 +3360,7 @@ extension VideoCallViewController: AVPictureInPictureControllerDelegate, AVPictu
             guard let self else { return }
             logger.log(level: .error, message: "PiP failed to start: \(error.localizedDescription)")
             pipStopInFlight = false
+            resumePictureInPictureStartWaiters(success: false)
         }
     }
     nonisolated public func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
@@ -3362,6 +3383,10 @@ extension VideoCallViewController: AVPictureInPictureControllerDelegate, AVPictu
         restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping @Sendable (Bool) -> Void
     ) {
         DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: PQSRTCCallUIPreferences.pictureInPictureRestoreUserInterfaceNotification,
+                object: nil
+            )
             completionHandler(true)
         }
     }

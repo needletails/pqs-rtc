@@ -579,11 +579,66 @@ extension RTCSession {
         logger.log(level: .info, message: "Screen share track removed for connection \(normalizedId)")
     }
 
-    private func awaitClearScreenShareOfferInFlight(connectionId: String) async {
-        let offerKey = connectionId.normalizedConnectionId
-        for _ in 0..<25 where offerInFlightConnectionIds.contains(offerKey) {
-            try? await Task.sleep(nanoseconds: 40_000_000)
+    static func shouldCoalesceScreenShareRenegotiation(
+        awaitingAnswer: Bool,
+        applyingAnswer: Bool,
+        offerInFlight: Bool
+    ) -> Bool {
+        awaitingAnswer || applyingAnswer || offerInFlight
+    }
+
+    func beginScreenShareAnswerApplicationIfNeeded(connectionId: String) -> Bool {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard screenShareRenegotiationCountsByConnectionId[normalizedId] != nil else {
+            return false
         }
+        screenShareAnswerApplicationConnectionIds.insert(normalizedId)
+        return true
+    }
+
+    func finishScreenShareAnswerApplication(
+        connectionId: String,
+        answerApplied: Bool
+    ) {
+        let normalizedId = connectionId.normalizedConnectionId
+        screenShareAnswerApplicationConnectionIds.remove(normalizedId)
+        guard answerApplied else { return }
+        screenShareRenegotiationAwaitingAnswerConnectionIds.remove(normalizedId)
+        settleOrFlushScreenShareRenegotiation(connectionId: normalizedId)
+    }
+
+    func screenShareSignalingDidBecomeStable(connectionId: String) {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard screenShareRenegotiationCountsByConnectionId[normalizedId] != nil,
+              !screenShareAnswerApplicationConnectionIds.contains(normalizedId) else {
+            return
+        }
+        screenShareRenegotiationAwaitingAnswerConnectionIds.remove(normalizedId)
+        settleOrFlushScreenShareRenegotiation(connectionId: normalizedId)
+    }
+
+    private func settleOrFlushScreenShareRenegotiation(connectionId: String) {
+        let normalizedId = connectionId.normalizedConnectionId
+        if let reason = pendingSettledScreenShareRenegotiationReasonsByConnectionId.removeValue(
+            forKey: normalizedId
+        ) {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.renegotiateScreenShareIfNeeded(
+                        connectionId: normalizedId,
+                        reason: reason
+                    )
+                } catch {
+                    self.logger.log(
+                        level: .warning,
+                        message: "Coalesced screen share \(reason) renegotiation failed connection=\(normalizedId): \(error)"
+                    )
+                }
+            }
+            return
+        }
+        setScreenShareRenegotiationActive(false, connectionId: normalizedId)
     }
 
     private func renegotiateScreenShareIfNeeded(
@@ -591,11 +646,27 @@ extension RTCSession {
         reason: String
     ) async throws {
         let normalizedId = connectionId.normalizedConnectionId
-        await awaitClearScreenShareOfferInFlight(connectionId: normalizedId)
         guard var connection = await connectionManager.findConnection(with: normalizedId) else {
             logger.log(
                 level: .warning,
                 message: "Screen share \(reason): no connection found for renegotiation id=\(normalizedId)"
+            )
+            pendingSettledScreenShareRenegotiationReasonsByConnectionId.removeValue(forKey: normalizedId)
+            screenShareRenegotiationAwaitingAnswerConnectionIds.remove(normalizedId)
+            setScreenShareRenegotiationActive(false, connectionId: normalizedId)
+            return
+        }
+
+        if Self.shouldCoalesceScreenShareRenegotiation(
+            awaitingAnswer: screenShareRenegotiationAwaitingAnswerConnectionIds.contains(normalizedId),
+            applyingAnswer: screenShareAnswerApplicationConnectionIds.contains(normalizedId),
+            offerInFlight: offerInFlightConnectionIds.contains(normalizedId)
+        ) {
+            pendingSettledScreenShareRenegotiationReasonsByConnectionId[normalizedId] = reason
+            setScreenShareRenegotiationActive(true, connectionId: normalizedId)
+            logger.log(
+                level: .info,
+                message: "Coalesced screen share \(reason) until current SDP answer settles connection=\(normalizedId)"
             )
             return
         }
@@ -606,27 +677,37 @@ extension RTCSession {
             || groupCall(forSfuIdentity: normalizedId) != nil
             || groupCall(forSfuIdentity: wireRoomId) != nil
 
-        if isSfuConnection {
-            let updatedCall = try await sendGroupCallOffer(connection.call)
+        setScreenShareRenegotiationActive(true, connectionId: normalizedId)
+        screenShareRenegotiationAwaitingAnswerConnectionIds.insert(normalizedId)
+        do {
+            if isSfuConnection {
+                let updatedCall = try await sendGroupCallOffer(connection.call)
+                connection.call = updatedCall
+                await connectionManager.updateConnection(id: normalizedId, with: connection)
+                if let group = groupCall(forSfuIdentity: wireRoomId) ?? groupCall(forSfuIdentity: normalizedId) {
+                    await group.applyUpdatedCallForNegotiation(updatedCall)
+                }
+                logger.log(
+                    level: .info,
+                    message: "Screen share \(reason): sent SFU renegotiation offer for connection=\(connection.id)"
+                )
+                return
+            }
+
+            let updatedCall = try await sendOneToOneScreenShareOffer(connection.call)
             connection.call = updatedCall
             await connectionManager.updateConnection(id: normalizedId, with: connection)
-            if let group = groupCall(forSfuIdentity: wireRoomId) ?? groupCall(forSfuIdentity: normalizedId) {
-                await group.applyUpdatedCallForNegotiation(updatedCall)
-            }
             logger.log(
                 level: .info,
-                message: "Screen share \(reason): sent SFU renegotiation offer for connection=\(connection.id)"
+                message: "Screen share \(reason): sent 1:1 renegotiation offer for connection=\(connection.id)"
             )
-            return
+        } catch {
+            screenShareRenegotiationAwaitingAnswerConnectionIds.remove(normalizedId)
+            if pendingSettledScreenShareRenegotiationReasonsByConnectionId[normalizedId] == nil {
+                setScreenShareRenegotiationActive(false, connectionId: normalizedId)
+            }
+            throw error
         }
-
-        let updatedCall = try await sendOneToOneScreenShareOffer(connection.call)
-        connection.call = updatedCall
-        await connectionManager.updateConnection(id: normalizedId, with: connection)
-        logger.log(
-            level: .info,
-            message: "Screen share \(reason): sent 1:1 renegotiation offer for connection=\(connection.id)"
-        )
     }
 
     private func sendOneToOneScreenShareOffer(_ call: Call) async throws -> Call {

@@ -837,6 +837,62 @@ public actor RTCSession {
 
     private var localScreenShareStateContinuations: [UUID: AsyncStream<Bool>.Continuation] = [:]
     private var remoteScreenTrackContinuations: [UUID: AsyncStream<RemoteScreenTrackEvent>.Continuation] = [:]
+    private var screenShareRenegotiationStateContinuations: [UUID: AsyncStream<Bool>.Continuation] = [:]
+    var screenShareRenegotiationCountsByConnectionId: [String: Int] = [:]
+    var screenShareRenegotiationAwaitingAnswerConnectionIds: Set<String> = []
+    var screenShareAnswerApplicationConnectionIds: Set<String> = []
+    var pendingSettledScreenShareRenegotiationReasonsByConnectionId: [String: String] = [:]
+
+    /// True only while an intentional screen-share SDP update is in flight. Call chrome uses
+    /// this to suppress transient quality/recovery banners caused by that media transition.
+    public var screenShareRenegotiationInProgress: Bool {
+        !screenShareRenegotiationCountsByConnectionId.isEmpty
+    }
+
+    /// Emits the complete lifetime of intentional screen-share SDP settlement. The initial
+    /// value is replayed so UI subscribers can clear stale quality state even when mounted late.
+    public func screenShareRenegotiationStateStream() -> AsyncStream<Bool> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeScreenShareRenegotiationStateContinuation(id) }
+            }
+            Task { [weak self] in
+                guard let self else {
+                    continuation.finish()
+                    return
+                }
+                await self.storeScreenShareRenegotiationStateContinuation(id, continuation: continuation)
+            }
+        }
+    }
+
+    private func storeScreenShareRenegotiationStateContinuation(
+        _ id: UUID,
+        continuation: AsyncStream<Bool>.Continuation
+    ) {
+        screenShareRenegotiationStateContinuations[id] = continuation
+        continuation.yield(screenShareRenegotiationInProgress)
+    }
+
+    private func removeScreenShareRenegotiationStateContinuation(_ id: UUID) {
+        screenShareRenegotiationStateContinuations.removeValue(forKey: id)
+    }
+
+    func setScreenShareRenegotiationActive(_ isActive: Bool, connectionId: String) {
+        let normalizedId = connectionId.normalizedConnectionId
+        let wasActive = screenShareRenegotiationInProgress
+        if isActive {
+            screenShareRenegotiationCountsByConnectionId[normalizedId] = 1
+        } else {
+            screenShareRenegotiationCountsByConnectionId.removeValue(forKey: normalizedId)
+        }
+        let isNowActive = screenShareRenegotiationInProgress
+        guard wasActive != isNowActive else { return }
+        for continuation in screenShareRenegotiationStateContinuations.values {
+            continuation.yield(isNowActive)
+        }
+    }
 
     /// Returns an async stream that yields local screen-share state transitions.
     func localScreenShareStateStream() -> AsyncStream<Bool> {
@@ -1394,6 +1450,7 @@ public actor RTCSession {
         participantRoles: [String: String],
         timing: ConferenceTiming? = nil
     ) {
+        let previouslyCouldScreenShare = conferencePermissions.canScreenShare
         var typedRoles: [String: ConferenceRole] = [:]
         for (username, roleString) in participantRoles {
             typedRoles[username] = ConferenceRole(rawValue: roleString) ?? .viewer
@@ -1426,6 +1483,44 @@ public actor RTCSession {
             timing: timing ?? conferencePermissions.timing
         )
         notifyConferencePermissionsChanged()
+        enforceAuthoritativeScreenSharePermissionLossIfNeeded(
+            previouslyCouldScreenShare: previouslyCouldScreenShare
+        )
+    }
+
+    static func shouldStopLocalScreenShareAfterAuthoritativeRoleUpdate(
+        previouslyCouldScreenShare: Bool,
+        currentlyCanScreenShare: Bool,
+        hasActiveLocalScreenTrack: Bool
+    ) -> Bool {
+        previouslyCouldScreenShare && !currentlyCanScreenShare && hasActiveLocalScreenTrack
+    }
+
+    private func enforceAuthoritativeScreenSharePermissionLossIfNeeded(
+        previouslyCouldScreenShare: Bool
+    ) {
+        guard previouslyCouldScreenShare, !conferencePermissions.canScreenShare else { return }
+        guard let connectionId = activeConnectionId?.normalizedConnectionId, !connectionId.isEmpty else {
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            let currentlyCanScreenShare = await self.conferencePermissions.canScreenShare
+            guard let connection = await self.connectionManager.findConnection(with: connectionId),
+                  Self.shouldStopLocalScreenShareAfterAuthoritativeRoleUpdate(
+                    previouslyCouldScreenShare: previouslyCouldScreenShare,
+                    currentlyCanScreenShare: currentlyCanScreenShare,
+                    hasActiveLocalScreenTrack: connection.localScreenTrack != nil
+                  ) else {
+                return
+            }
+            self.logger.log(
+                level: .info,
+                message: "Stopping local screen share after authoritative conference role removed presenter permission connection=\(connectionId)"
+            )
+            await self.removeScreenTrackFromStream(connectionId: connectionId)
+        }
     }
 
     /// Seeds/maintains a best-effort participant list from active media while waiting for
@@ -1445,7 +1540,12 @@ public actor RTCSession {
 
         let local = localUsername.trimmingCharacters(in: .whitespacesAndNewlines)
         if !local.isEmpty, existingKey(for: local) == nil {
-            roles[local] = roles.isEmpty ? localDefaultRole : conferencePermissions.localRole
+            // A conference starter explicitly requests `.host`. Preserve that intent while
+            // waiting for the authoritative SFU role NOTICE even when viewers are already
+            // present in the waiting room.
+            roles[local] = localDefaultRole == .host
+                ? .host
+                : (roles.isEmpty ? localDefaultRole : conferencePermissions.localRole)
         }
 
         for participant in activeRemoteParticipants {
@@ -1965,6 +2065,10 @@ public actor RTCSession {
         for v in variants {
             offerInFlightConnectionIds.remove(v)
             pendingInitialSfuGroupOfferConnectionIds.remove(v)
+            screenShareRenegotiationAwaitingAnswerConnectionIds.remove(v)
+            screenShareAnswerApplicationConnectionIds.remove(v)
+            pendingSettledScreenShareRenegotiationReasonsByConnectionId.removeValue(forKey: v)
+            setScreenShareRenegotiationActive(false, connectionId: v)
         }
     }
 

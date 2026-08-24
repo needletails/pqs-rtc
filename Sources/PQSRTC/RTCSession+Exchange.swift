@@ -243,12 +243,24 @@ extension RTCSession {
     /// - Returns: Call with answer SDP in metadata, ready to be encoded and sent.
     func handleRenegotiationOffer(sdp: SessionDescription, call: Call) async throws -> Call {
         let renegotiationNormId = teardownConnectionIdKey(call.sharedCommunicationId)
+        if sdp.type == .offer,
+           screenShareRenegotiationAwaitingAnswerConnectionIds.contains(renegotiationNormId),
+           let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
+           isGroupCallConnection(connection.id) {
+            stashDeferredSfuRenegotiationOffer(sdp, call: call, normalizedId: renegotiationNormId)
+            logger.log(
+                level: .info,
+                message: "Deferring inbound SFU offer until local screen-share answer settles connId=\(renegotiationNormId)"
+            )
+            throw RTCErrors.deferredSfuRenegotiationOffer(renegotiationNormId)
+        }
 #if canImport(WebRTC) && !os(Android)
         if sdp.type == .offer,
            let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
             if connection.peerConnection.signalingState == .haveLocalOffer {
                 let sharerOfferPending = connection.localScreenTrack != nil
                     || offerInFlightConnectionIds.contains(renegotiationNormId)
+                    || screenShareRenegotiationAwaitingAnswerConnectionIds.contains(renegotiationNormId)
                 if sharerOfferPending, isGroupCallConnection(connection.id) {
                     stashDeferredSfuRenegotiationOffer(sdp, call: call, normalizedId: renegotiationNormId)
                     logger.log(
@@ -539,6 +551,19 @@ extension RTCSession {
         sdp: SessionDescription
     ) async throws {
         let call = try resolveProperRecipient(call: call)
+        let screenShareAnswerConnectionId = call.sharedCommunicationId.normalizedConnectionId
+        let tracksScreenShareSettlement = beginScreenShareAnswerApplicationIfNeeded(
+            connectionId: screenShareAnswerConnectionId
+        )
+        var screenShareAnswerApplied = false
+        defer {
+            if tracksScreenShareSettlement {
+                finishScreenShareAnswerApplication(
+                    connectionId: screenShareAnswerConnectionId,
+                    answerApplied: screenShareAnswerApplied
+                )
+            }
+        }
 #if !os(Android)
         let modified: String
         if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
@@ -630,6 +655,7 @@ extension RTCSession {
         }
 #endif
 #endif
+        screenShareAnswerApplied = true
         if var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
             connection.call = call
             await connectionManager.updateConnection(id: call.sharedCommunicationId, with: connection)

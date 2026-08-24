@@ -762,6 +762,12 @@ extension RTCSession {
         // Treat this call's connection id as the active one.
         // This prevents late callbacks from a previous call from affecting the new call.
         activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
+        // Retire any previous state consumer while it is still blocked on the old streams.
+        // Replacing the streams first would let the old consumer end "naturally" and race
+        // its cancellation, so it could observe transitions meant for the new call.
+        stateTaskGeneration &+= 1
+        stateTask?.cancel()
+        stateTask = nil
         await callState.createStreams(with: call)
         handleStateStream()
         // SFU group bootstrap often creates the `RTCPeerConnection` before the app calls

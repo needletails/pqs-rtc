@@ -200,6 +200,37 @@ struct RTCLifecycleGenerationTests {
         #expect(signalingStable.contains("shouldDeferSfuGroupParticipantVideoAttach(for: connectionId)"))
     }
 
+    @Test("Android screen-share layout recovery is Compose-generation driven")
+    func androidScreenShareLayoutRecoveryUsesComposeGenerationEvents() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let controller = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/PQSRTC/Views/Android/AndroidVideoCallController.swift"
+            ),
+            encoding: .utf8
+        )
+        let compose = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/PQSRTC/Views/Android/AndroidLocalVideoCompose.swift"
+            ),
+            encoding: .utf8
+        )
+
+        #expect(controller.contains("beginParticipantVideoReconcileAfterScreenShareLayoutChange"))
+        #expect(controller.contains("participantSurfaceDidUpdateLayout"))
+        #expect(controller.contains("expectedComposeLayoutParticipantKeys.isSubset"))
+        #expect(!controller.contains("screenShareLayoutReconcileTask"))
+        #expect(!controller.contains("try await Task.sleep(nanoseconds: 100_000_000)"))
+        #expect(compose.contains("onParticipantSurfaceLayout(view)"))
+        #expect(compose.contains("_ = layoutGeneration"))
+        #expect(compose.contains("onParticipantSurfaceLayout: (AndroidSampleCaptureView) -> Void"))
+        #expect(!compose.contains("onParticipantSurfaceLayout(view, layoutGeneration)"))
+        #expect(compose.contains("screenShareLayoutGeneration = generation"))
+    }
+
     @Test("in-flight late-joiner track events are queued for post-settlement refresh")
     func lateJoinerTrackEventsAreQueuedDuringSfuRenegotiation() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)

@@ -34,6 +34,21 @@ public enum PQSRTCCallUIPreferences {
         return UserDefaults.standard.bool(forKey: key)
     }
 
+    /// When absent in `UserDefaults`, in-app Picture in Picture while the call UI is minimized defaults to `true`.
+    ///
+    /// Backgrounding the app during a video call still starts PiP regardless of this preference.
+    public static let automaticPictureInPictureWhenMinimizedUserDefaultsKey = "PQSRTC.automaticPictureInPictureWhenMinimized"
+
+    /// Reads ``automaticPictureInPictureWhenMinimizedUserDefaultsKey``; missing key defaults to `true`.
+    public static func resolvedAutomaticPictureInPictureWhenMinimizedEnabled() -> Bool {
+        let key = automaticPictureInPictureWhenMinimizedUserDefaultsKey
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }
+
+    /// Posted when the user returns from system Picture in Picture so the host can restore the in-app call UI.
+    public static let pictureInPictureRestoreUserInterfaceNotification = Notification.Name("PQSRTC.PictureInPictureRestoreUserInterface")
+
     /// Preferred camera `AVCaptureDevice.uniqueID`. Absent or empty means “first available”.
     public static let preferredVideoCaptureDeviceUIDKey = "PQSRTC.preferredVideoCaptureDeviceUID"
 

@@ -52,8 +52,10 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var screenTrackStreamTask: Task<Void, Never>?
     private var participantTrackStreamTask: Task<Void, Never>?
     private var screenView: AndroidSampleCaptureView?
+    private var hasActiveLocalScreenShare = false
     private(set) var hasActiveRemoteScreenShare = false
     private var activeRemoteScreenShareParticipantId: String?
+    private var keepRemoteSurfacesVisibleForSystemPiP = false
     private var conferenceRaisedHands: [String: Bool] = [:]
 
     /// Tracks which participant is currently rendered by which view.
@@ -71,7 +73,10 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var inboundVideoFlowStreamTask: Task<Void, Never>?
     private var lastInboundVideoFlowStateForDecodeStall: InboundVideoFlowState?
     private var postRenegotiationAttachEpisodeStreamTask: Task<Void, Never>?
-    private var screenShareLayoutReconcileTask: Task<Void, Never>?
+    private var composeScreenShareLayoutGeneration: UInt64 = 0
+    private var pendingComposeScreenShareLayoutReconcile: (isSharing: Bool, generation: UInt64)?
+    private var expectedComposeLayoutParticipantKeys: Set<String> = []
+    private var reportedComposeLayoutParticipantKeys: Set<String> = []
     /// Bumped on every remote screen-share stop so stale layout-recovery / pending-activation work aborts.
     private var remoteScreenShareLayoutGeneration: UInt64 = 0
     private var pendingRemoteScreenShareActivation: RemoteScreenTrackEvent?
@@ -1048,7 +1053,6 @@ public actor AndroidVideoCallController: CallActionDelegate {
 
     public func stopScreenShare() async {
         guard let connectionId = currentCall?.sharedCommunicationId else { return }
-        cancelScreenShareLayoutRecovery(reason: "local-screen-share-stop")
         await session.removeScreenTrackFromStream(connectionId: connectionId)
     }
 
@@ -1056,8 +1060,9 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private func cancelScreenShareLayoutRecovery(reason: String) {
         remoteScreenShareLayoutGeneration &+= 1
         pendingRemoteScreenShareActivation = nil
-        screenShareLayoutReconcileTask?.cancel()
-        screenShareLayoutReconcileTask = nil
+        pendingComposeScreenShareLayoutReconcile = nil
+        expectedComposeLayoutParticipantKeys.removeAll()
+        reportedComposeLayoutParticipantKeys.removeAll()
         logger.log(
             level: .info,
             message: "Cancelled screen-share layout recovery reason=\(reason) generation=\(remoteScreenShareLayoutGeneration)"
@@ -1073,9 +1078,14 @@ public actor AndroidVideoCallController: CallActionDelegate {
             let stream = await self.session.localScreenShareStateStream()
             for await isSharing in stream {
                 guard !Task.isCancelled else { break }
+                await self.setActiveLocalScreenShare(isSharing)
                 await self.videoCallDelegate?.screenShareDidChange(isSharing: isSharing)
             }
         }
+    }
+
+    private func setActiveLocalScreenShare(_ isSharing: Bool) {
+        hasActiveLocalScreenShare = isSharing
     }
 
     private func stopLocalScreenShareStateObservation() {
@@ -4757,42 +4767,65 @@ public actor AndroidVideoCallController: CallActionDelegate {
         await handleRemoteScreenTrackEvent(pending)
     }
 
-    /// Coalesced follow-up after the screen-share layout remounts participant tile surfaces.
-    ///
-    /// Compose already posts deferred EGL reconciles per tile; this schedules one attach pass
-    /// after surfaces settle. Must not run from `@MainActor` while probing views — native probes
-    /// use `runOnMainThreadSync` and will deadlock the UI thread.
-    func scheduleParticipantVideoReconcileAfterScreenShareLayoutChange(isSharing: Bool) async {
-        let generation = remoteScreenShareLayoutGeneration
-        screenShareLayoutReconcileTask?.cancel()
-        if isSharing, isGroupCall, let connectionId = currentCall?.sharedCommunicationId {
-            guard hasActiveRemoteScreenShare else { return }
-            postRenegotiationEpisodeIncludesGridLayout = true
-            await reattachParticipantVideoForScreenShareLayoutChange(
-                connectionId: connectionId,
-                layoutGeneration: generation
-            )
-        }
-        let task = Task { [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: 100_000_000)
-            } catch {
-                return
+    /// Begins one layout generation. The actual recovery is owned by Compose's
+    /// `AndroidView.update` callback after every visible participant surface reports that
+    /// generation; no elapsed-time guess or main-thread native probe is involved.
+    func beginParticipantVideoReconcileAfterScreenShareLayoutChange(
+        isSharing: Bool,
+        visibleViews: [AndroidSampleCaptureView]
+    ) -> UInt64 {
+        composeScreenShareLayoutGeneration &+= 1
+        let generation = composeScreenShareLayoutGeneration
+        pendingComposeScreenShareLayoutReconcile = (isSharing, generation)
+        reportedComposeLayoutParticipantKeys.removeAll()
+        expectedComposeLayoutParticipantKeys = Set(
+            participantViewAssignments.compactMap { participantId, assignedView in
+                visibleViews.contains(where: { $0 === assignedView })
+                    ? participantAssignmentKey(participantId)
+                    : nil
             }
-            guard !Task.isCancelled, let self else { return }
-            await self.performParticipantVideoReconcileAfterScreenShareLayoutChange(
-                isSharing: isSharing,
-                layoutGeneration: generation
-            )
+        )
+        logger.log(
+            level: .info,
+            message: "Waiting for Compose participant layout generation=\(generation) expected=\(expectedComposeLayoutParticipantKeys.count) isSharing=\(isSharing)"
+        )
+        return generation
+    }
+
+    /// Concrete renderer-layout event from Compose. Recovery starts once all currently visible
+    /// assigned tiles have posted their deferred EGL layout update.
+    func participantSurfaceDidUpdateLayout(
+        _ view: AndroidSampleCaptureView,
+        generation: UInt64
+    ) async {
+        guard let pending = pendingComposeScreenShareLayoutReconcile,
+              pending.generation == generation,
+              generation == composeScreenShareLayoutGeneration else {
+            return
         }
-        screenShareLayoutReconcileTask = task
+        guard let participantId = participantViewAssignments.first(where: { $0.value === view })?.key else {
+            return
+        }
+        reportedComposeLayoutParticipantKeys.insert(participantAssignmentKey(participantId))
+        guard !expectedComposeLayoutParticipantKeys.isEmpty,
+              expectedComposeLayoutParticipantKeys.isSubset(of: reportedComposeLayoutParticipantKeys) else {
+            return
+        }
+
+        pendingComposeScreenShareLayoutReconcile = nil
+        expectedComposeLayoutParticipantKeys.removeAll()
+        reportedComposeLayoutParticipantKeys.removeAll()
+        await performParticipantVideoReconcileAfterScreenShareLayoutChange(
+            isSharing: pending.isSharing,
+            layoutGeneration: generation
+        )
     }
 
     private func performParticipantVideoReconcileAfterScreenShareLayoutChange(
         isSharing: Bool,
         layoutGeneration: UInt64
     ) async {
-        guard layoutGeneration == remoteScreenShareLayoutGeneration else {
+        guard layoutGeneration == composeScreenShareLayoutGeneration else {
             logger.log(
                 level: .info,
                 message: "Skipping stale screen-share layout reconcile isSharing=\(isSharing) generation=\(layoutGeneration)"
@@ -4813,9 +4846,11 @@ public actor AndroidVideoCallController: CallActionDelegate {
             postRenegotiationEpisodeIncludesGridLayout = true
             await reattachParticipantVideoForScreenShareLayoutChange(
                 connectionId: connectionId,
-                layoutGeneration: layoutGeneration
+                layoutGeneration: remoteScreenShareLayoutGeneration
             )
-            await retryPendingRemoteScreenShareActivationIfNeeded(generation: layoutGeneration)
+            await retryPendingRemoteScreenShareActivationIfNeeded(
+                generation: remoteScreenShareLayoutGeneration
+            )
             return
         }
 
@@ -4911,11 +4946,20 @@ public actor AndroidVideoCallController: CallActionDelegate {
         }
     }
 
+    public func hasVisibleScreenShareForPiP() -> Bool {
+        hasActiveLocalScreenShare || hasActiveRemoteScreenShare
+    }
+
+    public func setKeepRemoteSurfacesVisibleForSystemPiP(_ keepVisible: Bool) {
+        keepRemoteSurfacesVisibleForSystemPiP = keepVisible
+    }
+
     /// SurfaceViews ignore Compose alpha/size/offset modifiers; hide every mounted renderer natively.
     public func setVideoSurfacesHidden(_ hidden: Bool) async {
+        let hideRemotes = hidden && !keepRemoteSurfacesVisibleForSystemPiP
         localView?.setHidden(hidden)
         for view in remoteViews {
-            view.setHidden(hidden)
+            view.setHidden(hideRemotes)
         }
         screenView?.setHidden(hidden)
         logger.log(
@@ -5250,15 +5294,19 @@ public actor AndroidVideoCallController: CallActionDelegate {
         stopInboundVideoFlowObservation()
         stopPostRenegotiationAttachEpisodeObservation()
         stopSfuGroupSignalingStableObservation()
-        screenShareLayoutReconcileTask?.cancel()
-        screenShareLayoutReconcileTask = nil
+        pendingComposeScreenShareLayoutReconcile = nil
+        expectedComposeLayoutParticipantKeys.removeAll()
+        reportedComposeLayoutParticipantKeys.removeAll()
+        composeScreenShareLayoutGeneration &+= 1
         pendingRemoteScreenShareActivation = nil
         remoteScreenShareLayoutGeneration &+= 1
         stateStreamTask?.cancel()
         stateStreamTask = nil
         screenView = nil
         activeRemoteScreenShareParticipantId = nil
+        hasActiveLocalScreenShare = false
         hasActiveRemoteScreenShare = false
+        keepRemoteSurfacesVisibleForSystemPiP = false
         participantAttachedTrackIdsByKey.removeAll()
         participantRendererRecoveryIssuedKeys.removeAll()
         participantCoordinatorSettledKeys.removeAll()

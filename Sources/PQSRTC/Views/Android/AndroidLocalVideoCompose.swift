@@ -230,6 +230,11 @@ public struct AndroidRemoteGridCompose: ContentComposer {
     /// screen share. On phones this selects the horizontal 16:9 collection; full-screen
     /// conference keeps the vertical grid.
     private let usesCompactParticipantStrip: Bool
+    /// Read from `AndroidView.update` so Compose invalidates on generation change. Do not pass
+    /// this (or any `UInt64`) through a Skip-bridged Swift closure — `JULong.fromJavaObject`
+    /// aborts (`swift_unexpectedError`) when the tile attaches.
+    private let layoutGeneration: Int64
+    private let onParticipantSurfaceLayout: (AndroidSampleCaptureView) -> Void
     private let onDispose: () -> Void
     
     public init(
@@ -239,6 +244,8 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         prefersAspectFit: Bool = true,
         cleanupOnDispose: Bool = true,
         usesCompactParticipantStrip: Bool = false,
+        layoutGeneration: Int64 = 0,
+        onParticipantSurfaceLayout: @escaping (AndroidSampleCaptureView) -> Void = { _ in },
         onDispose: @escaping () -> Void
     ) {
         self.client = client
@@ -247,6 +254,8 @@ public struct AndroidRemoteGridCompose: ContentComposer {
         self.prefersAspectFit = prefersAspectFit
         self.cleanupOnDispose = cleanupOnDispose
         self.usesCompactParticipantStrip = usesCompactParticipantStrip
+        self.layoutGeneration = layoutGeneration
+        self.onParticipantSurfaceLayout = onParticipantSurfaceLayout
         self.onDispose = onDispose
     }
     
@@ -414,6 +423,8 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                         fillWhenOrientationMatches: !prefersAspectFit
                     )
                     view.rendererDidUpdateLayoutFromCompose()
+                    _ = layoutGeneration
+                    onParticipantSurfaceLayout(view)
                 }
             )
             if showRaisedHand {
@@ -733,6 +744,8 @@ public struct AndroidRemoteGrid: View {
     private let prefersAspectFit: Bool
     private let cleanupOnDispose: Bool
     private let usesCompactParticipantStrip: Bool
+    private let layoutGeneration: Int64
+    private let onParticipantSurfaceLayout: (AndroidSampleCaptureView) -> Void
     private let onDispose: () -> Void
     
     public init(
@@ -742,6 +755,8 @@ public struct AndroidRemoteGrid: View {
         prefersAspectFit: Bool = true,
         cleanupOnDispose: Bool = true,
         usesCompactParticipantStrip: Bool = false,
+        layoutGeneration: Int64 = 0,
+        onParticipantSurfaceLayout: @escaping (AndroidSampleCaptureView) -> Void = { _ in },
         onDispose: @escaping () -> Void
     ) {
         self.client = client
@@ -750,6 +765,8 @@ public struct AndroidRemoteGrid: View {
         self.prefersAspectFit = prefersAspectFit
         self.cleanupOnDispose = cleanupOnDispose
         self.usesCompactParticipantStrip = usesCompactParticipantStrip
+        self.layoutGeneration = layoutGeneration
+        self.onParticipantSurfaceLayout = onParticipantSurfaceLayout
         self.onDispose = onDispose
     }
     
@@ -762,6 +779,8 @@ public struct AndroidRemoteGrid: View {
                 prefersAspectFit: prefersAspectFit,
                 cleanupOnDispose: cleanupOnDispose,
                 usesCompactParticipantStrip: usesCompactParticipantStrip,
+                layoutGeneration: layoutGeneration,
+                onParticipantSurfaceLayout: onParticipantSurfaceLayout,
                 onDispose: onDispose
             )
         }
@@ -817,6 +836,7 @@ public struct AndroidVideoCallView: View {
     @State var gridRaisedHandFlags: [Bool] = []
     @State var visibleRemoteCaptureViews: [AndroidSampleCaptureView] = []
     @State var mountedMultipartyRemoteSlotCount: Int = 0
+    @State var screenShareLayoutGeneration: UInt64 = 0
     var actionBridge: AndroidVideoCallActionBridge?
     @Binding var delegate: CallActionDelegate?
     @Binding var errorMessage: String
@@ -907,6 +927,17 @@ public struct AndroidVideoCallView: View {
             guard hasActiveRemoteScreenShare else { return 0 }
             return activeRemoteCount <= 1 ? 0.64 : 0.68
         }()
+        let capturedLayoutGeneration = screenShareLayoutGeneration
+        let composeLayoutGeneration = Int64(bitPattern: capturedLayoutGeneration)
+        // 1-arg only: Skip `Function2` + `UInt64` aborts in `JULong.fromJavaObject` on tile attach.
+        let onParticipantSurfaceLayout: (AndroidSampleCaptureView) -> Void = { view in
+            Task {
+                await resources.controller.participantSurfaceDidUpdateLayout(
+                    view,
+                    generation: capturedLayoutGeneration
+                )
+            }
+        }
 
         ZStack {
             GeometryReader { geo in
@@ -942,6 +973,8 @@ public struct AndroidVideoCallView: View {
                                     prefersAspectFit: remotePrefersAspectFit,
                                     cleanupOnDispose: false,
                                     usesCompactParticipantStrip: hasActiveRemoteScreenShare,
+                                    layoutGeneration: composeLayoutGeneration,
+                                    onParticipantSurfaceLayout: onParticipantSurfaceLayout,
                                     onDispose: {}
                                 )
                                 .tag(idx)
@@ -968,6 +1001,8 @@ public struct AndroidVideoCallView: View {
                             prefersAspectFit: remotePrefersAspectFit,
                             cleanupOnDispose: false,
                             usesCompactParticipantStrip: hasActiveRemoteScreenShare,
+                            layoutGeneration: composeLayoutGeneration,
+                            onParticipantSurfaceLayout: onParticipantSurfaceLayout,
                             onDispose: {}
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1007,11 +1042,23 @@ public struct AndroidVideoCallView: View {
             }
             currentRemotePage = min(currentRemotePage, newCount - 1)
         }
-        .task(id: hasActiveRemoteScreenShare) {
+        .task(id: "\(isScreenSharing)-\(hasActiveRemoteScreenShare)") {
             let controller = resources.controller
-            let isSharing = hasActiveRemoteScreenShare
+            let isSharing = isScreenSharing || hasActiveRemoteScreenShare
             let screenCaptureView = resources.screenCaptureView
-            await controller.scheduleParticipantVideoReconcileAfterScreenShareLayoutChange(isSharing: isSharing)
+            let visiblePageViews: [AndroidSampleCaptureView]
+            if remotePages.count > 1, remotePages.indices.contains(currentRemotePage) {
+                visiblePageViews = remotePages[currentRemotePage]
+            } else {
+                visiblePageViews = displayedRemoteCaptureViews
+            }
+            let generation = await controller.beginParticipantVideoReconcileAfterScreenShareLayoutChange(
+                isSharing: isSharing,
+                visibleViews: visiblePageViews
+            )
+            await MainActor.run {
+                screenShareLayoutGeneration = generation
+            }
             if isSharing {
                 await controller.setScreenView(screenCaptureView)
             }

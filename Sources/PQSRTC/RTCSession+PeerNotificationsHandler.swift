@@ -4697,10 +4697,14 @@ extension RTCSession {
             case .signalingStateDidChange(let connectionId, let stateChanged):
                 self.logger.log(level: .info, message: "peerConnection new signaling state: \(stateChanged.description)")
                 let norm = connectionId.normalizedConnectionId
+                let isStable = stateChanged.description == "stable"
+                if isStable {
+                    self.screenShareSignalingDidBecomeStable(connectionId: connectionId)
+                }
                 if self.isGroupCallConnection(norm) || self.groupCalls[norm] != nil {
                     self.noteSfuGroupSignalingStability(
                         for: connectionId,
-                        isStable: stateChanged.description == "stable"
+                        isStable: isStable
                     )
                 }
             case .addedStream(_, let streamId):

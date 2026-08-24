@@ -121,5 +121,52 @@ struct ScreenShareRenderingAndLifecycleTests {
 
         await session.shutdown(with: nil)
     }
+
+    @Test("rapid start-stop coalesces while the first SDP answer is outstanding")
+    func rapidStartStopCoalescesWhileAwaitingAnswer() {
+        #expect(RTCSession.shouldCoalesceScreenShareRenegotiation(
+            awaitingAnswer: true,
+            applyingAnswer: false,
+            offerInFlight: false
+        ))
+        #expect(RTCSession.shouldCoalesceScreenShareRenegotiation(
+            awaitingAnswer: false,
+            applyingAnswer: true,
+            offerInFlight: false
+        ))
+        #expect(!RTCSession.shouldCoalesceScreenShareRenegotiation(
+            awaitingAnswer: false,
+            applyingAnswer: false,
+            offerInFlight: false
+        ))
+    }
+
+    @Test("screen share renegotiation remains active through answer application")
+    func renegotiationSettlementLifetimeIncludesAnswerApplication() async {
+        let session = await RTCSession(
+            iceServers: [],
+            username: "",
+            password: "",
+            delegate: nil
+        )
+        defer { Task { await session.shutdown(with: nil) } }
+        let connectionId = "settlement-lifetime"
+
+        await session.setScreenShareRenegotiationActive(true, connectionId: connectionId)
+        #expect(await session.screenShareRenegotiationInProgress)
+
+        let tracksAnswer = await session.beginScreenShareAnswerApplicationIfNeeded(
+            connectionId: connectionId
+        )
+        #expect(tracksAnswer)
+        await session.screenShareSignalingDidBecomeStable(connectionId: connectionId)
+        #expect(await session.screenShareRenegotiationInProgress)
+
+        await session.finishScreenShareAnswerApplication(
+            connectionId: connectionId,
+            answerApplied: true
+        )
+        #expect(await session.screenShareRenegotiationInProgress == false)
+    }
 }
 #endif

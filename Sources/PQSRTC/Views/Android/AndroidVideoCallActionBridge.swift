@@ -40,6 +40,11 @@ public final class AndroidVideoCallActionBridge: CallActionDelegate, @unchecked 
         await activeBridge?.setVideoSurfacesHidden(hidden)
     }
 
+    /// Updates renderer visibility policy on the controller actor before Android enters or exits PiP.
+    public static func setKeepRemoteSurfacesVisibleForSystemPiP(_ keepVisible: Bool) async {
+        await activeBridge?.controller?.setKeepRemoteSurfacesVisibleForSystemPiP(keepVisible)
+    }
+
     /// Rebinds live tracks after Android recreates SurfaceViews on app foreground.
     public static func reconcileActiveCallVideoSurfacesAfterForeground() async {
         await activeBridge?.reconcileVideoSurfacesAfterAppForeground()
@@ -51,6 +56,10 @@ public final class AndroidVideoCallActionBridge: CallActionDelegate, @unchecked 
 
     public func reconcileVideoSurfacesAfterAppForeground() async {
         await controller?.reconcileVideoSurfacesAfterAppForeground()
+    }
+
+    public static func hasVisibleScreenShareForPiP() async -> Bool {
+        await activeBridge?.controller?.hasVisibleScreenShareForPiP() ?? false
     }
 
     public func endCall() async {
