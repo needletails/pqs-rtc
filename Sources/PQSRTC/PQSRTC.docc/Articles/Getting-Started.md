@@ -1,27 +1,25 @@
 # Getting Started
 
-This article covers the practical integration points for using `PQSRTC` in a production app:
+Practical integration points for `PQSRTC`:
 
-- How to implement the transport layer
-- How to instantiate ``RTCSession``
-- How to route inbound signaling and ciphertext
-- How to choose between 1:1 and SFU group calls
+- Implement the transport
+- Construct ``RTCSession`` (`async`)
+- Route inbound signaling and ciphertext
+- Choose 1:1 vs SFU group/conference
 
-If you’re starting with group calls, also read <doc:Group-Calls>.
+If you are starting with group calls, also read <doc:Group-Calls> and <doc:Architecture>.
 
 ## Before you start
 
 You need:
 
-- A signaling/control plane (your backend or P2P messaging layer) capable of routing:
-  - SDP offers/answers
-  - ICE candidates
-  - Opaque ciphertext blobs
-- Stable identifiers to route messages to a specific call instance, typically ``Call/sharedCommunicationId``.
+- A signaling/control plane that can route SDP, ICE, and opaque ciphertext
+- Stable identifiers, typically ``Call/sharedCommunicationId`` plus an explicit SFU wire id when the call is SFU-relayed
+- For NeedleTails production: Nudge Server (auth + messaging) and SwiftSFU (rooms + RTP). See <doc:Connecting-to-Servers>.
 
 ## 1) Implement the transport
 
-Your app implements ``RTCTransportEvents``. Think of these as “outbound intents” from the SDK.
+Your app implements ``RTCTransportEvents``. These are outbound intents from the SDK.
 
 ```swift
 import Foundation
@@ -29,17 +27,15 @@ import PQSRTC
 
 struct MyTransport: RTCTransportEvents {
   func sendStartCall(_ call: Call) async throws {
-    // 1:1 calls: Send start_call message to trigger VoIP notifications.
+    // 1:1: start_call so the callee can receive VoIP / incoming UI.
   }
 
   func sendOneToOneMessage(_ packet: RatchetMessagePacket, recipient: Call.Participant) async throws {
-    // 1:1 calls: Send encrypted signaling packet.
-    // Use `packet.flag` to distinguish offer/answer/candidate.
+    // 1:1 encrypted signaling. Use packet.flag for offer/answer/candidate.
   }
 
   func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws {
-    // Group calls: Send encrypted SFU signaling packet.
-    // Use `packet.flag` to distinguish offer/answer/candidate.
+    // SFU encrypted signaling. Use packet.flag for offer/answer/candidate/handshakeComplete.
   }
 
   func sendCiphertext(
@@ -48,109 +44,112 @@ struct MyTransport: RTCTransportEvents {
     ciphertext: Data,
     call: Call
   ) async throws {
-    // Deliver opaque ciphertext to a specific recipient.
-    // Used for 1:1 DoubleRatchet / call_cipher media-ratchet exchange.
-    // - `recipient` is an app-level identifier (e.g. secretName).
-    // - `connectionId` is a stable string you should round-trip back on receive.
-    // - preserve `call.frameIdentityProps` and `call.signalingIdentityProps`.
+    // Opaque 1:1 Double Ratchet / call_cipher bytes.
+    // Round-trip recipient, connectionId, ciphertext, and Call identity props unchanged.
   }
 
   func didEnd(call: Call, endState: CallStateMachine.EndState) async throws {
-    // Inform your backend/UI.
+    // Inform your backend / UI.
   }
 }
 ```
 
-> Recommended next read: <doc:Transport> (message routing + practical payload shapes).
+Next: <doc:Transport>.
 
 ## 2) Create a session
 
-Create one ``RTCSession`` per “client runtime” (app session) and reuse it across calls.
+Create one ``RTCSession`` per app runtime and reuse it. Init is `async`. Frame-encryption mode is on ``RTCSession/CryptorConfiguration`` (default `.perParticipant`).
 
 ```swift
 import PQSRTC
 
-let session = RTCSession(
+let session = await RTCSession(
   iceServers: ["stun:stun.l.google.com:19302"],
   username: "",
   password: "",
-  frameEncryptionKeyMode: .perParticipant,
+  cryptorConfig: .init(mode: .perParticipant),
   delegate: MyTransport()
 )
 ```
 
-### Choosing `frameEncryptionKeyMode`
+### Choosing `CryptorConfiguration.mode`
 
-- Use ``RTCFrameEncryptionKeyMode/perParticipant`` for SFU group calls.
-- For 1:1 calls you can use either:
-  - ``RTCFrameEncryptionKeyMode/shared`` (simpler), or
-  - ``RTCFrameEncryptionKeyMode/perParticipant`` (more consistent with group calls).
+- ``RTCFrameEncryptionKeyMode/perParticipant`` — required for SFU group/conference E2EE; also fine for 1:1.
+- ``RTCFrameEncryptionKeyMode/shared`` — simplest 1:1 key ring.
+- ``RTCFrameEncryptionKeyMode/none`` — FrameCryptor off (debugging or non-E2EE media).
+
+ICE defaults to ``RTCIceTransportPolicyStrategy/allThenRelay(timeoutMilliseconds:)`` (4 seconds). Pass TURN REST username/password when your backend issues them.
+
+On iOS inbound SFU, call ``RTCSession/setRequiresExternalAudioActivation(_:)`` before answering and ``RTCSession/markExternalAudioActivationComplete()`` from CallKit `didActivate`. See <doc:HostAppCallKitAndSFU>.
 
 ## 3) Route inbound messages
 
-Your app receives messages from the network and calls into the SDK.
+### 1:1 SDP / ICE
 
-### Inbound signaling (SDP / ICE)
+- Offer → ``RTCSession/handleOffer(call:sdp:metadata:)``
+- Answer → ``RTCSession/handleAnswer(call:sdp:)``
+- ICE → ``RTCSession/handleCandidate(call:candidate:)``
 
-For 1:1 calls:
+### SFU group / conference
 
-- Offerer receives an answer → ``RTCSession/handleAnswer(call:sdp:)``
-- Answerer receives an offer → ``RTCSession/handleOffer(call:sdp:metadata:)``
-- Both sides receive ICE candidates → ``RTCSession/handleCandidate(call:candidate:)``
-
-For SFU group calls, you typically route SFU answer/candidates into ``RTCGroupCall``:
+Decode wire payloads into ``RTCGroupCall/ControlMessage`` and call **``RTCSession/handleControlMessage(_:)``** (not a method on ``RTCGroupCall``):
 
 ```swift
-try await groupCall.handleControlMessage(.sfuAnswer(answerSdp))
-try await groupCall.handleControlMessage(.sfuCandidate(candidate))
+try await session.handleControlMessage(.sfuAnswer(answerPacket))
+try await session.handleControlMessage(.sfuCandidate(candidatePacket))
+try await session.handleControlMessage(.sfuOffer(offerPacket))
 ```
 
-### Inbound ciphertext and frame keys
+Roster cases take a ``RatchetMessagePacket``, not a raw participant array. After decrypt, you can also update the facade with ``RTCGroupCall/updateParticipants(_:)``.
 
-Pairwise `call_cipher` ciphertext is intentionally opaque to your transport. For 1:1 calls, route
-it into the ongoing call setup (see <doc:One-to-One-Calls> and <doc:OneToOneSfuFrameE2EE>).
+### Ciphertext and frame keys
 
-For encrypted SFU group calls, distribute per-sender frame keys over your own encrypted app route
-and inject them with ``RTCSession/setFrameEncryptionKey(_:index:for:)``. Do not feed group sender
-keys into the 1:1 `call_cipher` media-ratchet path. See <doc:GroupSfuFrameE2EE>.
+1:1 `call_cipher` stays opaque. Route it into the 1:1 setup path (<doc:One-to-One-Calls>, <doc:OneToOneSfuFrameE2EE>).
+
+Group sender keys travel on your encrypted app route. Inject with ``RTCSession/setFrameEncryptionKey(_:index:for:)``. Do not feed group keys into `finishCryptoSessionCreation`. See <doc:GroupSfuFrameE2EE>.
 
 ## 4) Choose a call style
 
-### SFU group calls
+### SFU group / conference
 
-Create a group call wrapper and join:
+Production join path:
 
 ```swift
-let groupCall = session.createGroupCall(call: call, sfuRecipientId: "sfu")
-try await groupCall.join()
+try await session.groupCallNegotiation(call: call, sfuRecipientId: roomId)
 
-Task {
-  for await event in await groupCall.events() {
-    // Update your UI or state machine.
-    // .remoteTrackAdded(participantId:kind:trackId:)
+if let groupCall = session.groupCallForRoom(roomId) {
+  Task {
+    for await event in await groupCall.events() {
+      // .stateChanged, .participantsUpdated, .remoteTrackAdded(...)
+    }
   }
 }
 ```
+
+`createGroupCall(call:sfuRecipientId:localIdentity:)` is the lower-level wrapper. Prefer `groupCallNegotiation`, which generates or loads ``ConnectionLocalIdentity`` and registers the room.
+
+Media is not up at `RTCGroupCall.join()`. The PeerConnection and initial offer run after SFU registration via ``beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId:)``.
 
 Next: <doc:Group-Calls>.
 
 ### 1:1 calls
 
-1:1 calls are driven by SDP+ICE methods on ``RTCSession``.
+Driven by SDP + ICE (and `call_cipher` when E2EE is on) on ``RTCSession``.
 
 Next: <doc:One-to-One-Calls>.
 
-## Platform requirements and SFU essentials (NeedleTails)
+## Platform notes
 
-- **Platforms:** iOS 18+ / macOS 15+ (per `Package.swift`), Swift 6.x, WebRTC via the package’s host integration on Apple platforms.
-- **High-level flow:** Create ``RTCSession`` with your ICE list, frame-encryption mode, and ``RTCTransportEvents``; join 1:1 or group SFU as needed; route inbound SFU/IRC payloads into ``RTCSession/handleControlMessage(_:)`` (and 1:1 handlers) per your wire format.
-- **Audio (iOS):** the host binds WebRTC to the system session. PQSRTC exposes `setExternalAudioSession()`, `setAudioMode`, and `activateAudioSession` through your integration. For **inbound** server-SFU + **CallKit**, read <doc:HostAppCallKitAndSFU> before changing answer flow.
-- **Implementation map:** ``RTCSession+GroupCall`` (SFU registration and decrypted control packets), ``RTCSession+State`` (CallKit / `.connected` rules), and the internal `TaskProcessor` for ratchet-encrypted signaling.
+- **Apple:** iOS 18+ / macOS 15+, Swift 6.3, WebRTC via the package’s Specs binary.
+- **Android:** same Swift sources via Skip; min SDK is the host app’s.
+- **Audio (iOS inbound SFU):** <doc:HostAppCallKitAndSFU> is mandatory before changing answer order.
 
-### SFU, CallKit, and remote video (next reads)
+### Next reads
 
-- <doc:HostAppCallKitAndSFU> — **mandatory** iOS + server SFU ordering
-- <doc:SFUSignalingOverview> — control-plane flags and `handshakeComplete`
-- <doc:OneToOneSfuFrameE2EE> — `call_cipher`, frame identity props, and 1:1 SFU FrameCryptor key agreement
-- <doc:GroupSfuFrameE2EE> — group/conference sender keys and app-injected frame keys
-- <doc:SfuRemoteVideoFrameE2EE> — if you use **per-participant** frame encryption on SFU, read before changing the `Call` graph or `RTCConnection` identity fields
+- <doc:Architecture>
+- <doc:HostAppCallKitAndSFU>
+- <doc:SFUSignalingOverview>
+- <doc:OneToOneSfuFrameE2EE>
+- <doc:GroupSfuFrameE2EE>
+- <doc:SfuRemoteVideoFrameE2EE>
+- <doc:ScreenShare>

@@ -248,7 +248,7 @@ public actor KeyManager: SessionIdentityDelegate {
         
             // Create a placeholder SessionIdentity (will be updated when recipient keys are received)
             // For now, use self's public keys as placeholder
-        let props = try SessionIdentity.UnwrappedProps(
+        let props = SessionIdentity.UnwrappedProps(
             secretName: secretName,
             deviceId: UUID(),
             sessionContextId: 0,

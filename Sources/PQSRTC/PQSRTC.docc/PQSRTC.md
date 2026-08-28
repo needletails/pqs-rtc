@@ -1,46 +1,45 @@
 # ``PQSRTC``
 
-Client-side WebRTC calling with SFU group calls and frame-level end-to-end encryption (E2EE).
+Client-side WebRTC for 1:1 and SFU group/conference calls, with optional frame-level E2EE.
 
 ## Overview
 
-`PQSRTC` is intentionally *transport-agnostic*: the SDK handles WebRTC state, but your app owns how messages move over the network.
+`PQSRTC` is transport-agnostic. The SDK owns WebRTC state; the host owns how messages move.
 
-At a high level:
+- Provide signaling via ``RTCTransportEvents``.
+- Own PeerConnections and call lifecycle in ``RTCSession`` (`async` init).
+- Join SFU rooms with ``RTCSession/groupCallNegotiation(call:sfuRecipientId:)``.
+- Apply inbound SFU packets with ``RTCSession/handleControlMessage(_:)``.
 
-- You provide a control plane/signaling layer via ``RTCTransportEvents``.
-- The SDK owns WebRTC state, negotiation, and call lifecycle inside ``RTCSession``.
-- SFU group calls are driven by ``RTCGroupCall``.
-
-For **server-SFU (SwiftSFU)** with NeedleTail-style signaling, also read the articles on **iOS + CallKit** media ordering, **SFU signaling** flags, and **per-participant frame E2EE** (remote video)—see the topics under *Server SFU, CallKit, and frame E2EE* below.
+For **SwiftSFU** + NeedleTail IRC, also read CallKit ordering, signaling flags, and frame E2EE articles below. The SFU forwards RTP and does not select frame keys.
 
 ### What you build vs what the SDK builds
 
 Your app (or backend) is responsible for:
 
-- Routing SDP offers/answers and ICE candidates to the correct peer/SFU.
-- Delivering opaque ciphertext blobs for 1:1 Double Ratchet / `call_cipher`.
-- Distributing SFU group sender frame keys over your encrypted application route.
-- Maintaining call membership/roster for group calls.
+- Routing SDP / ICE / encrypted packets to the peer or SFU
+- Delivering opaque `call_cipher` blobs for 1:1 media-ratchet exchange
+- Distributing SFU group sender frame keys over an encrypted application route
+- Maintaining roster for group calls
 
 The SDK is responsible for:
 
-- Creating and managing PeerConnections.
-- Managing the encryption key provider / FrameCryptors for audio+video frames.
-- Running pairwise Double Ratchet sessions used for 1:1 call setup and 1:1 SFU media-ratchet exchange.
+- Creating and managing PeerConnections
+- FrameCryptor / key-provider application
+- Pairwise Double Ratchet used for 1:1 setup and 1:1 SFU `call_cipher`
 
 ### Group-call keying model
 
-Encrypted SFU group media uses **application-injected per-sender frame keys**. Your app distributes
-each sender's frame key over an encrypted application route, then calls
-``RTCSession/setFrameEncryptionKey(_:index:for:)`` for the sender participant id. PQSRTC does not
-derive group media frame keys from pairwise `call_cipher`; that path is reserved for 1:1 media.
+Encrypted SFU group media uses **application-injected per-sender frame keys**. Call
+``RTCSession/setFrameEncryptionKey(_:index:for:)`` with the **sender** participant id. Do not
+derive group media keys from pairwise `call_cipher`.
 
 ## Topics
 
 ### Quickstarts
 
 - <doc:Getting-Started>
+- <doc:Architecture>
 - <doc:Group-Calls>
 
 ### Guides
@@ -49,19 +48,21 @@ derive group media frame keys from pairwise `call_cipher`; that path is reserved
 - <doc:Transport>
 - <doc:One-to-One-Calls>
 - <doc:End-to-End-Encryption>
-- <doc:GroupConferenceRemoteVideo> — group/conference **remote video** architecture (Apple + Android)
+- <doc:ScreenShare>
+- <doc:GroupConferenceRemoteVideo>
 
-### Server SFU, CallKit, and frame E2EE (NeedleTails)
+### Server SFU, CallKit, and frame E2EE
 
-- <doc:HostAppCallKitAndSFU> — iOS **CallKit** + server SFU **media bootstrap** ordering (inbound 1:1)
-- <doc:SFUSignalingOverview> — control plane, ``PacketFlag``, duplicate `handshakeComplete`
-- <doc:OneToOneSfuFrameE2EE> — `call_cipher`, frame identity props, and 1:1 SFU FrameCryptor key agreement
-- <doc:GroupSfuFrameE2EE> — group/conference sender keys and the app-injected FrameCryptor contract
-- <doc:SfuRemoteVideoFrameE2EE> — **remote video** and per-participant **FrameCryptor** identity (`msid`, 1:1 vs `conf-`)
+- <doc:HostAppCallKitAndSFU>
+- <doc:SFUSignalingOverview>
+- <doc:OneToOneSfuFrameE2EE>
+- <doc:GroupSfuFrameE2EE>
+- <doc:SfuRemoteVideoFrameE2EE>
 
 ### Core Types
 
 - ``RTCSession``
+- ``RTCSession/CryptorConfiguration``
 - ``RTCGroupCall``
 - ``RTCTransportEvents``
 - ``RTCSessionMediaEvents``
@@ -71,6 +72,7 @@ derive group media frame keys from pairwise `call_cipher`; that path is reserved
 - ``Call``
 - ``SessionDescription``
 - ``IceCandidate``
+- ``ConnectionLocalIdentity``
 
 ### E2EE
 
@@ -80,8 +82,8 @@ derive group media frame keys from pairwise `call_cipher`; that path is reserved
 
 ## Building this documentation
 
-- In **Xcode**: open the `pqs-rtc` package, select the **PQSRTC** target, then **Product → Build Documentation** (⌃⌥⌘D).
-- The DocC catalog is a single bundle at `Sources/PQSRTC/PQSRTC.docc/` (articles under `Articles/`).
+- In **Xcode**: open the `pqs-rtc` package, select **PQSRTC**, then **Product → Build Documentation**.
+- Catalog: `Sources/PQSRTC/PQSRTC.docc/`.
 
 @Metadata {
   @DisplayName("PQSRTC")

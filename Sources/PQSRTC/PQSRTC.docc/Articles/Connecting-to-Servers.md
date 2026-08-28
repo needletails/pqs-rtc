@@ -1,13 +1,15 @@
 # Connecting to Servers (Signaling, TURN/Coturn, SFU)
 
 PQSRTC is the **client-side** WebRTC + call orchestration + (optional) frame-level E2EE engine.
-To establish calls, your app must connect to three server-side components:
+To establish calls, the host must reach three server-side components:
 
-1) **Signaling / control plane** (your backend): authentication, roster, offer/answer exchange, ICE candidate relay, and (optionally) E2EE key distribution messages.
-2) **TURN (Coturn)**: reliable media connectivity when direct routes fail (NATs, cellular, enterprise networks).
-3) **SFU** (for group calls): a WebRTC endpoint that forwards media between participants.
+1) **Signaling / control plane** — authentication, roster, offer/answer, ICE relay, and E2EE key envelopes.
+2) **TURN (Coturn)** — media when direct ICE fails.
+3) **SFU** — RTP forward for group/conference and 1:1-over-SFU.
 
-This guide explains what each server does, what your client needs to know, and how they work together.
+NeedleTails production: Nudge Server (IRC + REST, ML-DSA-65 device JWTs) and **SwiftSFU** (IRC control plane + RTP forward, no transcoding, no frame keys). See the SwiftSFU README and DocC for environment names and the `NT-SFU-PROTO=1` wire contract.
+
+This guide is still written so a custom backend can implement the same semantics.
 
 ## High-level topology
 
@@ -29,7 +31,7 @@ This guide explains what each server does, what your client needs to know, and h
 
 Your signaling service is responsible for:
 
-- Authenticating the user/device and issuing a session token.
+- Authenticating the user/device (NeedleTails: IRC `PASS` + ML-DSA-65 device JWT).
 - Creating/joining/leaving calls.
 - Exchanging **SDP offers/answers**.
 - Relaying **ICE candidates**.
@@ -71,8 +73,8 @@ At minimum you typically need:
    - SFU routing identity (a string your app uses as `sfuRecipientId`)
    - ICE server list (STUN/TURN URLs and optional TURN credentials)
    - current participant roster
-3) Client creates ``RTCSession`` + ``RTCGroupCall``, calls `join()`.
-4) `RTCSession.createSFUIdentity(...)` triggers ``RTCTransportEvents/sendSfuMessage(_:call:)`` (with `packet.flag == .offer`).
+3) Client creates ``RTCSession`` and calls ``RTCSession/groupCallNegotiation(call:sfuRecipientId:)``.
+4) After SFU registration, media bootstrap triggers ``RTCTransportEvents/sendSfuMessage(_:call:)`` (`packet.flag == .offer`).
 5) Backend forwards offer to SFU, receives SFU answer, forwards answer back to client.
 6) Backend relays ICE candidates between client and SFU.
 7) Backend publishes roster updates as participants join/leave.
@@ -80,8 +82,9 @@ At minimum you typically need:
 ### Authentication & security notes
 
 - Use TLS for all signaling transports.
-- Prefer short-lived auth tokens (and short-lived TURN credentials).
-- If you run E2EE, treat roster + identity binding as security-critical.
+- Prefer short-lived TURN REST credentials (`TURN_AUTH_SECRET` on the server side).
+- NeedleTails clients present IRC `PASS` plus an ML-DSA-65 device JWT (SFU audience). `DEVICE_JWT_POLICY=disabled` rejects JWTs; it is not a bypass.
+- If you run E2EE, treat roster + participant-id binding as security-critical.
 
 ## 2) TURN (Coturn)
 
@@ -119,6 +122,8 @@ Notes:
 ## 3) SFU (Selective Forwarding Unit)
 
 ### What it must do
+
+NeedleTails production SFU is SwiftSFU. It does not transcode and does not pick frame keys.
 
 For PQSRTC group calls, the SFU must:
 
@@ -159,11 +164,10 @@ Example shape (illustrative):
 }
 ```
 
-Your app can then construct:
-
-- ``RTCSession``
-- ``RTCGroupCall``
+Your app constructs one ``RTCSession`` (`async`) and joins with ``RTCSession/groupCallNegotiation(call:sfuRecipientId:)``. ICE defaults to all-then-relay (4s).
 
 ## Where to go next
 
-- SFU group call flow details: <doc:Group-Calls>
+- SFU group call flow: <doc:Group-Calls>
+- Architecture: <doc:Architecture>
+- SwiftSFU: Getting Started, Configuration, Security Model, Client Integration

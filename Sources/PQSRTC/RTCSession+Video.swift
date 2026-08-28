@@ -543,7 +543,7 @@ extension RTCSession {
                 }
                 logger.log(
                     level: .info,
-                    message: "renderRemoteVideo resolved live inbound camera track connection=\(normalizedId) trackId=\(resolvedId) previousTrackId=\(cachedId ?? "nil")"
+                    message: "renderRemoteVideo resolved live inbound camera track connection=\(normalizedId) trackId=\(resolvedId ?? "nil") previousTrackId=\(cachedId ?? "nil")"
                 )
             }
         }

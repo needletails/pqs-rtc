@@ -56,6 +56,8 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private(set) var hasActiveRemoteScreenShare = false
     private var activeRemoteScreenShareParticipantId: String?
     private var keepRemoteSurfacesVisibleForSystemPiP = false
+    private var videoSurfacesHidden = false
+    private var keepLocalPreviewHiddenForPictureInPicture = false
     private var conferenceRaisedHands: [String: Bool] = [:]
 
     /// Tracks which participant is currently rendered by which view.
@@ -166,9 +168,21 @@ public actor AndroidVideoCallController: CallActionDelegate {
     /// Android `CallView` can appear while the session is already in `connecting`. Syncing after
     /// only the remote view is set causes the local preview bootstrap to run without a local view.
     public func setVideoViews(local: AndroidPreviewCaptureView, remotes: [AndroidSampleCaptureView]) async {
+        let sameLocal = localView === local
+        let sameRemotes = remoteViews.count == remotes.count
+            && zip(remoteViews, remotes).allSatisfy { $0 === $1 }
+        if sameLocal && sameRemotes {
+            logger.log(
+                level: .debug,
+                message: "AndroidVideoCallController setVideoViews skipped — same views already installed remoteCount=\(remotes.count)"
+            )
+            applyLocalPreviewHiddenState()
+            return
+        }
         self.localView = local
         let assignmentsLost = installRemoteViewsPreservingAssignments(remotes)
         logger.log(level: .info, message: "AndroidVideoCallController installed video views local=true remoteCount=\(remotes.count)")
+        applyLocalPreviewHiddenState()
         await videoCallDelegate?.remoteParticipantTilesDidChange()
         await syncWithCurrentState(reason: "setVideoViews")
         if assignmentsLost, isGroupCall, let connectionId = currentCall?.sharedCommunicationId {
@@ -833,7 +847,6 @@ public actor AndroidVideoCallController: CallActionDelegate {
     public func start() async {
         guard stateStreamTask == nil else {
             logger.log(level: .warning, message: "AndroidVideoCallController.start() called while already running; ignoring")
-            await syncWithCurrentState(reason: "start-already-running")
             return
         }
         isRunning = true
@@ -923,15 +936,21 @@ public actor AndroidVideoCallController: CallActionDelegate {
         case .held:
             break
         case .ended:
+            hideAllVideoSurfacesForCallEnd()
             await tearDownHostedMediaIfNeeded()
             markCallEndedLocally()
+            await videoCallDelegate?.endedCall(true)
         case .failed(_, _, let errorMessage):
             await videoCallDelegate?.passErrorMessage(errorMessage)
+            hideAllVideoSurfacesForCallEnd()
             await tearDownHostedMediaIfNeeded()
             markCallEndedLocally()
+            await videoCallDelegate?.endedCall(true)
         case .callAnsweredAuxDevice:
+            hideAllVideoSurfacesForCallEnd()
             await tearDownHostedMediaIfNeeded()
             markCallEndedLocally()
+            await videoCallDelegate?.endedCall(true)
         }
     }
 
@@ -955,6 +974,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
     /// Detaches session sinks while the call is still marked running and connection id is known.
     private func tearDownHostedMediaIfNeeded() async {
         guard isRunning else { return }
+        hideAllVideoSurfacesForCallEnd()
         await tearDownPreviewView()
         await tearDownSampleView()
         if let view = screenView, let connectionId = currentCall?.sharedCommunicationId {
@@ -4954,21 +4974,74 @@ public actor AndroidVideoCallController: CallActionDelegate {
         keepRemoteSurfacesVisibleForSystemPiP = keepVisible
     }
 
+    /// In-app and system PiP are remote-only. Survives `setVideoSurfacesHidden(false)`
+    /// so a chrome restore or system-PiP exit cannot bring local back over the floating remote.
+    public func setKeepLocalPreviewHiddenForPictureInPicture(_ hidden: Bool) {
+        if !hidden && !isCallActiveForSurfaceUnhide() {
+            keepLocalPreviewHiddenForPictureInPicture = true
+            applyLocalPreviewHiddenState()
+            logger.log(
+                level: .info,
+                message: "[CallChromeMinimize] keepLocalPreviewHiddenForPictureInPicture=true (ignored unhide — call not active)"
+            )
+            return
+        }
+        keepLocalPreviewHiddenForPictureInPicture = hidden
+        applyLocalPreviewHiddenState()
+        logger.log(
+            level: .info,
+            message: "[CallChromeMinimize] keepLocalPreviewHiddenForPictureInPicture=\(hidden)"
+        )
+    }
+
+    private func applyLocalPreviewHiddenState() {
+        localView?.setHidden(videoSurfacesHidden || keepLocalPreviewHiddenForPictureInPicture)
+    }
+
     /// SurfaceViews ignore Compose alpha/size/offset modifiers; hide every mounted renderer natively.
     public func setVideoSurfacesHidden(_ hidden: Bool) async {
+        if !hidden && !isCallActiveForSurfaceUnhide() {
+            hideAllVideoSurfacesForCallEnd()
+            logger.log(
+                level: .info,
+                message: "[CallChromeMinimize] AndroidVideoCallController setVideoSurfacesHidden skipped unhide — call not active remoteCount=\(remoteViews.count)"
+            )
+            return
+        }
+        videoSurfacesHidden = hidden
         let hideRemotes = hidden && !keepRemoteSurfacesVisibleForSystemPiP
-        localView?.setHidden(hidden)
+        applyLocalPreviewHiddenState()
         for view in remoteViews {
             view.setHidden(hideRemotes)
         }
         screenView?.setHidden(hidden)
         logger.log(
             level: .info,
-            message: "[CallChromeMinimize] AndroidVideoCallController setVideoSurfacesHidden hidden=\(hidden) remoteCount=\(remoteViews.count) hasScreenView=\(screenView != nil)"
+            message: "[CallChromeMinimize] AndroidVideoCallController setVideoSurfacesHidden hidden=\(hidden) remoteCount=\(remoteViews.count) hasScreenView=\(screenView != nil) keepLocalHidden=\(keepLocalPreviewHiddenForPictureInPicture)"
         )
         if !hidden {
             await reconcileVideoSurfacesAfterCallChromeUnhide()
         }
+    }
+
+    private func isCallActiveForSurfaceUnhide() -> Bool {
+        guard isRunning, currentCall != nil else { return false }
+        switch currentCallState {
+        case .ready, .connecting, .connected, .held:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func hideAllVideoSurfacesForCallEnd() {
+        videoSurfacesHidden = true
+        keepLocalPreviewHiddenForPictureInPicture = true
+        localView?.setHidden(true)
+        for view in remoteViews {
+            view.setHidden(true)
+        }
+        screenView?.setHidden(true)
     }
 
     /// After call chrome is restored, relayout native surfaces and rebind only when probes say sinks drifted.

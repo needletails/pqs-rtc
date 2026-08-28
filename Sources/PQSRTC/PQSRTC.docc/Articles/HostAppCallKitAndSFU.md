@@ -28,7 +28,9 @@ This article is the **canonical PQSRTC-side contract** for **inbound** 1:1 calls
 
 ### B. PQSRTC SDK (this package)
 
-- On `.connected`, if `audioSession.isActive`, PQSRTC **skips** redundant `setAudioMode` and only ensures WebRTC audio is enabled—see `RTCSession+State` implementation. Keep this behavior when merging.
+- Call ``RTCSession/setRequiresExternalAudioActivation(_:)`` with `true` on iOS inbound SFU so `call_cipher` PeerConnection creation waits for CallKit. Default is off (macOS / Android / tests).
+- After `provider(_:didActivate:)` and WebRTC bind, call ``RTCSession/markExternalAudioActivationComplete()``.
+- On `.connected`, if `audioSession.isActive`, PQSRTC **skips** redundant `setAudioMode` and only enables WebRTC audio (`RTCSession+State`). Do not reintroduce a second mode apply in the host.
 
 ### C. macOS and tests
 

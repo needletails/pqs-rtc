@@ -1,224 +1,117 @@
 # Group Calls (SFU)
 
-PQSRTC supports **SFU-style group calls** (one `RTCPeerConnection` to an SFU, multiple inbound tracks under Unified Plan) and **frame-level E2EE**.
+PQSRTC supports **SFU-style group calls**: one `RTCPeerConnection` to the SFU, multiple inbound tracks under Unified Plan, and optional frame-level E2EE.
 
-This SDK is intentionally transport-agnostic: your app provides signaling/control-plane networking via ``RTCTransportEvents``.
-
-If you haven’t set up your servers yet, start with <doc:Connecting-to-Servers>.
+The SDK is transport-agnostic. Your app provides ``RTCTransportEvents``. NeedleTails production SFU is SwiftSFU — see <doc:Connecting-to-Servers>.
 
 ## Concepts
 
 ### ``RTCSession``
 
-``RTCSession`` is the core actor that owns WebRTC state, call state, and E2EE primitives.
-
-You provide an app-defined transport (``RTCTransportEvents``) for exchanging offer/answer/candidates (and optional ciphertext).
+Owns WebRTC state, call state, and E2EE primitives. Inbound SFU packets enter through ``RTCSession/handleControlMessage(_:)``.
 
 ### ``RTCGroupCall``
 
-``RTCGroupCall`` is a small SFU group-call facade over ``RTCSession``.
+Per-room facade created by ``RTCSession/groupCallNegotiation(call:sfuRecipientId:)``.
 
-- `join()` starts the SFU call flow; after SFU identity negotiation, PQSRTC emits an encrypted
-  offer via ``RTCTransportEvents/sendSfuMessage(_:call:)``.
-- `handleControlMessage(.sfuAnswer(_))` / `handleControlMessage(.sfuCandidate(_))` apply SFU signaling.
-- `handleControlMessage(.participants(_))` / `handleControlMessage(.participantDemuxId(_))` apply roster updates.
-  Participant roster updates are also cleanup signals: when a stable participant leaves, PQSRTC
-  removes that participant's stored receiver tracks and FrameCryptors.
-- `events()` reports stable participant/track owners so the host can inject per-sender frame keys with
-  ``RTCSession/setFrameEncryptionKey(_:index:for:)``.
+- `join()` advances facade state only. Media starts after SFU registration via ``RTCSession/beginGroupCallMediaAfterSfuRegistrationIfNeeded(sfuRecipientId:)``.
+- `events()` reports state, roster, and ``RTCGroupCall/Event/remoteTrackAdded(participantId:kind:trackId:)``.
+- Use `updateParticipants` / `setDemuxId` for local roster views. Wire roster still arrives as encrypted packets on ``RTCSession/handleControlMessage(_:)``.
 
 ### Participant identifiers
 
-The SDK needs a stable `participantId` for each sender so that:
+Stable `participantId` values map tracks to UI tiles and FrameCryptor slots.
 
-- your app can map tracks to UI tiles, and
-- frame-level keys can be applied to the correct sender/track owner.
+Default: first WebRTC `streamId`. Apple SFU often emits a UUID placeholder first; PQSRTC reconciles the owner from SDP `msid` after `setRemoteDescription`. Camera and audio for one sender must share the same id.
 
-Default convention: `participantId == streamIds.first` (from the WebRTC receiver event).
+Override with ``RTCSession/setRemoteParticipantIdResolver(_:)`` if your SFU uses another convention.
 
-For Apple SFU calls, the first receiver callback can contain a UUID-like placeholder. PQSRTC
-reconciles the stable owner later from SDP `msid` lines after `setRemoteDescription`. This applies
-to camera and audio: both receivers for a sender must resolve to the same stable `participantId`
-before encrypted media can decode correctly.
+## Basic flow
 
-If your SFU uses a different convention, configure a resolver:
+### 1) Transport
 
-```swift
-session.setRemoteParticipantIdResolver { streamIds, trackId, trackKind in
-  // Return the participantId for this track.
-  streamIds.first
-}
-```
+Implement ``RTCTransportEvents`` (`sendSfuMessage`, `sendCiphertext` for 1:1 only, lifecycle callbacks). See <doc:Getting-Started>.
 
-## Basic flow (end-to-end)
-
-### 1) Implement the transport
-
-You implement ``RTCTransportEvents`` to send signaling to your backend/SFU.
+### 2) Session
 
 ```swift
-import PQSRTC
-
-struct MyTransport: RTCTransportEvents {
-  func sendStartCall(_ call: Call) async throws {
-    // 1:1 calls: Send start_call message to trigger VoIP notifications.
-  }
-
-  func sendOneToOneMessage(_ packet: RatchetMessagePacket, recipient: Call.Participant) async throws {
-    // 1:1 calls: Send encrypted signaling packet.
-    // Use `packet.flag` to distinguish offer/answer/candidate.
-  }
-
-  func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws {
-    // Group-call (SFU): forward the encoded packet to your SFU/signaling service.
-    // Use `packet.flag` to distinguish offer/answer/candidate.
-  }
-
-  func sendCiphertext(recipient: String, connectionId: String, ciphertext: Data, call: Call) async throws {
-    // Opaque ciphertext transport.
-    // Used for 1:1 Double Ratchet / call_cipher payloads.
-  }
-
-  func didEnd(call: Call, endState: CallStateMachine.EndState) async throws {
-    // Inform your backend/UI.
-  }
-}
-```
-
-### 2) Create the session
-
-For SFU group calls, prefer per-participant keying.
-
-```swift
-let session = RTCSession(
-  iceServers: ["stun:stun.l.google.com:19302"],
-  username: "",
-  password: "",
-  frameEncryptionKeyMode: .perParticipant,
+let session = await RTCSession(
+  iceServers: iceServers,
+  username: turnUser,
+  password: turnPass,
+  cryptorConfig: .init(mode: .perParticipant),
   delegate: MyTransport()
 )
 ```
 
-### 3) Create a group call handle
+### 3) Negotiate / register
 
-You provide a ``Call`` (your model object) and an `sfuRecipientId`.
-
-`sfuRecipientId` is a routing identity used by your transport. For SFU calls it represents “the SFU endpoint”, not a user.
+`sfuRecipientId` is the SFU room route (channel / `conf-` id), not a user.
 
 ```swift
-let groupCall = await session.createGroupCall(call: call, sfuRecipientId: "sfu")
+try await session.groupCallNegotiation(call: call, sfuRecipientId: roomId)
 ```
 
-### 4) Join and observe events
+There is also `join(sender:participants:sfuRecipientId:)` as a compatibility wrapper that builds the ``Call`` for you.
+
+After the SFU acknowledges registration and identity props exist, the session creates the PeerConnection and sends an encrypted offer through ``RTCTransportEvents/sendSfuMessage(_:call:)`` (`packet.flag == .offer`).
+
+### 4) Feed SFU signaling into the session
 
 ```swift
-Task {
+try await session.handleControlMessage(.sfuAnswer(answerPacket))
+try await session.handleControlMessage(.sfuCandidate(candidatePacket))
+try await session.handleControlMessage(.sfuOffer(renegotiationOfferPacket))
+try await session.handleControlMessage(.participants(rosterPacket))
+try await session.handleControlMessage(.participantDemuxId(demuxPacket))
+```
+
+Every case carries a ``RatchetMessagePacket``, not raw SDP strings or id arrays.
+
+### 5) Observe tracks
+
+```swift
+if let groupCall = session.groupCallForRoom(roomId) {
   for await event in await groupCall.events() {
-    switch event {
-    case .stateChanged(let state):
-      print("group call state=\(state)")
-
-    case .participantsUpdated(let participants):
-      print("participants=\(participants)")
-
-    case .remoteTrackAdded(let participantId, let kind, let trackId):
-      print("remote track: \(participantId) kind=\(kind) trackId=\(trackId)")
+    if case .remoteTrackAdded(let participantId, let kind, let trackId) = event {
+      // Attach UI / inject sender keys for that participantId
     }
   }
 }
-
-try await groupCall.join()
 ```
 
-After `join()`, your app should complete SFU identity negotiation (via your control plane) and
-call ``RTCSession/createSFUIdentity(sfuRecipientId:call:)`` once it has the SFU’s identity props.
-That call will:
+## Roster
 
-- create a PeerConnection intended to connect to your SFU,
-- create an offer,
-- call your transport: ``RTCTransportEvents/sendSfuMessage(_:call:)`` with `packet.flag == .offer`.
+Send the full current roster when possible. If the roster removes `alice`, the SDK prunes `alice`’s camera, audio, screen, and receiver FrameCryptors. Do not send a transient empty roster during reconnect unless everyone has left — an empty roster is ignored as non-authoritative cleanup.
 
-### 5) Feed SFU signaling back into the SDK
-
-When your app receives the SFU answer/candidates from your signaling service (encrypted packets):
+After you install a remote sender key, tell the SFU that this receiver is ready for that source:
 
 ```swift
-try await groupCall.handleControlMessage(.sfuAnswer(answerPacket))
-try await groupCall.handleControlMessage(.sfuCandidate(candidatePacket))
-```
-
-## Roster + demux updates
-
-Your control plane should tell the client who is in the call, and (optionally) any SFU demux ids.
-Send the full current roster when possible. If the roster removes `alice`, the SDK prunes `alice`'s
-camera, audio, screen-share receiver maps, and receiver FrameCryptors. Avoid sending a transient
-empty roster during reconnect unless everyone has really left, because an empty roster is ignored as
-non-authoritative cleanup input.
-
-```swift
-await groupCall.handleControlMessage(
-  .participants([
-    .init(id: "alice"),
-    .init(id: "bob")
-  ])
-)
-
-await groupCall.handleControlMessage(
-  .participantDemuxId(participantId: "alice", demuxId: 1234)
+try await session.sendSfuGroupMediaReady(
+  sourceParticipantId: remoteSenderId,
+  roomId: roomId,
+  call: call
 )
 ```
 
-## E2EE keying model
+Otherwise encrypted RTP can arrive before the matching receiver key exists.
 
-Encrypted group media uses application-injected **per-sender frame keys**.
+## E2EE
 
-The important rule: the `participantId` used with
-``RTCSession/setFrameEncryptionKey(_:index:for:)`` must identify the **track owner / sender id**.
+Per-sender keys, installed under the **track owner** id. See <doc:GroupSfuFrameE2EE>.
 
-Local sender setup:
+Do not derive group media keys from pairwise `call_cipher`.
 
-```swift
-let localSenderId = call.sender.secretName
-let localFrameKey = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+## Screen share
 
-await session.setFrameEncryptionKey(localFrameKey, index: 0, for: localSenderId)
-```
-
-Remote sender setup after your host transport receives an encrypted sender-key envelope:
-
-```swift
-await session.setFrameEncryptionKey(
-  remoteFrameKey,
-  index: remoteKeyIndex,
-  for: remoteSenderSecretName
-)
-```
-
-Your app must distribute the local frame key to every current participant and to late joiners. A
-minimal encrypted sender-key envelope contains:
-
-- room id
-- sender participant id
-- frame key bytes
-- key index
-
-The envelope can be carried over an app-defined encrypted call-control route. Some host apps keep a
-legacy metadata name such as `conferenceFrameKey`; that name is only wire compatibility. The SDK API
-contract is still: call ``RTCSession/setFrameEncryptionKey(_:index:for:)`` with the sender's stable
-participant id.
-
-Do not derive group media frame keys from pairwise `call_cipher`. Pairwise `call_cipher` is the
-1:1 media-ratchet identity exchange; group media has one outbound RTP stream per sender, so all
-receivers of that sender need the same key bytes under the same sender id.
-
-If encrypted video is correct but encrypted audio is garbled, check that the audio receiver was
-reconciled to the same sender id as the video receiver and that a sender key exists for that id.
-
-See <doc:GroupSfuFrameE2EE> and <doc:End-to-End-Encryption>.
+Fixed mids: audio `0`, camera `1`, screen `2`. See <doc:ScreenShare>.
 
 ## Remote video rendering
 
-Group/conference **camera tiles** (SFU renegotiation, wrapper rotation, Apple vs Android
-settlement, and host UI contracts) are documented in
-<doc:GroupConferenceRemoteVideo>. Read that article when implementing or reviewing multiparty
-video—not only when debugging frozen tiles.
+<doc:GroupConferenceRemoteVideo> covers wrapper rotation, attach policy, and Apple vs Android settlement. Read it when implementing multiparty tiles—not only when debugging frozen frames.
+
+## Related
+
+- <doc:Architecture>
+- <doc:SFUSignalingOverview>
+- <doc:SfuRemoteVideoFrameE2EE>

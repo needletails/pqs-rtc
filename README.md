@@ -1,87 +1,86 @@
 # PQSRTC
 
-[![Swift](https://img.shields.io/badge/Swift-6.3-orange.svg)](https://swift.org)
-[![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B%20%7C%20Android%2012%2B-blue.svg)](https://developer.apple.com)
-[![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE.txt)
+[![Swift](https://img.shields.io/badge/Swift-6.3+-orange.svg)](https://swift.org)
+[![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B-blue.svg)](https://developer.apple.com)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-PQSRTC is a cross-platform real-time communications (RTC) core designed for Apple platforms (Swift) and Android (Kotlin) via [Skip](https://skip.tools).
+Client-side WebRTC for Nudge: 1:1 calls, SFU group/conference calls, and optional frame-level E2EE. The SDK is transport-agnostic. Your app implements ``RTCTransportEvents`` and owns signaling. For NeedleTails production, that control plane is Nudge Server + [SwiftSFU](https://github.com/needletails/swift-sfu).
 
-It provides WebRTC session orchestration, call state/state-machine helpers, and optional frame-level end-to-end encryption (E2EE) primitives.
+Android uses the same Swift sources via [Skip](https://skip.tools). Package.swift platforms are iOS 18+ and macOS 15+. The host app sets the Android min SDK.
 
-## Platforms
+## What this SDK is (and is not)
 
-- Apple: iOS 18+, macOS 15+ (via Swift Package Manager)
-- Android: via Skip transpilation (Swift → Kotlin)
+- **Is:** PeerConnection lifecycle, SDP/ICE, SFU group-call state, FrameCryptor key application, 1:1 media-ratchet (`call_cipher`), screen-share contract (audio mid `0`, camera `1`, screen `2`).
+- **Is not:** A signaling server, an SFU, or a TURN service. SwiftSFU forwards RTP and does **not** pick frame keys.
+- **Is not:** A reason to rotate Nudge account keys. Session/media keys here are call-scoped.
 
 ## Installation
 
-Add this package to your app via Swift Package Manager (Xcode: **File → Add Packages…**) and import `PQSRTC`.
+Add the package with Swift Package Manager and `import PQSRTC`.
 
-## Quick start (Swift)
+## Quick start
 
-At the core is `RTCSession`, which requires your app to provide a transport delegate for exchanging offers/answers/ICE with your signaling layer.
+`RTCSession` is an actor. Construction is `async`. Frame-encryption mode lives on `CryptorConfiguration` (default `.perParticipant`).
 
 ```swift
 import PQSRTC
 
-let transport: RTCTransportEvents = /* your transport implementation */
-
-let session = RTCSession(
-	iceServers: ["stun:stun.l.google.com:19302"],
-	username: "",
-	password: "",
-	delegate: transport
+let session = await RTCSession(
+    iceServers: ["stun:stun.l.google.com:19302"],
+    username: "",
+    password: "",
+    cryptorConfig: .init(mode: .perParticipant),
+    delegate: transport
 )
 ```
 
-For multiparty, use `RTCGroupCall` (SFU-style) instead of building N×(N-1) peer connections.
+- **1:1:** identity exchange + `finishCryptoSessionCreation` / `handleOffer` / `handleAnswer` / `handleCandidate`. If the call is relayed through an SFU room, also read **OneToOneSfuFrameE2EE**.
+- **Group / conference:** `groupCallNegotiation(call:sfuRecipientId:)` is the production join path. It creates the ``RTCGroupCall``, registers with the SFU, and later bootstraps media. Feed inbound packets with ``RTCSession/handleControlMessage(_:)``. Inject per-sender frame keys with ``RTCSession/setFrameEncryptionKey(_:index:for:)``.
+
+Do not construct N×(N−1) mesh PeerConnections for multiparty.
 
 ## Documentation (DocC)
 
-The Swift **DocC** catalog for the `PQSRTC` target is a **single** bundle at [`Sources/PQSRTC/PQSRTC.docc/`](Sources/PQSRTC/PQSRTC.docc/) (articles in `Articles/`; root `PQSRTC.md`). In Xcode, open this package and use **Product → Build Documentation** (⌃⌥⌘D) to browse articles, including **host app + CallKit + server SFU** for iOS, **1:1 SFU `call_cipher` frame-key agreement** (`OneToOneSfuFrameE2EE.md`), and **remote video / per-participant frame E2EE** on the SFU (`SfuRemoteVideoFrameE2EE.md`).
+Single catalog: [`Sources/PQSRTC/PQSRTC.docc/`](Sources/PQSRTC/PQSRTC.docc/). In Xcode: **Product → Build Documentation**.
 
-## Building
+| Article | Use when |
+| --- | --- |
+| [Getting Started](Sources/PQSRTC/PQSRTC.docc/Articles/Getting-Started.md) | First integration |
+| [Architecture](Sources/PQSRTC/PQSRTC.docc/Articles/Architecture.md) | 1:1 vs group vs conference planes |
+| [Transport](Sources/PQSRTC/PQSRTC.docc/Articles/Transport.md) | `RTCTransportEvents` routing |
+| [Connecting to Servers](Sources/PQSRTC/PQSRTC.docc/Articles/Connecting-to-Servers.md) | Signaling, TURN, SwiftSFU |
+| [One-to-One Calls](Sources/PQSRTC/PQSRTC.docc/Articles/One-to-One-Calls.md) | Direct or SFU-relayed 1:1 |
+| [Group Calls](Sources/PQSRTC/PQSRTC.docc/Articles/Group-Calls.md) | SFU join, roster, control messages |
+| [End-to-End Encryption](Sources/PQSRTC/PQSRTC.docc/Articles/End-to-End-Encryption.md) | FrameCryptor model |
+| [Host app + CallKit + SFU](Sources/PQSRTC/PQSRTC.docc/Articles/HostAppCallKitAndSFU.md) | iOS inbound audio ordering |
+| [SFU signaling overview](Sources/PQSRTC/PQSRTC.docc/Articles/SFUSignalingOverview.md) | Flags, `handshakeComplete`, no extra offers |
+| [1:1 SFU frame E2EE](Sources/PQSRTC/PQSRTC.docc/Articles/OneToOneSfuFrameE2EE.md) | `call_cipher` |
+| [Group SFU frame E2EE](Sources/PQSRTC/PQSRTC.docc/Articles/GroupSfuFrameE2EE.md) | App-injected sender keys |
+| [Remote video / FrameCryptor ids](Sources/PQSRTC/PQSRTC.docc/Articles/SfuRemoteVideoFrameE2EE.md) | Black tiles with E2EE on |
+| [Group conference remote video](Sources/PQSRTC/PQSRTC.docc/Articles/GroupConferenceRemoteVideo.md) | Multiparty camera tiles |
+| [Screen share](Sources/PQSRTC/PQSRTC.docc/Articles/ScreenShare.md) | Mids, preempt, system audio |
 
-### Apple (SwiftPM)
+## Building and testing
 
 ```sh
 swift build
 swift test
 ```
 
-### Android (Skip)
-
-Install Skip with Homebrew:
+Android parity (Skip):
 
 ```sh
 brew install skiptools/skip/skip
-```
-
-Skip will install the required prerequisites (Kotlin/Gradle/Android tooling) and can run parity tests:
-
-```sh
 skip android test
 ```
 
-## Testing
+## Production notes
 
-- `swift test` runs the compiled Swift test suite on macOS.
-- `skip android test` can run cross-platform parity testing (Swift + transpiled Kotlin/JUnit).
-
-## Documentation
-
-- Group calls (SFU): [Sources/PQSRTC/PQSRTC.docc/Articles/Group-Calls.md](Sources/PQSRTC/PQSRTC.docc/Articles/Group-Calls.md)
-- Connecting to servers: [Sources/PQSRTC/PQSRTC.docc/Articles/Connecting-to-Servers.md](Sources/PQSRTC/PQSRTC.docc/Articles/Connecting-to-Servers.md)
-- DocC: see [Sources/PQSRTC/PQSRTC.docc](Sources/PQSRTC/PQSRTC.docc)
-
-## Troubleshooting / Production notes
-
-### iOS: video stalls after a few seconds (~300 frames)
-
-If you see a sender-side stall where video capture continues but outbound RTP stops, double-check H264
-`profile-level-id` negotiation. `RTCSession.modifySDP(...)` intentionally caps Constrained Baseline
-from level 5.2 (`42e034`) down to level 4.0 (`42e028`). Do **not** change this to level 3.1 (`42e01f`)
-for 1080p sources, as it can cause encoder/sender stalls.
+- **ICE:** default policy is `allThenRelay` (4s), then relay. TURN credentials go in `username` / `password`. Prefer time-limited TURN REST credentials from your backend.
+- **H264:** `RTCSession.modifySDP` caps Constrained Baseline `42e034` → `42e028` (level 4.0). Do not force `42e01f` for 1080p; that can stall the sender after a few hundred frames.
+- **iOS inbound SFU:** do not create SFU media before CallKit activates audio. Use `setRequiresExternalAudioActivation(true)` and `markExternalAudioActivationComplete()` plus the host contract in **HostAppCallKitAndSFU**.
+- **Group E2EE:** never derive group media keys from pairwise `call_cipher`. Install sender keys under participant ids, not room ids.
+- **Renegotiation:** only the documented offer origins (media bootstrap, sharer screen toggle, SFU receiver refresh). Do not fire extra offers from `negotiationNeeded`.
 
 ## License
 

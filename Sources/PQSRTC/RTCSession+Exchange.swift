@@ -1062,7 +1062,9 @@ extension RTCSession {
             logger.log(level: .info, message: "Android Modified Answer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
 
             logger.log(level: .info, message: "Generated SDP answer for call: \(call.sharedCommunicationId)")
+            logger.log(level: .info, message: "Android applying local answer SDP connection=\(connection.id)")
             try await self.rtcClient.setLocalDescription(description)
+            logger.log(level: .info, message: "Android applied local answer SDP connection=\(connection.id)")
 
             sdp = try SessionDescription(fromRTC: description)
 #elseif canImport(WebRTC)

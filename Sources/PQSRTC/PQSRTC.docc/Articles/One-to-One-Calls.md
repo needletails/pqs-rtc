@@ -94,7 +94,7 @@ try await session.handleAnswer(call: call, sdp: answer)
 ## Troubleshooting
 
 - If the caller never sends an offer after `finishCryptoSessionCreation`, check that you set `setCanAnswer(true)` (or `setCallAnswerState(_:for:)`).
-- If you see “RTCTransportEvents delegate not set”, ensure you passed a transport delegate into ``RTCSession/init(iceServers:username:password:logger:ratchetSalt:frameEncryptionKeyMode:delegate:)`` or called ``RTCSession/setDelegate(_:)``.
+- If you see “RTCTransportEvents delegate not set”, pass a transport into ``RTCSession/init(iceServers:username:password:iceTransportPolicyStrategy:iceDisconnectGracePeriodMs:logger:logLevel:cryptorConfig:delegate:)`` or call ``RTCSession/setDelegate(_:)``.
 - If audio/video decrypts as `missingKey`, ensure both sides are consistently using the same participant IDs (see <doc:End-to-End-Encryption>).
 - If 1:1 SFU media renders with FrameCryptor disabled but not when enabled, check the `call_cipher`
   contract in <doc:OneToOneSfuFrameE2EE> before changing PeerConnection or receiver creation.

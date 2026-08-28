@@ -33,16 +33,18 @@ import NeedleTailAsyncSequence
 /// Common usage:
 ///
 /// ```swift
-/// let session = RTCSession(
+/// let session = await RTCSession(
 ///   iceServers: ["stun:stun.l.google.com:19302"],
 ///   username: "",
 ///   password: "",
-///   frameEncryptionKeyMode: .perParticipant,
+///   cryptorConfig: .init(mode: .perParticipant),
 ///   delegate: transport
 /// )
+/// try await session.groupCallNegotiation(call: call, sfuRecipientId: roomId)
 /// ```
 ///
-/// For SFU group calls, prefer ``RTCSession/createGroupCall(call:sfuRecipientId:)``.
+/// For SFU group calls, prefer ``RTCSession/groupCallNegotiation(call:sfuRecipientId:)``.
+/// ``RTCSession/createGroupCall(call:sfuRecipientId:localIdentity:)`` is the lower-level wrapper.
 /* SKIP @bridge */
 public actor RTCSession {
     
@@ -1962,10 +1964,11 @@ public actor RTCSession {
 
     // MARK: - Public group-call API
     
-    /// Creates an SFU group call wrapper that drives SFU signaling through `RTCSession`.
+    /// Creates an SFU group-call facade.
     ///
-    /// The returned ``RTCGroupCall`` provides a single ingress for decoded SFU signaling,
-    /// roster updates, and key distribution.
+    /// Production hosts should call ``groupCallNegotiation(call:sfuRecipientId:)`` instead;
+    /// that path generates or loads ``ConnectionLocalIdentity`` and registers the room.
+    /// Inbound packets still enter through ``handleControlMessage(_:)``.
     public func createGroupCall(
         call: Call,
         sfuRecipientId: String,
@@ -2264,6 +2267,15 @@ public actor RTCSession {
     }()
 #endif
     
+    /// Creates a session.
+    ///
+    /// - Parameters:
+    ///   - iceServers: STUN/TURN URLs.
+    ///   - username: TURN username (empty if unused).
+    ///   - password: TURN credential (empty if unused).
+    ///   - iceTransportPolicyStrategy: Default `.allThenRelay` after 4 seconds.
+    ///   - cryptorConfig: Frame-encryption mode and ratchet salt. Default is per-participant.
+    ///   - delegate: Host transport. Required before outbound signaling.
     public init(
         iceServers: [String],
         username: String,
@@ -2415,6 +2427,10 @@ public actor RTCSession {
     }
 
 
+    /// Frame-encryption settings for a session.
+    ///
+    /// Default mode is ``RTCFrameEncryptionKeyMode/perParticipant``. Use `.none` only when
+    /// FrameCryptor should stay off. Pass this to ``init(iceServers:username:password:iceTransportPolicyStrategy:iceDisconnectGracePeriodMs:logger:logLevel:cryptorConfig:delegate:)``.
     public struct CryptorConfiguration: Sendable {
         let ratchetSalt: Data
         let mode: RTCFrameEncryptionKeyMode

@@ -18,7 +18,7 @@ With frame-level E2EE:
 
 ## Key application model: `RTCFrameEncryptionKeyMode`
 
-The SDK supports two ways to apply media keys:
+The SDK supports three ways to apply media keys:
 
 - ``RTCFrameEncryptionKeyMode/shared``
   - One shared key ring.
@@ -28,6 +28,9 @@ The SDK supports two ways to apply media keys:
 - ``RTCFrameEncryptionKeyMode/perParticipant``
   - Keys are applied per `participantId`.
   - Required for SFU group calls, where multiple senders’ frames are interleaved.
+
+- ``RTCFrameEncryptionKeyMode/none``
+  - FrameCryptor disabled. Use only when you intentionally send unencrypted media.
 
 ## The critical rule: participant IDs must match
 

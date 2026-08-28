@@ -43,13 +43,14 @@ receiver logs for a missing `Created receiver FrameCryptor kind=audio participan
 
 ## Server contract
 
-- The **SwiftSFU** process defines IRC-backed SFU behavior, room routing, and relay rules. See the SwiftSFU documentation catalog in the `swift-sfu` package for environment variables, control-plane behavior, and client-facing expectations.
+- The **SwiftSFU** process defines IRC-backed SFU behavior, room routing, and relay rules. See the SwiftSFU DocC catalog (`GettingStarted`, `Configuration`, `Architecture`, `SecurityModel`, `ClientIntegration`) and the `swift-sfu` README for environment names, the IRC wire contract, and client-facing expectations.
 - The **Nudge** / NeedleTail app bridges IRC SFU messages into PQSRTC; your host must key rooms consistently (`sharedCommunicationId`, `#` channel form, and normalized connection ids) as the SDK expects.
 - Roster updates should represent current room membership. PQSRTC uses them as an additional cleanup
   signal for departed participants' receiver tracks and FrameCryptors.
 
 ## See also
 
+- <doc:Architecture>
 - <doc:GroupConferenceRemoteVideo> — group/conference remote **video tile** architecture (Apple + Android)
 - <doc:HostAppCallKitAndSFU> for **iOS CallKit** ordering with SFU
 - <doc:OneToOneSfuFrameE2EE> for `call_cipher` and 1:1 SFU frame-key agreement

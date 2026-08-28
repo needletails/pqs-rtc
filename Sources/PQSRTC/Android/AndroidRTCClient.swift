@@ -423,11 +423,16 @@ private final class RTCOnSetObserver: NSObject, org.webrtc.SdpObserver, @uncheck
     private let callback: (String?) -> Void
     init(_ callback: @escaping (String?) -> Void) { self.callback = callback }
     
+    private var didFinish = false
+
     override func onSetSuccess() {
         lock.lock()
-        defer {
+        guard !didFinish else {
             lock.unlock()
+            return
         }
+        didFinish = true
+        lock.unlock()
         callback(nil)
     }
     
@@ -435,9 +440,12 @@ private final class RTCOnSetObserver: NSObject, org.webrtc.SdpObserver, @uncheck
     override func onCreateFailure(_ error: String?) {}
     override func onSetFailure(_ error: String?) {
         lock.lock()
-        defer {
+        guard !didFinish else {
             lock.unlock()
+            return
         }
+        didFinish = true
+        lock.unlock()
         callback(error ?? "set description failed")
     }
 }
@@ -745,7 +753,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
     // Retain SDP observers until their callbacks fire (avoid premature disposal)
     private var pendingOfferObserver: RTCOnCreateSdpObserver?
     private var pendingAnswerObserver: RTCOnCreateSdpObserver?
-    private var pendingSetLocalObserver: RTCOnSetObserver?
     private var pendingSetRemoteObserver: RTCOnSetObserver?
     
     private var iceServers = [String]()
@@ -2564,6 +2571,35 @@ public final class AndroidRTCClient: @unchecked Sendable {
         }
     }
 
+    /// Initializes the local TextureView preview with the client's EGL context.
+    public func safelyInitializeLocalPreview(
+        _ view: AndroidPreviewCaptureView,
+        mirror: Bool = false
+    ) -> Bool {
+        lock.lock()
+        let closed = isClosed
+        lock.unlock()
+        guard !closed else {
+            AndroidRTCViewSupport.logSurfaceRendererInitFailure()
+            return false
+        }
+        do {
+            try ensureEglBase()
+        } catch {
+            AndroidRTCViewSupport.logSurfaceRendererInitFailure()
+            return false
+        }
+        lock.lock()
+        let currentEglBase = eglBase
+        lock.unlock()
+        guard let currentEglBase else {
+            AndroidRTCViewSupport.logSurfaceRendererInitFailure()
+            return false
+        }
+        view.initializePreview(eglBase: currentEglBase, mirror: mirror)
+        return true
+    }
+
     /// Reinitializes a renderer after its Android `SurfaceView` changes dimensions.
     ///
     /// Grid relayout can shrink a tile from full-screen to a split grid cell while the EGL
@@ -2625,16 +2661,50 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // Remove from tracking
         activeSurfaceRenderers.remove(renderer)
     }
+
+    /// Hangup-safe unregister. A missing entry is a no-op. Call from Kotlin with a
+    /// native SurfaceView field — do not first-read an unused Skip getter after reset
+    /// (JNI method-id lookup SIGTRAPs; same class of bug as reading `keyProvider`).
+    @discardableResult
+    public func removeRendererIfTracked(_ renderer: org.webrtc.SurfaceViewRenderer) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeSurfaceRenderers.contains(renderer) else { return false }
+        activeSurfaceRenderers.remove(renderer)
+        return true
+    }
     
-    /// Safely releases a renderer, handling cases where the OpenGL context may already be destroyed.
+    /// Releases a renderer. Always calls `SurfaceViewRenderer.release()` so the EglRenderer
+    /// stats thread stops, even if the shared EGL context is already gone.
     ///
     /// - Parameter renderer: The renderer to release.
     public func safeReleaseRenderer(_ renderer: org.webrtc.SurfaceViewRenderer) {
         lock.lock()
-        let currentEglBase = eglBase
+        activeSurfaceRenderers.remove(renderer)
         lock.unlock()
-        
-        AndroidRTCViewSupport.safeReleaseRenderer(renderer: renderer, eglBase: currentEglBase)
+        AndroidRTCViewSupport.releaseRenderer(renderer, "AndroidRTCClient")
+    }
+
+    /// Stops every initialized `SurfaceViewRenderer` stats thread.
+    ///
+    /// Hangup reuses this client (`resetPeerConnectionForRetry`) and the remote grid uses
+    /// `cleanupOnDispose: false`, so Compose/UI teardown often never calls `release()`.
+    public func releaseAllSurfaceRenderers() {
+        lock.lock()
+        let renderers = Array(activeSurfaceRenderers)
+        activeSurfaceRenderers.removeAll()
+        lock.unlock()
+        releaseSurfaceRendererInstances(renderers)
+    }
+
+    private func releaseSurfaceRendererInstances(_ renderers: [org.webrtc.SurfaceViewRenderer]) {
+        guard !renderers.isEmpty else { return }
+        let releasedCount = renderers.count
+        _ = releasedCount
+        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Releasing " + releasedCount + " SurfaceViewRenderer(s) to stop EglRenderer stats")
+        for renderer in renderers {
+            AndroidRTCViewSupport.releaseRenderer(renderer, "AndroidRTCClient")
+        }
     }
     
     /// Attempts to fetch the first remote video track from the provided peer connection.
@@ -2866,38 +2936,33 @@ public final class AndroidRTCClient: @unchecked Sendable {
         peerConnection.createAnswer(obs, constraints.platformConstraints)
     }
     
-    private func setLocalDescription(_ sdp: RTCSessionDescription, completion: ((String?) -> Void)? = nil) throws {
+    /// Applies local SDP and waits for WebRTC's Java `SdpObserver`.
+    ///
+    /// Calls ``AndroidNativeSetLocalDescription`` on the raw `org.webrtc.PeerConnection`.
+    /// Skip's `RTCPeerConnection` wrapper has no `setLocalDescription`. A Skip-bridged Swift
+    /// observer also parks answer `createAnswer` when signaling goes STABLE during JNI.
+    private func setLocalDescriptionAndWait(_ sdp: RTCSessionDescription) throws -> String? {
         lock.lock()
         let isClosedCheck = isClosed
         let pc = peerConnection?.platformPeerConnection
         lock.unlock()
-        
+
         guard !isClosedCheck else {
             throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
         }
-        
-        guard let peerConnection = pc else {
+
+        guard let nativePeerConnection = pc else {
             throw RTCClientErrors.peerConnectionError("PeerConnection has not been initialized")
         }
-        
-        let obs = RTCOnSetObserver { [weak self] failureMessage in
-            guard let self else { return }
-            // Set-description success is a receiver-rotation boundary: mark the cached
-            // transceiver snapshot stale so the next resolution refreshes it exactly once.
-            if failureMessage == nil {
-                AndroidWebRTCTrackResolver.invalidateTransceiverSnapshot(peerConnection: peerConnection)
-            }
-            self.lock.lock()
-            defer { self.lock.unlock() }
-            completion?(failureMessage)
-            self.pendingSetLocalObserver = nil
+
+        let failureMessage = AndroidNativeSetLocalDescription.applyAndWait(
+            peerConnection: nativePeerConnection,
+            sdp: sdp.platform
+        )
+        if failureMessage == nil {
+            AndroidWebRTCTrackResolver.invalidateTransceiverSnapshot(peerConnection: nativePeerConnection)
         }
-        
-        lock.lock()
-        pendingSetLocalObserver = obs
-        lock.unlock()
-        
-        peerConnection.setLocalDescription(obs, sdp.platform)
+        return failureMessage
     }
     
     private func setRemoteDescription(_ sdp: RTCSessionDescription, completion: ((String?) -> Void)? = nil) throws {
@@ -2923,9 +2988,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
                 AndroidWebRTCTrackResolver.invalidateTransceiverSnapshot(peerConnection: peerConnection)
             }
             self.lock.lock()
-            defer { self.lock.unlock() }
-            completion?(failureMessage)
+            let pendingCompletion = completion
             self.pendingSetRemoteObserver = nil
+            self.lock.unlock()
+            pendingCompletion?(failureMessage)
         }
         
         lock.lock()
@@ -2976,11 +3042,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     
     /// Sets the peer connection's local description.
     public func setLocalDescription(_ sdp: RTCSessionDescription) async throws {
-        let failureMessage: String? = try await withCheckedThrowingContinuation { continuation in
-            try self.setLocalDescription(sdp) { failureMessage in
-                continuation.resume(returning: failureMessage)
-            }
-        }
+        let failureMessage = try self.setLocalDescriptionAndWait(sdp)
         if let failureMessage {
             throw RTCClientErrors.peerConnectionError(failureMessage)
         }
@@ -3039,7 +3101,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
         delegate = nil
         pendingOfferObserver = nil
         pendingAnswerObserver = nil
-        pendingSetLocalObserver = nil
         pendingSetRemoteObserver = nil
         observer = nil
 
@@ -3136,7 +3197,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // Clear pending observers
         pendingOfferObserver = nil
         pendingAnswerObserver = nil
-        pendingSetLocalObserver = nil
         pendingSetRemoteObserver = nil
         observer = nil
 
@@ -3174,16 +3234,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         surfaceTextureHelperToDispose?.dispose()
         screenSurfaceTextureHelperToDispose?.dispose()
 
-        // SKIP INSERT: for (renderer in renderersToRelease) {
-        // SKIP INSERT:     try {
-        // SKIP INSERT:         val egl = eglBaseToRelease
-        // SKIP INSERT:         if (egl != null && egl.eglBaseContext != null) {
-        // SKIP INSERT:             renderer.release()
-        // SKIP INSERT:         }
-        // SKIP INSERT:     } catch (_: Throwable) {
-        // SKIP INSERT:         // Ignore teardown-time renderer release failures.
-        // SKIP INSERT:     }
-        // SKIP INSERT: }
+        releaseSurfaceRendererInstances(renderersToRelease)
 
         AndroidWebRTCTrackResolver.invalidateTransceiverSnapshot(peerConnection: peerConnectionToClose)
         peerConnectionToClose?.close()

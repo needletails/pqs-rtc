@@ -68,7 +68,7 @@ When you send/receive SDP, you’ll usually serialize ``SessionDescription``.
 Serialize ``IceCandidate`` and route inbound via:
 
 - ``RTCSession/handleCandidate(call:candidate:)`` (1:1)
-- or for SFU group calls, via ``RTCGroupCall/handleControlMessage(_:)`` with `.sfuCandidate`.
+- or for SFU group calls, via ``RTCSession/handleControlMessage(_:)`` with `.sfuCandidate` (a ``RatchetMessagePacket``, not a raw ``IceCandidate``).
 
 ### Ciphertext
 
@@ -127,6 +127,6 @@ You do **not** need IRC tags for SFU signaling: the SDK emits/consumes a `Ratche
 that already includes a `flag` describing the message kind (offer/answer/candidate).
 
 - `to: "sfu"` (or any constant/identifier you choose)
-- deliver inbound SFU answer/candidates into ``RTCGroupCall`` using ``RTCGroupCall/handleControlMessage(_:)``.
+- deliver inbound SFU answer/candidates/offers into ``RTCSession/handleControlMessage(_:)``.
 
 See <doc:Group-Calls>.

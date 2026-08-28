@@ -24,10 +24,11 @@ import DoubleRatchetKit
 /// frame-level E2EE.
 ///
 /// `RTCGroupCall` provides:
-/// - A single entrypoint for decoded control-plane messages: ``handleControlMessage(_:)``
 /// - A stream of high-level events (state/roster/track arrival): ``events()``
-/// - Receiver identity events that let the host app inject per-sender frame keys with
-///   ``RTCSession/setFrameEncryptionKey(_:index:for:)``.
+/// - Local roster helpers (`updateParticipants`, `setDemuxId`)
+/// - `ControlMessage` cases consumed by ``RTCSession/handleControlMessage(_:)``
+///
+/// Hosts inject per-sender frame keys with ``RTCSession/setFrameEncryptionKey(_:index:for:)``.
 ///
 /// See <doc:Group-Calls>.
 public actor RTCGroupCall: RTCSessionMediaEvents {

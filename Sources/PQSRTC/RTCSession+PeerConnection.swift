@@ -102,6 +102,7 @@ extension RTCSession {
         rtcClient.setAudioEnabled(false)
         rtcClient.stopLocalVideo()
         rtcClient.stopScreenCapture()
+        rtcClient.releaseAllSurfaceRenderers()
 #endif
 
         logger.log(level: .info, message: "Released local media resources for ending call: \(call?.sharedCommunicationId ?? "<none>")")

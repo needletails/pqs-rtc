@@ -1,19 +1,25 @@
 package pqsrtc.module
 
 import android.graphics.Outline
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.graphics.SurfaceTexture
 import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import org.webrtc.AudioTrack
 import org.webrtc.EglBase
+import org.webrtc.EglRenderer
 import org.webrtc.FrameCryptor
 import org.webrtc.FrameCryptorAlgorithm
 import org.webrtc.FrameCryptorFactory
 import org.webrtc.FrameCryptorKeyProvider
+import org.webrtc.GlRectDrawer
 import org.webrtc.JavaI420Buffer
 import org.webrtc.MediaStreamTrack
 import org.webrtc.PeerConnection
@@ -22,13 +28,50 @@ import org.webrtc.RendererCommon
 import org.webrtc.RtpReceiver
 import org.webrtc.RtpSender
 import org.webrtc.RtpTransceiver
+import org.webrtc.SdpObserver
+import org.webrtc.SessionDescription
 import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoFrame
+import org.webrtc.VideoSink
 import org.webrtc.VideoTrack
 import org.webrtc.YuvHelper
 import skip.foundation.ProcessInfo
 import java.util.ConcurrentModificationException
 import java.util.WeakHashMap
+import java.util.concurrent.CountDownLatch
+
+/**
+ * Applies local SDP on the raw Java [PeerConnection].
+ *
+ * Skip's `RTCPeerConnection` wrapper has no `setLocalDescription`. A Skip-bridged Swift
+ * `SdpObserver` also parks answer `createAnswer` when signaling goes STABLE during JNI.
+ * This wait is Java-to-Java: native `onSetSuccess` / `onSetFailure` counts down the latch.
+ */
+object AndroidNativeSetLocalDescription {
+    fun applyAndWait(peerConnection: PeerConnection, sdp: SessionDescription): String? {
+        val errorHolder = arrayOfNulls<String>(1)
+        val latch = CountDownLatch(1)
+        val observer = object : SdpObserver {
+            override fun onSetSuccess() {
+                Log.i("AndroidRTCClient", "setLocalDescription completed via kotlin-observer")
+                latch.countDown()
+            }
+
+            override fun onSetFailure(error: String?) {
+                Log.e("AndroidRTCClient", "setLocalDescription failed: $error")
+                errorHolder[0] = error ?: "set description failed"
+                latch.countDown()
+            }
+
+            override fun onCreateSuccess(desc: SessionDescription?) {}
+
+            override fun onCreateFailure(error: String?) {}
+        }
+        peerConnection.setLocalDescription(observer, sdp)
+        latch.await()
+        return errorHolder[0]
+    }
+}
 
 /**
  * FrameCryptor reuse policy for Android SFU renegotiation.
@@ -266,15 +309,14 @@ object AndroidRTCViewSupport {
     /// `View.GONE` tears down surfaces; off-screen translation does not move SurfaceView layers.
     /// `INVISIBLE` keeps EGL sinks live while removing the layer from the screen.
     fun setViewHiddenForCallChromeMinimize(view: android.view.View, hidden: Boolean, logTag: String) {
-        view.translationX = 0f
-        view.translationY = 0f
+        // Do not reset translationX/Y. Native call-chrome drag stores position on the
+        // tile ancestor; visibility apply runs on every chrome sync and would snap drag back.
         if (hidden) {
             view.alpha = 0f
             view.visibility = android.view.View.INVISIBLE
         } else {
             view.alpha = 1f
             view.visibility = android.view.View.VISIBLE
-            view.requestLayout()
         }
         Log.d(
             logTag,
@@ -374,9 +416,9 @@ object AndroidRTCViewSupport {
         }
     }
 
-    fun addTrackSink(track: RTCVideoTrack, renderer: SurfaceViewRenderer, logTag: String, message: String): Boolean {
+    fun addTrackSink(track: RTCVideoTrack, sink: VideoSink, logTag: String, message: String): Boolean {
         return try {
-            track.platformTrack.addSink(renderer)
+            track.platformTrack.addSink(sink)
             Log.d(logTag, message)
             true
         } catch (e: IllegalStateException) {
@@ -385,9 +427,9 @@ object AndroidRTCViewSupport {
         }
     }
 
-    fun removeTrackSink(track: RTCVideoTrack, renderer: SurfaceViewRenderer) {
+    fun removeTrackSink(track: RTCVideoTrack, sink: VideoSink) {
         try {
-            track.platformTrack.removeSink(renderer)
+            track.platformTrack.removeSink(sink)
         } catch (_: IllegalStateException) {
             // Ignore receivers that were already detached or disposed during renegotiation.
         }
@@ -474,23 +516,14 @@ object AndroidRTCViewSupport {
     }
 
     fun applyRoundedOutline(view: View, radiusDp: Float) {
-        val radiusPx = radiusDp * view.resources.displayMetrics.density
-        view.clipToOutline = true
-        view.outlineProvider = object : ViewOutlineProvider() {
-            override fun getOutline(v: View, outline: Outline) {
-                outline.setRoundRect(0, 0, v.width, v.height, radiusPx)
-            }
-        }
-        view.invalidateOutline()
+        applyHostRoundedOutline(view, radiusDp)
     }
 
     /// Removes a previously applied rounded outline. Renderers are pooled across Compose
     /// remounts, so a renderer that used to carry the tile outline must be reset when the
     /// outline moves to its aspect-fit host container.
     fun clearRoundedOutline(view: View) {
-        view.clipToOutline = false
-        view.outlineProvider = ViewOutlineProvider.BACKGROUND
-        view.invalidateOutline()
+        applyHostRoundedOutline(view, 0f)
     }
 
     fun detachFromParent(view: View) {
@@ -502,6 +535,8 @@ object AndroidRTCViewSupport {
 
     private val rendererAspectFitContainers =
         WeakHashMap<SurfaceViewRenderer, android.widget.FrameLayout>()
+    private val localPreviewHosts =
+        WeakHashMap<View, android.widget.FrameLayout>()
 
     private data class RemoteCameraScaleState(
         var forceAspectFit: Boolean = true,
@@ -635,12 +670,17 @@ object AndroidRTCViewSupport {
         } else {
             aspectFillContainer(renderer)
         }
-        clearRoundedOutline(view = renderer)
         if (state.cornerRadiusDp > 0f) {
             applyRoundedOutline(view = container, radiusDp = state.cornerRadiusDp)
+            applyRoundedOutline(view = renderer, radiusDp = state.cornerRadiusDp)
         } else {
+            clearRoundedOutline(view = renderer)
             clearRoundedOutline(view = container)
         }
+        // SurfaceView must remain below the activity-content hit layer. PiP drag registration
+        // belongs to the outer call tile, not this renderer: rounded conference cells are style,
+        // not draggable in-app PiP windows.
+        renderer.setZOrderOnTop(false)
         return container
     }
 
@@ -798,6 +838,69 @@ object AndroidRTCViewSupport {
         renderer.setZOrderMediaOverlay(true)
     }
 
+    /// Local preview host. The preview is a TextureView so public `clipToOutline`
+    /// actually rounds pixels (a hole-punched SurfaceView cannot).
+    fun localPreviewHostContainer(
+        previewView: View,
+        cornerRadiusDp: Float,
+    ): android.widget.FrameLayout {
+        val host = synchronized(localPreviewHosts) {
+            localPreviewHosts[previewView] ?: android.widget.FrameLayout(previewView.context).also { created ->
+                created.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                localPreviewHosts[previewView] = created
+            }
+        }
+        host.layoutParams = (host.layoutParams ?: ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )).also {
+            it.width = ViewGroup.LayoutParams.MATCH_PARENT
+            it.height = ViewGroup.LayoutParams.MATCH_PARENT
+        }
+        if (previewView.parent !== host) {
+            detachFromParent(previewView)
+            host.addView(
+                previewView,
+                android.widget.FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            )
+        }
+        if (cornerRadiusDp > 0f) {
+            applyRoundedOutline(view = previewView, radiusDp = cornerRadiusDp)
+            applyRoundedOutline(view = host, radiusDp = cornerRadiusDp)
+            AndroidCallChromeNativeSupport.attachNativeCallChromeDrag(
+                seed = host,
+                key = "local",
+                enableTap = false,
+                edgeDp = 20f,
+            )
+        } else {
+            clearRoundedOutline(view = previewView)
+            clearRoundedOutline(view = host)
+        }
+        return host
+    }
+
+    fun localPreviewHostOrNull(previewView: View): android.widget.FrameLayout? {
+        return synchronized(localPreviewHosts) { localPreviewHosts[previewView] }
+    }
+
+    fun removeLocalPreviewHost(previewView: View) {
+        synchronized(localPreviewHosts) {
+            localPreviewHosts.remove(previewView)
+        }
+    }
+
+    fun initializeLocalPreviewTexture(
+        previewView: LocalPreviewTextureRenderer,
+        eglBase: EglBase,
+        mirror: Boolean,
+    ) {
+        previewView.initialize(eglBase, mirror)
+    }
+
     fun postToMainThread(action: () -> Unit) {
         Handler(Looper.getMainLooper()).post { action() }
     }
@@ -885,12 +988,13 @@ object AndroidRTCViewSupport {
         }
     }
 
-    fun safeReleaseRenderer(renderer: SurfaceViewRenderer, eglBase: EglBase?) {
-        if (eglBase?.eglBaseContext != null) {
-            releaseRenderer(renderer, "AndroidRTCClient")
-        } else {
-            Log.w("AndroidRTCClient", "Skipping renderer release - EGL context already destroyed")
-        }
+    fun safeReleaseRenderer(
+        renderer: SurfaceViewRenderer,
+        @Suppress("UNUSED_PARAMETER") eglBase: EglBase?,
+    ) {
+        // Always release. EglRenderer's 4s stats thread keeps logging until release(),
+        // even after the shared EglBase is already gone. releaseRenderer swallows GL errors.
+        releaseRenderer(renderer, "AndroidRTCClient")
     }
 
     fun logSurfaceRendererInitFailure() {
@@ -1406,34 +1510,140 @@ class AndroidFrameCryptorSupport {
     }
 }
 
+/// Local preview renders into a TextureView so public `clipToOutline` can round it.
+/// SurfaceView hole-punch ignores outline on Sony / targetSdk 36.
+class LocalPreviewTextureRenderer(
+    context: android.content.Context,
+) : TextureView(context), VideoSink, TextureView.SurfaceTextureListener {
+    private val eglRenderer = EglRenderer("LocalPreview")
+    private var eglReady = false
+    private var surfaceBound = false
+    private var pendingMirror = true
+    var onReady: (() -> Unit)? = null
+
+    init {
+        isOpaque = false
+        surfaceTextureListener = this
+    }
+
+    fun initialize(eglBase: EglBase, mirror: Boolean) {
+        pendingMirror = mirror
+        if (eglReady) {
+            eglRenderer.setMirror(mirror)
+            return
+        }
+        eglRenderer.init(eglBase.eglBaseContext, EglBase.CONFIG_PLAIN, GlRectDrawer())
+        eglRenderer.setMirror(mirror)
+        eglReady = true
+        tryBindSurface()
+    }
+
+    fun setMirror(mirror: Boolean) {
+        pendingMirror = mirror
+        if (eglReady) {
+            eglRenderer.setMirror(mirror)
+        }
+    }
+
+    fun releaseRenderer() {
+        Log.i("AndroidPreviewCaptureView", "LocalPreviewTextureRenderer.releaseRenderer eglReady=$eglReady")
+        try {
+            eglRenderer.release()
+        } catch (_: Throwable) {
+        }
+        eglReady = false
+        surfaceBound = false
+    }
+
+    fun isReady(): Boolean = eglReady && surfaceBound && width > 0 && height > 0
+
+    override fun onFrame(frame: VideoFrame) {
+        eglRenderer.onFrame(frame)
+    }
+
+    override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+        tryBindSurface()
+        if (isReady()) {
+            onReady?.invoke()
+        }
+    }
+
+    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+        if (width > 0 && height > 0) {
+            onReady?.invoke()
+        }
+    }
+
+    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+        surfaceBound = false
+        try {
+            eglRenderer.releaseEglSurface { }
+        } catch (_: Throwable) {
+        }
+        return true
+    }
+
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+
+    private fun tryBindSurface() {
+        if (!eglReady || surfaceBound) return
+        val texture = surfaceTexture ?: return
+        try {
+            eglRenderer.createEglSurface(texture)
+            surfaceBound = true
+        } catch (_: Throwable) {
+        }
+    }
+}
+
 class AndroidPreviewCaptureViewNative(
-    @Suppress("UNUSED_PARAMETER") client: AndroidRTCClient,
+    private val client: AndroidRTCClient,
 ) {
+    /// Unused leftover SurfaceView. Not in the view hierarchy. Unregister +
+    /// release happen here in Kotlin — do not read this through Skip Swift
+    /// after client shutdown (JNI getter SIGTRAPs).
     val surfaceViewRenderer: SurfaceViewRenderer =
         AndroidRTCViewSupport.createSurfaceViewRenderer(
             normalizeToUpright = false,
             logTag = "ANDROIDPREVIEWCAPTUREVIEW"
         )
 
+    val previewDisplayView: LocalPreviewTextureRenderer =
+        LocalPreviewTextureRenderer(ProcessInfo.processInfo.androidContext)
+
     private var pendingTrack: RTCVideoTrack? = null
-    private var surfaceCallbackSetup = false
     private var localOutlineRadiusDp = 12f
 
-    fun setMirror(mirrored: Boolean) {
-        surfaceViewRenderer.setMirror(mirrored)
+    init {
+        previewDisplayView.onReady = {
+            applyLocalPreviewRoundedOutline()
+            attachPendingTrackIfReady()
+        }
     }
 
-    // SurfaceViews composite on their own window layer, so Compose alpha/size/offset modifiers
-    // cannot hide them during call-chrome minimize. Park native views off-screen instead of
-    // GONE so Surface holders and track sinks stay live (Apple-style browse-while-in-call).
+    fun initializePreview(eglBase: EglBase, mirror: Boolean) {
+        previewDisplayView.initialize(eglBase, mirror)
+    }
+
+    fun setMirror(mirrored: Boolean) {
+        previewDisplayView.setMirror(mirrored)
+    }
+
     fun setHidden(hidden: Boolean) {
         val onMainThread = Looper.myLooper() == Looper.getMainLooper()
         val applyHidden = {
             AndroidRTCViewSupport.setViewHiddenForCallChromeMinimize(
-                view = surfaceViewRenderer,
+                view = previewDisplayView,
                 hidden = hidden,
                 logTag = "AndroidPreviewCaptureView"
             )
+            AndroidRTCViewSupport.localPreviewHostOrNull(previewDisplayView)?.let { host ->
+                AndroidRTCViewSupport.setViewHiddenForCallChromeMinimize(
+                    view = host,
+                    hidden = hidden,
+                    logTag = "AndroidPreviewCaptureView"
+                )
+            }
         }
         if (onMainThread) {
             applyHidden()
@@ -1442,44 +1652,60 @@ class AndroidPreviewCaptureViewNative(
         }
     }
 
-    fun release() {
-        pendingTrack = null
-        AndroidRTCViewSupport.releaseRenderer(surfaceViewRenderer, "AndroidPreviewCaptureView")
+    fun releaseLocalPreviewEgl() {
+        release()
     }
 
-    private fun isSurfaceReady(): Boolean =
-        AndroidRTCViewSupport.isSurfaceReady(surfaceViewRenderer)
-
-    private fun setupSurfaceCallback() {
-        if (surfaceCallbackSetup) return
-        surfaceCallbackSetup = AndroidRTCViewSupport.installSurfaceReadyCallback(
-            surfaceViewRenderer,
-            "AndroidPreviewCaptureView",
-            onReady = { attachPendingTrackIfReady() },
-            onDimensionsChanged = { width, height ->
-                if (width > 0 && height > 0) {
-                    AndroidRTCViewSupport.applyRoundedOutline(
-                        view = surfaceViewRenderer,
-                        radiusDp = localOutlineRadiusDp
-                    )
-                }
+    fun release() {
+        pendingTrack = null
+        setHidden(true)
+        AndroidRTCViewSupport.detachFromParent(previewDisplayView)
+        AndroidRTCViewSupport.localPreviewHostOrNull(previewDisplayView)?.let { host ->
+            AndroidRTCViewSupport.detachFromParent(host)
+        }
+        AndroidRTCViewSupport.removeLocalPreviewHost(previewDisplayView)
+        try {
+            if (client.removeRendererIfTracked(surfaceViewRenderer)) {
+                Log.i(
+                    "AndroidPreviewCaptureView",
+                    "unregistered leftover local SurfaceView from client",
+                )
             }
-        )
+        } catch (e: Throwable) {
+            Log.w(
+                "AndroidPreviewCaptureView",
+                "client unregister skipped after shutdown: ${e.message}",
+            )
+        }
+        Log.i("AndroidPreviewCaptureView", "Releasing local preview TextureView EGL")
+        previewDisplayView.releaseRenderer()
+        AndroidRTCViewSupport.releaseRenderer(surfaceViewRenderer, "AndroidPreviewCaptureView")
+        Log.i("AndroidPreviewCaptureView", "Released local preview TextureView EGL")
     }
 
     fun configureRoundedOutline(radiusDp: Float) {
         localOutlineRadiusDp = radiusDp
-        AndroidRTCViewSupport.applyRoundedOutline(view = surfaceViewRenderer, radiusDp = radiusDp)
+        applyLocalPreviewRoundedOutline()
+    }
+
+    private fun applyLocalPreviewRoundedOutline() {
+        AndroidRTCViewSupport.applyRoundedOutline(
+            view = previewDisplayView,
+            radiusDp = localOutlineRadiusDp
+        )
+        AndroidRTCViewSupport.localPreviewHostOrNull(previewDisplayView)?.let { host ->
+            AndroidRTCViewSupport.applyRoundedOutline(view = host, radiusDp = localOutlineRadiusDp)
+        }
     }
 
     private fun attachPendingTrackIfReady() {
         val track = pendingTrack ?: return
-        if (isSurfaceReady()) {
+        if (previewDisplayView.isReady()) {
             if (AndroidRTCViewSupport.addTrackSink(
                     track,
-                    surfaceViewRenderer,
+                    previewDisplayView,
                     "AndroidPreviewCaptureView",
-                    "Attached pending track after surface ready"
+                    "Attached pending track after texture ready"
                 )
             ) {
                 pendingTrack = null
@@ -1488,22 +1714,21 @@ class AndroidPreviewCaptureViewNative(
     }
 
     fun attach(track: RTCVideoTrack) {
-        setupSurfaceCallback()
-        if (isSurfaceReady()) {
+        if (previewDisplayView.isReady()) {
             AndroidRTCViewSupport.addTrackSink(
                 track,
-                surfaceViewRenderer,
+                previewDisplayView,
                 "AndroidPreviewCaptureView",
-                "Attached track immediately - surface ready"
+                "Attached track immediately - texture ready"
             )
         } else {
             pendingTrack = track
-            Log.d("AndroidPreviewCaptureView", "Surface not ready, queued track for later attachment")
+            Log.d("AndroidPreviewCaptureView", "Texture not ready, queued track for later attachment")
         }
     }
 
     fun detach(track: RTCVideoTrack) {
-        AndroidRTCViewSupport.removeTrackSink(track, surfaceViewRenderer)
+        AndroidRTCViewSupport.removeTrackSink(track, previewDisplayView)
         if (pendingTrack?.platformTrack == track.platformTrack) {
             pendingTrack = null
         }
@@ -1720,6 +1945,16 @@ class AndroidSampleCaptureViewNative(
     }
 
     fun release() {
+        val attachedBeforeRelease = attachedTrack
+        val pendingBeforeRelease = pendingTrack
+        attachedBeforeRelease?.let {
+            AndroidRTCViewSupport.removeTrackSink(it, surfaceViewRenderer)
+        }
+        if (pendingBeforeRelease != null &&
+            pendingBeforeRelease.platformTrack != attachedBeforeRelease?.platformTrack
+        ) {
+            AndroidRTCViewSupport.removeTrackSink(pendingBeforeRelease, surfaceViewRenderer)
+        }
         bumpRendererGeneration()
         pendingTrack = null
         attachedTrack = null
@@ -1735,7 +1970,25 @@ class AndroidSampleCaptureViewNative(
         lastEglInitSurfaceWidth = 0
         lastEglInitSurfaceHeight = 0
         surfaceReadyRetry = null
-        AndroidRTCViewSupport.releaseRenderer(surfaceViewRenderer, "AndroidSampleCaptureView")
+        sinkAttachFirstFrameObserver = null
+        setHidden(true)
+        var releaseRendererHere = true
+        try {
+            releaseRendererHere = client.removeRendererIfTracked(surfaceViewRenderer)
+        } catch (e: Throwable) {
+            Log.w(
+                "AndroidSampleCaptureView",
+                "client unregister skipped after shutdown: ${e.message}",
+            )
+        }
+        if (releaseRendererHere) {
+            AndroidRTCViewSupport.releaseRenderer(surfaceViewRenderer, "AndroidSampleCaptureView")
+        } else {
+            Log.i(
+                "AndroidSampleCaptureView",
+                "renderer already released by client reset or never initialized",
+            )
+        }
     }
 
     private fun isSurfaceReady(): Boolean =
@@ -2492,13 +2745,23 @@ class AndroidSampleCaptureViewNative(
         ensureFirstFrameHandlerRegistered()
         lastRendererWidth = surfaceViewRenderer.width
         lastRendererHeight = surfaceViewRenderer.height
+        if (!surfaceCallbackSetup) {
+            setupSurfaceCallback()
+        }
+        if (pendingTrack == null &&
+            attachedTrack != null &&
+            rendererHasSink &&
+            sinkMatchesCurrentRendererGeneration() &&
+            isSurfaceReady() &&
+            !rendererEglNeedsSurfaceResync()
+        ) {
+            logRendererLayoutState("renderer_did_initialize_reuse")
+            return
+        }
         lastEglInitSurfaceWidth = 0
         lastEglInitSurfaceHeight = 0
         hasRenderedFirstFrameSinceSinkAttach = false
         logRendererLayoutState("renderer_did_initialize")
-        if (!surfaceCallbackSetup) {
-            setupSurfaceCallback()
-        }
         val track = attachedTrack ?: pendingTrack ?: return
         pendingTrack = track
         attachedTrack = track
@@ -2518,8 +2781,18 @@ class AndroidSampleCaptureViewNative(
 
     /// Compose `AndroidView.update` runs on the main thread during layout; defer EGL reconcile so
     /// a multiparty grid cannot synchronously reinit every tile in one frame and trigger ANR.
+    /// Skip when size and sink are unchanged (`compose_layout_unchanged_skip`).
     fun rendererDidUpdateLayoutFromCompose() {
         if (composeLayoutUpdatePosted) return
+        val width = surfaceViewRenderer.width
+        val height = surfaceViewRenderer.height
+        if (width == lastRendererWidth &&
+            height == lastRendererHeight &&
+            pendingTrack == null &&
+            rendererHasSink
+        ) {
+            return
+        }
         composeLayoutUpdatePosted = true
         composeLayoutHandler.post {
             composeLayoutUpdatePosted = false

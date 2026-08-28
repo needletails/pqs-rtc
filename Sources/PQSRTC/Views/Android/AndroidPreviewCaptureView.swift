@@ -27,9 +27,19 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
 
     private let native: AndroidPreviewCaptureViewNative
 
-    /// The underlying SurfaceViewRenderer for local video.
+    /// Unused SurfaceView. Pixels render on `previewDisplayView`. Do not read this
+    /// from hangup/teardown — Skip JNI bind of the getter SIGTRAPs after client reset.
     internal var surfaceViewRenderer: org.webrtc.SurfaceViewRenderer {
         native.surfaceViewRenderer
+    }
+
+    /// TextureView that actually shows local preview (public `clipToOutline`).
+    internal var previewDisplayView: android.view.View {
+        native.previewDisplayView
+    }
+
+    func initializePreview(eglBase: org.webrtc.EglBase, mirror: Bool) {
+        native.initializePreview(eglBase: eglBase, mirror: mirror)
     }
 
     /// Creates a preview capture view bound to an `AndroidRTCClient`.
@@ -50,7 +60,13 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
 
     /// Releases renderer resources safely, handling cases where the OpenGL context may be destroyed.
     public func release() {
-        native.release()
+        releaseCaptureResources()
+    }
+
+    /// Unique name so Skip/Fuse cannot drop a `release()` mapping. Stops the
+    /// TextureView `EglRenderer("LocalPreview")` stats thread.
+    public func releaseCaptureResources() {
+        native.releaseLocalPreviewEgl()
     }
 
     /// Attaches a local video track to this preview renderer.
@@ -63,7 +79,7 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
         native.detach(track: track)
     }
 
-    /// Keeps the local preview clipped to rounded corners as the PiP surface is resized.
+    /// Applies the rounded outline on the TextureView preview and its host.
     public func configureRoundedOutline(radiusDp: Float = Float(12)) {
         native.configureRoundedOutline(radiusDp: radiusDp)
     }
@@ -216,6 +232,15 @@ public final class AndroidSampleCaptureView: @unchecked Sendable, Equatable {
     /// Native renderer layout snapshot for attach/EGL diagnostics.
     public func rendererAttachDiagnosticSummary() -> String {
         native.rendererAttachDiagnosticSummary()
+    }
+
+    /// Stops the WebRTC `EglRenderer` stats thread. Safe after EGL teardown.
+    public func release() {
+        releaseCaptureResources()
+    }
+
+    public func releaseCaptureResources() {
+        native.release()
     }
 
     /// Attaches a remote video track to this renderer.
