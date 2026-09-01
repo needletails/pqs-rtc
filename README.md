@@ -2,6 +2,7 @@
 
 [![Swift](https://img.shields.io/badge/Swift-6.3+-orange.svg)](https://swift.org)
 [![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B-blue.svg)](https://developer.apple.com)
+[![Android](https://img.shields.io/badge/Platform-Android-3DDC84?logo=android&logoColor=white)](https://www.swift.org/documentation/articles/swift-sdk-for-android-getting-started.html)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 Client-side WebRTC for Nudge: 1:1 calls, SFU group/conference calls, and optional frame-level E2EE. The SDK is transport-agnostic. Your app implements ``RTCTransportEvents`` and owns signaling. For NeedleTails production, that control plane is Nudge Server + [SwiftSFU](https://github.com/needletails/swift-sfu).

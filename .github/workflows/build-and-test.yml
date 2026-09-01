@@ -6,104 +6,62 @@ on:
   pull_request:
     branches: [ main ]
 
+# PQSRTC is iOS / macOS / Android (Skip). There is no Linux product surface:
+# Package.swift platforms are iOS 18+ and macOS 15+, WebRTC is Apple-only,
+# and Skip plugins do not produce a Linux library.
+
 jobs:
   build-and-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-          - os: macos-26
-            required_macos_major: '26'
-            required_xcode_major: '26'
-
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      required_macos_major: '26'
+      required_xcode_major: '26'
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Xcode version
-        if: ${{ runner.os == 'macOS' }}
         run: xcodebuild -version
 
-      - name: Require macOS 26 (macOS)
-        if: ${{ runner.os == 'macOS' }}
+      - name: Require macOS 26
         shell: bash
         run: |
           set -euo pipefail
-          echo "Expecting macOS major: ${{ matrix.required_macos_major }}"
+          echo "Expecting macOS major: ${required_macos_major}"
           MACOS_VERSION=$(sw_vers -productVersion)
           echo "macOS $MACOS_VERSION"
           MACOS_MAJOR=$(echo "$MACOS_VERSION" | cut -d. -f1)
-          if [[ "$MACOS_MAJOR" != "${{ matrix.required_macos_major }}" ]]; then
-            echo "macOS ${{ matrix.required_macos_major }} is required on this runner. Found: macOS $MACOS_VERSION" >&2
+          if [[ "$MACOS_MAJOR" != "${required_macos_major}" ]]; then
+            echo "macOS ${required_macos_major} is required on this runner. Found: macOS $MACOS_VERSION" >&2
             exit 1
           fi
 
-      - name: Require Xcode 26 (macOS)
-        if: ${{ runner.os == 'macOS' }}
+      - name: Require Xcode 26
         shell: bash
         run: |
           set -euo pipefail
-          echo "Expecting Xcode major: ${{ matrix.required_xcode_major }}"
+          echo "Expecting Xcode major: ${required_xcode_major}"
           XCODE_VERSION_LINE=$(xcodebuild -version | head -n 1)
           echo "$XCODE_VERSION_LINE"
           XCODE_MAJOR=$(echo "$XCODE_VERSION_LINE" | awk '{print $2}' | cut -d. -f1)
-          if [[ "$XCODE_MAJOR" != "${{ matrix.required_xcode_major }}" ]]; then
-            echo "Xcode ${{ matrix.required_xcode_major }} is required on this runner. Found: $XCODE_VERSION_LINE" >&2
+          if [[ "$XCODE_MAJOR" != "${required_xcode_major}" ]]; then
+            echo "Xcode ${required_xcode_major} is required on this runner. Found: $XCODE_VERSION_LINE" >&2
             exit 1
           fi
 
-      - name: Swift version (macOS)
-        if: ${{ runner.os == 'macOS' }}
+      - name: Swift version
         run: |
           swift --version
           xcrun swift --version
 
-      - name: Install system dependencies (Linux)
-        if: ${{ runner.os == 'Linux' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install libcurl4-openssl-dev
-
-      - name: Install Swift 6.3.0 with Swiftly (Linux)
-        if: ${{ runner.os == 'Linux' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -O https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz
-          tar zxf swiftly-$(uname -m).tar.gz
-          ./swiftly init --quiet-shell-followup --skip-install
-          source ~/.local/share/swiftly/env.sh
-          swiftly install --use 6.3.0
-
-          echo "Looking for Swift in toolchains directory..."
-          ls -la "$HOME/.local/share/swiftly/toolchains/" || true
-
-          SWIFT_PATH=$(find "$HOME/.local/share/swiftly/toolchains/6.3.0" -name "swift" -type f 2>/dev/null | head -1)
-          if [ -n "$SWIFT_PATH" ]; then
-            SWIFT_PATH=$(dirname "$SWIFT_PATH")
-          else
-            echo "Swift not found in toolchains, using bin directory..."
-            SWIFT_PATH="$HOME/.local/share/swiftly/bin"
-          fi
-
-          echo "SWIFT_PATH=$SWIFT_PATH" >> "$GITHUB_ENV"
-          echo "$SWIFT_PATH" >> "$GITHUB_PATH"
-
-      - name: Swift version (Linux)
-        if: ${{ runner.os == 'Linux' }}
-        run: swift --version
-
-      - name: Install Skip.tools (macOS)
-        if: ${{ runner.os == 'macOS' }}
+      - name: Install Skip.tools
         run: |
           brew install skiptools/skip/skip
           skip version
 
-      - name: Install Swift Android SDK (macOS)
-        if: ${{ runner.os == 'macOS' }}
+      - name: Install Swift Android SDK
         shell: bash
         run: |
           set -euo pipefail
@@ -117,25 +75,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-swift-
 
-      - name: Xcode version (pre-build)
-        if: ${{ runner.os == 'macOS' }}
-        run: xcodebuild -version
-
       - name: Build (Release)
         run: swift build --configuration release
 
-      - name: Test (Linux)
-        if: ${{ runner.os == 'Linux' }}
-        run: swift test
+      - name: Test (native Swift)
+        run: swift test --filter PQSRTCCompiledSwiftTests --skip XCSkipTests
 
-      - name: Test (macOS)
-        if: ${{ runner.os == 'macOS' }}
-        run: swift test
-
-      - name: Build Android (macOS)
-        if: ${{ runner.os == 'macOS' }}
+      - name: Build Android
         run: skip android build
 
-      - name: Build Android test targets (macOS)
-        if: ${{ runner.os == 'macOS' }}
+      - name: Build Android test targets
         run: skip android build --build-tests
