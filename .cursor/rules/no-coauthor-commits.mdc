@@ -1,0 +1,14 @@
+---
+description: Never add Cursor or any AI Co-authored-by trailer to commits
+alwaysApply: true
+---
+
+# No Co-Author Commits
+
+This project does not allow Cursor, Copilot, or any other AI/tool to be listed as a commit author or coauthor.
+
+- Never add `Co-authored-by:` (or any coauthor/trailer attribution) to commit messages.
+- Never pass `--trailer`, multi-author flags, or similar to attribute Cursor (`cursoragent@cursor.com`), Copilot, or any other AI/tool.
+- Commit messages must attribute only the human author already configured in git.
+- If a commit is created with a `Co-authored-by: Cursor` (or similar) trailer, remove it before push. Cursor may inject the trailer after `git commit`; do not leave it on the branch.
+- Do not invent additional authors.
