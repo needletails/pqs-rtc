@@ -13,7 +13,7 @@ on:
 jobs:
   build-and-test:
     runs-on: macos-26
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       required_macos_major: '26'
       required_xcode_major: '26'
@@ -69,9 +69,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-swift-
 
-      - name: Test (native Swift)
+      - name: Build tests (Release)
         timeout-minutes: 12
-        run: swift test --configuration release --filter PQSRTCCompiledSwiftTests --skip XCSkipTests
+        run: swift build --configuration release --build-tests
+
+      # Swift Testing parallelizes in-process by default and deadlocks when
+      # many RTCPeerConnections start at once on GitHub-hosted macOS.
+      - name: Test (native Swift)
+        timeout-minutes: 5
+        run: swift test --configuration release --skip-build --filter PQSRTCCompiledSwiftTests --skip XCSkipTests --no-parallel --experimental-maximum-parallelization-width 1
 
       - name: Install Swift Android SDK
         shell: bash
