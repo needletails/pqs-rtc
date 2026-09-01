@@ -66,19 +66,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .build
-          key: ${{ runner.os }}-swift-${{ hashFiles('Package.swift') }}
+          key: ${{ runner.os }}-swift-testable-${{ hashFiles('Package.swift') }}
           restore-keys: |
-            ${{ runner.os }}-swift-
+            ${{ runner.os }}-swift-testable-
 
-      - name: Build tests (Release)
-        timeout-minutes: 12
-        run: swift build --configuration release --build-tests
-
-      # Swift Testing parallelizes in-process by default and deadlocks when
-      # many RTCPeerConnections start at once on GitHub-hosted macOS.
+      # `swift test` compiles the library with -enable-testing (@testable).
+      # Do not `swift build --build-tests` then `--skip-build`: that library
+      # is not testable. Swift Testing parallelizes in-process unless
+      # --no-parallel is set; parallel RTCPeerConnections deadlock on GHA.
       - name: Test (native Swift)
-        timeout-minutes: 5
-        run: swift test --configuration release --skip-build --filter PQSRTCCompiledSwiftTests --skip XCSkipTests --no-parallel --experimental-maximum-parallelization-width 1
+        timeout-minutes: 15
+        run: swift test --configuration release --filter PQSRTCCompiledSwiftTests --skip XCSkipTests --no-parallel --experimental-maximum-parallelization-width 1
 
       - name: Install Swift Android SDK
         shell: bash
