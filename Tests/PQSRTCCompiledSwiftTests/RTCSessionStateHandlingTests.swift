@@ -14,6 +14,7 @@ struct RTCSessionStateHandlingTests {
         private(set) var didEndCalls: [(call: Call, endState: CallStateMachine.EndState)] = []
         private(set) var didBeginStartCall = false
         private let suspendStartCall: Bool
+        private var startCallBeganContinuation: CheckedContinuation<Void, Never>?
         private var startCallContinuation: CheckedContinuation<Void, Never>?
 
         init(suspendStartCall: Bool = false) {
@@ -23,11 +24,19 @@ struct RTCSessionStateHandlingTests {
         func sendCiphertext(recipient: String, connectionId: String, ciphertext: Data, call: Call) async throws {}
         func sendSfuMessage(_ packet: RatchetMessagePacket, call: Call) async throws {}
         func sendStartCall(_ call: Call) async throws {
-            didBeginStartCall = true
             if suspendStartCall {
+                // Park on the suspend continuation *before* waking the test, so
+                // releaseStartCall cannot run while startCallContinuation is still nil.
                 await withCheckedContinuation { continuation in
                     startCallContinuation = continuation
+                    didBeginStartCall = true
+                    startCallBeganContinuation?.resume()
+                    startCallBeganContinuation = nil
                 }
+            } else {
+                didBeginStartCall = true
+                startCallBeganContinuation?.resume()
+                startCallBeganContinuation = nil
             }
         }
         func sendCallAnswered(_ call: Call) async throws {}
@@ -38,6 +47,17 @@ struct RTCSessionStateHandlingTests {
 
         func didEnd(call: Call, endState: CallStateMachine.EndState) async throws {
             didEndCalls.append((call: call, endState: endState))
+        }
+
+        func waitForStartCallToBegin() async {
+            if didBeginStartCall { return }
+            await withCheckedContinuation { continuation in
+                if didBeginStartCall {
+                    continuation.resume()
+                } else {
+                    startCallBeganContinuation = continuation
+                }
+            }
         }
 
         func releaseStartCall() {
@@ -160,12 +180,7 @@ struct RTCSessionStateHandlingTests {
         let startTask = Task {
             try await session.startCall(call)
         }
-        for _ in 0..<100 {
-            if await events.didBeginStartCall {
-                break
-            }
-            await Task.yield()
-        }
+        await events.waitForStartCallToBegin()
 
         let didBeginStartCall = await events.didBeginStartCall
         let state = await session.callState.currentState
