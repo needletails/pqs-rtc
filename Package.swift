@@ -42,6 +42,18 @@ let package = Package(
             .process("Rendering/MetalProcessors/MetalShaders/RenderingShaders.metal")
         ],
                 plugins: [.plugin(name: "skipstone", package: "skip")]),
+    ]
+)
+
+let skipBridge = (Context.environment["SKIP_BRIDGE"] ?? "0") != "0"
+
+if skipBridge {
+    // Skip Android: dynamic product + Skip test module only.
+    package.products = package.products.map { product in
+        guard let libraryProduct = product as? Product.Library else { return product }
+        return .library(name: libraryProduct.name, type: .dynamic, targets: libraryProduct.targets)
+    }
+    package.targets.append(
         .testTarget(
             name: "PQSRTCTests",
             dependencies: [
@@ -50,13 +62,11 @@ let package = Package(
             ],
             path: "Tests/PQSRTCTests",
             plugins: [.plugin(name: "skipstone", package: "skip")]
-        ),
-    ]
-)
-
-// Apple-only (WebRTC, CoreGraphics, CoreImage). Skip's `android build --build-tests`
-// cross-compiles every test target for Android, so keep this target off that graph.
-if (Context.environment["SKIP_BRIDGE"] ?? "0") == "0" {
+        )
+    )
+} else {
+    // Apple-only (WebRTC, CoreGraphics, CoreImage). Keep this off the
+    // `skip android build --build-tests` graph.
     package.targets.append(
         .testTarget(
             name: "PQSRTCCompiledSwiftTests",
@@ -69,12 +79,4 @@ if (Context.environment["SKIP_BRIDGE"] ?? "0") == "0" {
             path: "Tests/PQSRTCCompiledSwiftTests"
         )
     )
-}
-
-if Context.environment["SKIP_BRIDGE"] ?? "0" != "0" {
-    // all library types must be dynamic to support bridging
-    package.products = package.products.map({ product in
-        guard let libraryProduct = product as? Product.Library else { return product }
-        return .library(name: libraryProduct.name, type: .dynamic, targets: libraryProduct.targets)
-    })
 }

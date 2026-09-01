@@ -13,7 +13,7 @@ on:
 jobs:
   build-and-test:
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 25
     env:
       required_macos_major: '26'
       required_xcode_major: '26'
@@ -61,12 +61,6 @@ jobs:
           brew install skiptools/skip/skip
           skip version
 
-      - name: Install Swift Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf 'y\n' | skip android sdk install
-
       - name: Cache Swift build artifacts
         uses: actions/cache@v4
         with:
@@ -75,14 +69,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-swift-
 
-      - name: Build (Release)
-        run: swift build --configuration release
-
       - name: Test (native Swift)
-        run: swift test --filter PQSRTCCompiledSwiftTests --skip XCSkipTests
+        timeout-minutes: 12
+        run: swift test --configuration release --filter PQSRTCCompiledSwiftTests --skip XCSkipTests
+
+      - name: Install Swift Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'y\n' | skip android sdk install
 
       - name: Build Android
+        timeout-minutes: 8
         run: skip android build
 
       - name: Build Android test targets
+        timeout-minutes: 8
         run: skip android build --build-tests
