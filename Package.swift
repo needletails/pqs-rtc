@@ -51,6 +51,13 @@ let package = Package(
             path: "Tests/PQSRTCTests",
             plugins: [.plugin(name: "skipstone", package: "skip")]
         ),
+    ]
+)
+
+// Apple-only (WebRTC, CoreGraphics, CoreImage). Skip's `android build --build-tests`
+// cross-compiles every test target for Android, so keep this target off that graph.
+if (Context.environment["SKIP_BRIDGE"] ?? "0") == "0" {
+    package.targets.append(
         .testTarget(
             name: "PQSRTCCompiledSwiftTests",
             dependencies: [
@@ -60,9 +67,9 @@ let package = Package(
                 .product(name: "WebRTC", package: "Specs", condition: .when(platforms: [.iOS, .macOS]))
             ],
             path: "Tests/PQSRTCCompiledSwiftTests"
-        ),
-    ]
-)
+        )
+    )
+}
 
 if Context.environment["SKIP_BRIDGE"] ?? "0" != "0" {
     // all library types must be dynamic to support bridging
