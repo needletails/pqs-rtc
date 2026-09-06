@@ -104,9 +104,15 @@ public final class VideoCallViewController: UICollectionViewController {
     private var lastVideoLayoutBoundsSize: CGSize = .zero
     /// Tracks whether the current snapshot includes a screen-share tile (local or remote).
     private var hasVisibleScreenShareInCollection = false
+    /// Incoming upright size for each remote camera context. Used only to size the
+    /// remote collection item, never the share tile.
+    private var remoteUprightSizeByContext: [String: CGSize] = [:]
     /// Last non-zero compositional container size; used when the layout environment briefly reports `.zero`.
     private var lastStableCompositionalContentSize: CGSize = .zero
     private var postScreenShareLayoutHealTask: Task<Void, Never>?
+    private var screenShareLayoutGeneration: UInt64 = 0
+    private var pendingScreenShareLayoutGeneration: UInt64?
+    private var pendingScreenShareLayoutExpectedVisible: Bool?
     private var isMinimized = false
     private static let sections = CollectionViewSections()
     private var loadedPreviewItem = false
@@ -582,6 +588,11 @@ public final class VideoCallViewController: UICollectionViewController {
         await handleRemoteScreenTrackEvent(pending)
     }
 
+    public override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        collectionView.collectionViewLayout.invalidateLayout()
+    }
+
     public override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let boundsSize = collectionView.bounds.size
@@ -596,6 +607,7 @@ public final class VideoCallViewController: UICollectionViewController {
             }
         }
         updateConferencePageIndicator()
+        settlePendingScreenShareLayoutIfNeeded()
     }
 
     public override func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -732,6 +744,9 @@ public final class VideoCallViewController: UICollectionViewController {
     /// This stops renderers, clears snapshots, removes blur overlays, cancels the state stream task,
     /// and notifies the host via ``VideoCallDelegate/endedCall(_:)``.
     private func tearDownCall() async {
+        stopRemoteRendererRecovery()
+        stopAllParticipantRendererRecovery()
+        stopAllScreenShareRendererRecovery()
         guard isRunning == true else {
             return
         }
@@ -740,8 +755,7 @@ public final class VideoCallViewController: UICollectionViewController {
         await session.releaseLocalMediaResourcesForCallEnding(call: currentCall)
 
         speakerPhoneEnabled = false
-        let audioSession = AVAudioSession.sharedInstance()
-        try? audioSession.overrideOutputAudioPort(.none)
+        try? session.setSpeakerOutputOverride(false)
         controllerView.removeVoiceCallChrome()
 
         if let didEnterBackgroundPiPObserver {
@@ -762,6 +776,9 @@ public final class VideoCallViewController: UICollectionViewController {
         inboundVideoFlowStreamTask = nil
         postScreenShareLayoutHealTask?.cancel()
         postScreenShareLayoutHealTask = nil
+        pendingScreenShareLayoutGeneration = nil
+        pendingScreenShareLayoutExpectedVisible = nil
+        screenShareLayoutGeneration &+= 1
         stopRemoteScreenShareAttachRetry()
         localScreenShareStateTask?.cancel()
         localScreenShareStateTask = nil
@@ -1029,12 +1046,19 @@ public final class VideoCallViewController: UICollectionViewController {
     /// Remote camera tiles in a multi-remote grid letterbox so portrait senders are not cropped.
     /// A solo fullscreen remote fills only when the remote upright orientation matches the local
     /// device viewport (portrait↔portrait or landscape↔landscape); mismatched pairs aspect-fit.
+    /// The screen-share strip match-fills once the remote **item** matches that incoming frame.
     private func participantCameraPrefersAspectFit() -> Bool {
-        remoteCameraTileCountForAspectPolicy() > 1
+        RemoteCameraAspectPolicy.forceFitForCameraTiles(
+            cameraTileCount: remoteCameraTileCountForAspectPolicy(),
+            hasVisibleScreenShare: hasVisibleScreenShareInCollection
+        )
     }
 
     private func participantCameraFillsWhenOrientationMatches() -> Bool {
-        remoteCameraTileCountForAspectPolicy() == 1 && !hasVisibleScreenShareInCollection
+        RemoteCameraAspectPolicy.fillWhenOrientationMatchesForCameraTiles(
+            cameraTileCount: remoteCameraTileCountForAspectPolicy(),
+            hasVisibleScreenShare: hasVisibleScreenShareInCollection
+        )
     }
 
     private func remoteCameraTileCountForAspectPolicy() -> Int {
@@ -1050,9 +1074,51 @@ public final class VideoCallViewController: UICollectionViewController {
         let matchFill = participantCameraFillsWhenOrientationMatches()
         view.setPrefersAspectFit(prefersFit)
         view.setFillsWhenOrientationMatches(matchFill)
+        bindRemoteCameraTileLayout(to: view)
         if let renderer {
             await renderer.setPrefersAspectFit(prefersFit)
             await renderer.setFillsWhenOrientationMatches(matchFill)
+            let size = await renderer.currentUprightSourceSize()
+            if size.width > 0, size.height > 0 {
+                remoteUprightSizeByContext[view.contextName] = size
+            }
+        }
+    }
+
+    private func bindRemoteCameraTileLayout(to view: NTMTKView) {
+        guard !view.contextName.hasPrefix("screen_"), view.contextName != "preview" else { return }
+        view.onRemoteUprightOrientationChange = { [weak self] size in
+            self?.handleRemoteCameraUprightSizeChange(contextName: view.contextName, size: size)
+        }
+    }
+
+    private func handleRemoteCameraUprightSizeChange(contextName: String, size: CGSize) {
+        let previous = remoteUprightSizeByContext[contextName] ?? .zero
+        remoteUprightSizeByContext[contextName] = size
+        let previousAspect = GroupCallVideoLayoutPolicy.cameraTileAspectForRemoteContent(
+            uprightWidth: Double(previous.width),
+            uprightHeight: Double(previous.height)
+        )
+        let nextAspect = GroupCallVideoLayoutPolicy.cameraTileAspectForRemoteContent(
+            uprightWidth: Double(size.width),
+            uprightHeight: Double(size.height)
+        )
+        guard abs(previousAspect - nextAspect) > 0.001 else { return }
+        guard hasVisibleScreenShareInCollection else { return }
+        collectionView.collectionViewLayout.invalidateLayout()
+    }
+
+    private func remoteCameraContentAspects() -> [CGFloat] {
+        let items = dataSource?.snapshot().itemIdentifiers ?? []
+        let cameras = items.filter { !isScreenShareModel($0) }
+        return cameras.map { model in
+            let size = remoteUprightSizeByContext[model.videoView.contextName] ?? .zero
+            return CGFloat(
+                GroupCallVideoLayoutPolicy.cameraTileAspectForRemoteContent(
+                    uprightWidth: Double(size.width),
+                    uprightHeight: Double(size.height)
+                )
+            )
         }
     }
 
@@ -1063,9 +1129,14 @@ public final class VideoCallViewController: UICollectionViewController {
         for model in videoViews.views where isParticipantCameraModel(model) || isOneToOneRemoteCameraModel(model) {
             model.videoView.setPrefersAspectFit(prefersFit)
             model.videoView.setFillsWhenOrientationMatches(matchFill)
+            bindRemoteCameraTileLayout(to: model.videoView)
             if let renderer = model.videoView.renderer as? SampleBufferViewRenderer {
                 await renderer.setPrefersAspectFit(prefersFit)
                 await renderer.setFillsWhenOrientationMatches(matchFill)
+                let size = await renderer.currentUprightSourceSize()
+                if size.width > 0, size.height > 0 {
+                    remoteUprightSizeByContext[model.videoView.contextName] = size
+                }
             }
         }
     }
@@ -1144,25 +1215,48 @@ public final class VideoCallViewController: UICollectionViewController {
     /// layout churn. Without this, screen-share tiles can keep scaling to a stale rect and look
     /// stretched until the next manual resize.
     private func effectiveBoundsForMountedVideoView(_ view: NTMTKView) -> CGRect {
-        if view.bounds.width > 1, view.bounds.height > 1 {
-            return view.bounds
-        }
+        var cellBounds = CGRect.zero
+        var attributesBounds = CGRect.zero
         for indexPath in collectionView.indexPathsForVisibleItems {
             guard let cell = collectionView.cellForItem(at: indexPath) as? RemoteViewItemCell,
                   cell.contentView.subviews.contains(where: { $0 === view }) else {
                 continue
             }
-            let contentBounds = cell.contentView.bounds
-            if contentBounds.width > 1, contentBounds.height > 1 {
-                return contentBounds
-            }
+            cellBounds = cell.contentView.bounds
             if let attributes = collectionView.layoutAttributesForItem(at: indexPath),
                attributes.bounds.width > 1,
                attributes.bounds.height > 1 {
-                return attributes.bounds
+                attributesBounds = attributes.bounds
             }
+            break
         }
-        return view.bounds
+        let resolved = GroupCallVideoLayoutPolicy.effectiveMountedVideoBounds(
+            viewBounds: GroupCallLayoutRect(
+                x: Double(view.bounds.origin.x),
+                y: Double(view.bounds.origin.y),
+                width: Double(view.bounds.width),
+                height: Double(view.bounds.height)
+            ),
+            cellContentBounds: GroupCallLayoutRect(
+                x: Double(cellBounds.origin.x),
+                y: Double(cellBounds.origin.y),
+                width: Double(cellBounds.width),
+                height: Double(cellBounds.height)
+            ),
+            layoutAttributesBounds: GroupCallLayoutRect(
+                x: Double(attributesBounds.origin.x),
+                y: Double(attributesBounds.origin.y),
+                width: Double(attributesBounds.width),
+                height: Double(attributesBounds.height)
+            ),
+            transitionPending: pendingScreenShareLayoutGeneration != nil
+        )
+        return CGRect(
+            x: CGFloat(resolved.x),
+            y: CGFloat(resolved.y),
+            width: CGFloat(resolved.width),
+            height: CGFloat(resolved.height)
+        )
     }
 
     private func refreshMountedVideoRendererBounds() async {
@@ -1195,21 +1289,41 @@ public final class VideoCallViewController: UICollectionViewController {
 
     /// After screen share ends, the remaining camera tile can keep strip-sized bounds until the next layout pass.
     private func schedulePostScreenShareLayoutHeal() {
-        postScreenShareLayoutHealTask?.cancel()
-        postScreenShareLayoutHealTask = Task { @MainActor [weak self] in
-            await Task.yield()
-            guard let self, self.isConnected(), !self.hasVisibleScreenShareInCollection else { return }
+        scheduleScreenShareLayoutTransitionHeal(expectingScreenShareVisible: false)
+    }
 
-            self.collectionView.collectionViewLayout.invalidateLayout()
-            self.collectionView.layoutIfNeeded()
+    private func scheduleScreenShareLayoutTransitionHeal(expectingScreenShareVisible: Bool) {
+        postScreenShareLayoutHealTask?.cancel()
+        postScreenShareLayoutHealTask = nil
+        screenShareLayoutGeneration &+= 1
+        pendingScreenShareLayoutGeneration = screenShareLayoutGeneration
+        pendingScreenShareLayoutExpectedVisible = expectingScreenShareVisible
+        collectionView.collectionViewLayout.invalidateLayout()
+        view.setNeedsLayout()
+    }
+
+    /// The concrete UIKit layout callback owns screen-share start/stop settlement.
+    private func settlePendingScreenShareLayoutIfNeeded() {
+        guard let generation = pendingScreenShareLayoutGeneration,
+              generation == screenShareLayoutGeneration,
+              pendingScreenShareLayoutExpectedVisible == hasVisibleScreenShareInCollection,
+              collectionView.bounds.width > 1,
+              collectionView.bounds.height > 1 else {
+            return
+        }
+        let hasMountedBounds = collectionView.indexPathsForVisibleItems.contains { indexPath in
+            guard let cell = collectionView.cellForItem(at: indexPath) else { return false }
+            return cell.contentView.bounds.width > 1 && cell.contentView.bounds.height > 1
+        }
+        guard hasMountedBounds || videoViews.views.isEmpty else { return }
+        pendingScreenShareLayoutGeneration = nil
+        pendingScreenShareLayoutExpectedVisible = nil
+        postScreenShareLayoutHealTask = Task { @MainActor [weak self] in
+            guard let self,
+                  self.isConnected(),
+                  generation == self.screenShareLayoutGeneration else { return }
             self.reconfigureVisibleVideoCells()
             await self.syncParticipantCameraTileAspectModes()
-            await self.refreshMountedVideoRendererBounds()
-
-            await Task.yield()
-            guard !Task.isCancelled, self.isConnected(), !self.hasVisibleScreenShareInCollection else { return }
-            self.collectionView.layoutIfNeeded()
-            self.reconfigureVisibleVideoCells()
             await self.refreshMountedVideoRendererBounds()
         }
     }
@@ -1452,18 +1566,14 @@ public final class VideoCallViewController: UICollectionViewController {
     }
 
     private func waitForMountedVideoView(_ view: NTMTKView) async {
-        for _ in 0..<20 {
-            if view.superview != nil,
-               view.window != nil,
-               view.bounds.width > 0,
-               view.bounds.height > 0 {
-                return
-            }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+        guard view.superview == nil
+            || view.window == nil
+            || view.bounds.width <= 0
+            || view.bounds.height <= 0 else {
+            return
         }
-        logger.log(
-            level: .warning,
-            message: "Timed out waiting for mounted video view context=\(view.contextName) superview=\(String(describing: view.superview)) window=\(String(describing: view.window)) bounds=\(view.bounds)"
+        scheduleScreenShareLayoutTransitionHeal(
+            expectingScreenShareVisible: hasVisibleScreenShareInCollection
         )
     }
 
@@ -1838,6 +1948,9 @@ public final class VideoCallViewController: UICollectionViewController {
 
     /// Updates the preview layout when the interface rotates.
     public override func viewWillTransition(to size: CGSize, with coordinator: any UIViewControllerTransitionCoordinator) {
+        if size.width >= 1, size.height >= 1 {
+            lastStableCompositionalContentSize = size
+        }
         collectionView.collectionViewLayout.invalidateLayout()
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1849,7 +1962,14 @@ public final class VideoCallViewController: UICollectionViewController {
                     forInterfaceSize: size,
                     fallback: currentInterfaceDeviceOrientation()
                 )
-                controllerView.updateLocalVideoSize(with: orientation, should: false, isConnected: isConnected() ? true : false, view: localView, animated: false)
+                controllerView.updateLocalVideoSize(
+                    with: orientation,
+                    should: false,
+                    isConnected: isConnected() ? true : false,
+                    view: localView,
+                    animated: false,
+                    containerSize: size
+                )
                 let pipSize = pictureInPictureLayoutSize()
                 pipVideoCallViewController?.preferredContentSize = pipSize
                 await pipSampleRenderer?.applyHostViewBounds(CGRect(origin: .zero, size: pipSize))
@@ -1952,8 +2072,10 @@ public final class VideoCallViewController: UICollectionViewController {
         }
         collectionView.layoutIfNeeded()
         await refreshMountedVideoRendererBounds()
-        if hadVisibleScreenShare, !hasVisibleScreenShare {
-            schedulePostScreenShareLayoutHeal()
+        if hadVisibleScreenShare != hasVisibleScreenShare {
+            scheduleScreenShareLayoutTransitionHeal(
+                expectingScreenShareVisible: hasVisibleScreenShare
+            )
         }
         applyConferenceRaisedHandIndicators()
         updateConferencePageIndicator(totalItems: data.count)
@@ -2156,15 +2278,25 @@ public final class VideoCallViewController: UICollectionViewController {
                 : 0
             let snapshotCount = self.dataSource?.snapshot().numberOfItems ?? 0
             let resolvedItemCount = itemCount ?? (liveCount > 0 ? liveCount : snapshotCount)
+            let safeAreaTop = self.collectionView.safeAreaInsets.top
             if self.hasVisibleScreenShareInCollection, resolvedItemCount > 1 {
                 return Self.sections.screenShareDominantSection(
                     cameraTileCount: resolvedItemCount - 1,
-                    containerSize: effective)
+                    containerSize: effective,
+                    cameraTileAspects: self.remoteCameraContentAspects(),
+                    safeAreaTop: safeAreaTop)
+            }
+            if self.hasActiveLocalScreenShare, resolvedItemCount >= 1 {
+                return Self.sections.conferenceViewSection(
+                    itemCount: resolvedItemCount,
+                    containerSize: effective,
+                    safeAreaTop: safeAreaTop)
             }
             if resolvedItemCount > 1 {
                 return Self.sections.conferenceViewSection(
                     itemCount: resolvedItemCount,
-                    containerSize: effective)
+                    containerSize: effective,
+                    safeAreaTop: safeAreaTop)
             }
             return Self.sections.fullScreenItem(groupAbsoluteExtent: effective)
         }
@@ -2176,6 +2308,8 @@ public final class VideoCallViewController: UICollectionViewController {
         }
         let nextType: SectionType
         if hasVisibleScreenShareInCollection, itemCount > 1 {
+            nextType = .conference
+        } else if hasActiveLocalScreenShare, itemCount >= 1 {
             nextType = .conference
         } else {
             nextType = itemCount > 1 ? .conference : .fullscreen
@@ -3031,19 +3165,19 @@ public final class VideoCallViewController: UICollectionViewController {
     }
 
     private func pictureInPictureLayoutSize() -> CGSize {
-        switch UIDevice.current.orientation {
-        case .unknown, .faceUp, .faceDown:
-            if UIScreen.main.bounds.width < UIScreen.main.bounds.height {
-                return controllerView.setSize(isLandscape: false, minimize: false)
-            }
-            return controllerView.setSize(isLandscape: true, minimize: false)
-        case .portrait, .portraitUpsideDown:
-            return controllerView.setSize(isLandscape: false, minimize: false)
-        case .landscapeRight, .landscapeLeft:
-            return controllerView.setSize(isLandscape: true, minimize: false)
-        default:
-            return controllerView.setSize(isLandscape: true, minimize: false)
+        let container: CGSize
+        if lastStableCompositionalContentSize.width > 1, lastStableCompositionalContentSize.height > 1 {
+            container = lastStableCompositionalContentSize
+        } else if view.bounds.width > 1, view.bounds.height > 1 {
+            container = view.bounds.size
+        } else {
+            container = UIScreen.main.bounds.size
         }
+        return controllerView.setSize(
+            isLandscape: container.width > container.height,
+            minimize: false,
+            containerSize: container
+        )
     }
 
     /// Prepares a reusable PiP controller while the call is still foregrounded.
@@ -3478,14 +3612,8 @@ extension VideoCallViewController: CallActionDelegate {
     
     /// Routes call audio to the built-in speaker or back to the default receiver/route.
     public func setSpeakerOutputEnabled(_ enabled: Bool) {
-        let session = AVAudioSession.sharedInstance()
         do {
-            try session.setActive(true)
-            if enabled {
-                try session.overrideOutputAudioPort(.speaker)
-            } else {
-                try session.overrideOutputAudioPort(.none)
-            }
+            try session.setSpeakerOutputOverride(enabled)
             speakerPhoneEnabled = enabled
         } catch {
             logger.log(level: .error, message: "setSpeakerOutputEnabled(\(enabled)): \(error)")

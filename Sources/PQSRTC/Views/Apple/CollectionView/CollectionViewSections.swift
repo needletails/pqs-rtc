@@ -106,8 +106,12 @@ public struct CollectionViewSections {
     /// Portrait phones need a different shape than desktop/landscape: a fixed `2 x 1`
     /// layout makes two-person calls look like narrow vertical strips. This variant
     /// chooses rows/columns from the live container and sizes the page group around a
-    /// camera-friendly aspect ratio, centering any remaining space.
-    public func conferenceViewSection(itemCount: Int, containerSize: CGSize) -> NSCollectionLayoutSection {
+    /// camera-friendly aspect ratio, packing tiles from the top.
+    public func conferenceViewSection(
+        itemCount: Int,
+        containerSize: CGSize,
+        safeAreaTop: CGFloat = 0
+    ) -> NSCollectionLayoutSection {
         guard itemCount > 0 else {
             assertionFailure("Item count must be greater than 0")
             return createSingleItemLayout()
@@ -116,18 +120,47 @@ public struct CollectionViewSections {
         return createConferenceLayout(
             itemCount: itemCount,
             groupAbsoluteExtent: nil,
-            containerSize: containerSize)
+            containerSize: containerSize,
+            safeAreaTop: safeAreaTop)
+    }
+
+    /// Conference tiles with an explicit aspect (used while the local user is presenting
+    /// and the snapshot has cameras only — those items must follow device orientation).
+    public func conferenceViewSection(
+        itemCount: Int,
+        containerSize: CGSize,
+        targetAspect: CGFloat,
+        safeAreaTop: CGFloat = 0
+    ) -> NSCollectionLayoutSection {
+        guard itemCount > 0 else {
+            assertionFailure("Item count must be greater than 0")
+            return createSingleItemLayout()
+        }
+        return createConferenceLayout(
+            itemCount: itemCount,
+            groupAbsoluteExtent: nil,
+            containerSize: containerSize,
+            targetAspect: targetAspect,
+            safeAreaTop: safeAreaTop)
     }
     #endif
     
     #if os(macOS)
     /// Conference row with a non-zero group extent so items do not collapse when the compositional container is briefly `.zero` during window resize.
-    public func conferenceViewSection(itemCount: Int, groupAbsoluteExtent: CGSize) -> NSCollectionLayoutSection {
+    public func conferenceViewSection(
+        itemCount: Int,
+        groupAbsoluteExtent: CGSize,
+        safeAreaTop: CGFloat = 0
+    ) -> NSCollectionLayoutSection {
         guard itemCount > 0 else {
             assertionFailure("Item count must be greater than 0")
             return createSingleItemLayout()
         }
-        return createConferenceLayout(itemCount: itemCount, groupAbsoluteExtent: groupAbsoluteExtent)
+        return createConferenceLayout(
+            itemCount: itemCount,
+            groupAbsoluteExtent: groupAbsoluteExtent,
+            safeAreaTop: safeAreaTop
+        )
     }
     #endif
     
@@ -237,7 +270,9 @@ public struct CollectionViewSections {
         itemCount: Int,
         contentInsets: NSDirectionalEdgeInsets = defaultContentInsets,
         groupAbsoluteExtent: CGSize? = nil,
-        containerSize: CGSize? = nil
+        containerSize: CGSize? = nil,
+        targetAspect: CGFloat = CGFloat(GroupCallVideoLayoutPolicy.targetAspect),
+        safeAreaTop: CGFloat = 0
     ) -> NSCollectionLayoutSection {
         #if os(iOS)
         let maxItemsPerPage = 12
@@ -249,7 +284,10 @@ public struct CollectionViewSections {
         #endif
 
         let resolvedContainerSize = groupAbsoluteExtent ?? containerSize
-        let baseInsets = conferenceContentInsets(base: contentInsets, for: layoutItemCount)
+        var baseInsets = conferenceContentInsets(base: contentInsets, for: layoutItemCount)
+        if safeAreaTop > 0 {
+            baseInsets.top += safeAreaTop
+        }
 
         let groupSize: NSCollectionLayoutSize
         if let resolvedContainerSize {
@@ -264,19 +302,13 @@ public struct CollectionViewSections {
             )
         }
 
-        let group = NSCollectionLayoutGroup.custom(layoutSize: groupSize) { environment in
-            let containerWidth = resolvedContainerSize?.width
-                ?? environment.container.effectiveContentSize.width
-
-            let containerHeight = resolvedContainerSize?.height
-                ?? environment.container.effectiveContentSize.height
-
-            return Self.conferenceCustomItems(
-                itemCount: layoutItemCount,
-                containerSize: CGSize(width: containerWidth, height: containerHeight),
-                insets: baseInsets
-            )
-        }
+        let group = Self.makeConferenceCustomGroup(
+            groupSize: groupSize,
+            resolvedContainerSize: resolvedContainerSize,
+            layoutItemCount: layoutItemCount,
+            insets: baseInsets,
+            targetAspect: targetAspect
+        )
 
         let section = NSCollectionLayoutSection(group: group)
 
@@ -289,15 +321,35 @@ public struct CollectionViewSections {
         return section
     }
 
-    private static func conferenceCustomItems(
+    nonisolated private static func makeConferenceCustomGroup(
+        groupSize: NSCollectionLayoutSize,
+        resolvedContainerSize: CGSize?,
+        layoutItemCount: Int,
+        insets: NSDirectionalEdgeInsets,
+        targetAspect: CGFloat
+    ) -> NSCollectionLayoutGroup {
+        NSCollectionLayoutGroup.custom(layoutSize: groupSize) { environment in
+            let containerWidth = resolvedContainerSize?.width
+                ?? environment.container.effectiveContentSize.width
+            let containerHeight = resolvedContainerSize?.height
+                ?? environment.container.effectiveContentSize.height
+            return conferenceCustomItems(
+                itemCount: layoutItemCount,
+                containerSize: CGSize(width: containerWidth, height: containerHeight),
+                insets: insets,
+                targetAspect: targetAspect
+            )
+        }
+    }
+
+    nonisolated private static func conferenceCustomItems(
         itemCount: Int,
         containerSize: CGSize,
         insets: NSDirectionalEdgeInsets,
-        preferVerticalStack: Bool = false
+        preferVerticalStack: Bool = false,
+        targetAspect: CGFloat = CGFloat(GroupCallVideoLayoutPolicy.targetAspect)
     ) -> [NSCollectionLayoutGroupCustomItem] {
         guard itemCount > 0 else { return [] }
-
-        let targetAspect: CGFloat = 16.0 / 9.0
 
         let availableWidth = max(
             1,
@@ -317,23 +369,14 @@ public struct CollectionViewSections {
             #endif
         }()
 
-        // Phones lay participants out as a single horizontal collection (not a vertical
-        // stack) during screen share on the bottom strip; tall sidebars stay vertical.
-        let isPhoneShape = min(containerSize.width, containerSize.height) < 600
-        let useHorizontalPhoneRow = !preferVerticalStack && isPhoneShape && itemCount <= 4
-        let grid: (columns: Int, rows: Int)
-        if useHorizontalPhoneRow {
-            grid = (columns: itemCount, rows: 1)
-        } else if preferVerticalStack {
-            grid = (columns: 1, rows: itemCount)
-        } else {
-            grid = bestConferenceGrid(
-                itemCount: itemCount,
-                availableSize: CGSize(width: availableWidth, height: availableHeight),
-                spacing: spacing,
-                targetAspect: targetAspect
-            )
-        }
+        let grid = GroupCallVideoLayoutPolicy.conferenceGridDimensions(
+            itemCount: itemCount,
+            containerSize: GroupCallLayoutSize(
+                width: Double(containerSize.width),
+                height: Double(containerSize.height)
+            ),
+            preferVerticalStack: preferVerticalStack
+        )
 
         let columns = max(1, grid.columns)
         let rows = max(1, grid.rows)
@@ -359,7 +402,7 @@ public struct CollectionViewSections {
         let gridHeight = CGFloat(rows) * tileHeight + totalVerticalSpacing
 
         let originX = insets.leading + max(0, availableWidth - gridWidth) / 2
-        let originY = insets.top + max(0, availableHeight - gridHeight) / 2
+        let originY = insets.top
 
         return (0..<itemCount).map { index in
             let row = index / columns
@@ -457,7 +500,7 @@ public struct CollectionViewSections {
         return bestGrid
     }
 
-    private static func conferenceTileSize(
+    nonisolated private static func conferenceTileSize(
         columns: Int,
         rows: Int,
         availableSize: CGSize,
@@ -546,7 +589,7 @@ public struct CollectionViewSections {
             size: CGSize(width: availableWidth, height: availableHeight),
             score: 0
         )
-        let topInset = max(0, (availableHeight - resolved.size.height) / 2)
+        let topInset: CGFloat = 0
         let leadingInset = max(0, (availableWidth - resolved.size.width) / 2)
 
         return ConferenceLayoutMetrics(
@@ -622,20 +665,45 @@ public struct CollectionViewSections {
     }
 
     /// iOS section-provider variant with the current collection view size.
-    public func screenShareDominantSection(cameraTileCount: Int, containerSize: CGSize) -> NSCollectionLayoutSection {
-        return createScreenShareDominantLayout(cameraTileCount: cameraTileCount, groupAbsoluteExtent: containerSize)
+    ///
+    /// `cameraTileAspects` are per remote **content** (incoming upright frame), not the
+    /// local collection. The share item stays a separate full-bleed top/sidebar group.
+    public func screenShareDominantSection(
+        cameraTileCount: Int,
+        containerSize: CGSize,
+        cameraTileAspects: [CGFloat] = [],
+        safeAreaTop: CGFloat = 0
+    ) -> NSCollectionLayoutSection {
+        return createScreenShareDominantLayout(
+            cameraTileCount: cameraTileCount,
+            groupAbsoluteExtent: containerSize,
+            cameraTileAspects: cameraTileAspects,
+            safeAreaTop: safeAreaTop
+        )
     }
 
     #if os(macOS)
     /// macOS variant with explicit group extent to avoid zero-bounds during resize.
-    public func screenShareDominantSection(cameraTileCount: Int, groupAbsoluteExtent: CGSize) -> NSCollectionLayoutSection {
-        return createScreenShareDominantLayout(cameraTileCount: cameraTileCount, groupAbsoluteExtent: groupAbsoluteExtent)
+    public func screenShareDominantSection(
+        cameraTileCount: Int,
+        groupAbsoluteExtent: CGSize,
+        cameraTileAspects: [CGFloat] = [],
+        safeAreaTop: CGFloat = 0
+    ) -> NSCollectionLayoutSection {
+        return createScreenShareDominantLayout(
+            cameraTileCount: cameraTileCount,
+            groupAbsoluteExtent: groupAbsoluteExtent,
+            cameraTileAspects: cameraTileAspects,
+            safeAreaTop: safeAreaTop
+        )
     }
     #endif
 
     private func createScreenShareDominantLayout(
         cameraTileCount: Int,
-        groupAbsoluteExtent: CGSize?
+        groupAbsoluteExtent: CGSize?,
+        cameraTileAspects: [CGFloat] = [],
+        safeAreaTop: CGFloat = 0
     ) -> NSCollectionLayoutSection {
         func outerLayoutSize(for extent: CGSize?) -> NSCollectionLayoutSize {
             if let extent {
@@ -667,26 +735,32 @@ public struct CollectionViewSections {
         }
 
         let visibleCameraCount = max(1, cameraTileCount)
-        let isWide = groupAbsoluteExtent.map { $0.width > max(1, $0.height) * 1.08 } ?? false
+        let collectionSize = GroupCallLayoutSize(
+            width: Double(groupAbsoluteExtent?.width ?? 0),
+            height: Double(groupAbsoluteExtent?.height ?? 0)
+        )
+        let isWide = GroupCallVideoLayoutPolicy.isWideCollection(collectionSize)
+        let resolvedAspects = (0..<visibleCameraCount).map { index -> Double in
+            if index < cameraTileAspects.count, cameraTileAspects[index] > 0 {
+                return Double(cameraTileAspects[index])
+            }
+            return GroupCallVideoLayoutPolicy.landscapeTileAspect
+        }
 
+        // Share stays a normal full-bleed item in its own group. Only the camera
+        // strip uses custom frames so remote content can be 16:9 or 9:16.
         let screenItem = NSCollectionLayoutItem(layoutSize: NSCollectionLayoutSize(
             widthDimension: .fractionalWidth(1.0),
             heightDimension: .fractionalHeight(1.0)
         ))
         screenItem.contentInsets = NSDirectionalEdgeInsets(top: 2, leading: 2, bottom: 2, trailing: 2)
 
-        /// Camera thumbnails in the screen-share strip use the same uniform 16:9 tile
-        /// placement as `conferenceViewSection` (not fractional stretch-to-fill cells).
         func cameraStripGroup(
-            cameraTileCount: Int,
             stripSize: CGSize?,
             layoutSize: NSCollectionLayoutSize,
-            preferVerticalStack: Bool
+            preferVerticalStack: Bool,
+            stripSafeAreaTop: CGFloat
         ) -> NSCollectionLayoutGroup {
-            let baseInsets = conferenceContentInsets(
-                base: Self.defaultContentInsets,
-                for: cameraTileCount
-            )
             return NSCollectionLayoutGroup.custom(layoutSize: layoutSize) { environment in
                 let width = max(
                     1,
@@ -696,27 +770,18 @@ public struct CollectionViewSections {
                     1,
                     stripSize?.height ?? environment.container.effectiveContentSize.height
                 )
-                return Self.conferenceCustomItems(
-                    itemCount: cameraTileCount,
-                    containerSize: CGSize(width: width, height: height),
-                    insets: baseInsets,
-                    preferVerticalStack: preferVerticalStack
-                )
+                return GroupCallVideoLayoutPolicy.screenShareCameraStripFrames(
+                    aspects: resolvedAspects,
+                    stripSize: GroupCallLayoutSize(width: Double(width), height: Double(height)),
+                    platform: .iOS,
+                    preferVerticalStack: preferVerticalStack,
+                    safeAreaTop: Double(stripSafeAreaTop)
+                ).map { rect in
+                    NSCollectionLayoutGroupCustomItem(
+                        frame: CGRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
+                    )
+                }
             }
-        }
-
-        /// Wide layouts place participants in a tall sidebar — one 16:9 tile per row.
-        func verticalSidebarCameraStripGroup(
-            cameraTileCount: Int,
-            stripSize: CGSize?,
-            layoutSize: NSCollectionLayoutSize
-        ) -> NSCollectionLayoutGroup {
-            cameraStripGroup(
-                cameraTileCount: cameraTileCount,
-                stripSize: stripSize,
-                layoutSize: layoutSize,
-                preferVerticalStack: true
-            )
         }
 
         let outerSize = outerLayoutSize(for: groupAbsoluteExtent)
@@ -726,8 +791,6 @@ public struct CollectionViewSections {
             switch visibleCameraCount {
             case 1:
                 screenFraction = 0.74
-            case 2:
-                screenFraction = 0.82
             default:
                 screenFraction = 0.82
             }
@@ -759,10 +822,11 @@ public struct CollectionViewSections {
                 )
             }
             let screenGroup = NSCollectionLayoutGroup.horizontal(layoutSize: screenSize, subitems: [screenItem])
-            let cameraGroup = verticalSidebarCameraStripGroup(
-                cameraTileCount: visibleCameraCount,
+            let cameraGroup = cameraStripGroup(
                 stripSize: cameraStripSize,
-                layoutSize: cameraSize
+                layoutSize: cameraSize,
+                preferVerticalStack: true,
+                stripSafeAreaTop: safeAreaTop
             )
             outerGroup = NSCollectionLayoutGroup.horizontal(layoutSize: outerSize, subitems: [screenGroup, cameraGroup])
         } else {
@@ -808,16 +872,15 @@ public struct CollectionViewSections {
             let screenGroup = NSCollectionLayoutGroup.horizontal(layoutSize: screenSize, subitems: [screenItem])
             let preferVerticalStack = cameraStripSize.map { $0.height > $0.width * 1.08 } ?? false
             let cameraGroup = cameraStripGroup(
-                cameraTileCount: visibleCameraCount,
                 stripSize: cameraStripSize,
                 layoutSize: cameraSize,
-                preferVerticalStack: preferVerticalStack
+                preferVerticalStack: preferVerticalStack,
+                stripSafeAreaTop: 0
             )
             outerGroup = NSCollectionLayoutGroup.vertical(layoutSize: outerSize, subitems: [screenGroup, cameraGroup])
         }
 
-        let section = NSCollectionLayoutSection(group: outerGroup)
-        return section
+        return NSCollectionLayoutSection(group: outerGroup)
     }
 }
 #endif

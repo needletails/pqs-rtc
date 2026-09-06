@@ -1353,6 +1353,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
     }
 
     /// Attaches FrameCryptor decryptors to current RTP receivers (audio/video) on the active PeerConnection.
+    public func disposeReceiverCryptors(forParticipant participantId: String) {
+        frameCryptorSupport.disposeReceiverCryptors(forParticipant: participantId)
+    }
+
     public func createReceiverEncryptedFrame(participant: String, connectionId: String, trackKind: String? = nil, trackId: String? = nil) {
         lock.lock()
         let canAttach = !isClosed && !frameCryptorUnavailable && keyProviderReady
@@ -2019,7 +2023,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     // They are used by `RTCSession` for SFU/group calls so the sender doesn't overshoot uplink,
     // and can ramp up quality on good internet.
     public func setVideoSenderEncodings(maxBitrateBps: Int, maxFramerate: Int, scaleResolutionDownBy: Double) {
-        // `pc.senders` / `sender.parameters` are synchronous proxies onto the WebRTC signaling
+        // Sender parameters are synchronous proxies onto the WebRTC signaling
         // thread. Never hold `lock` across them: the signaling thread takes this same lock in
         // `triggerRTCEvent`, so holding it here deadlocks the client (main-thread ANR at end call).
         lock.lock()
@@ -2027,7 +2031,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         lock.unlock()
         guard !closed else { return }
         // SKIP INSERT: val pc = this@AndroidRTCClient.peerConnection?.platformPeerConnection ?: return
-        // SKIP INSERT: val senders = pc.senders
+        // SKIP INSERT: val senders = AndroidWebRTCTrackResolver.stableSenders(pc)
         // SKIP INSERT: val videoSender = senders.firstOrNull { it.track()?.kind() == "video" } ?: return
         // SKIP INSERT: val params = videoSender.parameters
         // SKIP INSERT: val encodings = params.encodings

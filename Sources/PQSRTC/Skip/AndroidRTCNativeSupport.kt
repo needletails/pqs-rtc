@@ -351,6 +351,8 @@ object AndroidRTCViewSupport {
         }
     }
 
+    private val installedSurfaceCallbacks = mutableMapOf<Int, SurfaceHolder.Callback>()
+
     fun installSurfaceReadyCallback(
         renderer: SurfaceViewRenderer,
         logTag: String,
@@ -359,7 +361,7 @@ object AndroidRTCViewSupport {
         onDestroyed: (() -> Unit)? = null,
     ): Boolean {
         return try {
-            renderer.holder?.addCallback(object : SurfaceHolder.Callback {
+            val callback = object : SurfaceHolder.Callback {
                 override fun surfaceCreated(holder: SurfaceHolder) {
                     Log.d(logTag, "Surface created")
                     onReady()
@@ -375,7 +377,14 @@ object AndroidRTCViewSupport {
                     Log.d(logTag, "Surface destroyed")
                     onDestroyed?.invoke()
                 }
-            })
+            }
+            renderer.holder?.let { holder ->
+                installedSurfaceCallbacks.remove(System.identityHashCode(renderer))?.let { previous ->
+                    holder.removeCallback(previous)
+                }
+                holder.addCallback(callback)
+                installedSurfaceCallbacks[System.identityHashCode(renderer)] = callback
+            }
             if (isSurfaceReady(renderer)) {
                 val dimensions = currentSurfaceDimensions(renderer)
                 postToMainThread {
@@ -1070,6 +1079,29 @@ class AndroidFrameCryptorSupport {
     }
 
     @Synchronized
+    fun disposeReceiverCryptors(forParticipant participantId: String) {
+        val keys = (
+            videoReceiverCryptorsByParticipantId.keys +
+                audioReceiverCryptorsByParticipantId.keys +
+                screenReceiverCryptorsByParticipantId.keys
+            ).filter { it.equals(participantId, ignoreCase = true) }
+        for (key in keys) {
+            videoReceiverCryptorsByParticipantId.remove(key)?.dispose()
+            audioReceiverCryptorsByParticipantId.remove(key)?.dispose()
+            screenReceiverCryptorsByParticipantId.remove(key)?.dispose()
+            videoReceiverKeysByParticipantId.remove(key)
+            audioReceiverKeysByParticipantId.remove(key)
+            screenReceiverKeysByParticipantId.remove(key)
+            videoReceiverTrackIdsByParticipantId.remove(key)
+            audioReceiverTrackIdsByParticipantId.remove(key)
+            screenReceiverTrackIdsByParticipantId.remove(key)
+        }
+        if (keys.isNotEmpty()) {
+            generation += 1
+        }
+    }
+
+    @Synchronized
     fun disposeScreenSender() {
         generation += 1
         screenSenderCryptor?.dispose()
@@ -1342,22 +1374,29 @@ class AndroidFrameCryptorSupport {
             Log.i("AndroidRTCClient", "Rebinding audio receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$receiverKey newTrackId=$trackId")
         }
 
-        val cryptor = FrameCryptorFactory.createFrameCryptorForRtpReceiver(
-            factory,
-            receiver,
-            participant,
-            FrameCryptorAlgorithm.AES_GCM,
-            provider
-        )
-        attachObserver("audio-receiver", cryptor)
-        cryptor?.setEnabled(true)
-        if (cryptor != null) {
-            audioReceiverCryptorsByParticipantId[participant] = cryptor
-            audioReceiverKeysByParticipantId[participant] = receiverKey
-            audioReceiverTrackIdsByParticipantId[participant] = trackId
-            audioReceiverCryptor = cryptor
-            enableAndroidRemoteAudioReceiverTrack(receiver)
-            Log.i("AndroidRTCClient", "✅ Audio receiver cryptor attached receiverKey=$receiverKey trackId=$trackId")
+        var cryptor: FrameCryptor? = null
+        try {
+            cryptor = FrameCryptorFactory.createFrameCryptorForRtpReceiver(
+                factory,
+                receiver,
+                participant,
+                FrameCryptorAlgorithm.AES_GCM,
+                provider
+            )
+            attachObserver("audio-receiver", cryptor)
+            cryptor?.setEnabled(true)
+            if (cryptor != null) {
+                audioReceiverCryptorsByParticipantId[participant] = cryptor
+                audioReceiverKeysByParticipantId[participant] = receiverKey
+                audioReceiverTrackIdsByParticipantId[participant] = trackId
+                audioReceiverCryptor = cryptor
+                enableAndroidRemoteAudioReceiverTrack(receiver)
+                Log.i("AndroidRTCClient", "✅ Audio receiver cryptor attached receiverKey=$receiverKey trackId=$trackId")
+            }
+        } finally {
+            if (cryptor == null) {
+                enableAndroidRemoteAudioReceiverTrack(receiver)
+            }
         }
     }
 

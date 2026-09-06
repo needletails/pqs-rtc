@@ -1371,6 +1371,7 @@ extension RTCSession {
     /// receiver FrameCryptors are reattached after the key install so tracks that arrived before
     /// the sender-key envelope can begin decrypting without recreating the PeerConnection.
     public func setFrameEncryptionKey(_ key: Data, index: Int, for participantId: String) async {
+        let participantId = Self.conferenceParticipantIdentityKey(participantId)
         let keyRingIndex = frameCryptorKeyRingIndex(index)
 #if canImport(WebRTC)
         guard enableEncryption else { return }

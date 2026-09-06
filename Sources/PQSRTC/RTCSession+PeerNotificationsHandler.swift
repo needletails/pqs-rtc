@@ -3323,9 +3323,30 @@ extension RTCSession {
             ) {
                 continue
             }
-            if let existing = existingScreenTrack(for: participantId, in: connection),
-               let existingTrackId = existing.trackIdIfAvailable {
-                consumedTrackIds.insert(existingTrackId)
+            if let existing = existingScreenTrack(for: participantId, in: connection) {
+                let liveTrack = androidResolveLiveRemoteScreenTrack(
+                    participantId: participantId,
+                    storedTrack: existing,
+                    connection: connection,
+                    remoteSdp: remoteSdp
+                )
+                if let liveTrack,
+                   ScreenShareAttachPolicy.shouldRebindScreenWrapper(
+                    storedTrackId: existing.trackIdIfAvailable,
+                    liveTrackId: liveTrack.trackIdIfAvailable,
+                    platformTracksIdentical: existing.platformTrack === liveTrack.platformTrack
+                   ) {
+                    connection.remoteScreenTracksByParticipantId[participantId] = liveTrack
+                    connection.remoteScreenTrack = liveTrack
+                    await connectionManager.updateConnection(id: connection.id, with: connection)
+                    logger.log(
+                        level: .info,
+                        message: "Updated Android remote screen wrapper after SDP reconcile participant=\(participantId) trackId=\(liveTrack.trackIdIfAvailable ?? "<nil>") connection=\(connection.id)"
+                    )
+                }
+                if let consumedId = (liveTrack ?? existing).trackIdIfAvailable {
+                    consumedTrackIds.insert(consumedId)
+                }
                 notifyRemoteScreenTrackChanged(
                     RemoteScreenTrackEvent(connectionId: connection.id, participantId: participantId, isActive: true)
                 )
@@ -3454,6 +3475,47 @@ extension RTCSession {
         }
 
         return labels
+    }
+
+    func androidResolveLiveRemoteScreenTrack(
+        participantId: String,
+        storedTrack: RTCVideoTrack?,
+        connection: RTCConnection,
+        remoteSdp: String
+    ) -> RTCVideoTrack? {
+        let storedTrackId = storedTrack?.trackIdIfAvailable
+        if let storedTrackId, !storedTrackId.isEmpty,
+           let byId = rtcClient.getRemoteScreenVideoTrackById(
+            peerConnection: connection.peerConnection,
+            trackId: storedTrackId
+           ),
+           byId.isLiveVideoTrack {
+            return byId
+        }
+
+        let advertisedScreenMids = Self.remoteActiveIncomingScreenShareVideoMids(in: remoteSdp)
+            .union(Self.sfuRelayIncomingScreenShareVideoMids(in: remoteSdp))
+        let mappedCameraTrackIds = Set(
+            connection.remoteVideoTracksByParticipantId.values.compactMap(\.trackIdIfAvailable)
+        )
+        for mid in advertisedScreenMids.sorted() {
+            guard let byMid = rtcClient.getRemoteScreenVideoTrackByMid(
+                peerConnection: connection.peerConnection,
+                mid: mid
+            ),
+                  byMid.isLiveVideoTrack,
+                  let byMidTrackId = byMid.trackIdIfAvailable,
+                  !mappedCameraTrackIds.contains(byMidTrackId) else {
+                continue
+            }
+            return byMid
+        }
+
+        if let fallback = rtcClient.getRemoteScreenVideoTrack(peerConnection: connection.peerConnection),
+           fallback.isLiveVideoTrack {
+            return fallback
+        }
+        return storedTrack?.isLiveVideoTrack == true ? storedTrack : nil
     }
 #endif
 
@@ -4697,7 +4759,8 @@ extension RTCSession {
             case .signalingStateDidChange(let connectionId, let stateChanged):
                 self.logger.log(level: .info, message: "peerConnection new signaling state: \(stateChanged.description)")
                 let norm = connectionId.normalizedConnectionId
-                let isStable = stateChanged.description == "stable"
+                signalingStateByConnectionId[norm] = stateChanged
+                let isStable = stateChanged.description == "stable" || stateChanged.state == .stable
                 if isStable {
                     self.screenShareSignalingDidBecomeStable(connectionId: connectionId)
                 }

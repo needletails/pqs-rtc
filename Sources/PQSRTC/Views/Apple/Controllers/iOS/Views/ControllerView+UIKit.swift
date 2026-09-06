@@ -209,56 +209,67 @@ class ControllerView: UIView {
     ///   - isLandscape: Whether the UI should treat the interface as landscape.
     ///   - minimize: Whether the preview is in its minimized state.
     /// - Returns: The target size for the local preview overlay.
-    func setSize(isLandscape: Bool, minimize: Bool) -> CGSize {
-        var width: CGFloat = 0
-        var height: CGFloat = 0
-        
-        if isLandscape {
-            switch UIDevice.current.userInterfaceIdiom {
-            case .phone:
-                width = minimize ? (UIScreen.main.bounds.width / 4) : (UIScreen.main.bounds.width / 3)
-                height = minimize ? (UIScreen.main.bounds.width / 4) / getAspectRatio(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height) : (UIScreen.main.bounds.width / 3) / getAspectRatio(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
-            case .pad:
-                width = minimize ? UIScreen.main.bounds.width / 3 : UIScreen.main.bounds.width / 4
-                height = minimize ? (UIScreen.main.bounds.width / 3) / getAspectRatio(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height) : (UIScreen.main.bounds.width / 4) / getAspectRatio(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
-            default:
-                break
-            }
+    func setSize(isLandscape: Bool, minimize: Bool, containerSize: CGSize? = nil) -> CGSize {
+        let fallback: CGSize
+        if bounds.width > 1, bounds.height > 1 {
+            fallback = bounds.size
         } else {
-            switch UIDevice.current.userInterfaceIdiom {
-            case .phone:
-                width = minimize ? (UIScreen.main.bounds.width / 6.5) : UIScreen.main.bounds.height / 4.5
-                height = minimize ? (UIScreen.main.bounds.width / 6.5) * getAspectRatio(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height) : (UIScreen.main.bounds.height / 5.5) * getAspectRatio(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
-            case .pad:
-                width = minimize ? UIScreen.main.bounds.height / 3 : UIScreen.main.bounds.height / 4
-                height = minimize ? (UIScreen.main.bounds.height / 3) * getAspectRatio(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height) : (UIScreen.main.bounds.height / 4) * getAspectRatio(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
-            default:
-                break
-            }
+            fallback = UIScreen.main.bounds.size
         }
-        return CGSize(width: width, height: height)
+        let explicit = containerSize.flatMap { size -> GroupCallLayoutSize? in
+            guard size.width > 1, size.height > 1 else { return nil }
+            return GroupCallLayoutSize(width: Double(size.width), height: Double(size.height))
+        }
+        let container = GroupCallVideoLayoutPolicy.resolvedLocalPreviewHostSize(
+            explicitContainer: explicit,
+            fallbackContainer: GroupCallLayoutSize(
+                width: Double(fallback.width),
+                height: Double(fallback.height)
+            ),
+            requestedIsLandscape: isLandscape
+        )
+        let policy = GroupCallVideoLayoutPolicy.localPreviewOverlaySize(
+            platform: .iOS,
+            containerSize: container,
+            isTablet: UIDevice.current.userInterfaceIdiom == .pad,
+            isMinimized: minimize
+        )
+        return CGSize(width: policy.width, height: policy.height)
     }
     
     /// Updates the local preview's constraints based on orientation and state.
     ///
     /// This no-ops while the app is backgrounded.
-    func updateLocalVideoSize(with orientation: UIDeviceOrientation, should minimize: Bool, isConnected: Bool, view: NTMTKView, animated: Bool = true) {
+    func updateLocalVideoSize(
+        with orientation: UIDeviceOrientation,
+        should minimize: Bool,
+        isConnected: Bool,
+        view: NTMTKView,
+        animated: Bool = true,
+        containerSize: CGSize? = nil
+    ) {
         if UIApplication.shared.applicationState != .background {
-            var size: CGSize = .zero
-            switch orientation {
-            case .unknown, .faceUp, .faceDown:
-                if UIScreen.main.bounds.width < UIScreen.main.bounds.height {
-                    size = setSize(isLandscape: false, minimize: minimize)
-                } else {
-                    size = setSize(isLandscape: true, minimize: minimize)
+            let fallbackBox = bounds.width > 1 && bounds.height > 1
+                ? bounds.size
+                : UIScreen.main.bounds.size
+            let isLandscape: Bool
+            if let containerSize, containerSize.width > 1, containerSize.height > 1 {
+                isLandscape = containerSize.width > containerSize.height
+            } else {
+                switch orientation {
+                case .portrait, .portraitUpsideDown:
+                    isLandscape = false
+                case .landscapeLeft, .landscapeRight:
+                    isLandscape = true
+                default:
+                    isLandscape = fallbackBox.width > fallbackBox.height
                 }
-            case .portrait, .portraitUpsideDown:
-                size = setSize(isLandscape: false, minimize: minimize)
-            case .landscapeRight, .landscapeLeft:
-                size = setSize(isLandscape: true, minimize: minimize)
-            default:
-                size = setSize(isLandscape: true, minimize: minimize)
             }
+            let size = setSize(
+                isLandscape: isLandscape,
+                minimize: minimize,
+                containerSize: containerSize
+            )
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 await updateVideoConstraints(size: size, isConnected: isConnected, view: view, animated: animated)
@@ -398,12 +409,6 @@ class ControllerView: UIView {
         voiceCallChrome?.stopAmbientMotion()
         voiceCallChrome?.removeFromSuperview()
         voiceCallChrome = nil
-    }
-    
-    // MARK: - Aspect Ratio Calculation
-    /// Returns $\frac{\max(width, height)}{\min(width, height)}$.
-    private func getAspectRatio(width: CGFloat, height: CGFloat) -> CGFloat {
-        max(width, height) / min(width, height)
     }
 }
 #endif

@@ -774,6 +774,54 @@ extension RTCSession {
         }
     }
 
+    /// Group/conference SFU: after renegotiation the live Android screen receiver wrapper can
+    /// rotate while the negotiated track id stays stable. Rebind the mapping and notify UI.
+    func rebindAndroidGroupRemoteParticipantScreenAfterSfuRenegotiationIfNeeded(connectionId: String) async {
+        let norm = connectionId.normalizedConnectionId
+        guard var connection = await connectionManager.findConnection(with: norm) else { return }
+        guard !Self.isTrueOneToOneSfuRoom(call: connection.call) else { return }
+        guard isGroupCallConnection(connection.id) else { return }
+        guard let remoteSdp = androidRemoteOfferSdp(from: connection)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !remoteSdp.isEmpty else {
+            return
+        }
+
+        var didRebindAny = false
+        for (participantId, storedTrack) in connection.remoteScreenTracksByParticipantId {
+            let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            guard let liveTrack = androidResolveLiveRemoteScreenTrack(
+                participantId: trimmed,
+                storedTrack: storedTrack,
+                connection: connection,
+                remoteSdp: remoteSdp
+            ) else {
+                continue
+            }
+            guard ScreenShareAttachPolicy.shouldRebindScreenWrapper(
+                storedTrackId: storedTrack.trackIdIfAvailable,
+                liveTrackId: liveTrack.trackIdIfAvailable,
+                platformTracksIdentical: storedTrack.platformTrack === liveTrack.platformTrack
+            ) else {
+                continue
+            }
+
+            logger.log(
+                level: .info,
+                message: "SFU group renegotiation: rebinding Android remote screen participant=\(trimmed) oldTrackId=\(storedTrack.trackIdIfAvailable ?? "<nil>") newTrackId=\(liveTrack.trackIdIfAvailable ?? "<nil>") connection=\(norm)"
+            )
+            connection.remoteScreenTracksByParticipantId[trimmed] = liveTrack
+            connection.remoteScreenTrack = liveTrack
+            didRebindAny = true
+            notifyRemoteScreenTrackChanged(
+                RemoteScreenTrackEvent(connectionId: connection.id, participantId: trimmed, isActive: true)
+            )
+        }
+
+        guard didRebindAny else { return }
+        await connectionManager.updateConnection(id: connection.id, with: connection)
+    }
+
     /// Prunes disposed Android remote camera mappings after WebRTC removes a receiver during SFU
     /// renegotiation. Stale wrappers in ``RTCConnection/remoteVideoTracksByParticipantId`` would
     /// otherwise be re-attached and fail with "MediaStreamTrack has been disposed".
@@ -1236,6 +1284,29 @@ extension RTCSession {
         return screenTrack != nil
     }
 
+    func androidScreenRendererSharesMappedWrapper(
+        view: AndroidSampleCaptureView,
+        connectionId: String,
+        participantId: String
+    ) async -> Bool {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard let connection = await connectionManager.findConnection(with: normalizedId) else {
+            return false
+        }
+        var screenTrack = connection.remoteScreenTracksByParticipantId[participantId]
+        if screenTrack == nil {
+            let participantKey = Self.conferenceParticipantIdentityKey(participantId)
+            if !participantKey.isEmpty {
+                screenTrack = connection.remoteScreenTracksByParticipantId.first {
+                    Self.conferenceParticipantIdentityKey($0.key) == participantKey
+                }?.value
+            }
+        }
+        screenTrack = screenTrack ?? connection.remoteScreenTrack
+        guard let screenTrack else { return false }
+        return view.attachedTrackSharesRendererSink(with: screenTrack)
+    }
+
     @discardableResult
     func renderRemoteScreenVideo(to view: AndroidSampleCaptureView, connectionId: String, participantId: String) async -> Bool {
         let normalizedId = connectionId.normalizedConnectionId
@@ -1266,10 +1337,12 @@ extension RTCSession {
         }
 
         if let screenTrack {
-            if view.hasActiveSink(),
-               view.attachedTrackIsLive(),
-               view.attachedTrackSharesRendererSink(with: screenTrack),
-               !view.rendererLayoutNeedsSinkReconcile() {
+            if ScreenShareAttachPolicy.shouldSkipScreenRendererAttach(
+                hasActiveSink: view.hasActiveSink(),
+                attachedTrackIsLive: view.attachedTrackIsLive(),
+                sharesMappedWrapper: view.attachedTrackSharesRendererSink(with: screenTrack),
+                layoutNeedsReconcile: view.rendererLayoutNeedsSinkReconcile()
+            ) {
                 return true
             }
             logger.log(level: .info, message: "Rendering remote screen video for connection=\(connectionId) participant=\(participantId)")

@@ -1227,6 +1227,7 @@ extension RTCSession {
                 // rebindInboundRemoteVideoAfterSfuRenegotiationIfNeeded, not the group wrapper-sync path.
             } else if await isGroupCallConnection(connection.id) {
                 await rebindAndroidGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(connectionId: connection.id)
+                await rebindAndroidGroupRemoteParticipantScreenAfterSfuRenegotiationIfNeeded(connectionId: connection.id)
             }
             
         } catch let error as SDPHandlerError {

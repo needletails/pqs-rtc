@@ -105,8 +105,14 @@ public final class VideoCallViewController: NSViewController {
     private var hasActiveRemoteScreenShare = false
     /// Whether any screen-share tile (local or remote) is visible — drives presentation layout.
     private var hasVisibleScreenShareInCollection = false
+    /// Incoming upright size for each remote camera context. Used only to size the
+    /// remote collection item, never the share tile.
+    private var remoteUprightSizeByContext: [String: CGSize] = [:]
     /// Deferred layout pass after screen-share transitions (mirrors iOS heal for stale tile bounds).
     private var postScreenShareLayoutHealTask: Task<Void, Never>?
+    private var screenShareLayoutGeneration: UInt64 = 0
+    private var pendingScreenShareLayoutGeneration: UInt64?
+    private var pendingScreenShareLayoutExpectedVisible: Bool?
     private var localScreenShareAttachRetryTask: Task<Void, Never>?
     /// Participant id for the remote screen-share tile currently shown (mirrors Android guard).
     private var activeRemoteScreenShareParticipantId: String?
@@ -272,16 +278,19 @@ public final class VideoCallViewController: NSViewController {
                 case .ended(_, _):
                     controllerView.statusLabel.stringValue = "Ended"
                     await tearDownCall()
-                case .failed(_, _, let errorMessage):
+                case .failed(_, let failedCall, let errorMessage):
                     controllerView.statusLabel.stringValue = "Failed"
                     await session.stopRingtone()
                     await videoCallDelegate?.passErrorMessage(errorMessage)
-                    if currentCall != nil {
-                        await tearDownCall()
+                    if currentCall == nil {
+                        currentCall = failedCall
                     }
-                case .callAnsweredAuxDevice(_):
+                    await tearDownCall()
+                case .callAnsweredAuxDevice(let answeredCall):
                     controllerView.statusLabel.stringValue = "Answered on Auxiliary Device"
-                    currentCall = nil
+                    if currentCall == nil {
+                        currentCall = answeredCall
+                    }
                     await tearDownCall()
                 }
             }
@@ -337,16 +346,19 @@ public final class VideoCallViewController: NSViewController {
                 case .ended(_, _):
                     controllerView.statusLabel.stringValue = "Ended"
                     await tearDownCall()
-                case .failed(_, _, let errorMessage):
+                case .failed(_, let failedCall, let errorMessage):
                     controllerView.statusLabel.stringValue = "Failed"
                     await session.stopRingtone()
                     await videoCallDelegate?.passErrorMessage(errorMessage)
-                    if currentCall != nil {
-                        await tearDownCall()
+                    if currentCall == nil {
+                        currentCall = failedCall
                     }
-                case .callAnsweredAuxDevice(_):
+                    await tearDownCall()
+                case .callAnsweredAuxDevice(let answeredCall):
                     controllerView.statusLabel.stringValue = "Answered on Auxiliary Device"
-                    currentCall = nil
+                    if currentCall == nil {
+                        currentCall = answeredCall
+                    }
                     await tearDownCall()
                 }
             }
@@ -543,6 +555,7 @@ public final class VideoCallViewController: NSViewController {
                 controllerView.bringLocalPreviewOverlayToFront()
             }
         }
+        settlePendingScreenShareLayoutIfNeeded()
     }
     
     /// Starts a lightweight loop that updates the duration label every second while the call is active.
@@ -641,18 +654,14 @@ public final class VideoCallViewController: NSViewController {
     }
     
     private func waitForMountedVideoView(_ view: NTMTKView) async {
-        for _ in 0..<20 {
-            if view.superview != nil,
-               view.window != nil,
-               view.bounds.width > 0,
-               view.bounds.height > 0 {
-                return
-            }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+        guard view.superview == nil
+            || view.window == nil
+            || view.bounds.width <= 0
+            || view.bounds.height <= 0 else {
+            return
         }
-        logger.log(
-            level: .warning,
-            message: "Timed out waiting for mounted video view context=\(view.contextName) superview=\(String(describing: view.superview)) window=\(String(describing: view.window)) bounds=\(view.bounds)"
+        scheduleScreenShareLayoutTransitionHeal(
+            expectingScreenShareVisible: hasVisibleScreenShareInCollection
         )
     }
     
@@ -1055,6 +1064,9 @@ public final class VideoCallViewController: NSViewController {
     }
     
     private func tearDownCall() async {
+        stopRemoteRendererRecovery()
+        stopAllParticipantRendererRecovery()
+        stopAllScreenShareRendererRecovery()
         guard isRunning == true else {
             return
         }
@@ -1079,6 +1091,9 @@ public final class VideoCallViewController: NSViewController {
         sfuGroupSignalingStableStreamTask = nil
         postScreenShareLayoutHealTask?.cancel()
         postScreenShareLayoutHealTask = nil
+        pendingScreenShareLayoutGeneration = nil
+        pendingScreenShareLayoutExpectedVisible = nil
+        screenShareLayoutGeneration &+= 1
         stopRemoteScreenShareAttachRetry()
         stopLocalScreenShareAttachRetry()
         localScreenShareStateTask?.cancel()
@@ -1378,8 +1393,13 @@ public final class VideoCallViewController: NSViewController {
     private func syncParticipantCameraTileAspectModes() async {
         for model in videoViews.views where isParticipantCameraModel(model) || isOneToOneRemoteCameraModel(model) {
             model.videoView.setPrefersAspectFit(true)
+            bindRemoteCameraTileLayout(to: model.videoView)
             guard let renderer = model.videoView.renderer as? SampleBufferViewRenderer else { continue }
             await renderer.setPrefersAspectFit(true)
+            let size = await renderer.currentUprightSourceSize()
+            if size.width > 0, size.height > 0 {
+                remoteUprightSizeByContext[model.videoView.contextName] = size
+            }
             let bounds = effectiveBoundsForMountedVideoView(model.videoView)
             if bounds.width > 0, bounds.height > 0 {
                 await renderer.applyHostViewBounds(bounds)
@@ -1387,28 +1407,89 @@ public final class VideoCallViewController: NSViewController {
         }
     }
 
+    private func bindRemoteCameraTileLayout(to view: NTMTKView) {
+        guard !view.contextName.hasPrefix("screen_"), view.contextName != "preview" else { return }
+        view.onRemoteUprightOrientationChange = { [weak self] size in
+            self?.handleRemoteCameraUprightSizeChange(contextName: view.contextName, size: size)
+        }
+    }
+
+    private func handleRemoteCameraUprightSizeChange(contextName: String, size: CGSize) {
+        let previous = remoteUprightSizeByContext[contextName] ?? .zero
+        remoteUprightSizeByContext[contextName] = size
+        let previousAspect = GroupCallVideoLayoutPolicy.cameraTileAspectForRemoteContent(
+            uprightWidth: Double(previous.width),
+            uprightHeight: Double(previous.height)
+        )
+        let nextAspect = GroupCallVideoLayoutPolicy.cameraTileAspectForRemoteContent(
+            uprightWidth: Double(size.width),
+            uprightHeight: Double(size.height)
+        )
+        guard abs(previousAspect - nextAspect) > 0.001 else { return }
+        guard hasVisibleScreenShareInCollection else { return }
+        mainCollectionView()?.collectionViewLayout?.invalidateLayout()
+    }
+
+    private func remoteCameraContentAspects() -> [CGFloat] {
+        let items = dataSource?.snapshot().itemIdentifiers ?? []
+        let cameras = items.filter { !isScreenShareModel($0) }
+        return cameras.map { model in
+            let size = remoteUprightSizeByContext[model.videoView.contextName] ?? .zero
+            return CGFloat(
+                GroupCallVideoLayoutPolicy.cameraTileAspectForRemoteContent(
+                    uprightWidth: Double(size.width),
+                    uprightHeight: Double(size.height)
+                )
+            )
+        }
+    }
+
     /// Falls back to collection item bounds when `NTMTKView.bounds` is still stale after layout.
     private func effectiveBoundsForMountedVideoView(_ view: NTMTKView) -> CGRect {
-        if view.bounds.width > 1, view.bounds.height > 1 {
-            return view.bounds
-        }
-        guard let collectionView = mainCollectionView() else { return view.bounds }
-        for indexPath in collectionView.indexPathsForVisibleItems() {
-            guard let item = collectionView.item(at: indexPath) as? VideoItem,
-                  item.view.subviews.contains(where: { $0 === view }) else {
-                continue
-            }
-            let contentBounds = item.view.bounds
-            if contentBounds.width > 1, contentBounds.height > 1 {
-                return contentBounds
-            }
-            if let attributes = collectionView.layoutAttributesForItem(at: indexPath),
-               attributes.size.width > 1,
-               attributes.size.height > 1 {
-                return CGRect(origin: .zero, size: attributes.size)
+        var cellBounds = CGRect.zero
+        var attributesBounds = CGRect.zero
+        if let collectionView = mainCollectionView() {
+            for indexPath in collectionView.indexPathsForVisibleItems() {
+                guard let item = collectionView.item(at: indexPath) as? VideoItem,
+                      item.view.subviews.contains(where: { $0 === view }) else {
+                    continue
+                }
+                cellBounds = item.view.bounds
+                if let attributes = collectionView.layoutAttributesForItem(at: indexPath),
+                   attributes.size.width > 1,
+                   attributes.size.height > 1 {
+                    attributesBounds = CGRect(origin: .zero, size: attributes.size)
+                }
+                break
             }
         }
-        return view.bounds
+        let resolved = GroupCallVideoLayoutPolicy.effectiveMountedVideoBounds(
+            viewBounds: GroupCallLayoutRect(
+                x: Double(view.bounds.origin.x),
+                y: Double(view.bounds.origin.y),
+                width: Double(view.bounds.width),
+                height: Double(view.bounds.height)
+            ),
+            cellContentBounds: GroupCallLayoutRect(
+                x: Double(cellBounds.origin.x),
+                y: Double(cellBounds.origin.y),
+                width: Double(cellBounds.width),
+                height: Double(cellBounds.height)
+            ),
+            layoutAttributesBounds: GroupCallLayoutRect(
+                x: Double(attributesBounds.origin.x),
+                y: Double(attributesBounds.origin.y),
+                width: Double(attributesBounds.width),
+                height: Double(attributesBounds.height)
+            ),
+            transitionPending: pendingScreenShareLayoutGeneration != nil
+        )
+        return CGRect(
+            x: CGFloat(resolved.x),
+            y: CGFloat(resolved.y),
+            width: CGFloat(resolved.width),
+            height: CGFloat(resolved.height)
+        )
     }
 
     private func refreshMountedVideoRendererBounds() async {
@@ -1532,54 +1613,47 @@ public final class VideoCallViewController: NSViewController {
 
     /// After screen share ends, camera tiles can keep strip-sized bounds until the next layout pass.
     private func schedulePostScreenShareLayoutHeal() {
-        postScreenShareLayoutHealTask?.cancel()
-        postScreenShareLayoutHealTask = Task { @MainActor [weak self] in
-            await Task.yield()
-            guard let self, self.isRunning, !self.hasVisibleScreenShareInCollection else { return }
-            guard let collectionView = self.mainCollectionView() else { return }
-            collectionView.collectionViewLayout?.invalidateLayout()
-            collectionView.layoutSubtreeIfNeeded()
-            self.reconfigureVisibleVideoCells()
-            await self.syncParticipantCameraTileAspectModes()
-            await self.refreshMountedVideoRendererBounds()
-
-            await Task.yield()
-            guard !Task.isCancelled, self.isRunning, !self.hasVisibleScreenShareInCollection else { return }
-            collectionView.layoutSubtreeIfNeeded()
-            self.reconfigureVisibleVideoCells()
-            await self.healParticipantCameraTilesAfterScreenShareEnd()
-        }
+        scheduleScreenShareLayoutTransitionHeal(expectingScreenShareVisible: false)
     }
 
     private func scheduleScreenShareLayoutTransitionHeal(expectingScreenShareVisible: Bool? = nil) {
-        if expectingScreenShareVisible == false {
-            schedulePostScreenShareLayoutHeal()
+        postScreenShareLayoutHealTask?.cancel()
+        postScreenShareLayoutHealTask = nil
+        screenShareLayoutGeneration &+= 1
+        pendingScreenShareLayoutGeneration = screenShareLayoutGeneration
+        pendingScreenShareLayoutExpectedVisible = expectingScreenShareVisible
+            ?? hasVisibleScreenShareInCollection
+        mainCollectionView()?.collectionViewLayout?.invalidateLayout()
+        view.needsLayout = true
+    }
+
+    /// The concrete AppKit layout callback owns screen-share start/stop settlement.
+    private func settlePendingScreenShareLayoutIfNeeded() {
+        guard let generation = pendingScreenShareLayoutGeneration,
+              generation == screenShareLayoutGeneration,
+              pendingScreenShareLayoutExpectedVisible == hasVisibleScreenShareInCollection,
+              let collectionView = mainCollectionView(),
+              collectionView.bounds.width > 1,
+              collectionView.bounds.height > 1 else {
             return
         }
-        postScreenShareLayoutHealTask?.cancel()
+        let hasMountedBounds = collectionView.indexPathsForVisibleItems().contains { indexPath in
+            guard let item = collectionView.item(at: indexPath) else { return false }
+            return item.view.bounds.width > 1 && item.view.bounds.height > 1
+        }
+        guard hasMountedBounds || videoViews.views.isEmpty else { return }
+        pendingScreenShareLayoutGeneration = nil
+        pendingScreenShareLayoutExpectedVisible = nil
         postScreenShareLayoutHealTask = Task { @MainActor [weak self] in
-            await Task.yield()
-            guard let self, self.isRunning else { return }
-            if let expectingScreenShareVisible,
-               self.hasVisibleScreenShareInCollection != expectingScreenShareVisible {
-                return
-            }
-            guard let collectionView = self.mainCollectionView() else { return }
-            collectionView.collectionViewLayout?.invalidateLayout()
-            collectionView.layoutSubtreeIfNeeded()
+            guard let self,
+                  self.isRunning,
+                  generation == self.screenShareLayoutGeneration else { return }
             self.reconfigureVisibleVideoCells()
             await self.syncParticipantCameraTileAspectModes()
             await self.refreshMountedVideoRendererBounds()
-
-            await Task.yield()
-            guard !Task.isCancelled, self.isRunning else { return }
-            if let expectingScreenShareVisible,
-               self.hasVisibleScreenShareInCollection != expectingScreenShareVisible {
-                return
+            if !self.hasVisibleScreenShareInCollection {
+                await self.healParticipantCameraTilesAfterScreenShareEnd()
             }
-            collectionView.layoutSubtreeIfNeeded()
-            self.reconfigureVisibleVideoCells()
-            await self.refreshMountedVideoRendererBounds()
         }
     }
 
@@ -1670,6 +1744,7 @@ public final class VideoCallViewController: NSViewController {
             return
         }
         cameraView.setPrefersAspectFit(true)
+        bindRemoteCameraTileLayout(to: cameraView)
         await cameraRenderer.setPrefersAspectFit(true)
 
         let didAttach = await session.renderRemoteVideoForParticipant(
@@ -2877,12 +2952,27 @@ extension VideoCallViewController {
                 self.lastCompositionalLayoutProbeSignature = compSig
                 self.logLayoutProbe("compositionalSection effectiveContent=\(Int(effective.width))x\(Int(effective.height)) liveCount=\(liveCount) snapshotCount=\(snapshotCount) resolved=\(resolvedItemCount) section=\(sectionKind)")
             }
+            let safeAreaTop: CGFloat
+            if #available(macOS 11.0, *) {
+                safeAreaTop = collectionView?.safeAreaInsets.top ?? self.view.safeAreaInsets.top
+            } else {
+                safeAreaTop = 0
+            }
             if self.hasVisibleScreenShareInCollection, resolvedItemCount > 1 {
                 let cameraTileCount = resolvedItemCount - 1
-                return self.sections.screenShareDominantSection(cameraTileCount: cameraTileCount, groupAbsoluteExtent: effective)
+                return self.sections.screenShareDominantSection(
+                    cameraTileCount: cameraTileCount,
+                    groupAbsoluteExtent: effective,
+                    cameraTileAspects: self.remoteCameraContentAspects(),
+                    safeAreaTop: safeAreaTop
+                )
             }
             if resolvedItemCount > 1 {
-                return self.sections.conferenceViewSection(itemCount: resolvedItemCount, groupAbsoluteExtent: effective)
+                return self.sections.conferenceViewSection(
+                    itemCount: resolvedItemCount,
+                    groupAbsoluteExtent: effective,
+                    safeAreaTop: safeAreaTop
+                )
             }
             return self.sections.fullScreenItem(groupAbsoluteExtent: effective)
         }

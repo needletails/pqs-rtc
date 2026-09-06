@@ -231,6 +231,162 @@ struct RTCLifecycleGenerationTests {
         #expect(compose.contains("screenShareLayoutGeneration = generation"))
     }
 
+    @Test("duplicate same-presenter activation enters refresh policy")
+    func duplicateSamePresenterActivationEntersRefreshPolicy() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/PQSRTC/Views/Android/AndroidVideoCallController.swift"
+            ),
+            encoding: .utf8
+        )
+        let body = try sourceBody(of: "handleRemoteScreenTrackEvent", in: source)
+        #expect(
+            !body.contains("Ignoring duplicate remote screen-share activation"),
+            "same-presenter isActive must not end in a naked ignore return"
+        )
+        #expect(
+            body.contains("ScreenShareAttachPolicy.duplicateActivationDecision"),
+            "same-presenter isActive must enter ScreenShareAttachPolicy.refreshExisting"
+        )
+        #expect(body.contains(".refreshExisting"))
+    }
+
+    @Test("Compose layout wait is not keyed on local isScreenSharing")
+    func composeLayoutWaitIsNotKeyedOnLocalIsScreenSharing() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let compose = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/PQSRTC/Views/Android/AndroidLocalVideoCompose.swift"
+            ),
+            encoding: .utf8
+        )
+        #expect(
+            !compose.contains("\"\\(isScreenSharing)-\\(hasActiveRemoteScreenShare)\""),
+            "participant reconcile must not key on local isScreenSharing combined with remote share"
+        )
+        #expect(compose.contains("hasActiveRemoteScreenShare"))
+    }
+
+    @Test("participant surface layout callback remains one argument")
+    func participantSurfaceLayoutCallbackRemainsOneArgument() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let compose = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/PQSRTC/Views/Android/AndroidLocalVideoCompose.swift"
+            ),
+            encoding: .utf8
+        )
+        #expect(compose.contains("onParticipantSurfaceLayout(view)"))
+        #expect(compose.contains("onParticipantSurfaceLayout: (AndroidSampleCaptureView) -> Void"))
+        #expect(!compose.contains("onParticipantSurfaceLayout(view, layoutGeneration)"))
+    }
+
+    @Test("Apple screen-share heal is not Task.yield owned")
+    func appleScreenShareHealIsNotTaskYieldOwned() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let relativePaths = [
+            "Sources/PQSRTC/Views/Apple/Controllers/iOS/VideoCallViewController+UIKit.swift",
+            "Sources/PQSRTC/Views/Apple/Controllers/macOS/VideoCallViewController+AppKit.swift",
+        ]
+        for relativePath in relativePaths {
+            let source = try String(
+                contentsOf: packageRoot.appendingPathComponent(relativePath),
+                encoding: .utf8
+            )
+            let body = try sourceBody(of: "schedulePostScreenShareLayoutHeal", in: source)
+            #expect(
+                !body.contains("Task.yield"),
+                "\(relativePath) schedulePostScreenShareLayoutHeal must not own settlement with Task.yield"
+            )
+        }
+    }
+
+    @Test("waitForMountedVideoView has no 50ms poll")
+    func waitForMountedVideoViewHasNo50msPoll() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let relativePaths = [
+            "Sources/PQSRTC/Views/Apple/Controllers/iOS/VideoCallViewController+UIKit.swift",
+            "Sources/PQSRTC/Views/Apple/Controllers/macOS/VideoCallViewController+AppKit.swift",
+        ]
+        for relativePath in relativePaths {
+            let source = try String(
+                contentsOf: packageRoot.appendingPathComponent(relativePath),
+                encoding: .utf8
+            )
+            guard source.contains("func waitForMountedVideoView") else { continue }
+            let body = try sourceBody(of: "waitForMountedVideoView", in: source)
+            #expect(
+                !body.contains("50_000_000"),
+                "\(relativePath) waitForMountedVideoView must not poll with 50ms sleeps"
+            )
+            #expect(
+                !body.contains("Task.sleep"),
+                "\(relativePath) waitForMountedVideoView must not poll with Task.sleep"
+            )
+        }
+    }
+
+    @Test("Android local preview does not fill root then pad leading")
+    func androidLocalPreviewDoesNotFillRootThenPadLeading() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let compose = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/PQSRTC/Views/Android/AndroidLocalVideoCompose.swift"
+            ),
+            encoding: .utf8
+        )
+        let localCompose = try sourceBody(of: "Compose", in: compose)
+        let fillsRoot = localCompose.contains("context.modifier.fillMaxSize()")
+        let padsLeadingTop = compose.contains(".padding(.leading, previewX)")
+            && compose.contains(".padding(.top, previewY)")
+        #expect(
+            !(fillsRoot && padsLeadingTop),
+            "local preview must not combine full-root fillMaxSize with leading/top positioning padding"
+        )
+    }
+
+    @Test("Android screen rebind helper is called from SFU answer paths")
+    func androidScreenRebindHelperIsCalledFromExchange() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let video = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/PQSRTC/RTCSession+Video.swift"),
+            encoding: .utf8
+        )
+        #expect(video.contains("func rebindAndroidGroupRemoteParticipantScreenAfterSfuRenegotiationIfNeeded"))
+        let exchange = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/PQSRTC/RTCSession+Exchange.swift"),
+            encoding: .utf8
+        )
+        #expect(exchange.contains("rebindAndroidGroupRemoteParticipantScreenAfterSfuRenegotiationIfNeeded"))
+        let helpers = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/PQSRTC/RTCSession+SDPHelpers.swift"),
+            encoding: .utf8
+        )
+        #expect(helpers.contains("rebindAndroidGroupRemoteParticipantScreenAfterSfuRenegotiationIfNeeded"))
+    }
+
     @Test("in-flight late-joiner track events are queued for post-settlement refresh")
     func lateJoinerTrackEventsAreQueuedDuringSfuRenegotiation() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)

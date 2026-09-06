@@ -557,6 +557,7 @@ public actor RTCSession {
     /// Inbound SFU renegotiation offers deferred until signaling is stable or a placeholder relay
     /// offer is replaced by a distinct screen SSRC.
     var pendingDeferredSfuRenegotiationOffers: [String: (SessionDescription, Call)] = [:]
+    var signalingStateByConnectionId: [String: SPTSignalingState] = [:]
 
 #if os(Android)
     /// Last SFU remote offer successfully applied on Android, keyed by normalized connection id.
@@ -781,12 +782,10 @@ public actor RTCSession {
 #if os(iOS) && !os(Android)
     var _iOSScreenCaptureSourceStorage: iOSScreenCaptureSource?
 #endif
-#if canImport(WebRTC) && !os(Android)
     /// Connections currently mixing screen-share system audio on mid=0.
     var systemAudioShareActiveConnectionIds: Set<String> = []
     /// Mic was muted before system-audio share; restore that mute when share ends.
     var systemAudioShareMicWasMutedByConnectionId: [String: Bool] = [:]
-#endif
 #if os(iOS) || os(macOS) || os(Android)
     /// Connections waiting for platform capture start before advertising screen share to the SFU.
     var pendingScreenShareRenegotiationConnectionIds: Set<String> = []

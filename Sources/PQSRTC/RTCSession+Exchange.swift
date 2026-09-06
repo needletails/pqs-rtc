@@ -18,6 +18,11 @@
 import Foundation
 import NeedleTailAsyncSequence
 import NeedleTailLogger
+
+enum RemoteDescriptionApplyResult: Equatable, Sendable {
+    case applied
+    case dropped
+}
 import BinaryCodable
 import DequeModule
 #if !os(Android)
@@ -368,6 +373,7 @@ extension RTCSession {
                 await reconcileAndroidRemoteScreenTracksAfterSetRemoteSDP(modified, connectionId: connection.id)
                 await reconcileAndroidReceiverFrameCryptorsAfterSfuRenegotiation(connectionId: connection.id)
                 await rebindAndroidGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(connectionId: connection.id)
+                await rebindAndroidGroupRemoteParticipantScreenAfterSfuRenegotiationIfNeeded(connectionId: connection.id)
             }
         }
 #endif
@@ -421,6 +427,14 @@ extension RTCSession {
         }
 #if canImport(WebRTC) && !os(Android)
         guard connection.peerConnection.signalingState == .stable else {
+            pendingDeferredSfuRenegotiationOffers[normId] = pending
+            return
+        }
+#else
+        let cachedSignalingState = signalingStateByConnectionId[connection.id.normalizedConnectionId]
+        let isStable = cachedSignalingState?.state == .stable
+            || cachedSignalingState?.description == "stable"
+        guard isStable else {
             pendingDeferredSfuRenegotiationOffers[normId] = pending
             return
         }
@@ -603,6 +617,7 @@ extension RTCSession {
                 typeDescription: "ANSWER",
                 sdp: modified),
             call: call)
+        let remoteApplyResult = RemoteDescriptionApplyResult.applied
         if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
             if Self.isTrueOneToOneSfuRoom(call: call) {
                 await rebindInboundRemoteVideoAfterSfuRenegotiationIfNeeded(call: call)
@@ -612,12 +627,14 @@ extension RTCSession {
                 await reconcileAndroidRemoteParticipantAudioTracksAfterSetRemoteSDP(modified, connectionId: connection.id)
                 await reconcileAndroidRemoteScreenTracksAfterSetRemoteSDP(modified, connectionId: connection.id)
                 await rebindAndroidGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(connectionId: connection.id)
+                await rebindAndroidGroupRemoteParticipantScreenAfterSfuRenegotiationIfNeeded(connectionId: connection.id)
             }
         }
 #else
-        try await setRemote(sdp:
+        let remoteApplyResult = try await setRemote(sdp:
                                 WebRTC.RTCSessionDescription(type: sdp.type.rtcSdpType, sdp: modified),
                             call: call)
+        guard remoteApplyResult == .applied else { return }
 #if canImport(WebRTC) && !os(Android)
         if Self.isTrueOneToOneSfuRoom(call: call),
            let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
@@ -1217,10 +1234,11 @@ extension RTCSession {
         return Self.screenShareVideoMids(in: localSDP)
     }
 
+    @discardableResult
     func setRemote(
         sdp: WebRTC.RTCSessionDescription,
         call: Call
-    ) async throws {
+    ) async throws -> RemoteDescriptionApplyResult {
         logger.log(level: .info, message: "Setting remote SDP for call: \(call.sharedCommunicationId)")
 
         // Remote description can trigger negotiation/ICE events; ensure consumer is alive.
@@ -1239,7 +1257,7 @@ extension RTCSession {
             // would crash WebRTC if we tried to apply it.
             if sdp.type == .answer && connection.peerConnection.signalingState == .stable {
                 logger.log(level: .warning, message: "Dropping stale SDP answer for \(call.sharedCommunicationId): signaling state is already stable")
-                return
+                return .dropped
             }
 
             logger.log(level: .debug, message: "Found connection for call: \(call.sharedCommunicationId)")
@@ -1292,7 +1310,7 @@ extension RTCSession {
                 call: call,
                 errorDescription: error.errorDescription ?? String(describing: error)
             ) {
-                return
+                return .dropped
             }
             logger.log(level: .error, message: "Failed to set remote SDP: \(error.localizedDescription)")
             await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
@@ -1309,13 +1327,14 @@ extension RTCSession {
                 call: call,
                 errorDescription: error.localizedDescription
             ) {
-                return
+                return .dropped
             }
             logger.log(level: .error, message: "Unexpected error setting remote SDP: \(error)")
             await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
             await finishEndConnection(currentCall: call)
             throw RTCErrors.mediaError("Failed to set remote SDP: \(error.localizedDescription)")
         }
+        return .applied
     }
 
     private func recoverFromScreenShareAnswerSetRemoteFailureIfNeeded(

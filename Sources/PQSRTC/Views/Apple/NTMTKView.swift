@@ -98,6 +98,11 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     var renderer: RendererDelegate?
     @MainActor private(set) var prefersAspectFit = false
     @MainActor private(set) var fillsWhenOrientationMatches = false
+    /// Fired when the remote upright frame crosses portrait ↔ landscape. Used to
+    /// resize the remote collection item only — never the share tile.
+    @MainActor public var onRemoteUprightOrientationChange: (@MainActor @Sendable (CGSize) -> Void)? {
+        didSet { Task { await bindUprightOrientationHandler() } }
+    }
     
     /// Letterboxes video inside its tile instead of cropping. Participant camera tiles opt in via
     /// ``setPrefersAspectFit(_:)`` so remote video preserves the sender's aspect ratio.
@@ -121,6 +126,16 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         refreshSampleLayerVideoGravity()
         if let sampleRenderer = renderer as? SampleBufferViewRenderer {
             Task { await sampleRenderer.setFillsWhenOrientationMatches(enabled) }
+        }
+    }
+
+    @MainActor
+    private func bindUprightOrientationHandler() async {
+        guard type == .sample, !contextName.hasPrefix("screen_") else { return }
+        guard let sampleRenderer = renderer as? SampleBufferViewRenderer else { return }
+        let handler = onRemoteUprightOrientationChange
+        await sampleRenderer.setUprightOrientationClassHandler { size in
+            handler?(size)
         }
     }
 
@@ -304,10 +319,10 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         )
         
         super.init(frame: .zero, device: mtlDevice)
+        translatesAutoresizingMaskIntoConstraints = false
 #if os(macOS)
         // Default AppKit `NSView` uses translating autoresizing masks into constraints; that produces
         // implicit width/height ties to the superview and Auto Layout will break our explicit PiP size.
-        translatesAutoresizingMaskIntoConstraints = false
         autoresizingMask = []
 #endif
         delegate = mtkViewDelegateWrapper
@@ -353,8 +368,8 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
                 ]
             )
             super.init(frame: .zero, device: mtlDevice)
-#if os(macOS)
             translatesAutoresizingMaskIntoConstraints = false
+#if os(macOS)
             autoresizingMask = []
 #endif
             delegate = mtkViewDelegateWrapper
@@ -369,8 +384,8 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
                 ]
             )
             super.init(frame: .zero, device: nil)
-#if os(macOS)
             translatesAutoresizingMaskIntoConstraints = false
+#if os(macOS)
             autoresizingMask = []
 #endif
             delegate = mtkViewDelegateWrapper
@@ -500,14 +515,21 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
                 layerBox: layerBox,
                 ciContext: ciContext,
                 bounds: self.bounds,
-                rendersScreenShare: rendersScreenShare
+                rendersScreenShare: rendersScreenShare,
+                prefersAspectFit: prefersAspectFit,
+                fillsWhenOrientationMatches: fillsWhenOrientationMatches
             )
             
             await renderer.setDelegate(self)
             await renderer.startStream()
             self.renderer = renderer
+            await bindUprightOrientationHandler()
             self.logger.log(level: .debug, message: "Sample renderer installed (strong ref) and stream started")
-#if os(macOS)
+#if os(iOS)
+            superview?.layoutIfNeeded()
+            layoutIfNeeded()
+            await renderer.applyHostViewBounds(bounds)
+#elseif os(macOS)
             // Collection view / SwiftUI may not have laid out yet; still push whatever bounds we have and
             // rely on `layout`/`setFrameSize` to update once the cell gets a real size.
             superview?.layoutSubtreeIfNeeded()
@@ -847,9 +869,16 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         // `currentRenderPassDescriptor` can route through MTKView internals that also touch the
         // layer’s drawable queue and has been associated with “texture after present” faults.
         let drawableTexture = drawable.texture
+        let fitted = RemoteCameraAspectPolicy.letterboxedRect(
+            sourceWidth: Double(texture.width),
+            sourceHeight: Double(texture.height),
+            destinationWidth: Double(drawableTexture.width),
+            destinationHeight: Double(drawableTexture.height)
+        )
         let renderPassDescriptor = MTLRenderPassDescriptor()
         renderPassDescriptor.colorAttachments[0].texture = drawableTexture
-        renderPassDescriptor.colorAttachments[0].loadAction = .dontCare
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
         renderPassDescriptor.colorAttachments[0].storeAction = .store
 
         guard let renderEncoder = cb.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
@@ -862,6 +891,16 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         }
 
         renderEncoder.setRenderPipelineState(renderPipelineState)
+        renderEncoder.setViewport(
+            MTLViewport(
+                originX: fitted.x,
+                originY: fitted.y,
+                width: fitted.width,
+                height: fitted.height,
+                znear: 0,
+                zfar: 1
+            )
+        )
         renderEncoder.setFragmentTexture(texture, index: 0)
         renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         

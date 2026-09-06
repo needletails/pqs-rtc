@@ -1882,4 +1882,123 @@ struct GroupCallVideoRegressionTests {
             existingReceiverKey: nil,
             newReceiverKey: "") == false)
     }
+
+    @Test("one-arg surface report does not settle a newer generation")
+    func oneArgSurfaceReportDoesNotSettleNewerGeneration() throws {
+        let first = ScreenShareLayoutTransitionPolicy.beginTransition(
+            state: .idle,
+            isStartingShare: true,
+            expectedIdentities: ["view-a"]
+        )
+        let newer = ScreenShareLayoutTransitionPolicy.replacingExpectedIdentities(
+            state: first,
+            newIdentities: ["view-b"]
+        )
+        #expect(
+            ScreenShareLayoutTransitionPolicy.shouldAcceptSurfaceReport(
+                capturedGeneration: first.generation,
+                identity: "view-b",
+                state: newer
+            ) == false
+        )
+
+        let controller = try Self.androidControllerSource()
+        let body = try Self.sourceBody(of: "participantSurfaceDidUpdateLayout", in: controller)
+        #expect(body.contains("capturedGeneration: generation"))
+        #expect(body.contains("ScreenShareLayoutTransitionPolicy.shouldAcceptSurfaceReport"))
+    }
+
+    @Test("same presenter refresh does not re-emit visibility")
+    func samePresenterRefreshDoesNotReemitVisibility() throws {
+        #expect(
+            ScreenShareAttachPolicy.duplicateActivationDecision(
+                isActive: true,
+                samePresenterAlreadyActive: true
+            ) == .refreshExisting
+        )
+        let body = try Self.sourceBody(
+            of: "handleRemoteScreenTrackEvent",
+            in: try Self.androidControllerSource()
+        )
+        #expect(body.contains(".refreshExisting"))
+        #expect(!body.contains("Ignoring duplicate remote screen-share activation"))
+        let refresh = try Self.sourceBody(
+            of: "refreshExistingRemoteScreenShareRenderer",
+            in: try Self.androidControllerSource()
+        )
+        #expect(!refresh.contains("remoteScreenShareDidChange"))
+    }
+
+    @Test("healthy current wrapper refresh is idempotent")
+    func healthyCurrentWrapperRefreshIsIdempotent() throws {
+        #expect(
+            ScreenShareAttachPolicy.shouldSkipScreenRendererAttach(
+                hasActiveSink: true,
+                attachedTrackIsLive: true,
+                sharesMappedWrapper: true,
+                layoutNeedsReconcile: false
+            )
+        )
+        let setScreen = try Self.sourceBody(
+            of: "setScreenView",
+            in: try Self.androidControllerSource()
+        )
+        #expect(setScreen.contains("ScreenShareAttachPolicy.shouldSkipScreenRendererAttach"))
+        let render = try Self.videoSessionSource()
+        #expect(render.contains("ScreenShareAttachPolicy.shouldSkipScreenRendererAttach"))
+    }
+
+    private static func androidControllerSource() throws -> String {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        return try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/PQSRTC/Views/Android/AndroidVideoCallController.swift"
+            ),
+            encoding: .utf8
+        )
+    }
+
+    private static func videoSessionSource() throws -> String {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        return try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/PQSRTC/RTCSession+Video.swift"),
+            encoding: .utf8
+        )
+    }
+
+    private static func sourceBody(of functionName: String, in source: String) throws -> String {
+        let marker = "func \(functionName)"
+        guard let start = source.range(of: marker) else {
+            throw SourceGuardError.missingFunction(functionName)
+        }
+        let suffix = source[start.lowerBound...]
+        guard let openingBrace = suffix.firstIndex(of: "{") else {
+            throw SourceGuardError.missingFunction(functionName)
+        }
+        var depth = 0
+        for index in suffix.indices[openingBrace...] {
+            switch suffix[index] {
+            case "{":
+                depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    return String(suffix[...index])
+                }
+            default:
+                break
+            }
+        }
+        throw SourceGuardError.missingFunction(functionName)
+    }
+
+    private enum SourceGuardError: Error {
+        case missingFunction(String)
+    }
 }

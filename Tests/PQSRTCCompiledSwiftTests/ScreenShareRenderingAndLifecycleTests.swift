@@ -101,6 +101,22 @@ struct ScreenShareRenderingAndLifecycleTests {
         #expect(screenView.prefersAspectFit == false)
     }
 
+    @Test("startRendering copies camera aspect-fit onto the new Metal renderer")
+    @MainActor
+    func startRenderingCopiesCameraAspectFitOntoRenderer() async {
+        let view = NTMTKView(fallbackType: .sample, contextName: "camera_echo")
+        defer { view.shutdownMetalStream() }
+        view.setPrefersAspectFit(true)
+        view.setFillsWhenOrientationMatches(false)
+        await view.startRendering()
+        guard let renderer = view.renderer as? SampleBufferViewRenderer else {
+            Issue.record("Expected a sample-buffer renderer after startRendering")
+            return
+        }
+        #expect(await renderer.prefersAspectFitEnabled == true)
+        #expect(await renderer.fillsWhenOrientationMatchesEnabled == false)
+    }
+
     @Test("Late completion of an old screen capture cannot own a replacement capture")
     func staleScreenCaptureGenerationDoesNotMatchReplacement() async {
         let session = await RTCSession(

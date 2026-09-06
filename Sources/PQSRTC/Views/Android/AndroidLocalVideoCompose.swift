@@ -230,8 +230,9 @@ public struct AndroidRemoteGridCompose: ContentComposer {
     private let prefersAspectFit: Bool
     private let cleanupOnDispose: Bool
     /// When true, participant tiles live in the short camera strip below/beside an active
-    /// screen share. On phones this selects the horizontal 16:9 collection; full-screen
-    /// conference keeps the vertical grid.
+    /// screen share. On phones this selects the horizontal collection with tiles that
+    /// follow device orientation (9:16 portrait, 16:9 landscape). Full-screen conference
+    /// keeps the vertical 16:9 grid.
     private let usesCompactParticipantStrip: Bool
     /// Solo (1:1) tile corner radius. Full-screen stays 0; in-app PiP uses a native
     /// outline so SurfaceViews actually clip. Multi-tile grids keep 12.
@@ -311,13 +312,24 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                 itemCount: itemCount
             )
             let tileCornerRadiusDp = conferenceTileCornerRadiusDp(for: itemCount)
-            let isPhoneLayout = min(configuration.screenWidthDp, configuration.screenHeightDp) < 600
-            // Horizontal participant collection is only for the screen-share camera strip on
-            // phones. Full-screen conference view keeps the vertical 16:9 grid.
-            let useScreenSharePhoneHorizontalStrip =
-                usesCompactParticipantStrip && isPhoneLayout && itemCount > 1
+            // Screen-share leftover is always a short wide band (phone and tablet).
+            // Conference view uses the orientation grid instead.
+            let screenSize = GroupCallLayoutSize(
+                width: Double(configuration.screenWidthDp),
+                height: Double(configuration.screenHeightDp)
+            )
+            let shareCameraFrames = GroupCallVideoLayoutPolicy.screenShareDominantFrames(
+                cameraTileCount: max(1, itemCount),
+                containerSize: screenSize,
+                platform: GroupCallLayoutPlatform.android,
+                cameraTileAspect: GroupCallVideoLayoutPolicy.landscapeTileAspect
+            ).cameras
+            let cameraTileWidthDp = shareCameraFrames.first.map { CGFloat($0.width) } ?? 120
+            let cameraTileHeightDp = shareCameraFrames.first.map { CGFloat($0.height) } ?? 68
+            let useScreenShareCompactStrip =
+                usesCompactParticipantStrip && itemCount >= 1 && itemCount <= 4
 
-            if useScreenSharePhoneHorizontalStrip {
+            if useScreenShareCompactStrip {
                 let callControlsInsetDp = 112
                 Row(
                     modifier: Modifier
@@ -326,8 +338,10 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                         .navigationBarsPadding()
                         .horizontalScroll(rememberScrollState())
                         .padding(contentPaddingDp.dp),
-                    horizontalArrangement: Arrangement.spacedBy(tileSpacingDp.dp),
-                    verticalAlignment: androidx.compose.ui.Alignment.CenterVertically
+                    horizontalArrangement: itemCount == 1
+                        ? Arrangement.Center
+                        : Arrangement.spacedBy(tileSpacingDp.dp),
+                    verticalAlignment: androidx.compose.ui.Alignment.Top
                 ) {
                     for (view, showRaisedHand) in flaggedViews {
                         let rendererSlotKey = Int(view.surfaceViewRenderer.hashCode())
@@ -338,8 +352,8 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                                 cornerRadiusDp: tileCornerRadiusDp,
                                 enablesPipDrag: capturedEnablesCallChromeDrag,
                                 modifier: Modifier
-                                    .fillMaxHeight()
-                                    .aspectRatio(Float(16.0 / 9.0))
+                                    .width(cameraTileWidthDp.dp)
+                                    .height(cameraTileHeightDp.dp)
                             )
                         }
                     }
@@ -349,18 +363,29 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                 let rows = chunked(flaggedViews, size: grid.columns)
                 Column(
                     modifier: Modifier.fillMaxSize().padding(contentPaddingDp.dp),
-                    verticalArrangement: Arrangement.spacedBy(tileSpacingDp.dp)
+                    verticalArrangement: Arrangement.spacedBy(tileSpacingDp.dp),
+                    horizontalAlignment: androidx.compose.ui.Alignment.CenterHorizontally
                 ) {
                     for row in rows {
                         Row(
-                            modifier: Modifier.weight(Float(1.0)).fillMaxWidth(),
+                            modifier: itemCount == 1
+                                ? Modifier.fillMaxSize()
+                                : Modifier.fillMaxWidth(),
                             horizontalArrangement: Arrangement.spacedBy(tileSpacingDp.dp)
                         ) {
                             for (view, showRaisedHand) in row {
                                 let rendererSlotKey = Int(view.surfaceViewRenderer.hashCode())
                                 androidx.compose.runtime.key(rendererSlotKey) {
                                     if itemCount == 1 {
-                                        // Solo tile keeps the full-bleed layout.
+                                        // Solo conference tile keeps the full-bleed layout.
+                                        ConferenceTile(
+                                            view: view,
+                                            showRaisedHand: showRaisedHand,
+                                            cornerRadiusDp: tileCornerRadiusDp,
+                                            enablesPipDrag: capturedEnablesCallChromeDrag,
+                                            modifier: Modifier.fillMaxSize()
+                                        )
+                                    } else {
                                         ConferenceTile(
                                             view: view,
                                             showRaisedHand: showRaisedHand,
@@ -368,40 +393,17 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                                             enablesPipDrag: capturedEnablesCallChromeDrag,
                                             modifier: Modifier
                                                 .weight(Float(1.0))
-                                                .fillMaxHeight()
+                                                .aspectRatio(Float(16.0 / 9.0))
                                         )
-                                    } else {
-                                        // Equal grid cell hosting a centered uniform 16:9 tile so
-                                        // every participant container has the same width/height.
-                                        Box(
-                                            modifier: Modifier
-                                                .weight(Float(1.0))
-                                                .fillMaxHeight(),
-                                            contentAlignment: androidx.compose.ui.Alignment.Center
-                                        ) {
-                                            ConferenceTile(
-                                                view: view,
-                                                showRaisedHand: showRaisedHand,
-                                                cornerRadiusDp: tileCornerRadiusDp,
-                                                enablesPipDrag: capturedEnablesCallChromeDrag,
-                                                modifier: Modifier.aspectRatio(Float(16.0 / 9.0))
-                                            )
-                                        }
                                     }
                                 }
                             }
                             let missingColumns = max(0, grid.columns - row.count)
                             if missingColumns > 0 {
                                 for _ in 0..<missingColumns {
-                                    Spacer(modifier: Modifier.weight(Float(1.0)).fillMaxHeight())
+                                    Spacer(modifier: Modifier.weight(Float(1.0)))
                                 }
                             }
-                        }
-                    }
-                    let missingRows = max(0, grid.rows - rows.count)
-                    if missingRows > 0 {
-                        for _ in 0..<missingRows {
-                            Spacer(modifier: Modifier.weight(Float(1.0)).fillMaxWidth())
                         }
                     }
                 }
@@ -487,22 +489,10 @@ public struct AndroidRemoteGridCompose: ContentComposer {
     }
 
     private func conferenceGridDimensions(for itemCount: Int, isPortrait: Bool) -> (columns: Int, rows: Int) {
-        switch itemCount {
-        case 0:
-            return (1, 1)
-        case 1:
-            return (1, 1)
-        case 2:
-            return isPortrait ? (1, 2) : (2, 1)
-        case 3...4:
-            return (2, 2)
-        case 5...6:
-            return (3, 2)
-        case 7...9:
-            return (3, 3)
-        default:
-            return (4, 3)
-        }
+        GroupCallVideoLayoutPolicy.androidConferenceGridDimensions(
+            itemCount: itemCount,
+            isPortrait: isPortrait
+        )
     }
 
     /// Matches Apple `CollectionViewSections.defaultContentInsets`, scaled down as roster grows.
@@ -1017,9 +1007,10 @@ public struct AndroidVideoCallView: View {
         let remotePageSize = hasActiveRemoteScreenShare ? 8 : 12
         let remotePages = paginateRemotes(displayedRemoteCaptureViews, pageSize: remotePageSize)
         let activeRemoteCount = displayedRemoteCaptureViews.count
-        // Solo fullscreen remote fills when orientations match; multi-remote grids (and the
-        // screen-share camera strip) keep aspect-fit letterboxing inside tiles.
-        let remotePrefersAspectFit = activeRemoteCount > 1 || hasActiveRemoteScreenShare
+        // Solo fullscreen and share-strip tiles match-fill when the item matches the remote.
+        // Multi-remote conference grids letterbox inside uniform 16:9 cells.
+        let usesShareCameraStrip = hasActiveRemoteScreenShare || isScreenSharing
+        let remotePrefersAspectFit = activeRemoteCount > 1 && !usesShareCameraStrip
         let screenShareHeightFraction: CGFloat = {
             guard hasActiveRemoteScreenShare else { return 0 }
             return activeRemoteCount <= 1 ? 0.64 : 0.68
@@ -1042,7 +1033,7 @@ public struct AndroidVideoCallView: View {
             GeometryReader { geo in
                 // Explicit overlay: Skip's GeometryReader can stack a ViewBuilder tuple like a
                 // column, which measures the local SurfaceView at 0×0 and never creates a surface.
-                ZStack(alignment: .topLeading) {
+                ZStack(alignment: .bottomTrailing) {
                     VStack(spacing: 0) {
                         if hasActiveRemoteScreenShare {
                             AndroidScreenShareView(
@@ -1074,7 +1065,7 @@ public struct AndroidVideoCallView: View {
                                         raisedHandFlags: raisedHandFlags(for: remotes, allViews: displayedRemoteCaptureViews),
                                         prefersAspectFit: remotePrefersAspectFit,
                                         cleanupOnDispose: false,
-                                        usesCompactParticipantStrip: hasActiveRemoteScreenShare,
+                                        usesCompactParticipantStrip: usesShareCameraStrip,
                                         soloTileCornerRadiusDp: soloRemoteCornerRadiusDp,
                                         enablesCallChromeDrag: !expandsIntoSafeArea && idx == currentRemotePage,
                                         layoutGeneration: composeLayoutGeneration,
@@ -1104,7 +1095,7 @@ public struct AndroidVideoCallView: View {
                                 raisedHandFlags: raisedHandFlags(for: displayedRemoteCaptureViews, allViews: displayedRemoteCaptureViews),
                                 prefersAspectFit: remotePrefersAspectFit,
                                 cleanupOnDispose: false,
-                                usesCompactParticipantStrip: hasActiveRemoteScreenShare,
+                                usesCompactParticipantStrip: usesShareCameraStrip,
                                 soloTileCornerRadiusDp: soloRemoteCornerRadiusDp,
                                 enablesCallChromeDrag: !expandsIntoSafeArea,
                                 layoutGeneration: composeLayoutGeneration,
@@ -1117,38 +1108,23 @@ public struct AndroidVideoCallView: View {
                     }
                     .frame(width: geo.size.width, height: geo.size.height)
 
-                    let previewW = localViewSize.width
-                    let previewH = localViewSize.height
-                    let previewEdge: CGFloat = 20
-                    let previewBottomPad = localPreviewBottomPadding(in: geo)
-                    let previewMaxX = max(previewEdge, geo.size.width - previewW - previewEdge)
-                    let previewMaxY = max(previewEdge, geo.size.height - previewH - previewBottomPad)
-                    let previewDefaultX = previewMaxX
-                    let previewDefaultY = previewMaxY
-                    // Default bottom-trailing only. Native translationX/Y owns drag
-                    // so pointer-move does not recompose Skip/Compose or resize EGL.
-                    let previewX: CGFloat = showsLocalPreview
-                        ? previewDefaultX
-                        : geo.size.width + 400
-                    let previewY: CGFloat = showsLocalPreview ? previewDefaultY : 0
-
-                    AndroidLocalVideoView(
-                        client: session.rtcClient,
-                        captureView: resources.localCaptureView,
-                        onDispose: {}
-                    )
-                    .frame(width: previewW, height: previewH)
-                    .padding(.leading, previewX)
-                    .padding(.top, previewY)
-                    .onAppear {
-                        NeedleTailLogger().log(level: .debug, message: "GEO SIZE \(geo.size)")
-                        if showsLocalPreview {
+                    if showsLocalPreview {
+                        // The local renderer is a contained overlay. Native translationX/Y owns
+                        // drag so pointer movement does not recompose or resize EGL.
+                        AndroidLocalVideoView(
+                            client: session.rtcClient,
+                            captureView: resources.localCaptureView,
+                            onDispose: {}
+                        )
+                        .frame(width: localViewSize.width, height: localViewSize.height)
+                        .padding(.trailing, 20)
+                        .padding(.bottom, localPreviewBottomPadding(in: geo))
+                        .onAppear {
+                            NeedleTailLogger().log(level: .debug, message: "GEO SIZE \(geo.size)")
                             localViewSize = setSize(size: geo.size)
                         }
-                    }
-                    .onChange(of: geo.size) { _, newValue in
-                        NeedleTailLogger().log(level: .debug, message: "NEW SIZE \(newValue)")
-                        if showsLocalPreview {
+                        .onChange(of: geo.size) { _, newValue in
+                            NeedleTailLogger().log(level: .debug, message: "NEW SIZE \(newValue)")
                             localViewSize = setSize(size: newValue)
                         }
                     }
@@ -1165,9 +1141,9 @@ public struct AndroidVideoCallView: View {
             }
             currentRemotePage = min(currentRemotePage, newCount - 1)
         }
-        .task(id: "\(isScreenSharing)-\(hasActiveRemoteScreenShare)") {
+        .task(id: "\(hasActiveRemoteScreenShare)-\(currentRemotePage)-\(remotePages.count)-\(displayedRemoteCaptureViews.count)") {
             let controller = resources.controller
-            let isSharing = isScreenSharing || hasActiveRemoteScreenShare
+            let isSharing = hasActiveRemoteScreenShare
             let screenCaptureView = resources.screenCaptureView
             let visiblePageViews: [AndroidSampleCaptureView]
             if remotePages.count > 1, remotePages.indices.contains(currentRemotePage) {
@@ -1533,18 +1509,15 @@ public struct AndroidVideoCallView: View {
 
     /// Computes an appropriate overlay size for the local preview based on container size.
     func setSize(size: CGSize) -> CGSize {
-        let screenWidth = size.width
-        let screenHeight = size.height
-        let isLandscape = screenWidth > screenHeight
-        let minSide = min(screenWidth, screenHeight)
-        let isTablet = minSide >= 450
-
-        let maxOverlayWidth: CGFloat = isTablet ? 240 : 180
-        let widthFraction: CGFloat = isTablet ? 0.28 : 0.34
-        let overlayWidth = min(maxOverlayWidth, minSide * widthFraction)
-        let overlayHeight = isLandscape ? overlayWidth * (9.0 / 16.0) : overlayWidth * (16.0 / 9.0)
-
-        return CGSize(width: overlayWidth, height: overlayHeight)
+        let policySize = GroupCallVideoLayoutPolicy.localPreviewOverlaySize(
+            platform: .android,
+            containerSize: GroupCallLayoutSize(
+                width: Double(size.width),
+                height: Double(size.height)
+            ),
+            isTablet: min(size.width, size.height) >= 450
+        )
+        return CGSize(width: policySize.width, height: policySize.height)
     }
 
     private func paginateRemotes(_ source: [AndroidSampleCaptureView], pageSize: Int) -> [[AndroidSampleCaptureView]] {

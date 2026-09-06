@@ -93,6 +93,7 @@ extension RTCSession {
     ///     `call_answered_aux_device` is **not** deferred: sibling devices must stop ringing the
     ///     moment this device commits to answering, independent of media/audio bootstrap.
     public func answerCall(_ call: Call, deferTransportAnswered: Bool = false) async throws {
+        resetAttemptFlagsForNewCall(connectionId: call.sharedCommunicationId)
         // Mark this call's PeerConnection as the active one (SFU uses a single PC).
         activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
         let roleCall = await callForOneToOneSfuRoleDetection(call)

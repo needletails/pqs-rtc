@@ -60,7 +60,11 @@ extension RTCSession {
     ///   - isEnabled: Whether the audio track should be enabled
     ///   - connectionId: The connection ID to modify
     /// - Throws: AudioError if connection not found
-    func setAudioTrack(isEnabled: Bool, connectionId: String) async throws {
+    func setAudioTrack(
+        isEnabled: Bool,
+        connectionId: String,
+        updateSystemAudioMicSuppression: Bool = true
+    ) async throws {
         let normalizedId = connectionId.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).normalizedConnectionId
         logger.log(level: .info, message: "Setting audio track enabled: \(isEnabled) for connection: \(normalizedId)")
         guard !normalizedId.isEmpty else {
@@ -85,7 +89,33 @@ extension RTCSession {
 #elseif os(Android)
         self.rtcClient.setAudioEnabled(isEnabled)
 #endif
+        if updateSystemAudioMicSuppression {
+            updateSystemAudioShareMicSuppressionForAudioIntent(
+                isEnabled: isEnabled,
+                connectionId: normalizedId,
+                isMixerForcedTrackEnable: false
+            )
+        }
         logger.log(level: .info, message: "Successfully set audio track enabled: \(isEnabled) for connection: \(normalizedId)")
+    }
+
+    func updateSystemAudioShareMicSuppressionForAudioIntent(
+        isEnabled: Bool,
+        connectionId: String,
+        isMixerForcedTrackEnable: Bool
+    ) {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard let suppression = SystemAudioShareMicPolicy.suppressionForAudioIntent(
+            shareIsActive: systemAudioShareActiveConnectionIds.contains(normalizedId),
+            audioTrackRequestedEnabled: isEnabled,
+            isMixerForcedTrackEnable: isMixerForcedTrackEnable
+        ) else {
+            return
+        }
+#if canImport(WebRTC) && !os(Android)
+        RTCSession.screenShareSystemAudioProcessor.setSuppressMicCapture(suppression)
+#endif
+        systemAudioShareMicWasMutedByConnectionId[normalizedId] = suppression
     }
     
 
@@ -192,6 +222,15 @@ extension RTCSession {
         logger.log(level: .info, message: "Successfully set external audio session")
     }
     
+#if os(iOS)
+    /// Routes output through the locked WebRTC audio session instead of raw `AVAudioSession`.
+    public nonisolated func setSpeakerOutputOverride(_ enabled: Bool) throws {
+        audioSession.lockForConfiguration()
+        defer { audioSession.unlockForConfiguration() }
+        try audioSession.overrideOutputAudioPort(enabled ? .speaker : .none)
+    }
+#endif
+
     /// Sets the audio mode with proper validation and error handling
     /// - Parameter mode: The audio mode to set
     /// - Throws: AudioError if mode is invalid or setting fails

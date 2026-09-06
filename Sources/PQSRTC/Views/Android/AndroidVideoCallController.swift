@@ -66,6 +66,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var participantAttachedTrackIdsByKey: [String: String] = [:]
     /// Serializes concurrent renderer attach attempts for the same participant tile.
     private var participantVideoAttachInFlightKeys: Set<String> = []
+    private var participantVideoAttachLifecycleGeneration: UInt64 = 0
     /// Set when an attach was requested while another attach for the same participant was in flight.
     private var participantVideoAttachCoalescedKeys: Set<String> = []
     /// One renderer recovery attempt per participant stall episode.
@@ -75,11 +76,10 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var inboundVideoFlowStreamTask: Task<Void, Never>?
     private var lastInboundVideoFlowStateForDecodeStall: InboundVideoFlowState?
     private var postRenegotiationAttachEpisodeStreamTask: Task<Void, Never>?
-    private var composeScreenShareLayoutGeneration: UInt64 = 0
-    private var pendingComposeScreenShareLayoutReconcile: (isSharing: Bool, generation: UInt64)?
+    private var screenShareLayoutTransitionState = ScreenShareLayoutTransitionState.idle
     private var expectedComposeLayoutParticipantKeys: Set<String> = []
     private var reportedComposeLayoutParticipantKeys: Set<String> = []
-    /// Bumped on every remote screen-share stop so stale layout-recovery / pending-activation work aborts.
+    /// Single generation owner for remote screen-share layout recovery and activation replay.
     private var remoteScreenShareLayoutGeneration: UInt64 = 0
     private var pendingRemoteScreenShareActivation: RemoteScreenTrackEvent?
     private var sfuGroupSignalingStableStreamTask: Task<Void, Never>?
@@ -603,6 +603,10 @@ public actor AndroidVideoCallController: CallActionDelegate {
         return false
     }
 
+    private func shouldRunCoalescedParticipantAttach(generation: UInt64) -> Bool {
+        isRunning && participantVideoAttachLifecycleGeneration == generation
+    }
+
     /// Single attach owner per participant: coalesce duplicate attach requests into one follow-up.
     private func performParticipantVideoAttach(
         participantId: String,
@@ -610,6 +614,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
         connectionId: String,
         reason: String
     ) async -> Bool {
+        guard isRunning else { return false }
         if reason == "post-renegotiation-first-frame-reconcile",
            view.rendererEverConfirmedFirstFrameForAttachedTrack()
             || view.rendererHadConfirmedFirstFrameSinceSinkAttach() {
@@ -762,11 +767,17 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return false
         }
         participantVideoAttachInFlightKeys.insert(key)
+        let attachLifecycleGeneration = participantVideoAttachLifecycleGeneration
         defer {
             participantVideoAttachInFlightKeys.remove(key)
             if participantVideoAttachCoalescedKeys.remove(key) != nil {
                 Task { [weak self] in
                     guard let self else { return }
+                    guard await self.shouldRunCoalescedParticipantAttach(
+                        generation: attachLifecycleGeneration
+                    ) else {
+                        return
+                    }
                     let didAttach = await self.performParticipantVideoAttach(
                         participantId: participantId,
                         view: view,
@@ -1080,12 +1091,23 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private func cancelScreenShareLayoutRecovery(reason: String) {
         remoteScreenShareLayoutGeneration &+= 1
         pendingRemoteScreenShareActivation = nil
-        pendingComposeScreenShareLayoutReconcile = nil
+        screenShareLayoutTransitionState = ScreenShareLayoutTransitionState(
+            phase: .idle,
+            generation: remoteScreenShareLayoutGeneration
+        )
         expectedComposeLayoutParticipantKeys.removeAll()
         reportedComposeLayoutParticipantKeys.removeAll()
         logger.log(
             level: .info,
             message: "Cancelled screen-share layout recovery reason=\(reason) generation=\(remoteScreenShareLayoutGeneration)"
+        )
+    }
+
+    private func cancelPendingRemoteScreenShareActivation(reason: String) {
+        pendingRemoteScreenShareActivation = nil
+        logger.log(
+            level: .debug,
+            message: "Cancelled pending remote screen-share activation reason=\(reason)"
         )
     }
 
@@ -1150,11 +1172,16 @@ public actor AndroidVideoCallController: CallActionDelegate {
             if hasActiveRemoteScreenShare,
                let activeParticipantId = activeRemoteScreenShareParticipantId,
                RTCSession.remoteScreenShareParticipantMatches(activeParticipantId, event.participantId) {
-                logger.log(
-                    level: .debug,
-                    message: "Ignoring duplicate remote screen-share activation participant=\(event.participantId)"
-                )
-                return
+                switch ScreenShareAttachPolicy.duplicateActivationDecision(
+                    isActive: true,
+                    samePresenterAlreadyActive: true
+                ) {
+                case .refreshExisting:
+                    await refreshExistingRemoteScreenShareRenderer()
+                    return
+                case .ignore, .recreate:
+                    return
+                }
             }
             pendingRemoteScreenShareActivation = nil
             logger.log(level: .info, message: "Remote screen share started from participant=\(event.participantId)")
@@ -1179,7 +1206,10 @@ public actor AndroidVideoCallController: CallActionDelegate {
             await videoCallDelegate?.remoteScreenShareDidChange(participantId: event.participantId, isSharing: true)
         } else {
             logger.log(level: .info, message: "Remote screen share ended from participant=\(event.participantId)")
-            cancelScreenShareLayoutRecovery(reason: "remote-screen-share-ended")
+            // The stop layout transition is created by the next Compose layout event. Only
+            // cancel zombie activation replay here; cancelling layout state would discard the
+            // post-expand generation before its surfaces can report.
+            cancelPendingRemoteScreenShareActivation(reason: "remote-screen-share-ended")
             // Stop is authoritative: also tear down when a share is visibly active even if
             // participant-id aliases drifted between announce and stop.
             let endedActiveShare = RTCSession.shouldAcceptRemoteScreenShareEnd(
@@ -1201,9 +1231,13 @@ public actor AndroidVideoCallController: CallActionDelegate {
             activeRemoteScreenShareParticipantId = nil
             hasActiveRemoteScreenShare = false
             await videoCallDelegate?.remoteScreenShareDidChange(participantId: event.participantId, isSharing: false)
-            if isGroupCall, let connectionId = currentCall?.sharedCommunicationId {
-                await reattachParticipantVideoAfterScreenShareStopLayoutChange(connectionId: connectionId)
-            }
+        }
+    }
+
+    private func refreshExistingRemoteScreenShareRenderer() async {
+        pendingRemoteScreenShareActivation = nil
+        if let view = screenView {
+            await setScreenView(view)
         }
     }
 
@@ -4757,9 +4791,17 @@ public actor AndroidVideoCallController: CallActionDelegate {
         guard hasActiveRemoteScreenShare,
               let participantId = activeRemoteScreenShareParticipantId,
               let connectionId = currentCall?.sharedCommunicationId else { return }
-        if view.hasActiveSink(),
-           view.attachedTrackIsLive(),
-           !view.rendererLayoutNeedsSinkReconcile() {
+        let sharesMappedWrapper = await session.androidScreenRendererSharesMappedWrapper(
+            view: view,
+            connectionId: connectionId,
+            participantId: participantId
+        )
+        if ScreenShareAttachPolicy.shouldSkipScreenRendererAttach(
+            hasActiveSink: view.hasActiveSink(),
+            attachedTrackIsLive: view.attachedTrackIsLive(),
+            sharesMappedWrapper: sharesMappedWrapper,
+            layoutNeedsReconcile: view.rendererLayoutNeedsSinkReconcile()
+        ) {
             return
         }
         await session.renderRemoteScreenVideo(
@@ -4793,23 +4835,36 @@ public actor AndroidVideoCallController: CallActionDelegate {
     func beginParticipantVideoReconcileAfterScreenShareLayoutChange(
         isSharing: Bool,
         visibleViews: [AndroidSampleCaptureView]
-    ) -> UInt64 {
-        composeScreenShareLayoutGeneration &+= 1
-        let generation = composeScreenShareLayoutGeneration
-        pendingComposeScreenShareLayoutReconcile = (isSharing, generation)
-        reportedComposeLayoutParticipantKeys.removeAll()
-        expectedComposeLayoutParticipantKeys = Set(
+    ) async -> UInt64 {
+        if !isSharing, screenShareLayoutTransitionState.phase == .idle {
+            return remoteScreenShareLayoutGeneration
+        }
+        let expectedIdentities = Set(
             participantViewAssignments.compactMap { participantId, assignedView in
                 visibleViews.contains(where: { $0 === assignedView })
                     ? participantAssignmentKey(participantId)
                     : nil
             }
         )
+        screenShareLayoutTransitionState = ScreenShareLayoutTransitionPolicy.beginTransition(
+            state: screenShareLayoutTransitionState,
+            isStartingShare: isSharing,
+            expectedIdentities: expectedIdentities
+        )
+        remoteScreenShareLayoutGeneration = screenShareLayoutTransitionState.generation
+        expectedComposeLayoutParticipantKeys = screenShareLayoutTransitionState.expectedIdentities
+        reportedComposeLayoutParticipantKeys = screenShareLayoutTransitionState.reportedIdentities
         logger.log(
             level: .info,
-            message: "Waiting for Compose participant layout generation=\(generation) expected=\(expectedComposeLayoutParticipantKeys.count) isSharing=\(isSharing)"
+            message: "Waiting for Compose participant layout generation=\(remoteScreenShareLayoutGeneration) expected=\(expectedComposeLayoutParticipantKeys.count) isSharing=\(isSharing)"
         )
-        return generation
+        if !screenShareLayoutTransitionState.isAwaitingLayout {
+            await performParticipantVideoReconcileAfterScreenShareLayoutChange(
+                isSharing: isSharing,
+                layoutGeneration: remoteScreenShareLayoutGeneration
+            )
+        }
+        return remoteScreenShareLayoutGeneration
     }
 
     /// Concrete renderer-layout event from Compose. Recovery starts once all currently visible
@@ -4818,25 +4873,39 @@ public actor AndroidVideoCallController: CallActionDelegate {
         _ view: AndroidSampleCaptureView,
         generation: UInt64
     ) async {
-        guard let pending = pendingComposeScreenShareLayoutReconcile,
-              pending.generation == generation,
-              generation == composeScreenShareLayoutGeneration else {
-            return
-        }
         guard let participantId = participantViewAssignments.first(where: { $0.value === view })?.key else {
             return
         }
-        reportedComposeLayoutParticipantKeys.insert(participantAssignmentKey(participantId))
-        guard !expectedComposeLayoutParticipantKeys.isEmpty,
+        let identity = participantAssignmentKey(participantId)
+        guard ScreenShareLayoutTransitionPolicy.shouldAcceptSurfaceReport(
+            capturedGeneration: generation,
+            identity: identity,
+            state: screenShareLayoutTransitionState
+        ) else {
+            return
+        }
+        let wasStarting: Bool
+        switch screenShareLayoutTransitionState.phase {
+        case .awaitingStartLayout:
+            wasStarting = true
+        case .awaitingStopLayout:
+            wasStarting = false
+        case .idle, .active:
+            return
+        }
+        screenShareLayoutTransitionState = ScreenShareLayoutTransitionPolicy.applyingSurfaceReport(
+            capturedGeneration: generation,
+            identity: identity,
+            state: screenShareLayoutTransitionState
+        )
+        expectedComposeLayoutParticipantKeys = screenShareLayoutTransitionState.expectedIdentities
+        reportedComposeLayoutParticipantKeys = screenShareLayoutTransitionState.reportedIdentities
+        guard !screenShareLayoutTransitionState.isAwaitingLayout,
               expectedComposeLayoutParticipantKeys.isSubset(of: reportedComposeLayoutParticipantKeys) else {
             return
         }
-
-        pendingComposeScreenShareLayoutReconcile = nil
-        expectedComposeLayoutParticipantKeys.removeAll()
-        reportedComposeLayoutParticipantKeys.removeAll()
         await performParticipantVideoReconcileAfterScreenShareLayoutChange(
-            isSharing: pending.isSharing,
+            isSharing: wasStarting,
             layoutGeneration: generation
         )
     }
@@ -4845,7 +4914,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
         isSharing: Bool,
         layoutGeneration: UInt64
     ) async {
-        guard layoutGeneration == composeScreenShareLayoutGeneration else {
+        guard layoutGeneration == remoteScreenShareLayoutGeneration else {
             logger.log(
                 level: .info,
                 message: "Skipping stale screen-share layout reconcile isSharing=\(isSharing) generation=\(layoutGeneration)"
@@ -4874,11 +4943,19 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return
         }
 
-        await reattachParticipantVideoAfterScreenShareStopLayoutChange(connectionId: connectionId)
+        await reattachParticipantVideoAfterScreenShareStopLayoutChange(
+            connectionId: connectionId,
+            reason: "screen-share-stop-layout-reattach",
+            ignoreSfuDeferForSurfaceLayoutRecovery: true
+        )
     }
 
     /// Fast sink recovery when screen share ends and participant tiles return to full grid layout.
-    private func reattachParticipantVideoAfterScreenShareStopLayoutChange(connectionId: String) async {
+    private func reattachParticipantVideoAfterScreenShareStopLayoutChange(
+        connectionId: String,
+        reason: String,
+        ignoreSfuDeferForSurfaceLayoutRecovery: Bool
+    ) async {
         logger.log(
             level: .info,
             message: """
@@ -4894,10 +4971,10 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 participantId: participantId,
                 view: view,
                 connectionId: connectionId,
-                reason: "screen-share-stop-layout-reattach",
+                reason: reason,
                 allowWhenAlreadyReboundThisEpisode: true,
                 forceLiveWrapperRecovery: true,
-                ignoreSfuDeferForSurfaceLayoutRecovery: true
+                ignoreSfuDeferForSurfaceLayoutRecovery: ignoreSfuDeferForSurfaceLayoutRecovery
             )
             if didRebind,
                participantTileHasHealthySinkAfterLayoutRecovery(view) {
@@ -4908,7 +4985,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 participantId: participantId,
                 view: view,
                 connectionId: connectionId,
-                reason: "screen-share-stop-layout-reattach"
+                reason: reason
             )
         }
     }
@@ -5094,6 +5171,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
 
     /// After the app returns from background Android destroys and recreates SurfaceViews; rebind sinks.
     public func reconcileVideoSurfacesAfterAppForeground() async {
+        guard isCallActiveForSurfaceUnhide() else { return }
         guard let connectionId = currentCall?.sharedCommunicationId else { return }
         logger.log(
             level: .info,
@@ -5359,6 +5437,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
 
     private func markCallEndedLocally() {
         guard isRunning else { return }
+        participantVideoAttachLifecycleGeneration &+= 1
         isRunning = false
         cancelPostRenegotiationAttachCoordinator()
         stopLocalScreenShareStateObservation()
@@ -5367,10 +5446,12 @@ public actor AndroidVideoCallController: CallActionDelegate {
         stopInboundVideoFlowObservation()
         stopPostRenegotiationAttachEpisodeObservation()
         stopSfuGroupSignalingStableObservation()
-        pendingComposeScreenShareLayoutReconcile = nil
+        screenShareLayoutTransitionState = ScreenShareLayoutTransitionState(
+            phase: .idle,
+            generation: remoteScreenShareLayoutGeneration &+ 1
+        )
         expectedComposeLayoutParticipantKeys.removeAll()
         reportedComposeLayoutParticipantKeys.removeAll()
-        composeScreenShareLayoutGeneration &+= 1
         pendingRemoteScreenShareActivation = nil
         remoteScreenShareLayoutGeneration &+= 1
         stateStreamTask?.cancel()

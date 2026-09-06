@@ -1140,6 +1140,7 @@ extension RTCSession {
 
         var removedVideoParticipants: [String] = []
         var removedScreenParticipants: [String] = []
+        var removedAudioParticipants: [String] = []
 
         for participantId in Array(connection.remoteVideoTracksByParticipantId.keys) where shouldRemove(participantId) {
             connection.remoteVideoTracksByParticipantId.removeValue(forKey: participantId)
@@ -1149,8 +1150,13 @@ extension RTCSession {
             connection.remoteScreenTracksByParticipantId.removeValue(forKey: participantId)
             removedScreenParticipants.append(participantId)
         }
+        for participantId in Array(connection.remoteAudioTracksByParticipantId.keys) where shouldRemove(participantId) {
+            connection.remoteAudioTracksByParticipantId.removeValue(forKey: participantId)
+            removedAudioParticipants.append(participantId)
+        }
+        rtcClient.disposeReceiverCryptors(forParticipant: participantId)
 
-        guard !removedVideoParticipants.isEmpty || !removedScreenParticipants.isEmpty else {
+        guard !removedVideoParticipants.isEmpty || !removedScreenParticipants.isEmpty || !removedAudioParticipants.isEmpty else {
             notifyRemoteParticipantTrackChanged(
                 RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
             )

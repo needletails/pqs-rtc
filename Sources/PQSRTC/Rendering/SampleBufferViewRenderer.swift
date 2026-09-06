@@ -102,8 +102,12 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     private var prefersAspectFit = false
     /// Solo fullscreen: aspect-fill only when remote upright orientation matches the local viewport.
     private var fillsWhenOrientationMatches = false
+    /// Last WebRTC rotation applied to an inbound frame (degrees clockwise).
+    private var lastFrameRotationDegrees = 0
     /// Last upright source size used for orientation-matched scale decisions.
     private var lastUprightSourceSize: CGSize = .zero
+    private var lastUprightOrientationIsLandscape: Bool?
+    private var uprightOrientationClassHandler: (@MainActor @Sendable (CGSize) -> Void)?
     /// Last frame processed for Metal; re-scaled when host bounds change while ingress is stalled (frozen tile).
     private var lastMetalDisplayPixelBuffer: CVPixelBuffer?
     @MainActor var bounds: CGRect
@@ -152,7 +156,6 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     private var lastI420WireSignature: String?
     private var i420DetailedLogCount = 0
     private var didLogFirstRemoteMetalScale = false
-    private var didLogIOSRemoteI420MetalPath = false
     private var telemetryTask: Task<Void, Never>?
     /// Always-on 2s cadence: distinguish “no frames from WebRTC” vs “frames arrive but nothing is displayed”.
     private var remoteVideoHealthWatchdogTask: Task<Void, Never>?
@@ -185,26 +188,51 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         ciContext: CIContext,
         bounds: CGRect,
         rendersScreenShare: Bool = false,
+        prefersAspectFit: Bool = false,
+        fillsWhenOrientationMatches: Bool = false,
         logger: NeedleTailLogger = NeedleTailLogger("[SampleBufferViewRenderer]")
     ) {
         self.layerBox = layerBox
         self.ciContext = ciContext
         self.rendersScreenShare = rendersScreenShare
+        self.prefersAspectFit = prefersAspectFit
+        self.fillsWhenOrientationMatches = fillsWhenOrientationMatches
         self.bounds = bounds
         self.logger = logger
         self.rtcVideoRenderWrapper = RTCVideoRenderWrapper(id: rendersScreenShare ? "ScreenShareRenderer" : "SampleBufferViewRenderer")
-        logger.log(level: .info, message: "SampleBufferViewRenderer initialized with bounds: \(bounds) rendersScreenShare=\(rendersScreenShare)")
+        logger.log(level: .info, message: "SampleBufferViewRenderer initialized with bounds: \(bounds) rendersScreenShare=\(rendersScreenShare) prefersAspectFit=\(prefersAspectFit)")
     }
 
-    private func usesAspectFitRendering(sourceSize: CGSize, destinationSize: CGSize) -> Bool {
+    var prefersAspectFitEnabled: Bool { prefersAspectFit }
+    var fillsWhenOrientationMatchesEnabled: Bool { fillsWhenOrientationMatches }
+
+    private func usesAspectFitRendering(
+        sourceSize: CGSize,
+        destinationSize: CGSize,
+        rotationDegrees: Int
+    ) -> Bool {
         RemoteCameraAspectPolicy.prefersAspectFit(
             forceFit: rendersScreenShare || prefersAspectFit,
             fillWhenOrientationMatches: fillsWhenOrientationMatches,
-            remoteWidth: Double(sourceSize.width),
-            remoteHeight: Double(sourceSize.height),
-            localWidth: Double(destinationSize.width),
-            localHeight: Double(destinationSize.height)
+            sourceWidth: Double(sourceSize.width),
+            sourceHeight: Double(sourceSize.height),
+            rotationDegrees: rotationDegrees,
+            destinationWidth: Double(destinationSize.width),
+            destinationHeight: Double(destinationSize.height)
         )
+    }
+
+    private func webRTCRotationDegrees(_ rotation: RTCVideoRotation) -> Int {
+        switch rotation {
+        case ._90:
+            return 90
+        case ._180:
+            return 180
+        case ._270:
+            return 270
+        default:
+            return 0
+        }
     }
 
     func setPrefersAspectFit(_ enabled: Bool) {
@@ -220,6 +248,34 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         fillsWhenOrientationMatches = enabled
         if changed {
             Task { await self.reprocessCachedMetalFrameIfNeeded(reason: "fillsWhenOrientationMatches") }
+        }
+    }
+
+    func currentUprightSourceSize() -> CGSize {
+        lastUprightSourceSize
+    }
+
+    func setUprightOrientationClassHandler(
+        _ handler: (@MainActor @Sendable (CGSize) -> Void)?
+    ) {
+        uprightOrientationClassHandler = handler
+        if lastUprightSourceSize.width > 0, lastUprightSourceSize.height > 0 {
+            let size = lastUprightSourceSize
+            Task { @MainActor in
+                handler?(size)
+            }
+        }
+    }
+
+    private func rememberUprightSourceSize(_ size: CGSize) {
+        lastUprightSourceSize = size
+        guard size.width > 0, size.height > 0 else { return }
+        let isLandscape = size.width >= size.height
+        guard lastUprightOrientationIsLandscape != isLandscape else { return }
+        lastUprightOrientationIsLandscape = isLandscape
+        let handler = uprightOrientationClassHandler
+        Task { @MainActor in
+            handler?(size)
         }
     }
 
@@ -307,7 +363,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         let height = CVPixelBufferGetHeight(cached)
         guard width > 0, height > 0 else { return }
         do {
-            try await processFrameForMetal(pixelBuffer: cached)
+            try await processFrameForMetal(pixelBuffer: cached, rotationDegrees: 0)
         } catch {
             logger.log(
                 level: .debug,
@@ -695,12 +751,13 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             logger.log(level: .trace, message: "First remote CVPixelBuffer format=\(format) planes=\(planes) size=\(width)x\(height) pauseMetal=\(pauseMetalRendering)")
         }
         
+        lastFrameRotationDegrees = webRTCRotationDegrees(frame.rotation)
         if !pauseMetalRendering {
             let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
                 from: pixelBuffer,
                 rotation: frame.rotation
             )
-            try await processFrameForMetal(pixelBuffer: displayBuffer)
+            try await processFrameForMetal(pixelBuffer: displayBuffer, rotationDegrees: 0)
         } else {
             let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
                 from: pixelBuffer,
@@ -739,37 +796,16 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             didLogFirstIncomingI420Format = true
             logger.log(level: .trace, message: "First remote I420 frame received (detailed wire log emitted separately)")
         }
+        lastFrameRotationDegrees = webRTCRotationDegrees(frame.rotation)
         if !pauseMetalRendering {
-            #if os(iOS)
-            if frame.rotation != ._0 {
-                let pixelBuffer = try makeNV12PixelBuffer(fromI420: buffer)
-                let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
-                    from: pixelBuffer,
-                    rotation: frame.rotation
-                )
-                try await processFrameForMetal(pixelBuffer: displayBuffer)
-                return
-            }
-            // Render iOS remote frames from source I420 planes directly for Metal.
-            // This avoids an extra I420->NV12 interleave step and preserves source strides.
-            if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogIOSRemoteI420MetalPath == false {
-                didLogIOSRemoteI420MetalPath = true
-                logger.log(
-                    level: .trace,
-                    message: "Remote iOS direct I420->Metal path active src=\(buffer.width)x\(buffer.height) strides=\(buffer.strideY)/\(buffer.strideU)/\(buffer.strideV)"
-                )
-            }
-            try await processI420FrameForMetal(buffer: buffer)
-            #else
-            // macOS: bake WebRTC rotation metadata into upright NV12 pixels before Metal so
-            // group tiles aspect-fit landscape senders instead of showing quarter-turned video.
+            // Bake WebRTC rotation into upright pixels before Metal so a landscape buffer
+            // with 90/270 metadata letterboxes as portrait inside a 16:9 collection cell.
             let pixelBuffer = try makeNV12PixelBuffer(fromI420: buffer)
             let displayBuffer = try uprightScreenSharePixelBufferIfNeeded(
                 from: pixelBuffer,
                 rotation: frame.rotation
             )
-            try await processFrameForMetal(pixelBuffer: displayBuffer)
-            #endif
+            try await processFrameForMetal(pixelBuffer: displayBuffer, rotationDegrees: 0)
             return
         }
         
@@ -852,7 +888,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         return pixelBuffer
     }
     
-    private func processFrameForMetal(pixelBuffer: CVPixelBuffer) async throws {
+    private func processFrameForMetal(pixelBuffer: CVPixelBuffer, rotationDegrees: Int) async throws {
         lastMetalDisplayPixelBuffer = pixelBuffer
         do {
             let renderBounds = await resolveRenderableBounds()
@@ -862,9 +898,18 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             )
             
             let originalSize = CGSize(width: pixelBuffer.width, height: pixelBuffer.height)
-            lastUprightSourceSize = originalSize
+            let upright = RemoteCameraAspectPolicy.uprightDimensions(
+                width: Int(originalSize.width.rounded()),
+                height: Int(originalSize.height.rounded()),
+                rotationDegrees: rotationDegrees
+            )
+            rememberUprightSourceSize(CGSize(width: upright.width, height: upright.height))
             let scaleInfo: MetalProcessor.ScaledInfo
-            if usesAspectFitRendering(sourceSize: originalSize, destinationSize: renderBounds) {
+            if usesAspectFitRendering(
+                sourceSize: originalSize,
+                destinationSize: renderBounds,
+                rotationDegrees: rotationDegrees
+            ) {
                 scaleInfo = Self.aspectFitScaleInfo(
                     sourceSize: originalSize,
                     destinationSize: renderBounds
@@ -1114,9 +1159,18 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 height: CGFloat(buffer.height)
             )
             let originalSize = CGSize(width: CGFloat(buffer.width), height: CGFloat(buffer.height))
-            lastUprightSourceSize = originalSize
+            let upright = RemoteCameraAspectPolicy.uprightDimensions(
+                width: Int(buffer.width),
+                height: Int(buffer.height),
+                rotationDegrees: lastFrameRotationDegrees
+            )
+            rememberUprightSourceSize(CGSize(width: upright.width, height: upright.height))
             let scaleInfo: MetalProcessor.ScaledInfo
-            if usesAspectFitRendering(sourceSize: originalSize, destinationSize: renderBounds) {
+            if usesAspectFitRendering(
+                sourceSize: originalSize,
+                destinationSize: renderBounds,
+                rotationDegrees: lastFrameRotationDegrees
+            ) {
                 scaleInfo = Self.aspectFitScaleInfo(
                     sourceSize: originalSize,
                     destinationSize: renderBounds
@@ -1136,7 +1190,11 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             }
             if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, didLogFirstRemoteMetalScale == false {
                 didLogFirstRemoteMetalScale = true
-                let fit = usesAspectFitRendering(sourceSize: originalSize, destinationSize: renderBounds)
+                let fit = usesAspectFitRendering(
+                    sourceSize: originalSize,
+                    destinationSize: renderBounds,
+                    rotationDegrees: lastFrameRotationDegrees
+                )
                 logger.log(
                     level: .trace,
                     message: "Remote I420 Metal conversion srcSize=\(buffer.width)x\(buffer.height) renderBounds=\(renderBounds) aspectFit=\(fit) scaleX=\(scaleInfo.scaleX) scaleY=\(scaleInfo.scaleY)"

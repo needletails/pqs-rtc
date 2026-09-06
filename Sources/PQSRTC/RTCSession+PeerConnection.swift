@@ -88,6 +88,7 @@ extension RTCSession {
             // rebuilding the peer connection and re-activating the audio session (observed in
             // production as a ~60s zombie call that re-opened the mic after the user hung up).
             clearFallbackState(connectionId: connectionId)
+            await endSystemAudioShareEgressIfNeeded(connectionId: connectionId)
             await releaseLocalMediaResourcesForCallEnding(connectionId: connectionId)
         }
 
@@ -481,7 +482,7 @@ extension RTCSession {
         // Prefer idempotent teardown: `shutdown(with:)` can be invoked multiple times from
         // different end-call triggers (e.g. signaling end_call + CallKit). The rest of
         // `shutdown(with:)` still performs a full reset.
-        await finishEndConnection(currentCall: call, force: false, endState: endState)
+        await finishEndConnection(currentCall: call, force: true, endState: endState)
 
         // Close any remaining peer connections and notify delegates.
         // (Normally `finishEndConnection` already removed them, but keep this as a safety net.)
@@ -1204,6 +1205,14 @@ extension RTCSession {
         pendingVideoEnabledByConnectionId.removeAll()
         pendingAudioEnabledByConnectionId.removeAll()
         
+        pendingDeferredSfuRenegotiationOffers.removeAll()
+        signalingStateByConnectionId.removeAll()
+        for group in groupCalls.values {
+            await group.leave()
+        }
+        groupCalls.removeAll()
+        mediaDelegate = nil
+
         // Reset counters and flags
         notRunning = true
         isGroupCall = false

@@ -1693,7 +1693,11 @@ extension RTCSession {
         systemAudioShareMicWasMutedByConnectionId[normalizedId] = micEgressDisabled
 
         if micEgressDisabled {
-            try await setAudioTrack(isEnabled: true, connectionId: normalizedId)
+            try await setAudioTrack(
+                isEnabled: true,
+                connectionId: normalizedId,
+                updateSystemAudioMicSuppression: false
+            )
 #if os(iOS)
             setAudio(true)
 #endif
@@ -1712,31 +1716,7 @@ extension RTCSession {
         RTCSession.screenShareSystemAudioProcessor.setSuppressMicCapture(micEgressDisabled)
     }
 
-    private func endSystemAudioShareEgressIfNeeded(connectionId: String) async {
-        let normalizedId = connectionId.normalizedConnectionId
-        guard systemAudioShareActiveConnectionIds.remove(normalizedId) != nil else { return }
-
-        RTCSession.screenShareSystemAudioProcessor.setSuppressMicCapture(false)
-        RTCSession.deactivateSystemAudioCaptureProcessing()
-
-        guard systemAudioShareMicWasMutedByConnectionId.removeValue(forKey: normalizedId) == true else {
-            return
-        }
-        do {
-            try await setAudioTrack(isEnabled: false, connectionId: normalizedId)
-            logger.log(
-                level: .info,
-                message: "Restored muted mic after screen-share system audio connection=\(normalizedId)"
-            )
-        } catch {
-            logger.log(
-                level: .warning,
-                message: "Failed to restore muted mic after screen-share system audio connection=\(normalizedId): \(error)"
-            )
-        }
-    }
-
-    private func isLocalAudioEgressDisabled(on connection: RTCConnection) -> Bool {
+    func isLocalAudioEgressDisabled(on connection: RTCConnection) -> Bool {
         for sender in connection.peerConnection.senders {
             guard sender.track?.kind == kRTCMediaStreamTrackKindAudio else { continue }
             if let track = sender.track as? RTCAudioTrack, !track.isEnabled {
@@ -1754,4 +1734,30 @@ extension RTCSession {
         return false
     }
 #endif
+
+    func endSystemAudioShareEgressIfNeeded(connectionId: String) async {
+        let normalizedId = connectionId.normalizedConnectionId
+        guard systemAudioShareActiveConnectionIds.remove(normalizedId) != nil
+            || systemAudioShareMicWasMutedByConnectionId[normalizedId] != nil else {
+            return
+        }
+#if canImport(WebRTC) && !os(Android)
+        RTCSession.screenShareSystemAudioProcessor.setSuppressMicCapture(false)
+        RTCSession.deactivateSystemAudioCaptureProcessing()
+#endif
+        let shouldRestoreMute = systemAudioShareMicWasMutedByConnectionId.removeValue(forKey: normalizedId) == true
+        guard shouldRestoreMute else { return }
+        do {
+            try await setAudioTrack(isEnabled: false, connectionId: normalizedId)
+            logger.log(
+                level: .info,
+                message: "Restored muted mic after screen-share system audio connection=\(normalizedId)"
+            )
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "Failed to restore muted mic after screen-share system audio connection=\(normalizedId): \(error)"
+            )
+        }
+    }
 }

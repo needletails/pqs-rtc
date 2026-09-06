@@ -530,7 +530,23 @@ extension RTCSession {
         )
 
         // If absolutely no media is flowing despite connected transport, kick both media senders once.
-        if flow.state == .noTraffic && flow.audioPacketsSent == 0 && flow.deltaAudioPacketsSent <= 0 {
+        // Never re-enable audio when the user/session mute flag is already muted.
+        let userAudioEgressDisabled: Bool
+        if let connection = await connectionManager.findConnection(with: connectionId) {
+#if canImport(WebRTC) && !os(Android)
+            userAudioEgressDisabled = isLocalAudioEgressDisabled(on: connection)
+#else
+            userAudioEgressDisabled = connection.localAudioTrack?.isEnabled == false
+#endif
+        } else {
+            userAudioEgressDisabled = false
+        }
+        if OutboundVideoRecoveryPolicy.shouldKickAudio(
+            userAudioEgressDisabled: userAudioEgressDisabled,
+            flowState: OutboundVideoRecoveryFlowState(rawValue: flow.state.rawValue) ?? .advancingEgress,
+            audioPacketsSent: flow.audioPacketsSent,
+            deltaAudioPacketsSent: flow.deltaAudioPacketsSent
+        ) {
             try? await setAudioTrack(isEnabled: false, connectionId: connectionId)
             try? await Task.sleep(nanoseconds: 150_000_000)
             try? await setAudioTrack(isEnabled: true, connectionId: connectionId)
