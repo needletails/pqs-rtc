@@ -17,6 +17,7 @@
 
 import Foundation
 import DoubleRatchetKit
+import DequeModule
 #if canImport(WebRTC)
 @preconcurrency import WebRTC
 #endif
@@ -827,10 +828,9 @@ extension RTCSession {
         }
     }
 
-    /// A binding only guarantees decrypt when its cryptor still wraps the receiver that currently
-    /// carries the track. After SFU renegotiation WebRTC can rotate the `RTCRtpReceiver` while the
-    /// trackId stays stable; the old cryptor is then attached to a dead receiver and enabling the
-    /// track plays ciphertext (garbled audio).
+    /// Audio FrameCryptor reuse follows the stable track id. Video still requires a live
+    /// `RTCRtpReceiver` identity; audio must not mute on wrapper rotation or video-start
+    /// offers chirp playout (`Upgraded SFU audio mapping` with identical track ids).
     private func appleAudioReceiverCryptorBindingTargetsLiveReceiver(
         _ binding: RTCReceiverCryptorBinding,
         connection: RTCConnection
@@ -838,10 +838,14 @@ extension RTCSession {
         for transceiver in connection.peerConnection.transceivers where transceiver.mediaType == .audio {
             guard transceiver.sender.track == nil,
                   let track = transceiver.receiver.track as? RTCAudioTrack,
-                  track.trackId == binding.trackId,
                   track.readyState != .ended
             else { continue }
-            return String(describing: ObjectIdentifier(transceiver.receiver)) == binding.receiverId
+            if Self.shouldReuseAudioReceiverFrameCryptorByStableTrack(
+                existingTrackId: binding.trackId,
+                newTrackId: track.trackId
+            ) {
+                return true
+            }
         }
         return false
     }
@@ -1179,6 +1183,25 @@ extension RTCSession {
         existingTrackId == newTrackId && existingReceiverId == newReceiverId
     }
 
+    /// Audio playout chirps if we dispose/recreate on wrapper rotation. Same track id keeps
+    /// the live FrameCryptor; the native receiver attachment does not follow ObjectIdentifier.
+    internal static func shouldReuseAudioReceiverFrameCryptorByStableTrack(
+        existingTrackId: String,
+        newTrackId: String
+    ) -> Bool {
+        !existingTrackId.isEmpty && existingTrackId == newTrackId
+    }
+
+    /// Apple SFU audio reconcile must not treat a new `RTCAudioTrack` wrapper as a new leg
+    /// when the advertised msid is unchanged. That path mutes, drops the live cryptor, then
+    /// defers recreate until the answer — the click at `startRendering`.
+    internal static func shouldUpgradeAppleSfuAudioMapping(
+        existingTrackId: String,
+        advertisedTrackId: String
+    ) -> Bool {
+        !advertisedTrackId.isEmpty && existingTrackId != advertisedTrackId
+    }
+
     private func receiverFrameCryptorRebindReason(
         existingBinding: RTCReceiverCryptorBinding,
         newBinding: RTCReceiverCryptorBinding
@@ -1265,7 +1288,10 @@ extension RTCSession {
         let participantId = binding.participantId
         if let existingBinding = connection.audioReceiverCryptorBindingsByParticipantId[participantId] {
             if let existing = connection.audioReceiverCryptorsByParticipantId[participantId],
-               shouldReuseReceiverFrameCryptor(existingBinding: existingBinding, newBinding: binding) {
+               Self.shouldReuseAudioReceiverFrameCryptorByStableTrack(
+                existingTrackId: existingBinding.trackId,
+                newTrackId: binding.trackId
+               ) {
                 enableAppleFrameCryptor(existing, participantId: participantId)
                 connection.audioFrameCryptor = existing
                 connection.audioReceiverCryptorBindingsByParticipantId[participantId] = binding
@@ -1362,6 +1388,22 @@ extension RTCSession {
 #endif
 
     //MARK: Key Derivation & Cleanup
+
+    /// Drops leftover FrameCryptor key-ring state before a new call attempt installs keys.
+    ///
+    /// Hangup can skip same-room leftover shutdown, and Android hangup reuses the ICE-retry
+    /// PeerConnection reset which keeps the native key provider. Call this immediately before
+    /// minting a new sender key. Do not call it on ICE retry.
+    public func resetFrameEncryptionKeyProviderForNewCallAttempt() {
+#if os(Android)
+        rtcClient.resetFrameKeyProviderForHangup()
+#elseif canImport(WebRTC)
+        keyProvider = nil
+#endif
+        lastFrameKeyIndexByParticipantId.removeAll()
+        lastSharedFrameKeyIndex = 0
+        logger.log(level: .info, message: "Reset FrameCryptor key provider for new call attempt")
+    }
 
     /// Applies a frame-encryption key for a participant.
     ///
@@ -2726,7 +2768,32 @@ extension RTCSession {
         }
     }
 
-    func sendEncryptedSfuCandidateFromDeque(_ candidate: IceCandidate, call: Call) async throws {
+    func sendEncryptedSfuCandidateFromDeque(
+        _ candidate: IceCandidate,
+        call: Call,
+        isPreConnectJoinBurst: Bool = false
+    ) async throws {
+        let connKey = call.sharedCommunicationId.normalizedConnectionId
+        let decision = SfuOutboundIceCandidateSendPolicy.decide(
+            isGroupOrConference: isGroupOrConferenceSignalingLane(connectionId: connKey, call: call),
+            iceIsConnectedOrCompleted: iceConnectedOrCompletedConnectionIds.contains(connKey),
+            hasPendingOfferOrAnswer: await taskProcessor.hasPendingOfferOrAnswerOutbound(),
+            isPreConnectJoinBurst: isPreConnectJoinBurst
+        )
+        switch decision {
+        case .encryptNow:
+            break
+        case .keepBuffered:
+            iceDequeByConnectionId[connKey, default: Deque<IceCandidate>()].append(candidate)
+            return
+        case .dropBuffered:
+            logger.log(
+                level: .info,
+                message: "Dropped un-encrypted pre-connect ICE candidate burst; ICE already connected connId=\(connKey)"
+            )
+            return
+        }
+
         // Encode candidate into call metadata and ratchet-encrypt for SFU.
         var callForWire = call
         callForWire.metadata = try BinaryEncoder().encode(candidate)

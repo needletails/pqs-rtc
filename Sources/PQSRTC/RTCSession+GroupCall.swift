@@ -85,17 +85,135 @@ extension RTCSession {
         }
         readinessCall.metadata = nil
 
+        // Same wire id as offer/answer. A bare `sharedCommunicationId` UUID stamps a
+        // different `sfuIdentity` than `testing_<uuid>` and the SFU decrypts that
+        // packet on another session, leaving a hole in the live ratchet chain.
+        let wireRoomId = (readinessCall.resolvedChannelWireId ?? roomId).normalizedConnectionId
         let plaintext = try BinaryEncoder().encode(readinessCall)
         let writeTask = WriteTask(
             data: plaintext,
-            roomId: roomId.normalizedConnectionId,
+            roomId: wireRoomId,
             flag: .mediaReady,
             call: readinessCall)
-        try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+        let confirmationKey = "\(readinessCall.sharedCommunicationId.normalizedConnectionId)|\(Self.conferenceParticipantIdentityKey(sourceId))"
+        let sendWaitId = await taskProcessor.beginOutboundSendWait(matching: .mediaReady)
+        pendingSfuGroupMediaReadyKeys.insert(confirmationKey)
+        await noteEssentialOutbound(.begin, connectionId: readinessCall.sharedCommunicationId)
+        do {
+            try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+        } catch {
+            pendingSfuGroupMediaReadyKeys.remove(confirmationKey)
+            await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+            await noteEssentialOutbound(.failed, connectionId: readinessCall.sharedCommunicationId)
+            throw error
+        }
+
+        if SfuGroupMediaReadySendPolicy.shouldAwaitMediaReadySendOnCallingStack(
+            calledFromSharedCallControlActor: true
+        ) {
+            try await finishSfuGroupMediaReadySend(
+                sendWaitId: sendWaitId,
+                confirmationKey: confirmationKey,
+                sourceId: sourceId,
+                wireRoomId: wireRoomId,
+                connectionId: readinessCall.sharedCommunicationId
+            )
+        } else {
+            logger.log(
+                level: .info,
+                message: "Queued SFU group mediaReady send off calling stack source=\(sourceId) room=\(wireRoomId)"
+            )
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.finishSfuGroupMediaReadySend(
+                        sendWaitId: sendWaitId,
+                        confirmationKey: confirmationKey,
+                        sourceId: sourceId,
+                        wireRoomId: wireRoomId,
+                        connectionId: readinessCall.sharedCommunicationId
+                    )
+                } catch {
+                    self.logger.log(
+                        level: .warning,
+                        message: "SFU group mediaReady send failed source=\(sourceId) room=\(wireRoomId): \(error)"
+                    )
+                }
+            }
+        }
+    }
+
+    /// Waits for source-scoped `mediaReady` to hit the wire.
+    ///
+    /// Must not run on the shared call-control actor that just received a sender key.
+    func finishSfuGroupMediaReadySend(
+        sendWaitId: UUID,
+        confirmationKey: String,
+        sourceId: String,
+        wireRoomId: String,
+        connectionId: String
+    ) async throws {
+        do {
+            try await taskProcessor.waitForOutboundSendCompletion(id: sendWaitId)
+            pendingSfuGroupMediaReadyKeys.remove(confirmationKey)
+            await noteEssentialOutbound(.completed, connectionId: connectionId)
+        } catch {
+            pendingSfuGroupMediaReadyKeys.remove(confirmationKey)
+            await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+            await noteEssentialOutbound(.failed, connectionId: connectionId)
+            throw error
+        }
+        confirmedSfuGroupMediaReadyKeys.insert(confirmationKey)
         logger.log(
             level: .info,
-            message: "Sent SFU group media readiness for source=\(sourceId) room=\(roomId)"
+            message: "Sent SFU group media readiness for source=\(sourceId) room=\(wireRoomId)"
         )
+    }
+
+    func resetSfuGroupMediaReadyGeneration(connectionId: String, participantId: String) {
+        let source = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else { return }
+        let confirmationKey = "\(connectionId.normalizedConnectionId)|\(Self.conferenceParticipantIdentityKey(source))"
+        confirmedSfuGroupMediaReadyKeys.remove(confirmationKey)
+        unansweredGroupMediaReadyResentKeys.remove(confirmationKey)
+        pendingSfuGroupMediaReadyKeys.remove(confirmationKey)
+    }
+
+    func emitSfuGroupMediaReadyAfterReceivingMappingUpgradeIfNeeded(
+        connection: RTCConnection,
+        participantId: String,
+        previousTrackIsReceiving: Bool,
+        newTrackIsReceiving: Bool,
+        previousTrackId: String?,
+        newTrackId: String
+    ) async {
+        guard SfuRejoinedReceiverMappingPolicy.shouldEmitMediaReadyAfterReceivingMappingUpgrade(
+            previousTrackIsReceiving: previousTrackIsReceiving,
+            newTrackIsReceiving: newTrackIsReceiving,
+            previousTrackId: previousTrackId,
+            newTrackId: newTrackId
+        ) else { return }
+        let source = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else { return }
+        resetSfuGroupMediaReadyGeneration(connectionId: connection.call.sharedCommunicationId, participantId: source)
+        resetSfuGroupMediaReadyGeneration(connectionId: connection.id, participantId: source)
+        do {
+            try await sendSfuGroupMediaReady(
+                sourceParticipantId: source,
+                roomId: connection.call.resolvedChannelWireId
+                    ?? connection.call.sharedCommunicationId,
+                call: connection.call
+            )
+            logger.log(
+                level: .info,
+                message: "Emitted SFU group mediaReady after receiving mapping upgrade source=\(source) previousTrack=\(previousTrackId ?? "nil") newTrack=\(newTrackId) connection=\(connection.id)"
+            )
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "SFU group mediaReady after receiving mapping upgrade failed source=\(source) connection=\(connection.id): \(error)"
+            )
+        }
     }
 
     private func mergeGroupCallForMediaBootstrap(
@@ -207,6 +325,7 @@ extension RTCSession {
         call originalCall: Call,
         sfuRecipientId: String
     ) async throws {
+        await waitForCallTeardownIfNeeded()
         isGroupCall = true
         let normalizedId = sfuRecipientId.normalizedConnectionId
         let normalizedConnectionId = originalCall.sharedCommunicationId.normalizedConnectionId
@@ -264,8 +383,21 @@ extension RTCSession {
         guard let group = groupCalls[normalizedId] else {
             throw RTCErrors.missingGroupCall
         }
+        let owner = await group.currentCall
+        if !CallTeardownOwnershipPolicy.shouldApplyGroupLeave(
+            endingCallId: call.id,
+            registeredCallId: owner.id
+        ) {
+            logger.log(
+                level: .warning,
+                message: "Skipping group leave for ended attempt \(call.id.uuidString); live attempt \(owner.id.uuidString) owns this room"
+            )
+            return
+        }
         await group.leave()
-        groupCalls.removeValue(forKey: normalizedId)
+        if groupCalls[normalizedId] === group {
+            groupCalls.removeValue(forKey: normalizedId)
+        }
         await shutdown(with: call, endState: endState)
     }
     
@@ -304,14 +436,19 @@ extension RTCSession {
             roomId: wireRoomId,
             flag: .offer,
             call: call)
-        let encryptableTask = EncryptableTask(task: .writeMessage(writeTask))
-        try await taskProcessor.feedTask(task: encryptableTask)
-
+        let sendWaitId = await taskProcessor.beginOutboundSendWait(matching: .offer)
+        await noteEssentialOutbound(.begin, connectionId: call.sharedCommunicationId)
         do {
-            try await startSendingCandidates(call: call)
+            try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+            try await taskProcessor.waitForOutboundSendCompletion(id: sendWaitId)
+            await noteEssentialOutbound(.completed, connectionId: call.sharedCommunicationId)
         } catch {
-            logger.log(level: .warning, message: "Failed to start sending SFU ICE candidates after offer (will continue buffering): \(error)")
+            await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+            await noteEssentialOutbound(.failed, connectionId: call.sharedCommunicationId)
+            throw error
         }
+
+        await drainOrDropBufferedCandidatesAfterEssentialWire(call: call)
         
         return call
     }
@@ -940,8 +1077,22 @@ extension RTCSession {
         for participantId in Array(connection.remoteVideoTracksByParticipantId.keys) where shouldPruneParticipant(participantId) {
             clearScreenShareBookkeeping(for: participantId)
             let track = connection.remoteVideoTracksByParticipantId.removeValue(forKey: participantId)
-            if let track, connection.remoteVideoTrack === track {
-                connection.remoteVideoTrack = nil
+            if let track {
+                if SfuDepartedReceiverTrackPolicy.shouldDisableDepartedSfuReceiverTrack(mappingRemoved: true) {
+                    track.isEnabled = false
+                }
+                if connection.remoteVideoTrack === track {
+                    connection.remoteVideoTrack = nil
+                }
+            }
+            if SfuRejoinedReceiverMappingPolicy.shouldResetMediaReadyGenerationAfterDepartedMappingRemoved(
+                mappingRemoved: true
+            ) {
+                resetSfuGroupMediaReadyGeneration(connectionId: connection.id, participantId: participantId)
+                resetSfuGroupMediaReadyGeneration(
+                    connectionId: connection.call.sharedCommunicationId,
+                    participantId: participantId
+                )
             }
             if let cryptor = connection.videoReceiverCryptorsByParticipantId.removeValue(forKey: participantId) {
                 cryptor.enabled = false

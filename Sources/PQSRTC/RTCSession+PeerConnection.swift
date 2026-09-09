@@ -457,6 +457,20 @@ extension RTCSession {
         with call: Call?,
         endState: CallStateMachine.EndState = .userInitiated
     ) async {
+        if isCallTeardownInProgress {
+            await waitForCallTeardownIfNeeded()
+            return
+        }
+        if await shouldSkipShutdownForLiveAttempt(call) {
+            logger.log(
+                level: .warning,
+                message: "Skipping RTC shutdown for ended attempt \(call?.id.uuidString ?? "nil"); live attempt owns this room"
+            )
+            return
+        }
+        beginCallTeardown()
+        defer { finishCallTeardown() }
+
         await releaseLocalMediaResourcesForCallEnding(call: call)
 
         // Stop background consumers first so we don't process late callbacks
@@ -499,6 +513,7 @@ extension RTCSession {
 
     #if os(Android)
         self.rtcClient.resetPeerConnectionForRetry()
+        self.rtcClient.resetFrameKeyProviderForHangup()
         logger.log(level: .info, message: "Did reset AndroidRTCClient during shutdown")
     #endif
 
@@ -525,6 +540,9 @@ extension RTCSession {
         cancelAllBufferedCandidateDrains()
         iceDequeByConnectionId.removeAll()
         readyForCandidatesByConnectionId.removeAll()
+        iceConnectedOrCompletedConnectionIds.removeAll()
+        pendingSfuGroupMediaReadyKeys.removeAll()
+        essentialOutboundInFlightCountByConnectionId.removeAll()
         pendingRemoteVideoRenderersByConnectionId.removeAll()
         remoteParticipantVideoRendererAttachedTrackIdByKey.removeAll()
 #if os(iOS) || os(macOS)
@@ -546,25 +564,40 @@ extension RTCSession {
 #endif
 
         // Retire the current crypto-stack generation (terminal DoubleRatchetKit shutdown) and
-        // clear all crypto/key state so the next call starts from a clean slate. The crypto
-        // accessors build a fresh generation when the next call begins; see the crypto-state
-        // section in RTCSession.swift.
+        // clear all crypto/key state so the next call starts from a clean slate. Rebuild the
+        // next generation on this hangup event so offer/key install does not hit a retired stack.
+        let generationAtEntry = cryptoStackGeneration
         await retireCryptoStackGeneration()
-        await keyManager.clearAll()
-        await pcKeyManager.clearAll()
-
-        await connectionManager.removeAllConnections()
+        let retiredLiveStack = CallTeardownOwnershipPolicy.shouldRetireCryptoStack(
+            teardownGeneration: generationAtEntry,
+            liveGeneration: cryptoStackGeneration
+        )
+        if retiredLiveStack {
+            await keyManager.clearAll()
+            await pcKeyManager.clearAll()
+            await connectionManager.removeAllConnections()
+            prepareCryptoStackForNextCallIfNeeded()
+        } else {
+            logger.log(
+                level: .warning,
+                message: "Preserving live crypto keys and connections; generation advanced during teardown"
+            )
+        }
     #if os(Android)
-        didStartReceiving = false
-        remoteViewData.removeAll()
+        if retiredLiveStack {
+            didStartReceiving = false
+            remoteViewData.removeAll()
+        }
     #endif
 
     #if DEBUG
-        let remainingConnectionCount = await connectionManager.findAllConnections().count
-        assert(remainingConnectionCount == 0, "RTCSession shutdown should leave zero connections (found: \(remainingConnectionCount))")
-        assert(inboundCandidateConsumers.isEmpty, "RTCSession shutdown should clear inbound candidate buffers")
-        assert(pcStateByConnectionId.isEmpty, "RTCSession shutdown should clear per-connection pcState")
-        assert(pcState == .none, "RTCSession shutdown should reset pcState to .none")
+        if retiredLiveStack {
+            let remainingConnectionCount = await connectionManager.findAllConnections().count
+            assert(remainingConnectionCount == 0, "RTCSession shutdown should leave zero connections (found: \(remainingConnectionCount))")
+            assert(inboundCandidateConsumers.isEmpty, "RTCSession shutdown should clear inbound candidate buffers")
+            assert(pcStateByConnectionId.isEmpty, "RTCSession shutdown should clear per-connection pcState")
+            assert(pcState == .none, "RTCSession shutdown should reset pcState to .none")
+        }
     #endif
     }
     
@@ -899,6 +932,7 @@ extension RTCSession {
         if let connectionId, let callForTeardown = currentCall {
             readyForCandidatesByConnectionId[connectionId] = nil
             iceDequeByConnectionId.removeValue(forKey: connectionId)
+            iceConnectedOrCompletedConnectionIds.remove(connectionId)
             cancelBufferedCandidateDrain(connectionId: connectionId)
             await taskProcessor.removeJobs(forConnectionId: connectionId)
             for key in sfuRoomSignalingPropsKeys(
@@ -915,6 +949,7 @@ extension RTCSession {
             oneToOneSfuReceiveKeyReadyConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
             oneToOneSfuPostCipherHandshakeSentConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
             remoteVideoRendererAttachedTrackIdByConnectionId.removeValue(forKey: connectionId)
+            iceHadMediaPathDisruptionByConnectionId.removeValue(forKey: connectionId)
             clearRemoteParticipantVideoRendererAttachments(connectionId: connectionId)
             sfuRenegotiationReceiverCryptorRebindDeferredConnectionIds.remove(teardownConnectionIdKey(callForTeardown.sharedCommunicationId))
             pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)
@@ -1148,12 +1183,17 @@ extension RTCSession {
         pcStateByConnectionId.removeAll()
         cancelAllBufferedCandidateDrains()
         readyForCandidatesByConnectionId.removeAll()
+        iceConnectedOrCompletedConnectionIds.removeAll()
         for task in inboundVideoFlowSamplerTasksByConnectionId.values {
             task.cancel()
         }
         inboundVideoFlowSamplerTasksByConnectionId.removeAll()
         inboundVideoFlowSamplerActiveByConnectionId.removeAll()
         inboundVideoFlowSamplerGenerationByConnectionId.removeAll()
+        unansweredGroupMediaReadyResentKeys.removeAll()
+        confirmedSfuGroupMediaReadyKeys.removeAll()
+        pendingSfuGroupMediaReadyKeys.removeAll()
+        essentialOutboundInFlightCountByConnectionId.removeAll()
         e2eeSenderFailedConnectionIds.removeAll()
         requiresExternalAudioActivation = false
         externalAudioActivationOpen = false
@@ -1193,6 +1233,9 @@ extension RTCSession {
         lastSharedFrameKeyIndex = 0
 #if canImport(WebRTC) && !os(Android)
         keyProvider = nil
+#endif
+#if os(Android)
+        rtcClient.resetFrameKeyProviderForHangup()
 #endif
         
         // Clean up candidate buffers

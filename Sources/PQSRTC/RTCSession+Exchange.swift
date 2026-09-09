@@ -450,7 +450,10 @@ extension RTCSession {
         }
     }
 
-    /// Applies an inbound SFU renegotiation offer and returns the encrypted answer to the SFU.
+    /// Applies an inbound SFU renegotiation offer and queues the encrypted answer.
+    ///
+    /// The answer write is a sibling TaskProcessor job. Waiting for it here
+    /// deadlocks `processingLoop` (inbound `.offer` still in-flight).
     func completeSfuRenegotiationOfferHandling(sdp: SessionDescription, call: Call) async throws {
         let normId = teardownConnectionIdKey(call.sharedCommunicationId)
         if sfuRenegotiationInFlightConnectionIds.contains(normId) {
@@ -463,21 +466,81 @@ extension RTCSession {
         }
         sfuRenegotiationInFlightConnectionIds.insert(normId)
         noteSfuGroupRenegotiationSettlementStarted(connectionId: normId)
-        defer { sfuRenegotiationInFlightConnectionIds.remove(normId) }
 
-        let processedCall = try await handleRenegotiationOffer(sdp: sdp, call: call)
-        activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
-        if var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
-            connection.call = processedCall
-            await connectionManager.updateConnection(id: connection.id, with: connection)
+        let processedCall: Call
+        let sendWaitId: UUID
+        do {
+            processedCall = try await handleRenegotiationOffer(sdp: sdp, call: call)
+            activeConnectionId = call.sharedCommunicationId.normalizedConnectionId
+            if var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
+                connection.call = processedCall
+                await connectionManager.updateConnection(id: connection.id, with: connection)
+            }
+            let answerPlaintext = try BinaryEncoder().encode(processedCall)
+            let writeTask = WriteTask(
+                data: answerPlaintext,
+                roomId: (call.resolvedChannelWireId ?? call.sharedCommunicationId).normalizedConnectionId,
+                flag: .answer,
+                call: processedCall)
+            sendWaitId = await taskProcessor.beginOutboundSendWait(matching: .answer)
+            await noteEssentialOutbound(.begin, connectionId: call.sharedCommunicationId)
+            do {
+                try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+            } catch {
+                await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+                await noteEssentialOutbound(.failed, connectionId: call.sharedCommunicationId)
+                throw error
+            }
+        } catch {
+            sfuRenegotiationInFlightConnectionIds.remove(normId)
+            throw error
         }
-        let answerPlaintext = try BinaryEncoder().encode(processedCall)
-        let writeTask = WriteTask(
-            data: answerPlaintext,
-            roomId: (call.resolvedChannelWireId ?? call.sharedCommunicationId).normalizedConnectionId,
-            flag: .answer,
-            call: processedCall)
-        try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+
+        if SfuRenegotiationAnswerSendPolicy.shouldAwaitAnswerSendOnCallingStack(
+            calledFromTaskProcessorInboundJob: true
+        ) {
+            await finishSfuRenegotiationAnswerSend(
+                sendWaitId: sendWaitId,
+                call: processedCall,
+                normId: normId
+            )
+        } else {
+            logger.log(
+                level: .info,
+                message: "Queued SFU renegotiation answer send off inbound TaskProcessor stack connId=\(normId)"
+            )
+            Task { [weak self] in
+                guard let self else { return }
+                await self.finishSfuRenegotiationAnswerSend(
+                    sendWaitId: sendWaitId,
+                    call: processedCall,
+                    normId: normId
+                )
+            }
+        }
+    }
+
+    /// Waits for the renegotiation answer to hit the wire, then settles tiles.
+    ///
+    /// Must not run on the inbound `TaskProcessor.process` stack.
+    func finishSfuRenegotiationAnswerSend(
+        sendWaitId: UUID,
+        call: Call,
+        normId: String
+    ) async {
+        do {
+            try await taskProcessor.waitForOutboundSendCompletion(id: sendWaitId)
+            await noteEssentialOutbound(.completed, connectionId: call.sharedCommunicationId)
+        } catch {
+            await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+            await noteEssentialOutbound(.failed, connectionId: call.sharedCommunicationId)
+            sfuRenegotiationInFlightConnectionIds.remove(normId)
+            logger.log(
+                level: .warning,
+                message: "SFU renegotiation answer send failed connId=\(normId): \(error)"
+            )
+            return
+        }
 #if canImport(WebRTC) && !os(Android)
         if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
            let remoteSdp = connection.peerConnection.remoteDescription?.sdp {
@@ -494,23 +557,16 @@ extension RTCSession {
             }
         }
 #endif
-        do {
-            try await startSendingCandidates(call: processedCall)
-        } catch {
-            logger.log(
-                level: .warning,
-                message: "Failed to start sending SFU ICE candidates after renegotiation answer (will continue buffering): \(error)")
-        }
+        await drainOrDropBufferedCandidatesAfterEssentialWire(call: call)
+        // Clear before deferred replay so the next offer is not rejected as in-flight.
+        sfuRenegotiationInFlightConnectionIds.remove(normId)
         if pendingDeferredSfuRenegotiationOffers[normId] == nil {
-            // Post-SFU tile refresh must observe settlement complete; leaving the in-flight
-            // guard set would suppress the only delivery the UI receives after mapping churn.
-            sfuRenegotiationInFlightConnectionIds.remove(normId)
             await emitRemoteParticipantTrackRefreshAfterSfuRenegotiation(connectionId: call.sharedCommunicationId)
         }
         await processDeferredSfuRenegotiationOfferIfNeeded(for: call)
     }
 
-    private func emitRemoteParticipantTrackRefreshAfterSfuRenegotiation(connectionId: String) async {
+    func emitRemoteParticipantTrackRefreshAfterSfuRenegotiation(connectionId: String) async {
         guard let connection = await connectionManager.findConnection(with: connectionId) else { return }
 #if os(Android)
         if Self.isTrueOneToOneSfuRoom(call: connection.call) {
@@ -815,10 +871,8 @@ extension RTCSession {
         updateFallbackLatestCall(call)
 
         guard let buffered, !buffered.isEmpty else { return }
-        // Each candidate send is a ratchet-encrypt round trip (~hundreds of ms). Draining inline
-        // blocked `sendGroupCallOffer` — and with it the deferred `call_answered` on inbound 1:1
-        // SFU answers — for ~10s. Trickle ICE has no ordering requirement between candidates, and
-        // all sends are fed after the offer's write task, so drain on a separate actor task.
+        // Trickle ICE has no ordering requirement between candidates. Drain on a
+        // separate actor task so offer/answer wire waits are not blocked on encrypt.
         let generation = (bufferedCandidateDrainGenerationByConnectionId[connKey] ?? 0) &+ 1
         bufferedCandidateDrainGenerationByConnectionId[connKey] = generation
         bufferedCandidateDrainTasksByConnectionId[connKey] = Task { [weak self] in
@@ -855,7 +909,7 @@ extension RTCSession {
                 return
             }
             do {
-                try await sendEncryptedSfuCandidateFromDeque(item, call: call)
+                try await sendEncryptedSfuCandidateFromDeque(item, call: call, isPreConnectJoinBurst: true)
             } catch {
                 logger.log(level: .error, message: "Failed to send buffered ICE candidate (id=\(item.id)): \(error)")
             }
@@ -866,6 +920,50 @@ extension RTCSession {
         let key = connectionId.normalizedConnectionId
         bufferedCandidateDrainGenerationByConnectionId[key] = (bufferedCandidateDrainGenerationByConnectionId[key] ?? 0) &+ 1
         bufferedCandidateDrainTasksByConnectionId.removeValue(forKey: key)?.cancel()
+    }
+
+    func dropUnencryptedPreConnectCandidateBurst(connectionId: String, call: Call? = nil) {
+        let connKey = connectionId.normalizedConnectionId
+        guard isGroupOrConferenceSignalingLane(connectionId: connKey, call: call) else { return }
+        let hadBuffered = !(iceDequeByConnectionId[connKey]?.isEmpty ?? true)
+        iceDequeByConnectionId.removeValue(forKey: connKey)
+        cancelBufferedCandidateDrain(connectionId: connKey)
+        guard hadBuffered else { return }
+        logger.log(
+            level: .info,
+            message: "Dropped un-encrypted pre-connect ICE candidate burst; ICE already connected connId=\(connKey)"
+        )
+    }
+
+    func markIceConnectedOrCompleted(connectionId: String, call: Call? = nil) {
+        let connKey = connectionId.normalizedConnectionId
+        iceConnectedOrCompletedConnectionIds.insert(connKey)
+        dropUnencryptedPreConnectCandidateBurst(connectionId: connKey, call: call)
+    }
+
+    func clearIceConnectedOrCompleted(connectionId: String) {
+        iceConnectedOrCompletedConnectionIds.remove(connectionId.normalizedConnectionId)
+    }
+
+    /// After an offer/answer IRC write completes: trickle remaining buffered
+    /// candidates only while ICE is still checking. If ICE is already up, drop
+    /// the leftover join burst instead of encrypting it. Always marks the
+    /// connection ready so later continual-gather candidates take the live path.
+    func drainOrDropBufferedCandidatesAfterEssentialWire(call: Call) async {
+        let connKey = call.sharedCommunicationId.normalizedConnectionId
+        if iceConnectedOrCompletedConnectionIds.contains(connKey) {
+            readyForCandidatesByConnectionId[connKey] = true
+            dropUnencryptedPreConnectCandidateBurst(connectionId: connKey, call: call)
+            return
+        }
+        do {
+            try await startSendingCandidates(call: call)
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "Failed to drain buffered ICE candidates after essential wire (will continue buffering): \(error)"
+            )
+        }
     }
 
     func cancelAllBufferedCandidateDrains() {

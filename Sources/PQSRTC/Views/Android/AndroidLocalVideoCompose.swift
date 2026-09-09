@@ -74,16 +74,16 @@ public struct AndroidLocalVideoCompose: ContentComposer {
                         previewView: localCaptureView.previewDisplayView,
                         cornerRadiusDp: Float(12)
                     )
+                    // Compose clip cannot round the SurfaceView overlay.
+                    // configureRoundedOutline applies GL rounded-rect on the overlay.
                     localCaptureView.configureRoundedOutline(radiusDp: Float(12))
                     AndroidRTCViewSupport.detachFromParent(view: host)
                     host
                 },
                 modifier: Modifier.fillMaxSize(),
                 update: { _ in
-                    _ = AndroidRTCViewSupport.localPreviewHostContainer(
-                        previewView: localCaptureView.previewDisplayView,
-                        cornerRadiusDp: Float(12)
-                    )
+                    // Do not re-wrap the SurfaceView host on parent recomposition.
+                    // That destroys the surface (`LocalPreviewDropping frame - No surface`).
                 }
             )
         }
@@ -134,12 +134,6 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
                 },
                 modifier: Modifier.fillMaxSize(),
                 update: { _ in
-                    _ = AndroidRTCViewSupport.remoteCameraHostContainer(
-                        renderer: renderer,
-                        prefersAspectFit: false,
-                        cornerRadiusDp: Float(0),
-                        fillWhenOrientationMatches: true
-                    )
                     captureView.rendererDidUpdateLayoutFromCompose()
                 }
             )
@@ -314,18 +308,16 @@ public struct AndroidRemoteGridCompose: ContentComposer {
             let tileCornerRadiusDp = conferenceTileCornerRadiusDp(for: itemCount)
             // Screen-share leftover is always a short wide band (phone and tablet).
             // Conference view uses the orientation grid instead.
-            let screenSize = GroupCallLayoutSize(
-                width: Double(configuration.screenWidthDp),
-                height: Double(configuration.screenHeightDp)
+            // Skip cannot see Swift-only `GroupCallVideoLayoutPolicy`; keep this
+            // primitive-only and aligned with `androidConferenceGridDimensions`
+            // / Android leftover-band 16:9 tiles.
+            let compactTile = screenShareCompactCameraTileDp(
+                screenWidthDp: configuration.screenWidthDp,
+                screenHeightDp: configuration.screenHeightDp,
+                itemCount: itemCount
             )
-            let shareCameraFrames = GroupCallVideoLayoutPolicy.screenShareDominantFrames(
-                cameraTileCount: max(1, itemCount),
-                containerSize: screenSize,
-                platform: GroupCallLayoutPlatform.android,
-                cameraTileAspect: GroupCallVideoLayoutPolicy.landscapeTileAspect
-            ).cameras
-            let cameraTileWidthDp = shareCameraFrames.first.map { CGFloat($0.width) } ?? 120
-            let cameraTileHeightDp = shareCameraFrames.first.map { CGFloat($0.height) } ?? 68
+            let cameraTileWidthDp = compactTile.width
+            let cameraTileHeightDp = compactTile.height
             let useScreenShareCompactStrip =
                 usesCompactParticipantStrip && itemCount >= 1 && itemCount <= 4
 
@@ -361,8 +353,32 @@ public struct AndroidRemoteGridCompose: ContentComposer {
             } else {
                 let grid = conferenceGridDimensions(for: itemCount, isPortrait: isPortrait)
                 let rows = chunked(flaggedViews, size: grid.columns)
+                // Nested Compose inside SwiftUI `.ignoresSafeArea()` often reports
+                // `WindowInsets.statusBars` as 0. Read the window inset in px.
+                let density = LocalDensity.current
+                let hostView = LocalView.current
+                let statusTopPx = androidx.core.view.ViewCompat.getRootWindowInsets(hostView)?
+                    .getInsets(androidx.core.view.WindowInsetsCompat.Type.statusBars())?
+                    .top ?? 0
+                let statusTopDp = with(density) { statusTopPx.toDp().value }
+                let rememberedStatusTopDp = remember { mutableStateOf(Float(0)) }
+                if statusTopDp > Float(0) {
+                    rememberedStatusTopDp.value = statusTopDp
+                }
+                let insetTopDp = statusTopDp > Float(0) ? statusTopDp : rememberedStatusTopDp.value
+                // 1-up stays full-bleed under the status bar (iOS fullscreen). N-up
+                // conference tiles sit below it. Hold the last non-zero inset so
+                // rotation 0-blips do not bounce the grid.
+                var gridModifier: Modifier = Modifier.fillMaxSize()
+                if itemCount > 1 {
+                    if insetTopDp > Float(0) {
+                        gridModifier = gridModifier.padding(top: insetTopDp.dp)
+                    } else {
+                        gridModifier = gridModifier.statusBarsPadding()
+                    }
+                }
                 Column(
-                    modifier: Modifier.fillMaxSize().padding(contentPaddingDp.dp),
+                    modifier: gridModifier.padding(contentPaddingDp.dp),
                     verticalArrangement: Arrangement.spacedBy(tileSpacingDp.dp),
                     horizontalAlignment: androidx.compose.ui.Alignment.CenterHorizontally
                 ) {
@@ -375,27 +391,31 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                         ) {
                             for (view, showRaisedHand) in row {
                                 let rendererSlotKey = Int(view.surfaceViewRenderer.hashCode())
-                                androidx.compose.runtime.key(rendererSlotKey) {
-                                    if itemCount == 1 {
-                                        // Solo conference tile keeps the full-bleed layout.
-                                        ConferenceTile(
-                                            view: view,
-                                            showRaisedHand: showRaisedHand,
-                                            cornerRadiusDp: tileCornerRadiusDp,
-                                            enablesPipDrag: capturedEnablesCallChromeDrag,
-                                            modifier: Modifier.fillMaxSize()
-                                        )
-                                    } else {
-                                        ConferenceTile(
-                                            view: view,
-                                            showRaisedHand: showRaisedHand,
-                                            cornerRadiusDp: tileCornerRadiusDp,
-                                            enablesPipDrag: capturedEnablesCallChromeDrag,
-                                            modifier: Modifier
-                                                .weight(Float(1.0))
-                                                .aspectRatio(Float(16.0 / 9.0))
-                                        )
-                                    }
+                                // Include solo/grid in the key. Skip reuses AndroidView by key;
+                                // Device3 21:35 `mounted count=1` kept the 317×564 letterbox
+                                // because the remaining tile never remasured to fillMaxSize.
+                                // Same formula as `composeTileKey`. Do not call that
+                                // Swift policy from this SKIP Compose body — it is
+                                // compiled-only and would be dropped.
+                                let tileKey = itemCount <= 1
+                                    ? rendererSlotKey
+                                    : rendererSlotKey &* 31 &+ 2
+                                androidx.compose.runtime.key(tileKey) {
+                                    // 1:1 stays full-bleed; conference uses uniform 16:9 cells.
+                                    // Native letterbox waits for this tile size — do not wrap
+                                    // the SurfaceView while fillMaxSize ↔ aspectRatio remasures.
+                                    let tileModifier: Modifier = itemCount == 1
+                                        ? Modifier.fillMaxSize()
+                                        : Modifier
+                                            .weight(Float(1.0))
+                                            .aspectRatio(Float(16.0 / 9.0))
+                                    ConferenceTile(
+                                        view: view,
+                                        showRaisedHand: showRaisedHand,
+                                        cornerRadiusDp: tileCornerRadiusDp,
+                                        enablesPipDrag: capturedEnablesCallChromeDrag,
+                                        modifier: tileModifier
+                                    )
                                 }
                             }
                             let missingColumns = max(0, grid.columns - row.count)
@@ -454,27 +474,22 @@ public struct AndroidRemoteGridCompose: ContentComposer {
                 },
                 modifier: Modifier.fillMaxSize(),
                 update: { _ in
-                    let host = AndroidRTCViewSupport.remoteCameraHostContainer(
+                    // Restyle letterbox vs fill when 1-up ↔ conference flips. Native
+                    // policy keeps MATCH_PARENT until the tile settles, then one exact
+                    // letterbox size — do not remasure wrap-content here.
+                    // Do not re-attach PiP drag — that remasures the SurfaceView host.
+                    // `rendererDidUpdateLayoutFromCompose` is size-only. A missing sink
+                    // must not notify the controller (that Task/reattach loop ANRs).
+                    _ = AndroidRTCViewSupport.remoteCameraHostContainer(
                         renderer: view.surfaceViewRenderer,
                         prefersAspectFit: prefersAspectFit,
                         cornerRadiusDp: Float(cornerRadiusDp),
                         fillWhenOrientationMatches: !prefersAspectFit
                     )
-                    if enablesPipDrag {
-                        AndroidCallChromeNativeSupport.attachNativeCallChromeDrag(
-                            seed: host,
-                            key: "pip",
-                            enableTap: true,
-                            edgeDp: Float(16)
-                        )
-                    } else {
-                        AndroidCallChromeNativeSupport.detachNativeCallChromeDrag(
-                            key: "pip"
-                        )
-                    }
-                    view.rendererDidUpdateLayoutFromCompose()
                     _ = layoutGeneration
-                    onParticipantSurfaceLayout(view)
+                    if view.rendererDidUpdateLayoutFromCompose() {
+                        onParticipantSurfaceLayout(view)
+                    }
                 }
             )
             if showRaisedHand {
@@ -489,10 +504,87 @@ public struct AndroidRemoteGridCompose: ContentComposer {
     }
 
     private func conferenceGridDimensions(for itemCount: Int, isPortrait: Bool) -> (columns: Int, rows: Int) {
-        GroupCallVideoLayoutPolicy.androidConferenceGridDimensions(
-            itemCount: itemCount,
-            isPortrait: isPortrait
-        )
+        let count = max(0, itemCount)
+        switch count {
+        case 0, 1:
+            return (1, 1)
+        case 2...4:
+            return isPortrait ? (1, count) : (count, 1)
+        case 5...6:
+            return (3, 2)
+        case 7...9:
+            return (3, 3)
+        default:
+            let columns = 4
+            return (columns, (count + columns - 1) / columns)
+        }
+    }
+
+    /// First leftover-band camera tile for the compact share strip.
+    /// Mirrors `GroupCallVideoLayoutPolicy.screenShareDominantFrames` Android 16:9 math
+    /// without importing Swift-only layout types into Skip Kotlin.
+    private func screenShareCompactCameraTileDp(
+        screenWidthDp: Int,
+        screenHeightDp: Int,
+        itemCount: Int
+    ) -> (width: Int, height: Int) {
+        let count = max(1, itemCount)
+        let containerW = Double(screenWidthDp)
+        let containerH = Double(screenHeightDp)
+        let isWide = containerW > max(1.0, containerH) * 1.08
+        let aspect = 16.0 / 9.0
+        let padding: Double
+        switch count {
+        case ...4:
+            padding = 15
+        case 5...9:
+            padding = 11.25
+        default:
+            padding = 7.5
+        }
+        let spacing: Double = count > 1 ? (containerW < 600 ? 6.0 : 10.0) : 0.0
+
+        let maxWidth: Double
+        let maxHeight: Double
+        if isWide {
+            let screenFraction = count == 1 ? 0.74 : 0.82
+            let cameraWidth = max(1.0, containerW * (1.0 - screenFraction))
+            maxWidth = max(1.0, cameraWidth - padding * 2)
+            maxHeight = max(1.0, containerH - padding * 2)
+        } else {
+            let screenFraction: Double
+            switch count {
+            case 1:
+                screenFraction = 0.70
+            case 2...4:
+                screenFraction = 0.82
+            default:
+                screenFraction = 0.78
+            }
+            let cameraHeight = max(1.0, containerH * (1.0 - screenFraction))
+            let availableW = max(1.0, containerW - padding * 2)
+            let availableH = max(1.0, cameraHeight - padding * 2)
+            let totalSpacing = Double(max(0, count - 1)) * spacing
+            maxWidth = (availableW - totalSpacing) / Double(count)
+            maxHeight = availableH
+        }
+
+        let tile = fitLandscapeTile(aspect: aspect, maxWidth: maxWidth, maxHeight: maxHeight)
+        return (max(1, Int(tile.width.rounded())), max(1, Int(tile.height.rounded())))
+    }
+
+    private func fitLandscapeTile(
+        aspect: Double,
+        maxWidth: Double,
+        maxHeight: Double
+    ) -> (width: Double, height: Double) {
+        guard maxWidth > 0, maxHeight > 0 else { return (120.0, 68.0) }
+        if maxWidth / maxHeight > aspect {
+            let height = maxHeight
+            return (height * aspect, height)
+        }
+        let width = maxWidth
+        return (width, width / aspect)
     }
 
     /// Matches Apple `CollectionViewSections.defaultContentInsets`, scaled down as roster grows.
@@ -655,11 +747,9 @@ fileprivate final class AndroidVideoCallResources {
         localCaptureView.setHidden(true)
         for view in remoteCaptureViews { view.setHidden(true) }
         _screenCaptureView?.setHidden(true)
-#if SKIP
-        AndroidCallChromeNativeSupport.detachNativeCallChromeDrag(key: "pip")
-        AndroidCallChromeNativeSupport.detachNativeCallChromeDrag(key: "local")
-        AndroidCallChromeNativeSupport.setInAppPipTapHandler(handler: nil)
-#endif
+        // Compiled Fuse Swift cannot see SKIP-only code, so this must go through the
+        // transpiled bridge or the hit layer / global-layout listener outlives the call.
+        AndroidCallChromeBridge.detachAllForCallEnd()
         // Local pixels are on TextureView. Do not read `surfaceViewRenderer` here:
         // hangup is often the first Skip JNI bind of that unused getter and SIGTRAPs
         // after client reset. Kotlin `releaseCaptureResources` unregisters the
@@ -896,9 +986,13 @@ public struct AndroidVideoCallView: View {
     private let hidesVideoSurfaces: Bool
     /// Full-screen call UI expands past safe area. In-app floating PiP must stay boxed.
     private let expandsIntoSafeArea: Bool
-    /// In-app and system PiP show remote video only. Keep `AndroidLocalVideoView` mounted
-    /// and hide the SurfaceView — unmounting runs Compose `onDispose` and releases EGL.
+    /// Keep `AndroidLocalVideoView` mounted when false and hide the SurfaceView —
+    /// unmounting runs Compose `onDispose` and releases EGL.
     private let showsLocalPreview: Bool
+    /// In-app / system PiP boxes the call (`expandsIntoSafeArea == false`).
+    /// Local fills that window so outbound PiP is not a black remote tile.
+    private var localPreviewFillsContainer: Bool { !expandsIntoSafeArea }
+
     /// Native SurfaceView drag owns pointer move. This restores chrome on a PiP tap.
     private let onInAppPipTap: (() -> Void)?
     private static let minimizeLogger = NeedleTailLogger()
@@ -988,8 +1082,9 @@ public struct AndroidVideoCallView: View {
         }
     }
 
-    /// Size the renderer pool from roster/remote count. Group calls keep two slots mounted so the
-    /// first assigned participant does not remount through a fullscreen `SurfaceViewRenderer`.
+    /// Size the renderer pool from roster/remote count. Group calls may keep extra unused
+    /// slots in the pool so a later joiner can attach without allocating a new
+    /// `SurfaceViewRenderer`. Visible Compose `itemCount` still follows assigned remotes.
     private var effectiveRemoteCount: Int {
         isMultipartyCall ? max(remoteCount, 2) : max(remoteCount, 1)
     }
@@ -1001,9 +1096,15 @@ public struct AndroidVideoCallView: View {
             remoteCount: effectiveRemoteCount,
             allowCreateReplacement: isLiveCallState(callState) && !endedCall
         )
-        let displayedRemoteCaptureViews = isMultipartyCall
-            ? visibleRemoteCaptureViews
-            : Array(resources.remoteCaptureViews.prefix(max(effectiveRemoteCount, 1)))
+        // Roster `remoteCount` only sizes the renderer pool. After refresh,
+        // `visibleRemoteCaptureViews` is assigned remotes (or one waiting slot).
+        // An empty first frame uses one pool view so we never mount leftover siblings.
+        let displayedRemoteCaptureViews = visibleRemoteCaptureViews.isEmpty
+            ? AndroidMultipartyVideoLayout.mountedRemoteViews(
+                assignedViews: [],
+                poolViews: resources.remoteCaptureViews
+            )
+            : visibleRemoteCaptureViews
         let remotePageSize = hasActiveRemoteScreenShare ? 8 : 12
         let remotePages = paginateRemotes(displayedRemoteCaptureViews, pageSize: remotePageSize)
         let activeRemoteCount = displayedRemoteCaptureViews.count
@@ -1106,27 +1207,12 @@ public struct AndroidVideoCallView: View {
                             .background(Color.black.opacity(hasActiveRemoteScreenShare ? 0.92 : 1.0))
                         }
                     }
-                    .frame(width: geo.size.width, height: geo.size.height)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                     if showsLocalPreview {
                         // The local renderer is a contained overlay. Native translationX/Y owns
                         // drag so pointer movement does not recompose or resize EGL.
-                        AndroidLocalVideoView(
-                            client: session.rtcClient,
-                            captureView: resources.localCaptureView,
-                            onDispose: {}
-                        )
-                        .frame(width: localViewSize.width, height: localViewSize.height)
-                        .padding(.trailing, 20)
-                        .padding(.bottom, localPreviewBottomPadding(in: geo))
-                        .onAppear {
-                            NeedleTailLogger().log(level: .debug, message: "GEO SIZE \(geo.size)")
-                            localViewSize = setSize(size: geo.size)
-                        }
-                        .onChange(of: geo.size) { _, newValue in
-                            NeedleTailLogger().log(level: .debug, message: "NEW SIZE \(newValue)")
-                            localViewSize = setSize(size: newValue)
-                        }
+                        localPreviewHost(resources: resources, geo: geo)
                     }
                 }
             }
@@ -1175,40 +1261,30 @@ public struct AndroidVideoCallView: View {
                 message: "[CallChromeMinimize] AndroidVideoCallView onChange showsLocalPreview=\(visible)"
             )
             applyCallVideoSurfaceVisibility(resources: resources, source: "onChange showsLocalPreview")
-#if SKIP
             if visible {
-                let previewView = resources.localCaptureView.previewDisplayView
-                if let host = AndroidRTCViewSupport.localPreviewHostOrNull(previewView: previewView) {
-                    AndroidCallChromeNativeSupport.resetNativeCallChromeDrag(key: "local")
-                    AndroidCallChromeNativeSupport.attachNativeCallChromeDrag(
-                        seed: host,
-                        key: "local",
-                        enableTap: false,
-                        edgeDp: Float(20)
-                    )
-                }
+                _ = AndroidCallChromeBridge.attachLocalPreviewDrag(
+                    captureView: resources.localCaptureView,
+                    edgeDp: Float(20)
+                )
             } else {
-                AndroidCallChromeNativeSupport.detachNativeCallChromeDrag(key: "local")
+                AndroidCallChromeBridge.detachDrag(key: "local")
             }
-#endif
         }
         .onChange(of: expandsIntoSafeArea) { _, fullBleed in
-#if SKIP
             if fullBleed {
-                AndroidCallChromeNativeSupport.resetNativeCallChromeDrag(key: "pip")
-                AndroidCallChromeNativeSupport.detachNativeCallChromeDrag(key: "pip")
-                AndroidCallChromeNativeSupport.resetNativeCallChromeDrag(key: "local")
-                AndroidCallChromeNativeSupport.setInAppPipTapHandler(handler: nil)
+                AndroidCallChromeBridge.resetDrag(key: "pip")
+                AndroidCallChromeBridge.detachDrag(key: "pip")
+                AndroidCallChromeBridge.resetDrag(key: "local")
+                AndroidCallChromeBridge.setInAppPipTapHandler(nil)
             } else {
-                AndroidCallChromeNativeSupport.setInAppPipTapHandler(handler: onInAppPipTap)
+                AndroidCallChromeBridge.setInAppPipTapHandler(onInAppPipTap)
             }
-#endif
             applyCallVideoSurfaceVisibility(
                 resources: resources,
                 source: "onChange expandsIntoSafeArea"
             )
         }
-        .task(id: "\(hidesVideoSurfaces)-\(showsLocalPreview)") { @MainActor in
+        .task(id: "\(hidesVideoSurfaces)-\(showsLocalPreview)-\(expandsIntoSafeArea)") { @MainActor in
             Self.minimizeLogger.log(
                 level: .info,
                 message: "[CallChromeMinimize] AndroidVideoCallView task(id:) hidesVideoSurfaces=\(hidesVideoSurfaces) showsLocalPreview=\(showsLocalPreview)"
@@ -1224,13 +1300,11 @@ public struct AndroidVideoCallView: View {
                 message: "[CallChromeMinimize] AndroidVideoCallView onAppear hidesVideoSurfaces=\(hidesVideoSurfaces) showsLocalPreview=\(showsLocalPreview)"
             )
             applyCallVideoSurfaceVisibility(resources: resources, source: "onAppear")
-#if SKIP
             if expandsIntoSafeArea {
-                AndroidCallChromeNativeSupport.setInAppPipTapHandler(handler: nil)
+                AndroidCallChromeBridge.setInAppPipTapHandler(nil)
             } else {
-                AndroidCallChromeNativeSupport.setInAppPipTapHandler(handler: onInAppPipTap)
+                AndroidCallChromeBridge.setInAppPipTapHandler(onInAppPipTap)
             }
-#endif
             Task { @MainActor in
                 await configureController(resources: resources)
             }
@@ -1342,16 +1416,24 @@ public struct AndroidVideoCallView: View {
         force: Bool
     ) {
         let shouldTeardown = force
-            || endedCall
-            || isTerminalCallState(callState)
-            || (isIdleCallState(callState) && didEnterLiveCall)
+            || AndroidRemoteGridTransitionPolicy.shouldTeardownRenderersOnDisappear(
+                didEnterLiveCall: didEnterLiveCall,
+                showsLocalPreview: showsLocalPreview,
+                endedCall: endedCall,
+                isTerminalCallState: isTerminalCallState(callState),
+                isIdleAfterLiveCall: isIdleCallState(callState) && didEnterLiveCall
+            )
         guard shouldTeardown else {
             Self.minimizeLogger.log(
                 level: .info,
-                message: "[CallChromeMinimize] skipping renderer teardown on transient disappear reason=\(reason) state=\(callState)"
+                message: "[CallChromeMinimize] skipping renderer teardown on transient disappear reason=\(reason) state=\(callState) showsLocalPreview=\(showsLocalPreview)"
             )
             return
         }
+        Self.minimizeLogger.log(
+            level: .info,
+            message: "[CallChromeMinimize] tearing down call video renderers reason=\(reason) state=\(callState) showsLocalPreview=\(showsLocalPreview)"
+        )
         didEnterLiveCall = false
         resources.releaseAllVideoRenderers()
         Task { @MainActor in
@@ -1378,26 +1460,27 @@ public struct AndroidVideoCallView: View {
         }
     }
 
-    /// Multiparty grids mount a stable pool prefix so `AndroidRemoteGrid` itemCount matches the
-    /// expected roster layout without remounting assigned tiles through a transient one-up grid.
+    /// Compose `itemCount` follows assigned remotes, matching iOS live collection items.
+    /// Extra pool renderers stay allocated; they are not shown as empty tiles.
     @MainActor
     private func multipartyRemoteCaptureViews(from resources: AndroidVideoCallResources) async -> [AndroidSampleCaptureView] {
+        let assigned = await resources.controller.assignedRemoteViews()
         let assignedCount = await resources.controller.assignedParticipantCount()
         let slotCount = AndroidMultipartyVideoLayout.multipartyGridSlotCount(
             assignedParticipantCount: assignedCount,
-            rosterRemoteSlotCount: effectiveRemoteCount,
             poolSize: resources.remoteCaptureViews.count
         )
         mountedMultipartyRemoteSlotCount = slotCount
-        return Array(resources.remoteCaptureViews.prefix(slotCount))
+        return AndroidMultipartyVideoLayout.mountedRemoteViews(
+            assignedViews: assigned,
+            poolViews: resources.remoteCaptureViews
+        )
     }
 
     @MainActor
     private func refreshGridRaisedHandFlags(resources: AndroidVideoCallResources) async {
         await resources.controller.updateConferenceRaisedHands(conferenceRaisedHands)
-        let views = isMultipartyCall
-            ? await multipartyRemoteCaptureViews(from: resources)
-            : resources.remoteCaptureViews
+        let views = await multipartyRemoteCaptureViews(from: resources)
         gridRaisedHandFlags = await resources.controller.raisedHandFlags(for: views)
     }
 
@@ -1406,15 +1489,37 @@ public struct AndroidVideoCallView: View {
         let previousViews = visibleRemoteCaptureViews
         let previousSignature = await resources.controller.participantAssignmentSignature()
         let previousVisibleCount = previousViews.count
-        if !isMultipartyCall {
-            mountedMultipartyRemoteSlotCount = 0
-        }
-        visibleRemoteCaptureViews = isMultipartyCall
-            ? await multipartyRemoteCaptureViews(from: resources)
-            : resources.remoteCaptureViews
+        visibleRemoteCaptureViews = await multipartyRemoteCaptureViews(from: resources)
         let signature = await resources.controller.participantAssignmentSignature()
         let nextVisibleCount = visibleRemoteCaptureViews.count
-        let gridLayoutChanged = AndroidMultipartyVideoLayout.shouldReattachAssignedParticipantVideo(
+        if previousVisibleCount != nextVisibleCount {
+            NeedleTailLogger().log(
+                level: .info,
+                message: "Android remote grid mounted count=\(nextVisibleCount) previous=\(previousVisibleCount)"
+            )
+        }
+        if previousVisibleCount > 1 && nextVisibleCount == 1 {
+            for view in visibleRemoteCaptureViews {
+                view.applySoloFullscreenLayout()
+            }
+        }
+        let waitForComposeLayout = !hasActiveRemoteScreenShare
+            && !isScreenSharing
+            && AndroidRemoteGridTransitionPolicy.shouldWaitForComposeLayoutBeforeReattach(
+                previousVisibleCount: previousVisibleCount,
+                nextVisibleCount: nextVisibleCount
+            )
+        if waitForComposeLayout {
+            for view in visibleRemoteCaptureViews {
+                view.rendererDidUpdateLayoutFromCompose()
+            }
+            let generation = await resources.controller.beginParticipantVideoReconcileAfterGridSlotLayoutChange(
+                visibleViews: visibleRemoteCaptureViews
+            )
+            screenShareLayoutGeneration = generation
+            return
+        }
+        let gridLayoutChanged = AndroidRemoteGridTransitionPolicy.shouldReattachAssignedTilesImmediately(
             previousVisibleCount: previousVisibleCount,
             nextVisibleCount: nextVisibleCount,
             previousSignature: previousSignature,
@@ -1474,6 +1579,45 @@ public struct AndroidVideoCallView: View {
         await resources.controller.start()
     }
 
+    @ViewBuilder
+    private func localPreviewHost(
+        resources: AndroidVideoCallResources,
+        geo: GeometryProxy
+    ) -> some View {
+        if localPreviewFillsContainer {
+            AndroidLocalVideoView(
+                client: session.rtcClient,
+                captureView: resources.localCaptureView,
+                onDispose: {}
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            AndroidLocalVideoView(
+                client: session.rtcClient,
+                captureView: resources.localCaptureView,
+                onDispose: {}
+            )
+            .frame(width: localViewSize.width, height: localViewSize.height)
+            .padding(.trailing, 20)
+            .padding(.bottom, localPreviewBottomPadding(in: geo))
+            .onAppear {
+                localViewSize = setSize(size: geo.size)
+            }
+            .onChange(of: geo.size) { _, newValue in
+                let proposed = setSize(size: newValue)
+                guard AndroidRendererLayoutPolicy.shouldReplaceLocalPreviewOverlaySize(
+                    currentWidth: Double(localViewSize.width),
+                    currentHeight: Double(localViewSize.height),
+                    proposedWidth: Double(proposed.width),
+                    proposedHeight: Double(proposed.height)
+                ) else {
+                    return
+                }
+                localViewSize = proposed
+            }
+        }
+    }
+
     /// Apply hide-all first, then the local-only PiP override so a skipped
     /// `setVideoSurfacesHidden` (already false) still hides the preview.
     /// Hangup expands chrome while this view can still be mounted — keep every
@@ -1486,8 +1630,8 @@ public struct AndroidVideoCallView: View {
             || endedCall
             || isTerminalCallState(callState)
             || (isIdleCallState(callState) && didEnterLiveCall)
-        let hideAll = hidesVideoSurfaces || hideBecauseCallEnded
-        let hideLocal = hideAll || !showsLocalPreview
+        let hideAll = hidesVideoSurfaces || hideBecauseCallEnded || localPreviewFillsContainer
+        let hideLocal = hideBecauseCallEnded || hidesVideoSurfaces || !showsLocalPreview
         resources.setVideoSurfacesHidden(hideAll, source: source)
         resources.applyLocalPreviewHidden(hideLocal, source: source)
         Task {

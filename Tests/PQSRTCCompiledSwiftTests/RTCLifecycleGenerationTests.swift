@@ -82,6 +82,7 @@ struct RTCLifecycleGenerationTests {
         #expect(rebuiltPcRatchetManager !== originalPcRatchetManager)
         #expect(await session.ratchetManager !== originalRatchetManager)
         #expect(await session.taskProcessor !== originalTaskProcessor)
+        #expect(await session.cryptoStackGeneration == 1)
 
         // Stable again until the next teardown.
         #expect(await session.pcRatchetManager === rebuiltPcRatchetManager)

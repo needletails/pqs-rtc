@@ -116,6 +116,146 @@ extension RTCSession {
         }
     }
 
+    /// Light tile settlement after ICE returns on the same PeerConnection.
+    /// Does not pulse tracks or run decode-stall recovery.
+    func settleGroupRemoteCameraTilesAfterIceReconnectIfNeeded(connectionId: String) async {
+        let norm = connectionId.normalizedConnectionId
+        guard let connection = await connectionManager.findConnection(with: norm) else { return }
+        guard isGroupCallConnection(connection.id) else { return }
+        guard !Self.isTrueOneToOneSfuRoom(call: connection.call) else { return }
+        let mapped = IceReconnectCameraTileSettlementPolicy.participantIdsNeedingIceReconnectTileRefresh(
+            allMappedParticipantIds: Array(connection.remoteVideoTracksByParticipantId.keys)
+        )
+        guard !mapped.isEmpty else { return }
+
+        logger.log(
+            level: .info,
+            message: "Settling group camera tiles after ICE reconnect participants=\(mapped.joined(separator: ",")) connection=\(norm)"
+        )
+
+#if os(Android)
+        await rebindAndroidGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(connectionId: norm)
+#elseif canImport(WebRTC)
+        await rebindGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(
+            connectionId: norm,
+            forceParticipantSinkRefreshWhenTrackIdentityMatches: true
+        )
+#endif
+        queueParticipantCameraRendererSinkRefresh(connectionId: norm, participantIds: mapped)
+        await emitRemoteParticipantTrackRefreshAfterSfuRenegotiation(connectionId: connection.id)
+    }
+
+    /// Sink-only refresh for a mapped camera tile that never received `renderFrame`
+    /// while inbound decode is already advancing. Does not pulse tracks or run
+    /// decode-stall cryptor recovery.
+    func refreshNeverAttachedParticipantCameraSinkIfNeeded(
+        connectionId: String,
+        participantId: String
+    ) async {
+        let norm = connectionId.normalizedConnectionId
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let connection = await connectionManager.findConnection(with: norm) else { return }
+        guard isGroupCallConnection(connection.id) else { return }
+        guard !Self.isTrueOneToOneSfuRoom(call: connection.call) else { return }
+
+#if canImport(WebRTC) && !os(Android)
+        var mutableConnection = connection
+        if refreshGroupParticipantCameraTrackBindingIfNeeded(
+            connection: &mutableConnection,
+            participantId: trimmed
+        ) {
+            await connectionManager.updateConnection(id: mutableConnection.id, with: mutableConnection)
+        }
+#endif
+
+        logger.log(
+            level: .info,
+            message: "Refreshing never-attached camera sink after advancing ingress participant=\(trimmed) connection=\(norm)"
+        )
+        clearRemoteParticipantVideoRendererAttachment(connectionId: norm, participantId: trimmed)
+        queueParticipantCameraRendererSinkRefresh(connectionId: norm, participantIds: [trimmed])
+    }
+
+    /// Re-sends source-scoped SFU `mediaReady` once when the first encrypt never reached the SFU.
+    /// Bypasses CallManager send dedupe. Not a timer retry: one shot per source generation.
+    func refreshUnansweredGroupMediaReadyIfNeeded(
+        connectionId: String,
+        participantId: String,
+        inboundFlowIsAdvancing: Bool
+    ) async {
+        let norm = connectionId.normalizedConnectionId
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let generationKey = "\(norm)|\(Self.conferenceParticipantIdentityKey(trimmed))"
+
+        if UnansweredGroupMediaReadyResendPolicy.shouldClearUnansweredResendGeneration(
+            inboundFlowIsAdvancing: inboundFlowIsAdvancing
+        ) {
+            unansweredGroupMediaReadyResentKeys.remove(generationKey)
+            return
+        }
+
+        guard let connection = await connectionManager.findConnection(with: norm) else { return }
+        guard await isConnectionStillActiveForRecovery(norm) else { return }
+        let isGroupOrConference = isGroupCallConnection(connection.id)
+            && !Self.isTrueOneToOneSfuRoom(call: connection.call)
+        let sourceKeyInstalled = hasInstalledGroupSourceMediaKey(
+            connection: connection,
+            participantId: trimmed
+        )
+        let alreadyResent = unansweredGroupMediaReadyResentKeys.contains(generationKey)
+        let confirmedWireSend = confirmedSfuGroupMediaReadyKeys.contains(generationKey)
+        let inFlight = pendingSfuGroupMediaReadyKeys.contains(generationKey)
+        guard UnansweredGroupMediaReadyResendPolicy.shouldResendUnansweredGroupMediaReady(
+            isGroupOrConference: isGroupOrConference,
+            sourceKeyInstalled: sourceKeyInstalled,
+            inboundFlowIsAdvancing: inboundFlowIsAdvancing,
+            confirmedWireSendForSource: confirmedWireSend,
+            wireSendInFlightForSource: inFlight,
+            alreadyResentForCurrentReadyGeneration: alreadyResent
+        ) else {
+            return
+        }
+
+        unansweredGroupMediaReadyResentKeys.insert(generationKey)
+        do {
+            try await sendSfuGroupMediaReady(
+                sourceParticipantId: trimmed,
+                roomId: connection.call.resolvedChannelWireId
+                    ?? connection.call.sharedCommunicationId,
+                call: connection.call
+            )
+            logger.log(
+                level: .warning,
+                message: "Re-sent unanswered SFU group media readiness source=\(trimmed) connection=\(norm)"
+            )
+        } catch {
+            unansweredGroupMediaReadyResentKeys.remove(generationKey)
+            logger.log(
+                level: .warning,
+                message: "Unanswered SFU group media readiness resend failed source=\(trimmed) connection=\(norm): \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func hasInstalledGroupSourceMediaKey(
+        connection: RTCConnection,
+        participantId: String
+    ) -> Bool {
+        let trimmed = participantId.trimmingCharacters(in: .whitespacesAndNewlines)
+        func matches(_ key: String) -> Bool {
+            key.caseInsensitiveCompare(trimmed) == .orderedSame
+                || Self.conferenceParticipantIdentityKey(key) == Self.conferenceParticipantIdentityKey(trimmed)
+        }
+#if canImport(WebRTC) && !os(Android)
+        if connection.videoReceiverCryptorsByParticipantId.keys.contains(where: matches) {
+            return true
+        }
+#endif
+        return connection.remoteVideoTracksByParticipantId.keys.contains(where: matches)
+    }
+
 #if os(Android)
     func installAndroidVideoReceiverFrameCryptorReadyHandler() {
         rtcClient.setVideoReceiverFrameCryptorReadyHandler { [weak self] participantId in
@@ -184,7 +324,12 @@ extension RTCSession {
             }
         }
         let source = receivingMid ?? fallbackMid ?? "trackObject:\(ObjectIdentifier(track))"
-        return "\(track.trackId)|mid:\(source)|\(ObjectIdentifier(renderer))"
+        return AppleRemoteVideoTrackAttachPolicy.participantRendererAttachmentValue(
+            trackId: track.trackId,
+            receivingMid: source,
+            trackObjectIdentity: String(describing: ObjectIdentifier(track)),
+            rendererObjectIdentity: String(describing: ObjectIdentifier(renderer))
+        )
     }
 
     func refreshGroupParticipantCameraTrackBindingIfNeeded(

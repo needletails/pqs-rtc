@@ -93,6 +93,7 @@ extension RTCSession {
     }
 
     func resetAttemptFlagsForNewCall(connectionId: String) {
+        prepareCryptoStackForNextCallIfNeeded()
         let normalizedId = normalizedFallbackConnectionId(for: connectionId)
         clearFallbackState(connectionId: normalizedId)
         resetTeardownIdempotency(forConnectionId: connectionId)
@@ -270,6 +271,7 @@ extension RTCSession {
         cancelRelayFallbackTimer(connectionId: connectionId)
         readyForCandidatesByConnectionId[connectionId] = nil
         iceDequeByConnectionId[connectionId] = nil
+        iceConnectedOrCompletedConnectionIds.remove(connectionId)
         cancelBufferedCandidateDrain(connectionId: connectionId)
 #if os(Android)
         pendingRemoteVideoRenderersByConnectionId.removeValue(forKey: connectionId)

@@ -109,6 +109,9 @@ import FoundationEssentials
     /// Last resolved SFU camera mids keyed by stable participant id.
     var androidRemoteCameraResolvedMidsByParticipantId: [String: String] = [:]
     public var remoteAudioTracksByParticipantId: [String: RTCAudioTrack] = [:]
+    /// Last resolved SFU audio track ids keyed by stable participant id.
+    /// Android WebRTC wrappers can lose `trackIdIfAvailable` during SFU renegotiation.
+    var androidRemoteAudioResolvedTrackIdsByParticipantId: [String: String] = [:]
     /// Screen share tracks received from remote participants, keyed by participant ID.
     public var remoteScreenTracksByParticipantId: [String: RTCVideoTrack] = [:]
     /// Participants whose remote screen-share mapping was cleared during SDP reconcile and

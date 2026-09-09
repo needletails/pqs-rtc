@@ -323,6 +323,22 @@ struct GroupCallVideoRegressionTests {
             episodeParticipantIds: ["echo"]))
         #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldDeferGridLayoutReattach(
             episodeActive: true))
+        #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldQueueCoordinatorRerunWhileInFlight(
+            participantSetGrew: false,
+            episodeParticipantsAlreadySettled: true))
+        #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldQueueCoordinatorRerunWhileInFlight(
+            participantSetGrew: false,
+            episodeParticipantsAlreadySettled: false))
+        #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldQueueCoordinatorRerunWhileInFlight(
+            participantSetGrew: true,
+            episodeParticipantsAlreadySettled: true))
+        #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldQueueCoordinatorRerunWhileInFlight(
+            participantSetGrew: true,
+            episodeParticipantsAlreadySettled: false))
+        #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldClearSettledPostRenegotiationEpisode(
+            episodeParticipantsAlreadySettled: true))
+        #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldClearSettledPostRenegotiationEpisode(
+            episodeParticipantsAlreadySettled: false))
     }
 
     @Test("coordinator media-ready sweep requires assigned view when participant needs binding")
@@ -361,6 +377,10 @@ struct GroupCallVideoRegressionTests {
         #expect(AndroidGroupPostRenegotiationAttachCoordinator
             .postCoordinatorRecoveryShouldDeferToPendingLiveWrapperRebind(
                 hasPendingLiveWrapperRebind: false) == false)
+        #expect(AndroidGroupPostRenegotiationAttachCoordinator
+            .postCoordinatorRecoveryShouldDeferToPendingLiveWrapperRebind(
+                hasPendingLiveWrapperRebind: true,
+                attachedTrackIsLive: false) == false)
     }
 
     @Test("post-coordinator pending apply retries after stale tail stops")
@@ -397,25 +417,23 @@ struct GroupCallVideoRegressionTests {
 
     // MARK: - Android multiparty visible grid (nudge 0×0 surface root cause)
 
-    @Test("multiparty grid reserves stable 2-up slots before second assignment")
-    func multipartyGridSlotCountReservesTwoUpLayoutForExpectedRoster() {
+    @Test("multiparty grid follows assigned remotes like Apple itemCount")
+    func multipartyGridSlotCountMatchesAppleLiveRemoteCount() {
         #expect(AndroidMultipartyVideoLayout.multipartyGridSlotCount(
             assignedParticipantCount: 2,
-            rosterRemoteSlotCount: 3,
             poolSize: 3) == 2)
         #expect(AndroidMultipartyVideoLayout.multipartyGridSlotCount(
             assignedParticipantCount: 1,
-            rosterRemoteSlotCount: 2,
-            poolSize: 3) == 2)
-        // True 2-person call (one remote in roster): single fullscreen slot, not a reserved 2-up.
+            poolSize: 3) == 1)
         #expect(AndroidMultipartyVideoLayout.multipartyGridSlotCount(
             assignedParticipantCount: 1,
-            rosterRemoteSlotCount: 1,
             poolSize: 3) == 1)
         #expect(AndroidMultipartyVideoLayout.multipartyGridSlotCount(
             assignedParticipantCount: 0,
-            rosterRemoteSlotCount: 2,
-            poolSize: 3) == 2)
+            poolSize: 3) == 1)
+        #expect(AndroidMultipartyVideoLayout.multipartyGridSlotCount(
+            assignedParticipantCount: 3,
+            poolSize: 2) == 2)
     }
 
     @Test("multiparty grid mounts enough slots for assigned participants")
@@ -427,11 +445,11 @@ struct GroupCallVideoRegressionTests {
         #expect(AndroidMultipartyVideoLayout.visibleRemoteViewCount(
             remoteSlotCount: 3,
             assignedParticipantCount: 1,
-            poolSize: 3) == 3)
+            poolSize: 3) == 1)
         #expect(AndroidMultipartyVideoLayout.visibleRemoteViewCount(
             remoteSlotCount: 5,
             assignedParticipantCount: 2,
-            poolSize: 3) == 3)
+            poolSize: 3) == 2)
         #expect(AndroidMultipartyVideoLayout.visibleRemoteViewCount(
             remoteSlotCount: 0,
             assignedParticipantCount: 0,
@@ -440,7 +458,7 @@ struct GroupCallVideoRegressionTests {
             previousVisibleCount: 3,
             requestedVisibleCount: 1,
             assignedParticipantCount: 1,
-            poolSize: 3) == 3)
+            poolSize: 3) == 1)
         #expect(AndroidMultipartyVideoLayout.stableVisibleRemoteViewCount(
             previousVisibleCount: 0,
             requestedVisibleCount: 1,
@@ -451,6 +469,18 @@ struct GroupCallVideoRegressionTests {
             requestedVisibleCount: 1,
             assignedParticipantCount: 0,
             poolSize: 3) == 1)
+        #expect(AndroidMultipartyVideoLayout.mountedRemoteViews(
+            assignedViews: ["nudge"],
+            poolViews: ["nudge", "empty"]
+        ) == ["nudge"])
+        #expect(AndroidMultipartyVideoLayout.mountedRemoteViews(
+            assignedViews: [String](),
+            poolViews: ["nudge", "empty"]
+        ) == ["nudge"])
+        #expect(AndroidMultipartyVideoLayout.mountedRemoteViews(
+            assignedViews: ["nudge", "mm26"],
+            poolViews: ["nudge", "mm26", "empty"]
+        ) == ["nudge", "mm26"])
     }
 
     @Test("grid refresh reattaches when assignment signature or visible slot count changes")
@@ -638,6 +668,55 @@ struct GroupCallVideoRegressionTests {
             queuedRefreshParticipantIds: ["frank"],
             allMappedParticipantIds: ["echo", "nudge", "frank"]
         ) == ["frank"])
+    }
+
+    @Test("leave tile policy follows live camera, not channel roster")
+    func leaveTilePolicyReleasesUnmappedDepartedParticipant() {
+        #expect(!GroupSfuVideoAttachPolicy.shouldSurfaceParticipantCameraTile(
+            hasMappedCamera: false,
+            conferenceVideoEnabled: false))
+        #expect(GroupSfuVideoAttachPolicy.shouldSurfaceParticipantCameraTile(
+            hasMappedCamera: true,
+            conferenceVideoEnabled: false))
+        #expect(GroupSfuVideoAttachPolicy.shouldSurfaceParticipantCameraTile(
+            hasMappedCamera: false,
+            conferenceVideoEnabled: true))
+        #expect(!GroupSfuVideoAttachPolicy.shouldSurfaceParticipantCameraTile(
+            hasMappedCamera: false,
+            conferenceVideoEnabled: true,
+            explicitlyDeparted: true))
+        #expect(GroupSfuVideoAttachPolicy.shouldForceReleaseAssignmentAfterTrackRemoved(
+            hasMappedCamera: false))
+        #expect(!GroupSfuVideoAttachPolicy.shouldForceReleaseAssignmentAfterTrackRemoved(
+            hasMappedCamera: true))
+        #expect(!GroupSfuVideoAttachPolicy.shouldRetainParticipantTileAcrossTransientTrackRemoval(
+            hasMappedOrAdvertisedCamera: false,
+            episodeActive: true,
+            deferAttach: true,
+            hasActiveRemoteScreenShare: false))
+        #expect(GroupSfuVideoAttachPolicy.shouldRetainParticipantTileAcrossTransientTrackRemoval(
+            hasMappedOrAdvertisedCamera: true,
+            episodeActive: true,
+            deferAttach: false,
+            hasActiveRemoteScreenShare: false))
+        #expect(GroupSfuVideoAttachPolicy.shouldReleaseParticipantViewAssignment(
+            hasMappedOrAdvertisedCamera: false,
+            stillInRoster: true))
+        #expect(!GroupSfuVideoAttachPolicy.shouldReleaseParticipantViewAssignment(
+            hasMappedOrAdvertisedCamera: true,
+            stillInRoster: true))
+        #expect(GroupSfuVideoAttachPolicy.episodeParticipantIdsAfterRefresh(
+            previousIds: ["mm26", "nudge"],
+            refreshIds: ["mm26"],
+            mappedCameraIds: ["mm26"],
+            identityKey: RTCSession.conferenceParticipantIdentityKey
+        ) == Set(["mm26"]))
+        #expect(GroupSfuVideoAttachPolicy.episodeParticipantIdsAfterRefresh(
+            previousIds: ["mm26", "nudge"],
+            refreshIds: ["mm26", "nudge"],
+            mappedCameraIds: ["mm26", "nudge"],
+            identityKey: RTCSession.conferenceParticipantIdentityKey
+        ) == Set(["mm26", "nudge"]))
     }
 
     @Test("suppressed in-flight late-joiner track events are queued for post-settlement refresh")
@@ -1841,6 +1920,194 @@ struct GroupCallVideoRegressionTests {
             rendererHasSink: true,
             eglInitStaleForSurface: true,
             hasPendingTrack: false))
+        #expect(AndroidRendererLayoutPolicy.isLikelyTransientRotationSurfaceMeasure(
+            previousWidth: 1002,
+            previousHeight: 564,
+            newWidth: 564,
+            newHeight: 1002))
+        #expect(AndroidRendererLayoutPolicy.shouldReinitRendererEglForImmediateHolderResize(
+            previousWidth: 1002,
+            previousHeight: 564,
+            newWidth: 564,
+            newHeight: 1002) == false)
+        #expect(AndroidRendererLayoutPolicy.shouldReinitRendererEglForImmediateHolderResize(
+            previousWidth: 1002,
+            previousHeight: 564,
+            newWidth: 564,
+            newHeight: 1002,
+            windowOrientationMatchesConfiguration: true) == false)
+        #expect(AndroidRendererLayoutPolicy.isLikelyAspectFitWrapSurfaceMeasure(
+            surfaceWidth: 317,
+            surfaceHeight: 564,
+            tileWidth: 1002,
+            tileHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.isLikelyAspectFitWrapSurfaceMeasure(
+            surfaceWidth: 1002,
+            surfaceHeight: 564,
+            tileWidth: 1002,
+            tileHeight: 564))
+        #expect(AndroidRendererLayoutPolicy.shouldReinitRendererEglForImmediateHolderResize(
+            previousWidth: 1080,
+            previousHeight: 2520,
+            newWidth: 317,
+            newHeight: 564,
+            tileWidth: 1002,
+            tileHeight: 564) == false)
+        #expect(AndroidRendererLayoutPolicy.shouldReinitRendererEglForImmediateHolderResize(
+            previousWidth: 1002,
+            previousHeight: 564,
+            newWidth: 317,
+            newHeight: 564,
+            tileWidth: 1002,
+            tileHeight: 564) == false)
+        #expect(AndroidRendererLayoutPolicy.shouldReinitRendererEglForImmediateHolderResize(
+            previousWidth: 317,
+            previousHeight: 564,
+            newWidth: 1002,
+            newHeight: 564,
+            tileWidth: 1002,
+            tileHeight: 564))
+        #expect(AndroidRendererLayoutPolicy.shouldReinitRendererEglForImmediateHolderResize(
+            previousWidth: 493,
+            previousHeight: 1213,
+            newWidth: 1002,
+            newHeight: 1213))
+        #expect(AndroidRendererLayoutPolicy.shouldReplaceLocalPreviewOverlaySize(
+            currentWidth: 140,
+            currentHeight: 249,
+            proposedWidth: 141,
+            proposedHeight: 250) == false)
+        #expect(AndroidRendererLayoutPolicy.shouldReplaceLocalPreviewOverlaySize(
+            currentWidth: 140,
+            currentHeight: 249,
+            proposedWidth: 180,
+            proposedHeight: 220) == false)
+        #expect(AndroidRendererLayoutPolicy.shouldReplaceLocalPreviewOverlaySize(
+            currentWidth: 140,
+            currentHeight: 249,
+            proposedWidth: 249,
+            proposedHeight: 140))
+        #expect(AndroidRendererLayoutPolicy.shouldReinitRendererEglAfterComposeLayoutSettled(
+            viewWidth: 564,
+            viewHeight: 1002,
+            lastRendererWidth: 564,
+            lastRendererHeight: 1002,
+            eglNeedsResync: true,
+            windowOrientationMatchesConfiguration: false) == false)
+        #expect(AndroidRendererLayoutPolicy.shouldReinitRendererEglAfterComposeLayoutSettled(
+            viewWidth: 564,
+            viewHeight: 1002,
+            lastRendererWidth: 1002,
+            lastRendererHeight: 564,
+            eglNeedsResync: true,
+            windowOrientationMatchesConfiguration: true) == false)
+        #expect(AndroidRendererLayoutPolicy.shouldReinitRendererEglAfterComposeLayoutSettled(
+            viewWidth: 564,
+            viewHeight: 1002,
+            lastRendererWidth: 564,
+            lastRendererHeight: 1002,
+            eglNeedsResync: true,
+            windowOrientationMatchesConfiguration: true))
+        #expect(!AndroidRendererLayoutPolicy.shouldAllowAttachDrivenEglReinit(
+            previousWidth: 317,
+            previousHeight: 564,
+            newWidth: 488,
+            newHeight: 275,
+            eglNeedsResync: true,
+            windowOrientationMatchesConfiguration: false,
+            tileWidth: 1002,
+            tileHeight: 564,
+            lastRendererWidth: 317,
+            lastRendererHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.shouldAllowAttachDrivenEglReinit(
+            previousWidth: 1080,
+            previousHeight: 2520,
+            newWidth: 1002,
+            newHeight: 564,
+            eglNeedsResync: true,
+            windowOrientationMatchesConfiguration: true,
+            tileWidth: 1002,
+            tileHeight: 564,
+            lastRendererWidth: 1080,
+            lastRendererHeight: 2520))
+        #expect(AndroidRendererLayoutPolicy.bindsLocalPreviewToVideoTrackSink == false)
+        #expect(AndroidRendererLayoutPolicy.fansOutLocalPreviewFromCapturerObserver)
+        #expect(AndroidRendererLayoutPolicy.androidLocalCameraCaptureFps == 30)
+        #expect(AndroidRendererLayoutPolicy.androidLocalPreviewFansOutBeforeAppearanceSoftening)
+        #expect(AndroidRendererLayoutPolicy.androidLocalPreviewUsesCamera2OutputSurface == false)
+        #expect(AndroidRendererLayoutPolicy.androidLocksCamera2FixedCaptureFps)
+        #expect(AndroidRendererLayoutPolicy.androidLocalPreviewTextureViewIsOpaque)
+        #expect(AndroidRendererLayoutPolicy.androidLocalPreviewUsesSurfaceViewOverlay)
+        #expect(AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: true,
+            windowOrientationMatchesConfiguration: false,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 1080,
+            windowHeight: 2520,
+            previousHostWidth: 1002,
+            previousHostHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: false,
+            windowOrientationMatchesConfiguration: false,
+            hostWidth: 1080,
+            hostHeight: 2520,
+            windowWidth: 1080,
+            windowHeight: 2520,
+            previousHostWidth: 1080,
+            previousHostHeight: 2520))
+        #expect(AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: true,
+            windowOrientationMatchesConfiguration: true,
+            hostWidth: 1080,
+            hostHeight: 2520,
+            windowWidth: 1080,
+            windowHeight: 2520,
+            previousHostWidth: 1080,
+            previousHostHeight: 2520))
+        #expect(AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: true,
+            windowOrientationMatchesConfiguration: true,
+            hostWidth: 155,
+            hostHeight: 275,
+            windowWidth: 1080,
+            windowHeight: 2520,
+            previousHostWidth: 1002,
+            previousHostHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: true,
+            windowOrientationMatchesConfiguration: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 1080,
+            windowHeight: 2520,
+            previousHostWidth: 1080,
+            previousHostHeight: 2520))
+        #expect(!AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: true,
+            windowOrientationMatchesConfiguration: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 1080,
+            windowHeight: 2520,
+            previousHostWidth: 1002,
+            previousHostHeight: 564))
+        #expect(AndroidRendererLayoutPolicy.letterboxExactSize(
+            frameWidth: 180,
+            frameHeight: 320,
+            frameRotation: 0,
+            hostWidth: 1002,
+            hostHeight: 564) == (317, 564))
+        #expect(AndroidRendererLayoutPolicy.isLikelyFullscreenHost(
+            hostWidth: 1080,
+            hostHeight: 2520,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(AndroidRendererLayoutPolicy.isLikelyUnsettledFragmentHost(
+            hostWidth: 155,
+            hostHeight: 275,
+            windowWidth: 1080,
+            windowHeight: 2520))
     }
 
     @Test("queued Android renderer attach is not treated as complete")
@@ -1881,6 +2148,38 @@ struct GroupCallVideoRegressionTests {
             newTrackId: "",
             existingReceiverKey: nil,
             newReceiverKey: "") == false)
+    }
+
+    @Test("Android SFU audio cryptor attach runs only when the advertised track id changes")
+    func androidSfuAudioCryptorAttachRunsOnlyWhenAdvertisedTrackIdChanges() {
+        #expect(AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
+            existingTrackId: nil,
+            advertisedTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00"))
+        #expect(AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
+            existingTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            advertisedTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00") == false)
+        #expect(AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
+            existingTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            advertisedTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00"))
+        #expect(AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
+            existingTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            advertisedTrackId: "") == false)
+    }
+
+    @Test("Android audio receiver cryptor reuse follows stable track id across wrapper rotation")
+    func androidAudioReceiverCryptorReuseFollowsStableTrackIdAcrossWrapperRotation() {
+        #expect(AndroidReceiverCryptorPolicy.shouldReuseAudioReceiverCryptorBinding(
+            existingTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            newTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00"))
+        #expect(AndroidReceiverCryptorPolicy.shouldReuseAudioReceiverCryptorBinding(
+            existingTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            newTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00") == false)
+        #expect(AndroidReceiverCryptorPolicy.shouldReuseAudioReceiverCryptorBinding(
+            existingTrackId: nil,
+            newTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00") == false)
+        #expect(AndroidReceiverCryptorPolicy.shouldReuseAudioReceiverCryptorBinding(
+            existingTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            newTrackId: "") == false)
     }
 
     @Test("one-arg surface report does not settle a newer generation")
@@ -1946,6 +2245,45 @@ struct GroupCallVideoRegressionTests {
         #expect(setScreen.contains("ScreenShareAttachPolicy.shouldSkipScreenRendererAttach"))
         let render = try Self.videoSessionSource()
         #expect(render.contains("ScreenShareAttachPolicy.shouldSkipScreenRendererAttach"))
+    }
+
+    @Test("leave shrink does not wait for Compose before reattach")
+    func leaveShrinkDoesNotWaitForComposeBeforeReattach() {
+        #expect(AndroidRemoteGridTransitionPolicy.shouldWaitForComposeLayoutBeforeReattach(
+            previousVisibleCount: 2,
+            nextVisibleCount: 1) == false)
+        #expect(AndroidRemoteGridTransitionPolicy.composeTileKey(
+            rendererIdentity: 7,
+            itemCount: 1
+        ) != AndroidRemoteGridTransitionPolicy.composeTileKey(
+            rendererIdentity: 7,
+            itemCount: 2
+        ))
+        #expect(AndroidRemoteGridTransitionPolicy.shouldWaitForComposeLayoutBeforeReattach(
+            previousVisibleCount: 1,
+            nextVisibleCount: 2))
+        #expect(AndroidRemoteGridTransitionPolicy.shouldReattachAssignedTilesImmediately(
+            previousVisibleCount: 2,
+            nextVisibleCount: 1,
+            previousSignature: "0:mm26|1:nudge",
+            nextSignature: "0:nudge"))
+        let awaiting = AndroidRemoteGridTransitionPolicy.beginGridSlotTransition(
+            state: .idle,
+            expectedIdentities: ["nudge"]
+        )
+        let coalesced = AndroidRemoteGridTransitionPolicy.beginGridSlotTransition(
+            state: awaiting,
+            expectedIdentities: ["nudge"]
+        )
+        #expect(coalesced.generation == awaiting.generation)
+        #expect(AndroidGroupParticipantRendererAttachPolicy
+            .shouldQueuePendingLiveWrapperRebindAfterSettledSkip(
+                tileAttachedTrackIsLive: true,
+                probeBoundTrackSharesRendererSinkWithTarget: true) == false)
+        #expect(AndroidGroupParticipantRendererAttachPolicy
+            .shouldQueuePendingLiveWrapperRebindAfterSettledSkip(
+                tileAttachedTrackIsLive: false,
+                probeBoundTrackSharesRendererSinkWithTarget: false) == false)
     }
 
     private static func androidControllerSource() throws -> String {

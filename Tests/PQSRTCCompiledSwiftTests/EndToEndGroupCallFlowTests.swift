@@ -142,7 +142,8 @@ struct EndToEndGroupCallFlowTests {
         }
         _ = try BinaryDecoder().decode(SessionDescription.self, from: decryptedOfferMetadata)
 
-        // Allow candidate sending, then inject a generated ICE candidate notification.
+        // Offer is already off the wire (`gotOffer` above). Inject the candidate
+        // only after that write so the gate may encrypt it.
         try await step("startSendingCandidates") {
             try await session.startSendingCandidates(call: call)
         }
@@ -452,16 +453,22 @@ struct EndToEndGroupCallFlowTests {
         call.signalingIdentityProps = sfuProps
 
         // Offer is encrypted and handed to the send lane; the transport wedges the send forever.
+        // `sendGroupCallOffer` now waits for that write, so run media start off the test's
+        // critical path.
         try await session.createSFUIdentity(sfuRecipientId: sfuRecipientId, call: call)
-        try await session.beginGroupCallMediaAfterSfuRegistrationIfNeeded(
-            sfuRecipientId: sfuRecipientId,
-            updatedCall: call)
+        let offerCall = call
+        let offerRecipient = sfuRecipientId
+        let offerWaitTask = Task {
+            try? await session.beginGroupCallMediaAfterSfuRegistrationIfNeeded(
+                sfuRecipientId: offerRecipient,
+                updatedCall: offerCall)
+        }
         let offerSendAttempted = await waitUntil(timeoutSeconds: 5.0) { await transport.sendAttempts == 1 }
         #expect(offerSendAttempted, "Expected the encrypted offer send to be attempted (and wedge)")
 
-        // With the offer send wedged, later outbound work must still encrypt (job cache drains;
-        // the packet queues in the lane behind the blocked send).
-        try await session.startSendingCandidates(call: call)
+        // While the offer write is in flight, a group candidate must stay buffered
+        // (not encrypted) so it cannot sit ahead of the essential packet.
+        try await session.startSendingCandidates(call: offerCall)
         await session.peerConnectionNotificationsContinuation.yield(
             .generatedIceCandidate(sfuRecipientId, "candidate: 1 1 UDP 1234 1.2.3.4 9999 typ host", 0, "0")
         )
@@ -469,7 +476,8 @@ struct EndToEndGroupCallFlowTests {
             await session.taskProcessor.jobs.isEmpty
         }
         #expect(writesDrained, "Encrypt pipeline stalled behind a wedged transport send (write path)")
-        #expect(await transport.sendAttempts == 1, "Send lane must stay serial: candidate queues behind the wedged offer send")
+        #expect(await transport.sendAttempts == 1, "Candidate must not enter the lane while the offer write is pending")
+        _ = offerWaitTask
 
         // Inbound decrypts must also flow while the send is wedged: SFU encrypts an answer to the
         // client; the stream job must decrypt and complete (the handler may reject the minimal

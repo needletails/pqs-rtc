@@ -36,7 +36,11 @@ Use ``RTCFrameEncryptionKeyMode/perParticipant`` for encrypted SFU group calls.
 The host app is responsible for distributing sender keys over an encrypted application route. For
 each local group media session:
 
-1. Generate a fresh 32-byte local sender frame key.
+1. Generate a fresh 32-byte local sender frame key. A later outbound or inbound attempt in the
+   same channel is a new `Call.id`: mint again and reset fanout. Call
+   ``RTCSession/resetFrameEncryptionKeyProviderForNewCallAttempt()`` immediately before installing
+   that new key. Do not reuse the previous attempt's key or "already distributed" set. ICE retry
+   inside one attempt keeps the key.
 2. Install it locally with ``RTCSession/setFrameEncryptionKey(_:index:for:)`` using the local
    participant id.
 3. Encrypt and send that key to each remote participant with metadata that identifies:

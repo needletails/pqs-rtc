@@ -203,6 +203,83 @@ Android multiparty video adds a **coordinated settlement layer** because:
 - Rebinding one tile can transiently affect sink generation state on siblings.
 - Compose layout can deliver surfaces after tracks are already mapped.
 
+Device rotation with `configChanges` is **not** a grid-slot or SFU attach event. Holder and
+`OnLayout` callbacks must not reinit EGL on dual-axis intermediate sizes — that starves the
+shared local-preview context and skips TextureView frames. Layout must also keep the
+`SurfaceView` match-parent until the window matches configuration and the Compose tile
+has settled: wrap-content `onMeasure` (317↔1002, then 155/488/2394 during rotate) is the
+main-thread hitch even when EGL is left alone. 1-up leftover fullscreen and rotation
+fragments stay match-parent; a settled 16:9 conference tile letterboxes in that apply
+(do not wait for a second 1002 fill → 317 hop). 1-up ↔ conference flips `fillMaxSize` ↔
+16:9 `aspectRatio`; letterbox uses one exact fitted size after that tile lands, not
+`WRAP_CONTENT` on every `onFrameResolutionChanged`.
+
+Visible Android tiles follow **live camera presence** (session map or conference
+`videoEnabled`), not the channel roster. A participant-left / pruned-map event must
+release the assignment immediately so 2-up returns to 1:1 — `videoEnabled` and the
+channel roster must not keep the departed tile, and a skip-already-settled episode
+must **clear** so the coordinator does not run for minutes. An in-flight episode
+must not `formUnion` a departed id back onto the grid, and remount / grid-layout
+must not queue coordinator reruns while a pass is in flight. Leave 2-up → 1:1
+must reattach the remaining sink immediately — do not wait for Compose
+`layoutGeneration` (parallel `tilesDidChange` stomps the generation and the
+leftover remote stays frozen). Compose must also remount the remaining
+`AndroidView` when `itemCount` crosses 1 (`composeTileKey`); Skip key reuse
+kept the 317×564 letterbox after `mounted count=1`. A leftover remote that
+still renders at conference-tile size is not 1:1. A shared live sink must not
+`requestPendingLiveWrapperRebind`; that queues an EGL tear after the next
+frame stall. A dead Java wrapper must force-apply the live receiver on the
+leave offer, not wait for tail frames.
+
+1-up ↔ N-up wrap-content letterbox is also not a new surface: tearing the sink there
+freezes remotes (`surface_holder_resize_reinit` 1080×2520 → 317×564 → 1002×564).
+`surface_holder_rotation_skip` must accept the holder size so `egl_init_stale`
+cannot force `egl_reinit_with_track` on the same hop. Attach / sink-reconcile use
+``AndroidRendererLayoutPolicy/shouldAllowAttachDrivenEglReinit`` — one reinit only
+after Compose layout has settled. The local PiP overlay size follows orientation
+class, not every `GeometryReader` blip. Do not `.id()` ``AndroidVideoCallView`` to
+chase rotation remounts — that recreates the renderer pool. Full-screen Android
+call chrome must not apply `GeometryReader` pixel size as `.frame`; that remounts
+the call on rotate (`onDisappear` + channel rejoin + bouncing controls).
+
+Hangup dismisses the call view after chrome already sets `showsLocalPreview=false`
+(`showCallView=false` / `Waiting`) while ``CallStateMachine`` can still be `Connected`.
+`onDisappear` must release the local TextureView then — skipping as a “transient remount”
+leaves `EglRenderer: LocalPreviewDuration` running after camera stop. Rotation remounts
+keep `showsLocalPreview=true` and must not release.
+
+Local preview pixels are **not** a `VideoTrack` sink. The send track shares a `VideoSource`
+with the encoder; WebRTC's adapter (CPU overuse / `maxFramerate` sink wants) drops frames
+for every sink on that source. Device3 showed `CameraStatistics: 15` fps while
+`EglRenderer: LocalPreview` received 7 fps and dropped 0. The capturer observer fans frames
+to the TextureView **before** `VideoSource`, so the PiP stays at camera rate.
+Apple's PiP is `AVCaptureVideoPreviewLayer` (hardware). A second Camera2 output
+on the Android TextureView is **not** that equivalent: Device3 09:49 attached
+`1280x720`, then the PiP was rotated 90°, undersized, and still skippy while
+camera fps floated 13–26. Upright I420 fanout → TextureView `EglRenderer` is
+also not that path: Device3 13:16 rendered `120/0/120` at 30.0 and still
+skipped while GC freed ~70MB every ~3s. Android local preview fans the camera
+`TextureBuffer` to `EglRenderer` on the **shared** factory `EglBase` (required
+to draw the OES texture). Do not `toI420` for the PiP — lesson 26 was
+TextureBuffer **plus** readback on the same context, not TextureBuffer alone.
+VideoSource keeps the same `TextureBuffer` when Settings softening is off.
+When “Soften video appearance” is on, a worker `toI420`s after the TextureBuffer
+is no longer drawn (lesson 26) and both preview and send get the softened I420.
+A full-res 5-tap is invisible once the overlay downscales (~367 px); the worker
+blurs a 1/4 luma plane and upsamples so the in-call local tile matches iOS
+Gaussian σ≈min(w,h)/240. Capture fps is owned in Kotlin
+(`AndroidRTCViewSupport.startLocalCameraCapture` at 30). WebRTC still prefers
+`[15.0:30.0]`; first frame rewrites AE to `[30:30]` only — it must not recreate
+the session onto the TextureView. Local overlay is a SurfaceView media overlay
+(`setZOrderMediaOverlay`) so it does not composite a TextureView on top of
+the remote hole-punch — Device3 16:20 still skipped at TextureBuffer 30/0/30
+on TextureView. Round that overlay in the public EGL drawer (`RoundedRectGlDrawer`)
+with a translucent `SurfaceView` so corner alpha composites over the remote.
+`clipToOutline` and Compose `.clip` do not clip the hole-punch. Do not call
+`SurfaceView` / `SurfaceControl.Transaction` corner APIs — they are not in the
+public compileSdk 36 stubs (lesson 17). Send encodings still follow
+``RTCVideoQualityProfile``.
+
 ### Components
 
 | Component | Responsibility |
@@ -244,7 +321,6 @@ Single owner for tile binds while an episode is active. One coordinator pass:
 ```
 Pass begin
   → session.rebindAndroidGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded (pass 1 only)
-  → rendererDidUpdateLayout on all assigned views
 Phase 1 — full attach for participants not yet settled this episode
   → performParticipantVideoAttach(reason: post-renegotiation-coordinator | grid-layout)
 Phase 2 — wrapper sync for already-settled participants
@@ -324,7 +400,13 @@ so tiles cannot stall waiting for a 6s stale threshold after the episode ends.
 ``AndroidSampleCaptureView`` (Kotlin) owns:
 
 - `rendererGeneration` / `sinkBoundGeneration` coupling
-- EGL reinit when surface becomes ready or layout requires resync
+- EGL reinit when the surface is created or the Compose host tile actually changes size.
+  Not on wrap-content / exact letterbox or dual-axis rotation intermediates.
+  Letterbox waits for a settled tile, then uses one exact fitted size.
+  Same-size `OnLayout` must not re-apply or reassign `layoutParams` — that
+  requestLayouts forever and ANRs the call UI.
+  Compose `AndroidView.update` reports a layout event only when the renderer
+  size changes. A missing sink is an attach event, not a layout event.
 - Same-track-id wrapper rotation via remove stale sink → attach live track → optional EGL reinit
   when first frame was already confirmed
 - ``requestPendingLiveWrapperRebind`` / ``applyPendingLiveWrapperRebindIfEligible`` for the narrow
@@ -387,6 +469,16 @@ To be a **well-designed client** of PQSRTC group/conference video:
       active—except through coordinator-owned reasons.
 - [ ] Forward ``rendererDidUpdateLayout`` / ``rendererDidInitialize`` from Compose when surfaces
       change so EGL/generation state stays aligned.
+- [ ] On hangup, detach native call-chrome overlays (the `android.R.id.content` hit
+      layer and control exclusions). Leaving them after `showCallView` becomes false
+      keeps HWUI drawing (`OpenGLRenderer` / `Choreographer`) on the chat window.
+- [ ] Reach Kotlin call-chrome support from **compiled** Swift only through
+      `AndroidCallChromeBridge` (transpiled). PQSRTC and the host app are Skip
+      `mode: native`; an `#if SKIP` block inside a compiled function body is always
+      false, so a direct `AndroidCallChromeNativeSupport.*` call there is silently dropped.
+- [ ] Keep the host shell stable across rotation. Classify phone vs. tablet by the
+      **smallest** container side; a width-based rule turns a landscape phone into a
+      tablet, swaps the split-view tree, and remounts every call `SurfaceView`.
 
 ### Identifiers
 

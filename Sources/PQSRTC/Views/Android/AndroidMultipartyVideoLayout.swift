@@ -114,6 +114,68 @@ enum GroupSfuVideoAttachPolicy {
             }
             .sorted()
     }
+
+    /// Channel roster can still list a departed member (`participants=3` after leave).
+    /// Visible tiles follow live camera presence: session map or conference video=true.
+    /// An explicit leave / pruned map must not keep a tile because `videoEnabled`
+    /// or the roster still lists them (Device3 17:52: leave then 20s-late 1:1).
+    static func shouldSurfaceParticipantCameraTile(
+        hasMappedCamera: Bool,
+        conferenceVideoEnabled: Bool,
+        explicitlyDeparted: Bool = false
+    ) -> Bool {
+        if hasMappedCamera { return true }
+        if explicitlyDeparted { return false }
+        return conferenceVideoEnabled
+    }
+
+    /// Track-removed after the session map is pruned is a leave, not wrapper
+    /// rotation. Conference `videoEnabled` must not retain that assignment.
+    static func shouldForceReleaseAssignmentAfterTrackRemoved(hasMappedCamera: Bool) -> Bool {
+        !hasMappedCamera
+    }
+
+    /// Transient `isActive: false` during wrapper rotation still has a mapped camera.
+    /// Leave prunes the map first, then emits removal — release that tile so 2-up
+    /// can return to 1:1. Episode/defer alone must not keep an unmapped leaver.
+    static func shouldRetainParticipantTileAcrossTransientTrackRemoval(
+        hasMappedOrAdvertisedCamera: Bool,
+        episodeActive: Bool,
+        deferAttach: Bool,
+        hasActiveRemoteScreenShare: Bool
+    ) -> Bool {
+        guard hasMappedOrAdvertisedCamera else { return false }
+        return episodeActive || deferAttach || hasActiveRemoteScreenShare
+    }
+
+    /// Free the assignment when live camera presence is gone, even if the
+    /// channel roster still contains the secret name.
+    static func shouldReleaseParticipantViewAssignment(
+        hasMappedOrAdvertisedCamera: Bool,
+        stillInRoster: Bool
+    ) -> Bool {
+        if !hasMappedOrAdvertisedCamera {
+            return true
+        }
+        return !stillInRoster
+    }
+
+    /// A leave refresh is only the remaining remotes. Do not `formUnion` the
+    /// previous episode set — that re-assigns the departed tile (Device3 nudge).
+    static func episodeParticipantIdsAfterRefresh(
+        previousIds: Set<String>,
+        refreshIds: Set<String>,
+        mappedCameraIds: Set<String>,
+        identityKey: (String) -> String
+    ) -> Set<String> {
+        func key(_ participantId: String) -> String {
+            let normalized = identityKey(participantId)
+            return normalized.isEmpty ? participantId : normalized
+        }
+        let mappedKeys = Set(mappedCameraIds.map(key))
+        let retainedPrevious = previousIds.filter { mappedKeys.contains(key($0)) }
+        return retainedPrevious.union(refreshIds)
+    }
 }
 
 /// Single owner for Android group-call tile binds after SFU renegotiation settles.
@@ -170,11 +232,14 @@ enum AndroidGroupPostRenegotiationAttachCoordinator {
         coordinatorSettledParticipant
     }
 
-    /// Pending live-wrapper rebind is event-driven; post-coordinator recovery must not compete.
+    /// Pending live-wrapper rebind is event-driven; post-coordinator recovery must not compete
+    /// while the tile is still on a live wrapper. A dead attached wrapper must apply now
+    /// (Device3 19:09–19:10: pending sat until frames stalled and 1:1 stayed frozen).
     static func postCoordinatorRecoveryShouldDeferToPendingLiveWrapperRebind(
-        hasPendingLiveWrapperRebind: Bool
+        hasPendingLiveWrapperRebind: Bool,
+        attachedTrackIsLive: Bool = true
     ) -> Bool {
-        hasPendingLiveWrapperRebind
+        hasPendingLiveWrapperRebind && attachedTrackIsLive
     }
 
     /// Post-coordinator pending apply retries only after stale-wrapper tail frames stop.
@@ -201,6 +266,24 @@ enum AndroidGroupPostRenegotiationAttachCoordinator {
     /// Grid relayout during an active episode should be folded into the coordinator pass.
     static func shouldDeferGridLayoutReattach(episodeActive: Bool) -> Bool {
         episodeActive
+    }
+
+    /// In-flight coordinator must not queue a rerun for remount / already-settled
+    /// / stale-wrapper defer (Device3 17:48–17:51: three-minute begin/end loop).
+    /// Only a grown participant set needs another pass.
+    static func shouldQueueCoordinatorRerunWhileInFlight(
+        participantSetGrew: Bool,
+        episodeParticipantsAlreadySettled: Bool
+    ) -> Bool {
+        participantSetGrew && !episodeParticipantsAlreadySettled
+    }
+
+    /// Skip-already-settled must clear the episode. Leaving it active lets every
+    /// grid remount schedule the coordinator again.
+    static func shouldClearSettledPostRenegotiationEpisode(
+        episodeParticipantsAlreadySettled: Bool
+    ) -> Bool {
+        episodeParticipantsAlreadySettled
     }
 
     /// A participant that already received a coordinator bind must not be re-attached during the
@@ -777,6 +860,7 @@ enum AndroidGroupParticipantRendererAttachPolicy {
     /// Defer live-wrapper promotion only while the renderer is still bound to the same live wrapper
     /// the session map expects. During a coordinator episode a rotated wrapper must be swapped
     /// immediately even if the old Java wrapper is still LIVE and painting tail frames.
+    /// A dead Java wrapper after leave / SFU prune must not wait for tail frames.
     static func shouldDeferLiveWrapperSinkRebindWhileTileDeliversRecentFrames(
         tileAttachedTrackIsLive: Bool,
         tileHasActiveSink: Bool,
@@ -791,6 +875,18 @@ enum AndroidGroupParticipantRendererAttachPolicy {
         return hasSinkEvidence
             && rendererEverConfirmedFirstFrameForAttachedTrack
             && !rendererFramesStaleWhileBound
+    }
+
+    /// `shouldDefer…` on a shared live sink means leave the tile alone — not queue
+    /// `requestPendingLiveWrapperRebind` for a later EGL tear (Device3 19:10:01
+    /// pending on a live 1:1 tile, then `egl_reinit_with_track` at 19:10:39).
+    static func shouldQueuePendingLiveWrapperRebindAfterSettledSkip(
+        tileAttachedTrackIsLive: Bool,
+        probeBoundTrackSharesRendererSinkWithTarget: Bool
+    ) -> Bool {
+        _ = tileAttachedTrackIsLive
+        _ = probeBoundTrackSharesRendererSinkWithTarget
+        return false
     }
 
     /// Pass-end stale sweep must not tear down a live tile that full-attached this episode while
@@ -1056,6 +1152,17 @@ enum AndroidGroupParticipantRendererRecoveryPolicy {
 
 /// Apple group-call remote camera renderer attach dedupe policy.
 enum AppleRemoteVideoTrackAttachPolicy {
+    /// Identity for a live camera sink. Track-object identity is required so a rotated
+    /// WebRTC wrapper with the same `trackId` + mid is not treated as already bound.
+    static func participantRendererAttachmentValue(
+        trackId: String,
+        receivingMid: String,
+        trackObjectIdentity: String,
+        rendererObjectIdentity: String
+    ) -> String {
+        "\(trackId)|mid:\(receivingMid)|track:\(trackObjectIdentity)|\(rendererObjectIdentity)"
+    }
+
     /// Skip redundant renderer binds when the cache matches the live peer-connection receiver.
     static func shouldSkipParticipantRendererAttach(
         cachedAttachmentValue: String?,
@@ -1080,58 +1187,59 @@ enum AppleRemoteVideoTrackAttachPolicy {
 
 /// Pure layout/reconcile policy for Android multiparty remote video grids.
 enum AndroidMultipartyVideoLayout {
-    /// How many remote renderer slots must stay mounted in Compose so assigned participants
-    /// always have a laid-out `SurfaceViewRenderer`.
+    /// How many remote renderer slots Compose should mount.
+    ///
+    /// Channel roster / pool size (`remoteSlotCount`) must not reserve empty tiles. iOS
+    /// `updateLayoutForItemCount` follows live assigned remotes: 1 → fullscreen, 2+ → grid.
     static func visibleRemoteViewCount(
         remoteSlotCount: Int,
         assignedParticipantCount: Int,
         poolSize: Int
     ) -> Int {
-        guard poolSize > 0 else { return 0 }
-        let requested = max(remoteSlotCount, assignedParticipantCount, 1)
-        return min(requested, poolSize)
+        _ = remoteSlotCount
+        return multipartyGridSlotCount(
+            assignedParticipantCount: assignedParticipantCount,
+            poolSize: poolSize
+        )
     }
 
-    /// SurfaceView-backed grids must not shrink active renderer slots during roster/SFU churn.
-    /// Remounting a tile through a transient one-up layout can leave Android's buffer queue sized
-    /// for the wrong surface even though WebRTC still renders tile-sized buffers.
+    /// Visible slot count after a roster/SFU refresh. A leave that leaves one assigned
+    /// remote must return to 1-up; keeping the previous N-up count is what stuck Android
+    /// on two 16:9 tiles with one live stream.
     static func stableVisibleRemoteViewCount(
         previousVisibleCount: Int,
         requestedVisibleCount: Int,
         assignedParticipantCount: Int,
         poolSize: Int
     ) -> Int {
-        guard poolSize > 0 else { return 0 }
-        let requested = min(max(requestedVisibleCount, assignedParticipantCount, 1), poolSize)
-        guard previousVisibleCount > 0, assignedParticipantCount > 0 else {
-            return requested
-        }
-        return min(max(previousVisibleCount, requested), poolSize)
+        _ = previousVisibleCount
+        _ = requestedVisibleCount
+        return multipartyGridSlotCount(
+            assignedParticipantCount: assignedParticipantCount,
+            poolSize: poolSize
+        )
     }
 
-    /// How many stable pool slots Compose should mount for multiparty grids.
-    ///
-    /// Uses the renderer pool prefix (not assigned-only filtering) so tile surfaces stay mounted while
-    /// participants assign. When two remotes are expected, reserve a 2-up layout before the second
-    /// assignment lands so the first tile does not flash fullscreen (`1080×2520`) and back.
-    /// A true 2-person call (only one remote in the roster) mounts a single fullscreen slot so
-    /// remote video can aspect-fill the device orientation.
+    /// How many Compose tiles to mount. Extra pool renderers stay allocated off-tree.
     static func multipartyGridSlotCount(
         assignedParticipantCount: Int,
-        rosterRemoteSlotCount: Int,
         poolSize: Int
     ) -> Int {
         guard poolSize > 0 else { return 0 }
-        if assignedParticipantCount >= 2 {
-            return min(assignedParticipantCount, poolSize)
-        }
-        if assignedParticipantCount > 0, rosterRemoteSlotCount >= 2, poolSize >= 2 {
-            return 2
-        }
-        if rosterRemoteSlotCount >= 2 {
-            return min(2, poolSize)
-        }
         return min(max(assignedParticipantCount, 1), poolSize)
+    }
+
+    /// Views Compose may mount. Assigned remotes only; if none yet, one waiting pool slot.
+    /// Never returns leftover unassigned pool siblings — those become empty 16:9 tiles.
+    static func mountedRemoteViews<View>(
+        assignedViews: [View],
+        poolViews: [View]
+    ) -> [View] {
+        if !assignedViews.isEmpty {
+            return assignedViews
+        }
+        guard let first = poolViews.first else { return [] }
+        return [first]
     }
 
     /// Whether assigned participant tiles should be re-rendered after a grid refresh.
@@ -1169,6 +1277,143 @@ enum AndroidMultipartyVideoLayout {
     }
 }
 
+/// Event-driven 1-up ↔ N-up Android grid settlement. Destination layouts stay
+/// unchanged; only the handoff waits for Compose `AndroidView.update`.
+struct GridSlotLayoutTransitionState: Equatable, Sendable {
+    var generation: UInt64
+    var expectedIdentities: Set<String>
+    var reportedIdentities: Set<String>
+
+    init(
+        generation: UInt64 = 0,
+        expectedIdentities: Set<String> = [],
+        reportedIdentities: Set<String> = []
+    ) {
+        self.generation = generation
+        self.expectedIdentities = expectedIdentities
+        self.reportedIdentities = reportedIdentities
+    }
+
+    static let idle = GridSlotLayoutTransitionState()
+
+    var isAwaiting: Bool {
+        !expectedIdentities.isEmpty
+    }
+}
+
+enum AndroidRemoteGridTransitionPolicy {
+    /// Skip `AndroidView` identity for one SurfaceView. Solo and grid must differ
+    /// so 2-up → 1:1 remounts the view under `fillMaxSize`. Keying only the
+    /// renderer hash reused the 317×564 letterbox after `mounted count=1`
+    /// (Device3 21:35:50–21:36:17).
+    static func composeTileKey(rendererIdentity: Int, itemCount: Int) -> Int {
+        if itemCount <= 1 {
+            return rendererIdentity
+        }
+        return rendererIdentity &* 31 &+ 2
+    }
+
+    /// Wait only when the grid *grows*. Shrink (2-up → 1:1) keeps the remaining
+    /// sink; waiting stomps `layoutGeneration` (Device3 19:09:40 gen 2/3/4 in
+    /// one ms) and freezes the leftover remote until the coordinator attaches.
+    static func shouldWaitForComposeLayoutBeforeReattach(
+        previousVisibleCount: Int,
+        nextVisibleCount: Int
+    ) -> Bool {
+        previousVisibleCount > 0 && nextVisibleCount > previousVisibleCount
+    }
+
+    /// Immediate reattach is only safe when the mounted slot count did not change.
+    static func shouldReattachAssignedTilesImmediately(
+        previousVisibleCount: Int,
+        nextVisibleCount: Int,
+        previousSignature: String,
+        nextSignature: String
+    ) -> Bool {
+        if shouldWaitForComposeLayoutBeforeReattach(
+            previousVisibleCount: previousVisibleCount,
+            nextVisibleCount: nextVisibleCount
+        ) {
+            return false
+        }
+        return AndroidMultipartyVideoLayout.shouldReattachAssignedParticipantVideo(
+            previousVisibleCount: previousVisibleCount,
+            nextVisibleCount: nextVisibleCount,
+            previousSignature: previousSignature,
+            nextSignature: nextSignature
+        )
+    }
+
+    /// Roster growth must reuse the same `AndroidVideoCallView` identity / renderer pool.
+    static func shouldResetVideoCallViewIdentityOnRemoteCountChange() -> Bool {
+        false
+    }
+
+    /// Hangup unmounts the call view after chrome already hid the local PiP
+    /// (`showsLocalPreview=false`) while `callState` can still be `Connected`.
+    /// Rotation remounts with `showsLocalPreview=true`. Minimize / in-app PiP
+    /// keep the view mounted. Device3 2026-09-08: skip on `onDisappear
+    /// state=Connected` left `LocalPreviewDuration` ticking after the call ended.
+    static func shouldTeardownRenderersOnDisappear(
+        didEnterLiveCall: Bool,
+        showsLocalPreview: Bool,
+        endedCall: Bool,
+        isTerminalCallState: Bool,
+        isIdleAfterLiveCall: Bool
+    ) -> Bool {
+        if endedCall || isTerminalCallState || isIdleAfterLiveCall {
+            return true
+        }
+        return didEnterLiveCall && !showsLocalPreview
+    }
+
+    static func beginGridSlotTransition(
+        state: GridSlotLayoutTransitionState,
+        expectedIdentities: Set<String>
+    ) -> GridSlotLayoutTransitionState {
+        if state.isAwaiting, state.expectedIdentities == expectedIdentities {
+            return state
+        }
+        return GridSlotLayoutTransitionState(
+            generation: state.generation &+ 1,
+            expectedIdentities: expectedIdentities,
+            reportedIdentities: []
+        )
+    }
+
+    static func shouldAcceptGridSlotSurfaceReport(
+        capturedGeneration: UInt64,
+        identity: String,
+        state: GridSlotLayoutTransitionState
+    ) -> Bool {
+        guard state.isAwaiting else { return false }
+        guard capturedGeneration == state.generation else { return false }
+        return state.expectedIdentities.contains(identity)
+    }
+
+    static func applyingGridSlotSurfaceReport(
+        capturedGeneration: UInt64,
+        identity: String,
+        state: GridSlotLayoutTransitionState
+    ) -> GridSlotLayoutTransitionState {
+        guard shouldAcceptGridSlotSurfaceReport(
+            capturedGeneration: capturedGeneration,
+            identity: identity,
+            state: state
+        ) else {
+            return state
+        }
+        var next = state
+        next.reportedIdentities.insert(identity)
+        guard next.expectedIdentities.isSubset(of: next.reportedIdentities) else {
+            return next
+        }
+        next.expectedIdentities.removeAll()
+        next.reportedIdentities.removeAll()
+        return next
+    }
+}
+
 /// Swift-side mirror of `AndroidReceiverCryptorPolicy` in Skip/Kotlin (kept in sync for tests).
 enum AndroidReceiverCryptorPolicy {
     static func shouldReuseReceiverCryptorBinding(
@@ -1179,6 +1424,27 @@ enum AndroidReceiverCryptorPolicy {
     ) -> Bool {
         guard !newTrackId.isEmpty, !newReceiverKey.isEmpty else { return false }
         return existingTrackId == newTrackId && existingReceiverKey == newReceiverKey
+    }
+
+    /// Audio FrameCryptor is bound to the native receiver, not the Java wrapper identity.
+    /// Requiring `receiverKey` equality mute-disposes on every SFU offer and chirps playout.
+    static func shouldReuseAudioReceiverCryptorBinding(
+        existingTrackId: String?,
+        newTrackId: String
+    ) -> Bool {
+        guard !newTrackId.isEmpty else { return false }
+        return existingTrackId == newTrackId
+    }
+
+    /// Audio FrameCryptor attach after an SFU offer. Same advertised track id means the live
+    /// cryptor is already bound; calling attach again mutes playout for a Java wrapper refresh.
+    static func shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
+        existingTrackId: String?,
+        advertisedTrackId: String
+    ) -> Bool {
+        guard !advertisedTrackId.isEmpty else { return false }
+        guard let existingTrackId, !existingTrackId.isEmpty else { return true }
+        return existingTrackId != advertisedTrackId
     }
 }
 
@@ -1362,6 +1628,294 @@ enum AndroidRendererLayoutPolicy {
             return false
         }
         return viewWidth != surfaceWidth || viewHeight != surfaceHeight
+    }
+
+    /// Device rotation changes both axes at once. Holder/OnLayout callbacks fire for
+    /// intermediate sizes; EGL reinit there starves the shared local-preview context.
+    static func isLikelyTransientRotationSurfaceMeasure(
+        previousWidth: Int,
+        previousHeight: Int,
+        newWidth: Int,
+        newHeight: Int
+    ) -> Bool {
+        previousWidth > 0
+            && previousHeight > 0
+            && newWidth > 0
+            && newHeight > 0
+            && previousWidth != newWidth
+            && previousHeight != newHeight
+    }
+
+    /// 1-up leftover: Compose still measures the remote at the window before the
+    /// 16:9 conference tile lands. Wrapping there letterboxes the fullscreen pane.
+    static func isLikelyFullscreenHost(
+        hostWidth: Int,
+        hostHeight: Int,
+        windowWidth: Int,
+        windowHeight: Int
+    ) -> Bool {
+        guard hostWidth > 0, hostHeight > 0, windowWidth > 0, windowHeight > 0 else {
+            return false
+        }
+        return hostWidth * 10 >= windowWidth * 9 && hostHeight * 10 >= windowHeight * 9
+    }
+
+    /// Rotation fragments (Device3: 155×275, 488×275) are far smaller than a 2-up tile.
+    static func isLikelyUnsettledFragmentHost(
+        hostWidth: Int,
+        hostHeight: Int,
+        windowWidth: Int,
+        windowHeight: Int
+    ) -> Bool {
+        guard hostWidth > 0, hostHeight > 0, windowWidth > 0, windowHeight > 0 else {
+            return true
+        }
+        return hostWidth * hostHeight * 8 < windowWidth * windowHeight
+    }
+
+    /// Keep MATCH_PARENT during rotation fragments and 1-up leftover fullscreen.
+    /// A settled 16:9 conference tile (Device3 1002×564) must letterbox in that
+    /// same apply — dual-axis from 1080×2520 used to defer, then hop 1002 fill → 317.
+    static func shouldDeferAspectFitWrapContent(
+        preferFit: Bool,
+        windowOrientationMatchesConfiguration: Bool,
+        hostWidth: Int,
+        hostHeight: Int,
+        windowWidth: Int,
+        windowHeight: Int,
+        previousHostWidth: Int,
+        previousHostHeight: Int
+    ) -> Bool {
+        _ = previousHostWidth
+        _ = previousHostHeight
+        if !preferFit { return false }
+        if !windowOrientationMatchesConfiguration { return true }
+        if hostWidth <= 0 || hostHeight <= 0 { return true }
+        if isLikelyFullscreenHost(
+            hostWidth: hostWidth,
+            hostHeight: hostHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+        ) {
+            return true
+        }
+        if isLikelyUnsettledFragmentHost(
+            hostWidth: hostWidth,
+            hostHeight: hostHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+        ) {
+            return true
+        }
+        return false
+    }
+
+    /// Fitted letterbox size so the SurfaceView can use EXACT pixels instead of
+    /// WRAP_CONTENT (VideoLayoutMeasure remasures on every frame-resolution callback).
+    static func letterboxExactSize(
+        frameWidth: Int,
+        frameHeight: Int,
+        frameRotation: Int,
+        hostWidth: Int,
+        hostHeight: Int
+    ) -> (width: Int, height: Int) {
+        guard frameWidth > 0, frameHeight > 0, hostWidth > 0, hostHeight > 0 else {
+            return (0, 0)
+        }
+        var rotation = frameRotation % 360
+        if rotation < 0 { rotation += 360 }
+        let uprightWidth = (rotation == 90 || rotation == 270) ? frameHeight : frameWidth
+        let uprightHeight = (rotation == 90 || rotation == 270) ? frameWidth : frameHeight
+        if uprightWidth * hostHeight > uprightHeight * hostWidth {
+            let fittedHeight = max(1, hostWidth * uprightHeight / uprightWidth)
+            return (hostWidth, min(hostHeight, fittedHeight))
+        }
+        let fittedWidth = max(1, hostHeight * uprightWidth / uprightHeight)
+        return (min(hostWidth, fittedWidth), hostHeight)
+    }
+
+    /// Wrap-content letterbox inside a 16:9 Compose tile (Device3: host 1002×564,
+    /// SurfaceView 317×564 = 9:16 of the tile height). That is not a new EGL surface.
+    static func isLikelyAspectFitWrapSurfaceMeasure(
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        tileWidth: Int,
+        tileHeight: Int
+    ) -> Bool {
+        guard surfaceWidth > 0, surfaceHeight > 0, tileWidth > 0, tileHeight > 0 else {
+            return false
+        }
+        if surfaceWidth == tileWidth && surfaceHeight == tileHeight {
+            return false
+        }
+        if surfaceWidth > tileWidth || surfaceHeight > tileHeight {
+            return false
+        }
+        return (surfaceWidth == tileWidth && surfaceHeight < tileHeight)
+            || (surfaceHeight == tileHeight && surfaceWidth < tileWidth)
+    }
+
+    /// Holder-callback reinit. Dual-axis measures are rotation or 1-up ↔ N-up
+    /// intermediates — never tear the sink here. Wrap-content letterbox inside the
+    /// host tile is also not a new surface. One-axis tile splits may reinit only
+    /// when the holder already matches the Compose host.
+    static func shouldReinitRendererEglForImmediateHolderResize(
+        previousWidth: Int,
+        previousHeight: Int,
+        newWidth: Int,
+        newHeight: Int,
+        windowOrientationMatchesConfiguration: Bool = false,
+        tileWidth: Int = 0,
+        tileHeight: Int = 0
+    ) -> Bool {
+        _ = windowOrientationMatchesConfiguration
+        guard newWidth > 0, newHeight > 0 else { return false }
+        guard previousWidth > 0, previousHeight > 0 else { return false }
+        if previousWidth == newWidth && previousHeight == newHeight { return false }
+        if isLikelyTransientRotationSurfaceMeasure(
+            previousWidth: previousWidth,
+            previousHeight: previousHeight,
+            newWidth: newWidth,
+            newHeight: newHeight
+        ) {
+            return false
+        }
+        if isLikelyAspectFitWrapSurfaceMeasure(
+            surfaceWidth: newWidth,
+            surfaceHeight: newHeight,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight
+        ) {
+            return false
+        }
+        if tileWidth > 0, tileHeight > 0,
+           newWidth != tileWidth || newHeight != tileHeight {
+            return false
+        }
+        return true
+    }
+
+    /// Local PiP must not be a `VideoTrack` sink. Device3: camera 15 fps,
+    /// LocalPreview received 7 fps with 0 drops — the encoder VideoSource
+    /// adapter was starving the preview. Fan out from the capturer instead.
+    static var bindsLocalPreviewToVideoTrackSink: Bool { false }
+
+    static var fansOutLocalPreviewFromCapturerObserver: Bool { true }
+
+    /// Apple local preview is `AVCaptureVideoPreviewLayer` (hardware). Android
+    /// must not treat I420→TextureView EGL as that path: Device3 07:45 locked
+    /// Camera/LocalPreview at 30 fps / 0 drops and still looked skippy.
+    /// Requesting 15 locks Camera2 to `[15.0:15.0]` (Device3 06:11:09). 30
+    /// selects `[15.0:30.0]`; WebRTC prefers a low min (06:51: 17–26 fps).
+    /// First frame rewrites AE to `[30:30]`. Device3 09:49 proved a second
+    /// Camera2 output on the TextureView: 90°, undersized, still skippy.
+    /// Camera TextureBuffer fanout + shared-EGL is the local PiP path.
+    /// I420+EGL still skipped at 30/0/30 (Device3 13:16). Send encodings still
+    /// follow ``RTCVideoQualityProfile``.
+    static var androidLocalCameraCaptureFps: Int { 30 }
+
+    /// Local overlay fans TextureBuffer when softening is off. When Settings
+    /// softening is on, the worker delivers I420Softened to preview and send.
+    static var androidLocalPreviewFansOutBeforeAppearanceSoftening: Bool { true }
+
+    /// Device3 09:49: Camera2 → TextureView attached and looked worse.
+    static var androidLocalPreviewUsesCamera2OutputSurface: Bool { false }
+
+    /// WebRTC's closest-range picker will not choose `[30:30]` when `[15:30]`
+    /// exists. Lock AE after the Camera2 session is running.
+    static var androidLocksCamera2FixedCaptureFps: Bool { true }
+
+    /// Local PiP is a SurfaceView media overlay (Device3 16:20: TextureView
+    /// over the remote hole-punch still skipped at 30/0/30).
+    static var androidLocalPreviewTextureViewIsOpaque: Bool { true }
+
+    static var androidLocalPreviewUsesSurfaceViewOverlay: Bool { true }
+
+    /// Local PiP overlay. Ignore GeometryReader blips during rotation; apply on
+    /// orientation-class change or a real size jump.
+    static func shouldReplaceLocalPreviewOverlaySize(
+        currentWidth: Double,
+        currentHeight: Double,
+        proposedWidth: Double,
+        proposedHeight: Double,
+        minimumDelta: Double = 12
+    ) -> Bool {
+        if currentWidth <= 1 || currentHeight <= 1 { return proposedWidth > 1 && proposedHeight > 1 }
+        if proposedWidth <= 1 || proposedHeight <= 1 { return false }
+        let currentLandscape = currentWidth > currentHeight
+        let proposedLandscape = proposedWidth > proposedHeight
+        if currentLandscape != proposedLandscape { return true }
+        // Both overlay axes moving is a rotation intermediate (140×249 → 180×220).
+        // Apply only the orientation-class flip, not every GeometryReader blip.
+        if abs(currentWidth - proposedWidth) >= 0.5
+            && abs(currentHeight - proposedHeight) >= 0.5 {
+            return false
+        }
+        return abs(currentWidth - proposedWidth) >= minimumDelta
+            || abs(currentHeight - proposedHeight) >= minimumDelta
+    }
+
+    /// Attach / sink-reconcile must not tear EGL on the same dual-axis hop that
+    /// `surface_holder_rotation_skip` already declined. Device3 17:49: skip
+    /// 317→488 then `egl_reinit_with_track` in the same millisecond.
+    static func shouldAllowAttachDrivenEglReinit(
+        previousWidth: Int,
+        previousHeight: Int,
+        newWidth: Int,
+        newHeight: Int,
+        eglNeedsResync: Bool,
+        windowOrientationMatchesConfiguration: Bool,
+        tileWidth: Int,
+        tileHeight: Int,
+        lastRendererWidth: Int,
+        lastRendererHeight: Int
+    ) -> Bool {
+        guard eglNeedsResync else { return false }
+        if isLikelyTransientRotationSurfaceMeasure(
+            previousWidth: previousWidth,
+            previousHeight: previousHeight,
+            newWidth: newWidth,
+            newHeight: newHeight
+        ) {
+            return false
+        }
+        if isLikelyAspectFitWrapSurfaceMeasure(
+            surfaceWidth: newWidth,
+            surfaceHeight: newHeight,
+            tileWidth: tileWidth,
+            tileHeight: tileHeight
+        ) {
+            return false
+        }
+        if tileWidth > 0, tileHeight > 0,
+           newWidth != tileWidth || newHeight != tileHeight {
+            return false
+        }
+        return shouldReinitRendererEglAfterComposeLayoutSettled(
+            viewWidth: newWidth,
+            viewHeight: newHeight,
+            lastRendererWidth: lastRendererWidth,
+            lastRendererHeight: lastRendererHeight,
+            eglNeedsResync: true,
+            windowOrientationMatchesConfiguration: windowOrientationMatchesConfiguration
+        )
+    }
+
+    /// Compose-posted reinit after rotation. Holder/OnLayout must not reinit on
+    /// dual-axis transients; this runs once the window matches configuration and
+    /// OnLayout has already recorded the current tile size.
+    static func shouldReinitRendererEglAfterComposeLayoutSettled(
+        viewWidth: Int,
+        viewHeight: Int,
+        lastRendererWidth: Int,
+        lastRendererHeight: Int,
+        eglNeedsResync: Bool,
+        windowOrientationMatchesConfiguration: Bool
+    ) -> Bool {
+        guard eglNeedsResync else { return false }
+        guard viewWidth > 0, viewHeight > 0 else { return false }
+        guard windowOrientationMatchesConfiguration else { return false }
+        return viewWidth == lastRendererWidth && viewHeight == lastRendererHeight
     }
 
     /// Compose may briefly measure a pooled SurfaceView at fullscreen before tile constraints apply.

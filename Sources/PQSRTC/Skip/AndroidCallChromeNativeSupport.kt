@@ -122,6 +122,28 @@ object AndroidCallChromeNativeSupport {
         }
     }
 
+    /// Hangup must drop the full-screen hit layer and its global-layout listener even
+    /// when individual `pip`/`local` sessions were never attached (or Compose never
+    /// ran exclusion `onDispose`). Leaving either on `android.R.id.content` keeps
+    /// HWUI drawing after `showCallView=false` (`Davey!` / `Skipped N frames`).
+    fun detachAllForCallEnd() {
+        val sessionKeys = ArrayList(dragSessions.keys)
+        val exclusionKeys = ArrayList(controlExclusions.keys)
+        val hadHitLayer = hitLayer != null
+        for (key in sessionKeys) {
+            dragSessions.remove(key)?.detach()
+        }
+        activityTouchSession = null
+        controlExclusions.clear()
+        inAppPipTapHandler = null
+        removeHitLayer()
+        Log.i(
+            TAG,
+            "detached all call chrome overlays sessions=${sessionKeys.joinToString()} " +
+                "exclusions=${exclusionKeys.joinToString()} hitLayer=$hadHitLayer",
+        )
+    }
+
     /**
      * MainActivity calls this before normal dispatch. SurfaceView and Skip/Compose
      * cannot swallow a tile gesture before this owner sees it; non-tile touches

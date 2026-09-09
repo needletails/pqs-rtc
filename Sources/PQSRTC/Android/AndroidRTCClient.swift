@@ -22,202 +22,27 @@ import Collections
 import org.webrtc.__
 import kotlin.__
 
-// SKIP INSERT: // Subtle luma smoothing for outgoing camera frames ("soften appearance", Zoom-style).
-// SKIP INSERT: // Blur is weighted per pixel by a skin-tone likelihood computed from chroma (Cb/Cr
-// SKIP INSERT: // ellipse). Pure function of color: temporally stable, no segmentation flutter. Hair,
-// SKIP INSERT: // eyes, clothing, and background keep their sharpness.
-// SKIP INSERT: private class VideoAppearanceFrameSoftening {
-// SKIP INSERT:     private val blurWeight = 45
-// SKIP INSERT:     private var luma = ByteArray(0)
-// SKIP INSERT:     private var blurTmp = ByteArray(0)
-// SKIP INSERT:     private var rowBuf = ByteArray(0)
-// SKIP INSERT:     private var chromaU = ByteArray(0)
-// SKIP INSERT:     private var chromaV = ByteArray(0)
-// SKIP INSERT:     private var skinWeight = ByteArray(0)
-// SKIP INSERT:     // Returns a new frame whose buffer the caller must release after delivery, or null on failure.
-// SKIP INSERT:     fun soften(frame: org.webrtc.VideoFrame): org.webrtc.VideoFrame? {
-// SKIP INSERT:         val src = frame.buffer.toI420() ?: return null
-// SKIP INSERT:         val w = src.width
-// SKIP INSERT:         val h = src.height
-// SKIP INSERT:         val cw = (w + 1) / 2
-// SKIP INSERT:         val ch = (h + 1) / 2
-// SKIP INSERT:         val dst = org.webrtc.JavaI420Buffer.allocate(w, h)
-// SKIP INSERT:         computeSkinWeights(src.dataU, src.strideU, src.dataV, src.strideV, cw, ch)
-// SKIP INSERT:         softenYPlane(src.dataY, src.strideY, dst.dataY, dst.strideY, w, h, cw)
-// SKIP INSERT:         copyPlane(src.dataU, src.strideU, dst.dataU, dst.strideU, cw, ch)
-// SKIP INSERT:         copyPlane(src.dataV, src.strideV, dst.dataV, dst.strideV, cw, ch)
-// SKIP INSERT:         src.release()
-// SKIP INSERT:         return org.webrtc.VideoFrame(dst, frame.rotation, frame.timestampNs)
-// SKIP INSERT:     }
-// SKIP INSERT:     // One weight per chroma sample (2x2 luma block), 0..blurWeight. Skin chroma ellipse:
-// SKIP INSERT:     // Cb ~102±25, Cr ~153±20; soft falloff between core (dist<=0.7) and edge (dist>=1.6).
-// SKIP INSERT:     private fun computeSkinWeights(
-// SKIP INSERT:         u: java.nio.ByteBuffer,
-// SKIP INSERT:         uStride: Int,
-// SKIP INSERT:         v: java.nio.ByteBuffer,
-// SKIP INSERT:         vStride: Int,
-// SKIP INSERT:         cw: Int,
-// SKIP INSERT:         ch: Int
-// SKIP INSERT:     ) {
-// SKIP INSERT:         val n = cw * ch
-// SKIP INSERT:         if (chromaU.size < n) {
-// SKIP INSERT:             chromaU = ByteArray(n)
-// SKIP INSERT:             chromaV = ByteArray(n)
-// SKIP INSERT:             skinWeight = ByteArray(n)
-// SKIP INSERT:         }
-// SKIP INSERT:         val us = u.duplicate()
-// SKIP INSERT:         val vs = v.duplicate()
-// SKIP INSERT:         for (row in 0 until ch) {
-// SKIP INSERT:             us.position(row * uStride)
-// SKIP INSERT:             us.get(chromaU, row * cw, cw)
-// SKIP INSERT:             vs.position(row * vStride)
-// SKIP INSERT:             vs.get(chromaV, row * cw, cw)
-// SKIP INSERT:         }
-// SKIP INSERT:         for (i in 0 until n) {
-// SKIP INSERT:             val cb = chromaU[i].toInt() and 0xFF
-// SKIP INSERT:             val cr = chromaV[i].toInt() and 0xFF
-// SKIP INSERT:             val dcb = cb - 102
-// SKIP INSERT:             val dcr = cr - 153
-// SKIP INSERT:             // Ellipse distance scaled x100 (100 == boundary); integer math only.
-// SKIP INSERT:             val dist = (dcb * dcb * 100) / 625 + (dcr * dcr * 100) / 400
-// SKIP INSERT:             val wgt = when {
-// SKIP INSERT:                 dist >= 160 -> 0
-// SKIP INSERT:                 dist <= 70 -> blurWeight
-// SKIP INSERT:                 else -> (blurWeight * (160 - dist)) / 90
-// SKIP INSERT:             }
-// SKIP INSERT:             skinWeight[i] = wgt.toByte()
-// SKIP INSERT:         }
-// SKIP INSERT:     }
-// SKIP INSERT:     private fun copyPlane(
-// SKIP INSERT:         src: java.nio.ByteBuffer,
-// SKIP INSERT:         srcStride: Int,
-// SKIP INSERT:         dst: java.nio.ByteBuffer,
-// SKIP INSERT:         dstStride: Int,
-// SKIP INSERT:         width: Int,
-// SKIP INSERT:         height: Int
-// SKIP INSERT:     ) {
-// SKIP INSERT:         val s = src.duplicate()
-// SKIP INSERT:         val d = dst.duplicate()
-// SKIP INSERT:         if (rowBuf.size < width) { rowBuf = ByteArray(width) }
-// SKIP INSERT:         for (row in 0 until height) {
-// SKIP INSERT:             s.position(row * srcStride)
-// SKIP INSERT:             s.get(rowBuf, 0, width)
-// SKIP INSERT:             d.position(row * dstStride)
-// SKIP INSERT:             d.put(rowBuf, 0, width)
-// SKIP INSERT:         }
-// SKIP INSERT:     }
-// SKIP INSERT:     private fun softenYPlane(
-// SKIP INSERT:         src: java.nio.ByteBuffer,
-// SKIP INSERT:         srcStride: Int,
-// SKIP INSERT:         dst: java.nio.ByteBuffer,
-// SKIP INSERT:         dstStride: Int,
-// SKIP INSERT:         width: Int,
-// SKIP INSERT:         height: Int,
-// SKIP INSERT:         chromaWidth: Int
-// SKIP INSERT:     ) {
-// SKIP INSERT:         val n = width * height
-// SKIP INSERT:         if (luma.size < n) {
-// SKIP INSERT:             luma = ByteArray(n)
-// SKIP INSERT:             blurTmp = ByteArray(n)
-// SKIP INSERT:         }
-// SKIP INSERT:         val s = src.duplicate()
-// SKIP INSERT:         for (row in 0 until height) {
-// SKIP INSERT:             s.position(row * srcStride)
-// SKIP INSERT:             s.get(luma, row * width, width)
-// SKIP INSERT:         }
-// SKIP INSERT:         // Horizontal 5-tap pass: luma -> blurTmp
-// SKIP INSERT:         for (row in 0 until height) {
-// SKIP INSERT:             val base = row * width
-// SKIP INSERT:             for (x in 0 until width) {
-// SKIP INSERT:                 var sum = 0
-// SKIP INSERT:                 for (dx in -2..2) {
-// SKIP INSERT:                     var nx = x + dx
-// SKIP INSERT:                     if (nx < 0) nx = 0
-// SKIP INSERT:                     if (nx > width - 1) nx = width - 1
-// SKIP INSERT:                     sum += luma[base + nx].toInt() and 0xFF
-// SKIP INSERT:                 }
-// SKIP INSERT:                 blurTmp[base + x] = (sum / 5).toByte()
-// SKIP INSERT:             }
-// SKIP INSERT:         }
-// SKIP INSERT:         // Vertical 5-tap pass + skin-weighted blend, written back into luma in place.
-// SKIP INSERT:         // Safe: each pixel's original value is read before being overwritten, and the
-// SKIP INSERT:         // vertical pass only reads neighbors from blurTmp.
-// SKIP INSERT:         for (row in 0 until height) {
-// SKIP INSERT:             val base = row * width
-// SKIP INSERT:             val chromaRowBase = (row / 2) * chromaWidth
-// SKIP INSERT:             for (x in 0 until width) {
-// SKIP INSERT:                 val mask = skinWeight[chromaRowBase + (x / 2)].toInt()
-// SKIP INSERT:                 if (mask <= 0) { continue }
-// SKIP INSERT:                 var sum = 0
-// SKIP INSERT:                 for (dy in -2..2) {
-// SKIP INSERT:                     var ny = row + dy
-// SKIP INSERT:                     if (ny < 0) ny = 0
-// SKIP INSERT:                     if (ny > height - 1) ny = height - 1
-// SKIP INSERT:                     sum += blurTmp[ny * width + x].toInt() and 0xFF
-// SKIP INSERT:                 }
-// SKIP INSERT:                 val blurred = sum / 5
-// SKIP INSERT:                 val original = luma[base + x].toInt() and 0xFF
-// SKIP INSERT:                 luma[base + x] = ((original * (100 - mask) + blurred * mask) / 100).toByte()
-// SKIP INSERT:             }
-// SKIP INSERT:         }
-// SKIP INSERT:         val d = dst.duplicate()
-// SKIP INSERT:         for (row in 0 until height) {
-// SKIP INSERT:             d.position(row * dstStride)
-// SKIP INSERT:             d.put(luma, row * width, width)
-// SKIP INSERT:         }
-// SKIP INSERT:     }
-// SKIP INSERT: }
-// SKIP INSERT: // Capturer observer that normalizes orientation (rotation=0) without resizing.
-// SKIP INSERT: // Appearance softening reads a cached Kotlin preference snapshot (not per-frame Swift).
+// SKIP INSERT: // Local overlay is a SurfaceView + GL rounded-rect corners.
+// SKIP INSERT: // TextureBuffer when softening is off; worker I420Softened when on.
 // SKIP INSERT: class CapturerObserverProxy(
 // SKIP INSERT:     private val downstream: org.webrtc.CapturerObserver,
 // SKIP INSERT:     private val normalizeToUpright: Boolean = true,
-// SKIP INSERT:     private val allowAppearanceSoftening: Boolean = true
+// SKIP INSERT:     private val allowAppearanceSoftening: Boolean = true,
+// SKIP INSERT:     private val fanOutLocalPreview: Boolean = false
 // SKIP INSERT: ) : org.webrtc.CapturerObserver {
-// SKIP INSERT:     private val softening = VideoAppearanceFrameSoftening()
 // SKIP INSERT:     override fun onCapturerStarted(success: Boolean) = downstream.onCapturerStarted(success)
-// SKIP INSERT:     override fun onCapturerStopped() = downstream.onCapturerStopped()
-// SKIP INSERT:     private fun deliverFrame(frame: org.webrtc.VideoFrame) {
-// SKIP INSERT:         if (!allowAppearanceSoftening || !AndroidCaptureUIPreferenceCache.isVideoAppearanceSofteningEnabled()) {
-// SKIP INSERT:             downstream.onFrameCaptured(frame)
-// SKIP INSERT:             return
-// SKIP INSERT:         }
-// SKIP INSERT:         val softened = softening.soften(frame)
-// SKIP INSERT:         if (softened == null) {
-// SKIP INSERT:             downstream.onFrameCaptured(frame)
-// SKIP INSERT:             return
-// SKIP INSERT:         }
-// SKIP INSERT:         downstream.onFrameCaptured(softened)
-// SKIP INSERT:         softened.release()
+// SKIP INSERT:     override fun onCapturerStopped() {
+// SKIP INSERT:         CameraCaptureFrameRouter.stop()
+// SKIP INSERT:         downstream.onCapturerStopped()
 // SKIP INSERT:     }
 // SKIP INSERT:     override fun onFrameCaptured(frame: org.webrtc.VideoFrame) {
-// SKIP INSERT:         val rot = frame.rotation
-// SKIP INSERT:         if (!normalizeToUpright || rot == 0) {
-// SKIP INSERT:             deliverFrame(frame)
-// SKIP INSERT:             return
-// SKIP INSERT:         }
-// SKIP INSERT:         val src = frame.buffer.toI420() ?: run {
-// SKIP INSERT:             deliverFrame(frame); return
-// SKIP INSERT:         }
-// SKIP INSERT:         val w = src.width
-// SKIP INSERT:         val h = src.height
-// SKIP INSERT:         val outW = if (rot == 90 || rot == 270) h else w
-// SKIP INSERT:         val outH = if (rot == 90 || rot == 270) w else h
-// SKIP INSERT:         val dst = org.webrtc.JavaI420Buffer.allocate(outW, outH)
-// SKIP INSERT:         org.webrtc.YuvHelper.I420Rotate(
-// SKIP INSERT:             src.dataY, src.strideY,
-// SKIP INSERT:             src.dataU, src.strideU,
-// SKIP INSERT:             src.dataV, src.strideV,
-// SKIP INSERT:             dst.dataY, dst.strideY,
-// SKIP INSERT:             dst.dataU, dst.strideU,
-// SKIP INSERT:             dst.dataV, dst.strideV,
-// SKIP INSERT:             w, h, rot // rotate pixels to upright
+// SKIP INSERT:         CameraCaptureFrameRouter.deliver(
+// SKIP INSERT:             frame,
+// SKIP INSERT:             normalizeToUpright,
+// SKIP INSERT:             allowAppearanceSoftening,
+// SKIP INSERT:             fanOutLocalPreview,
+// SKIP INSERT:             downstream
 // SKIP INSERT:         )
-// SKIP INSERT:         src.release()
-// SKIP INSERT:         val rotatedFrame = org.webrtc.VideoFrame(dst, /*rotation*/ 0, frame.timestampNs)
-//android.util.Log.d("NeedleTailRTC", "SEND VideoPacket w=${rotatedFrame.buffer.width} h=${rotatedFrame.buffer.height} rot=${rotatedFrame.rotation} ts=${frame.timestampNs}")
-// SKIP INSERT:         deliverFrame(rotatedFrame)
-// SKIP INSERT:         dst.release() // creator-owned ref; downstream retains internally during onFrameCaptured
 // SKIP INSERT:     }
 // SKIP INSERT: }
 
@@ -1496,11 +1321,22 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       return null
         // SKIP INSERT:     }
         // SKIP INSERT:     
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "Creating EGL base")
-        // SKIP INSERT:     val egl = org.webrtc.EglBase.create() ?: run {
-        // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "Failed to create EGL base")
-        // SKIP INSERT:       this@AndroidRTCClient.initializationFailed = true
-        // SKIP INSERT:       return null
+        // SKIP INSERT:     // One EglBase per client. Renderers initialized via ensureEglBase before
+        // SKIP INSERT:     // the factory exists (local PiP at call-view mount) share *that* root
+        // SKIP INSERT:     // context. Creating a second one here put the camera SurfaceTextureHelper
+        // SKIP INSERT:     // in a different share group: Device3 15:38 LocalPreview 120/0/120 at 30
+        // SKIP INSERT:     // with buffer=TextureBuffer and a black PiP.
+        // SKIP INSERT:     val existingEgl = this@AndroidRTCClient.eglBase
+        // SKIP INSERT:     val egl = if (existingEgl != null) {
+        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "Reusing EGL base for PeerConnectionFactory")
+        // SKIP INSERT:       existingEgl
+        // SKIP INSERT:     } else {
+        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "Creating EGL base")
+        // SKIP INSERT:       org.webrtc.EglBase.create() ?: run {
+        // SKIP INSERT:         android.util.Log.e("AndroidRTCClient", "Failed to create EGL base")
+        // SKIP INSERT:         this@AndroidRTCClient.initializationFailed = true
+        // SKIP INSERT:         return null
+        // SKIP INSERT:       }
         // SKIP INSERT:     }
         // SKIP INSERT:     this@AndroidRTCClient.eglBase = egl
         // SKIP INSERT:
@@ -1901,7 +1737,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
         let orientedObserver = CapturerObserverProxy(
             downstream: rawDownstream,
             normalizeToUpright: true,
-            allowAppearanceSoftening: false)
+            allowAppearanceSoftening: false,
+            fanOutLocalPreview: false)
 
         // SKIP INSERT: val intentData = AndroidMediaProjectionResultHolder.consume()
         // SKIP INSERT:     ?: throw IllegalStateException("MediaProjection consent intent not available; launch the consent flow before starting screen share")
@@ -2255,7 +2092,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Creating a sender track is cheap and needed for SDP. Starting Camera2 is not: on Android it
     /// competes with Firebase broadcast handling, EglRenderer, audio, and encrypted signaling during
     /// the fragile `connecting` window.
-    public func startLocalVideoCaptureIfNeeded(fps: Int = 15, useFrontCamera: Bool = true) {
+    public func startLocalVideoCaptureIfNeeded(useFrontCamera: Bool = true) {
         // `track.enabled()` is a proxied WebRTC call; read it outside the lock (see
         // setScreenVideoEnabled for the deadlock this avoids).
         lock.lock()
@@ -2283,7 +2120,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
             guard let self else { return }
             defer { self.markLocalVideoCaptureStartFinished() }
             do {
-                try self.startLocalVideo(fps: fps, useFrontCamera: useFrontCamera)
+                try self.startLocalVideo(useFrontCamera: useFrontCamera)
                 // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Deferred local video capture started")
             } catch {
                 // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Failed to start deferred local video capture")
@@ -2307,11 +2144,14 @@ public final class AndroidRTCClient: @unchecked Sendable {
     
     /// Starts camera capture and feeds frames into the current local video source.
     ///
+    /// Camera2 fps is owned by `AndroidRTCViewSupport.startLocalCameraCapture`
+    /// (`LOCAL_CAMERA_CAPTURE_FPS`). A Swift `fps:` default does not reach the
+    /// device — callers bake the old 15 at the call site (Device3 06:11:09).
+    ///
     /// - Parameters:
-    ///   - fps: Target capture framerate.
     ///   - useFrontCamera: Whether to prefer the front-facing camera.
     /// - Throws: `RTCClientErrors` if capture cannot be started.
-    private func startLocalVideo(fps: Int = 15, useFrontCamera: Bool = true) throws {
+    private func startLocalVideo(useFrontCamera: Bool = true) throws {
         let existingVideoSource: RTCVideoSource
         let staleHelper: org.webrtc.SurfaceTextureHelper?
 
@@ -2386,11 +2226,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
         let capturer = org.webrtc.Camera2Capturer(ctx, cameraName, events)
 
         let downstream = existingVideoSource.platformSource.getCapturerObserver()
-        /* Camera only: softening reads the cached prefs; screen share passes allowAppearanceSoftening=false. */
+        /* Camera only: softening follows Settings via the cached prefs; screen share passes allowAppearanceSoftening=false. */
         // SKIP INSERT: AndroidCaptureUIPreferenceCache.refreshFromStoredPreferences()
         let proxy = CapturerObserverProxy(
             downstream: downstream,
-            normalizeToUpright: true)
+            normalizeToUpright: true,
+            fanOutLocalPreview: true)
         // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Initializing camera capturer")
         capturer.initialize(helper, ctx, proxy)
 
@@ -2416,11 +2257,17 @@ public final class AndroidRTCClient: @unchecked Sendable {
         if let selectedLandscape = selectableCandidates
             .filter({ $0.isLandscape })
             .max(by: { $0.width * $0.height < $1.width * $1.height }) {
-            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting camera capture: " + selectedLandscape.width + "x" + selectedLandscape.height + "@" + fps + "fps")
-            capturer.startCapture(Int32(selectedLandscape.width), Int32(selectedLandscape.height), Int32(fps))
+            AndroidRTCViewSupport.startLocalCameraCapture(
+                capturer: capturer,
+                width: Int32(selectedLandscape.width),
+                height: Int32(selectedLandscape.height)
+            )
         } else if let selectedPortrait = selectableCandidates.max(by: { $0.width * $0.height < $1.width * $1.height }) {
-            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting camera capture: " + selectedPortrait.width + "x" + selectedPortrait.height + "@" + fps + "fps")
-            capturer.startCapture(Int32(selectedPortrait.width), Int32(selectedPortrait.height), Int32(fps))
+            AndroidRTCViewSupport.startLocalCameraCapture(
+                capturer: capturer,
+                width: Int32(selectedPortrait.width),
+                height: Int32(selectedPortrait.height)
+            )
         } else {
             throw RTCClientErrors.peerConnectionError("No suitable video format found")
         }
@@ -2463,6 +2310,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
         capturerToStop?.stopCapture()
         helperToDispose?.dispose()
+        AndroidRTCViewSupport.clearOpenedCameraCapturer()
     }
     
     /// Ensures a local video track exists, creating a source/track if needed.
@@ -2494,7 +2342,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     override fun onCameraDisconnected() {}
         // SKIP INSERT:     override fun onCameraFreezed(error: String) {}
         // SKIP INSERT:     override fun onCameraOpening(cameraName: String) {}
-        // SKIP INSERT:     override fun onFirstFrameAvailable() {}
+        // SKIP INSERT:     override fun onFirstFrameAvailable() {
+        // SKIP INSERT:         AndroidRTCViewSupport.lockOpenedCamera2ToFixedFpsIfNeeded()
+        // SKIP INSERT:     }
         // SKIP INSERT:     override fun onCameraClosed() {}
         // SKIP INSERT: }
     }
@@ -3069,6 +2919,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Unlike ``close()``, this keeps the factory, EGL base, frame-key provider, and process-global
     /// WebRTC initialization alive. Calling `close()` here makes `initializeFactory` fail forever on
     /// the same `AndroidRTCClient`, which turns an ICE retry into a native bridge crash.
+    ///
+    /// Hangup must also call ``resetFrameKeyProviderForHangup()``. ICE retry must not: mid-call
+    /// recreation has to keep the live FrameCryptor key ring.
     public func resetPeerConnectionForRetry() {
         let videoCapturerToStop: org.webrtc.Camera2Capturer?
         let screenCapturerToStop: org.webrtc.VideoCapturer?
@@ -3134,6 +2987,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         videoCapturerToStop?.stopCapture()
         // SKIP INSERT: (screenCapturerToStop as? org.webrtc.ScreenCapturerAndroid)?.stopCapture()
         // SKIP INSERT: (screenCapturerToStop as? org.webrtc.ScreenCapturerAndroid)?.dispose()
+        AndroidRTCViewSupport.clearOpenedCameraCapturer()
 
         surfaceTextureHelperToDispose?.dispose()
         screenSurfaceTextureHelperToDispose?.dispose()
@@ -3148,6 +3002,27 @@ public final class AndroidRTCClient: @unchecked Sendable {
         videoSourceToDispose?.dispose()
         screenVideoSourceToDispose?.dispose()
         audioSourceToDispose?.dispose()
+    }
+
+    /// Drops the leftover FrameCryptor key ring after hangup without closing this client.
+    ///
+    /// `resetPeerConnectionForRetry()` keeps the provider so ICE fallback can recreate the
+    /// PeerConnection mid-call. A later call on the same process would then `setKey(..., index: 0)`
+    /// on leftover native ratchet state (Device3 18:02: same pid, new call, same room). Apple hangup
+    /// already nils `keyProvider`; Android must do the same without `close()`.
+    public func resetFrameKeyProviderForHangup() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { return }
+
+        frameCryptorSupport.clearKeyProvider()
+        keyProvider = nil
+        keyProviderIsSharedKeyMode = nil
+        keyProviderReady = false
+        pendingPerParticipantKeys.removeAll()
+        pendingSharedKey = nil
+        pendingSharedKeyIndex = nil
+        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "🔐 Reset FrameCryptorKeyProvider after hangup; next call will create a fresh provider")
     }
     
     /// Closes the peer connection and releases all WebRTC resources owned by this client.
@@ -3234,6 +3109,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         videoCapturerToStop?.stopCapture()
         // SKIP INSERT: (screenCapturerToStop as? org.webrtc.ScreenCapturerAndroid)?.stopCapture()
         // SKIP INSERT: (screenCapturerToStop as? org.webrtc.ScreenCapturerAndroid)?.dispose()
+        AndroidRTCViewSupport.clearOpenedCameraCapturer()
 
         surfaceTextureHelperToDispose?.dispose()
         screenSurfaceTextureHelperToDispose?.dispose()

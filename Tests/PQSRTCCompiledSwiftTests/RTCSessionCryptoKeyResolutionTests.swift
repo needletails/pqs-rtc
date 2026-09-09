@@ -660,6 +660,38 @@ struct RTCSessionCryptoKeyResolutionTests {
         ) == false)
     }
 
+    @Test("audio receiver cryptor reuse follows stable track id across wrapper rotation")
+    func audioReceiverCryptorReuseFollowsStableTrackIdAcrossWrapperRotation() {
+        #expect(RTCSession.shouldReuseAudioReceiverFrameCryptorByStableTrack(
+            existingTrackId: "74697943-38bb-40ae-8d72-ceca4e1eefb3",
+            newTrackId: "74697943-38bb-40ae-8d72-ceca4e1eefb3"
+        ))
+        #expect(RTCSession.shouldReuseAudioReceiverFrameCryptorByStableTrack(
+            existingTrackId: "74697943-38bb-40ae-8d72-ceca4e1eefb3",
+            newTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00"
+        ) == false)
+        #expect(RTCSession.shouldReuseAudioReceiverFrameCryptorByStableTrack(
+            existingTrackId: "",
+            newTrackId: "74697943-38bb-40ae-8d72-ceca4e1eefb3"
+        ) == false)
+    }
+
+    @Test("Apple SFU audio mapping upgrades only when the advertised track id changes")
+    func appleSfuAudioMappingUpgradesOnlyWhenAdvertisedTrackIdChanges() {
+        #expect(RTCSession.shouldUpgradeAppleSfuAudioMapping(
+            existingTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            advertisedTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00"
+        ) == false)
+        #expect(RTCSession.shouldUpgradeAppleSfuAudioMapping(
+            existingTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            advertisedTrackId: "26097448-afd9-4205-b106-7af246744be5"
+        ))
+        #expect(RTCSession.shouldUpgradeAppleSfuAudioMapping(
+            existingTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            advertisedTrackId: ""
+        ) == false)
+    }
+
     @Test("renderer recovery skips advancing ingress and attempts true decode stalls")
     func inboundRemoteVideoRendererRecoveryPolicy() {
         let advancing = RTCSession.InboundVideoFlowCheck(

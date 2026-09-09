@@ -2069,8 +2069,13 @@ public final class VideoCallViewController: UICollectionViewController {
         }
         if hadVisibleScreenShare != hasVisibleScreenShare {
             collectionView.collectionViewLayout.invalidateLayout()
+            // Screen-share start/stop needs a sync layout so leftover camera
+            // frames are correct. Adding a remote camera tile must not force
+            // layoutIfNeeded — that hitch freezes the local overlay.
+            collectionView.layoutIfNeeded()
+        } else {
+            collectionView.setNeedsLayout()
         }
-        collectionView.layoutIfNeeded()
         await refreshMountedVideoRendererBounds()
         if hadVisibleScreenShare != hasVisibleScreenShare {
             scheduleScreenShareLayoutTransitionHeal(
@@ -2764,6 +2769,43 @@ public final class VideoCallViewController: UICollectionViewController {
                     )
                 }
 
+                await self.session.refreshUnansweredGroupMediaReadyIfNeeded(
+                    connectionId: normalizedConnectionId,
+                    participantId: trimmedParticipantId,
+                    inboundFlowIsAdvancing: GroupParticipantInboundAdvancingPolicy.isSourceInboundAdvancing(
+                        connectionInboundIsAdvancing: inboundFlow?.state == .advancingIngress,
+                        mappedRendererCallbackAgeMs: callbackAgeMs
+                    )
+                )
+
+                if NeverAttachedCameraSinkRefreshPolicy.shouldRefreshRemoteCameraSink(
+                    inboundFlowIsAdvancing: inboundFlow?.state == .advancingIngress,
+                    hasAnyCallbacks: hasAnyCallbacks,
+                    callbackAgeMs: callbackAgeMs,
+                    expectationAgeMs: expectationAgeMs
+                ) {
+                    self.logger.log(
+                        level: .warning,
+                        message: "iOS never-attached camera sink refresh after advancing ingress participant=\(trimmedParticipantId) connectionId=\(normalizedConnectionId)"
+                    )
+                    self.lastParticipantRendererRecoveryUptimeNsByKey[key] = now
+                    await self.session.refreshNeverAttachedParticipantCameraSinkIfNeeded(
+                        connectionId: normalizedConnectionId,
+                        participantId: trimmedParticipantId
+                    )
+                    await renderer.startStream()
+                    let didAttach = await self.session.renderRemoteVideoForParticipant(
+                        to: renderer.rtcVideoRenderWrapper,
+                        connectionId: normalizedConnectionId,
+                        participantId: trimmedParticipantId,
+                        forceParticipantRendererRebind: true
+                    )
+                    if didAttach {
+                        await renderer.setRemoteVideoInboundExpected(true)
+                    }
+                    continue
+                }
+
                 let shouldRecoverRenderer = RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
                     inboundFlow: inboundFlow,
                     callbackAgeMs: callbackAgeMs,
@@ -2777,6 +2819,14 @@ public final class VideoCallViewController: UICollectionViewController {
                     self.logger.log(
                         level: .warning,
                         message: "iOS participant camera recovery skipped: inbound counters not advancing enough; participant=\(trimmedParticipantId) likelyCause=\(inboundFlow?.likelyCause ?? "unknown") connectionId=\(normalizedConnectionId)"
+                    )
+                    await self.session.refreshUnansweredGroupMediaReadyIfNeeded(
+                        connectionId: normalizedConnectionId,
+                        participantId: trimmedParticipantId,
+                        inboundFlowIsAdvancing: GroupParticipantInboundAdvancingPolicy.isSourceInboundAdvancing(
+                            connectionInboundIsAdvancing: inboundFlow?.state == .advancingIngress,
+                            mappedRendererCallbackAgeMs: callbackAgeMs
+                        )
                     )
                     continue
                 }

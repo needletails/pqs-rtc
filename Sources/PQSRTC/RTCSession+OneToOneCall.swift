@@ -63,6 +63,7 @@ extension RTCSession {
     }
     
     public func setupCallState(_ call: Call) async throws {
+        await waitForCallTeardownIfNeeded()
         resetAttemptFlagsForNewCall(connectionId: call.sharedCommunicationId)
         try await createStateStream(with: call)
     }

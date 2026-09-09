@@ -63,6 +63,12 @@ actor TaskProcessor {
     private var outboundSenderTask: Task<Void, Never>?
     /// Terminal: set when this crypto-stack generation is retired; the lane never restarts.
     private var isOutboundLaneShutdown = false
+    /// Tokens registered before `feedTask` so a waiter can bind to the next encrypt of that flag.
+    private var pendingOutboundWaitTokensByFlag: [String: [UUID]] = [:]
+    /// Encrypt/send UUID → waiter token (set at enqueue).
+    private var outboundSendWaitTokenBySendId: [UUID: UUID] = [:]
+    private var outboundSendWaiters: [UUID: [CheckedContinuation<Void, Error>]] = [:]
+    private var outboundSendResults: [UUID: Result<Void, Error>] = [:]
     
     /// Ratchet messages already successfully applied for `.handshakeComplete` (per connection).
     private var processedPostCipherHandshakes: Set<ProcessedPostCipherHandshakeKey> = []
@@ -96,7 +102,7 @@ actor TaskProcessor {
     }
     
     enum Errors: Error {
-        case cacheNotFound, invalidType, invalidSender
+        case cacheNotFound, invalidType, invalidSender, outboundSendDropped
     }
     
     var jobs: [Job] = []
@@ -114,6 +120,10 @@ actor TaskProcessor {
         guard !normalized.isEmpty else { return }
 
         let beforeCached = jobs.count
+        let droppedJobs = jobs.filter { $0.referencesConnectionId(normalized) }
+        for job in droppedJobs {
+            failUnboundOutboundWait(for: job, error: Errors.outboundSendDropped)
+        }
         jobs.removeAll { job in
             job.referencesConnectionId(normalized)
         }
@@ -124,20 +134,22 @@ actor TaskProcessor {
             processedPostCipherHandshakes.filter { $0.connectionId != normalized }
         )
 
-        let beforeSends = outboundSends.count
+        let removedSends = outboundSends.filter { $0.task.referencesConnectionId(normalized) }
         outboundSends.removeAll { $0.task.referencesConnectionId(normalized) }
-        let removedSends = beforeSends - outboundSends.count
-        if removedSends > 0 {
+        for send in removedSends {
+            finishOutboundSend(id: send.id, result: .failure(Errors.outboundSendDropped), alreadyRemoved: true)
+        }
+        if !removedSends.isEmpty {
             // The in-flight send may belong to this (now torn down) connection and could be
             // parked on a dead transport gate forever, holding the lane hostage. Cancel it;
             // the drain task's defer restarts a fresh lane for any surviving sends.
             outboundSenderTask?.cancel()
         }
 
-        if removedCached > 0 || removedQueued > 0 || removedSends > 0 {
+        if removedCached > 0 || removedQueued > 0 || !removedSends.isEmpty {
             logger.log(
                 level: .debug,
-                message: "Dropped stale task-processor jobs for connectionId=\(normalized) cached=\(removedCached) queued=\(removedQueued) outboundSends=\(removedSends)"
+                message: "Dropped stale task-processor jobs for connectionId=\(normalized) cached=\(removedCached) queued=\(removedQueued) outboundSends=\(removedSends.count)"
             )
         }
     }
@@ -146,8 +158,41 @@ actor TaskProcessor {
     /// is retired; queued sends are stale by definition and the lane never restarts.
     func shutdownOutboundLane() {
         isOutboundLaneShutdown = true
+        let pending = outboundSends
         outboundSends.removeAll()
+        for send in pending {
+            finishOutboundSend(id: send.id, result: .failure(Errors.outboundSendDropped), alreadyRemoved: true)
+        }
+        failAllUnboundOutboundWaits(error: Errors.outboundSendDropped)
         outboundSenderTask?.cancel()
+    }
+
+    /// Register before `feedTask` so the waiter binds to this encrypt even if the crypto
+    /// job is still queued when `feedTask` returns.
+    func beginOutboundSendWait(matching flag: PacketFlag) -> UUID {
+        let token = UUID()
+        pendingOutboundWaitTokensByFlag[outboundWaitFlagKey(flag), default: []].append(token)
+        return token
+    }
+
+    func waitForOutboundSendCompletion(id: UUID) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            if let result = outboundSendResults.removeValue(forKey: id) {
+                continuation.resume(with: result)
+            } else {
+                outboundSendWaiters[id, default: []].append(continuation)
+            }
+        }
+    }
+
+    func cancelOutboundSendWait(id: UUID) {
+        finishOutboundWait(token: id, result: .failure(Errors.outboundSendDropped))
+        for (flagKey, tokens) in pendingOutboundWaitTokensByFlag {
+            pendingOutboundWaitTokensByFlag[flagKey] = tokens.filter { $0 != id }
+        }
+        if let sendId = outboundSendWaitTokenBySendId.first(where: { $0.value == id })?.key {
+            outboundSendWaitTokenBySendId.removeValue(forKey: sendId)
+        }
     }
 
     // MARK: - Public API
@@ -218,10 +263,59 @@ actor TaskProcessor {
     // MARK: - Core loop
 
     private static let maxPausedRetries = 8
-    /// Essential `.offer`/`.answer` survive brief SFU `channel_inactive` / writer recycle.
-    /// Writer-not-ready uses the same bound; transport-down retries are offer/answer only.
+    /// Essential `.offer`/`.answer`/`.mediaReady` survive brief SFU `channel_inactive` / writer recycle.
+    /// Writer-not-ready uses the same bound; transport-down retries are essential flags only.
     private static let maxOutboundTransportRetries = 24
     private static let pausedRetryIntervalNs: UInt64 = 250_000_000 // 250ms
+
+    /// SDP and source-scoped `mediaReady` must survive a brief SFU writer recycle.
+    /// Candidates are opportunistic; dropping one does not block forwarding.
+    static func isEssentialOutboundSignalingFlag(_ flag: PacketFlag) -> Bool {
+        switch flag {
+        case .offer, .answer, .mediaReady:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Send lane stays in encrypt order. Jumping `mediaReady`/`answer` ahead of
+    /// already-encrypted candidates makes the SFU skip ratchet headers and fail
+    /// later decrypts with `maxSkippedHeadersExceeded`.
+    static func outboundSendInsertIndex(
+        existingFlags: [PacketFlag],
+        incomingFlag: PacketFlag
+    ) -> Int {
+        _ = incomingFlag
+        return existingFlags.count
+    }
+
+    /// Offer/answer only. `.mediaReady` is not an ICE gate.
+    static func isPendingOfferOrAnswerFlag(_ flag: PacketFlag) -> Bool {
+        switch flag {
+        case .offer, .answer:
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func hasPendingOfferOrAnswer(flags: [PacketFlag]) -> Bool {
+        flags.contains(where: isPendingOfferOrAnswerFlag)
+    }
+
+    /// Queued encrypt jobs plus fed-but-unsent packets. `.mediaReady` is ignored.
+    func hasPendingOfferOrAnswerOutbound() -> Bool {
+        if outboundSends.contains(where: { Self.isPendingOfferOrAnswerFlag($0.packet.flag) }) {
+            return true
+        }
+        return jobs.contains { job in
+            if case .writeMessage(let write) = job.task {
+                return Self.isPendingOfferOrAnswerFlag(write.flag)
+            }
+            return false
+        }
+    }
 
     /// Whether an outbound send failure should stay queued for another transport attempt.
     static func shouldRetryOutboundTransportSend(
@@ -233,9 +327,9 @@ actor TaskProcessor {
     ) -> Bool {
         guard attempt < maxAttempts else { return false }
         if isWriterNotReady { return true }
-        // Renegotiation answers encrypted just as SFU recycled were dropped after one
-        // failure — SFU never activated forwarding (one-way / missing remote video).
-        if (flag == .offer || flag == .answer), isTransientTransportFailure {
+        // Renegotiation answers and source-scoped mediaReady encrypted just as SFU
+        // recycled were dropped after one failure — SFU never activated forwarding.
+        if isEssentialOutboundSignalingFlag(flag), isTransientTransportFailure {
             return true
         }
         return false
@@ -272,6 +366,7 @@ actor TaskProcessor {
                             consecutivePauses += 1
                             if consecutivePauses > Self.maxPausedRetries {
                                 logger.log(level: .warning, message: "Paused job exceeded \(Self.maxPausedRetries) retries, dropping: \(job.id)")
+                                failUnboundOutboundWait(for: job, error: Errors.outboundSendDropped)
                                 removeJob(id: job.id)
                                 consecutivePauses = 0
                             } else {
@@ -335,6 +430,7 @@ actor TaskProcessor {
                 let lower = message.lowercased()
                 if lower.contains("missing connection identity") || lower.contains("missing local connection identity") {
                     // This is expected when late jobs from a previous call race teardown.
+                    failUnboundOutboundWait(for: job, error: error)
                     removeJob(id: job.id)
                     logger.log(level: .debug, message: "Dropping stale job with missing identity: \(job.id) (\(message))")
                     return .deleted
@@ -342,6 +438,7 @@ actor TaskProcessor {
             default:
                 break
             }
+            failUnboundOutboundWait(for: job, error: error)
             removeJob(id: job.id)
             logger.log(level: .error, message: "Job error: \(error)")
             await escalateTerminalFailureIfEssential(job: job, error: error)
@@ -357,6 +454,7 @@ actor TaskProcessor {
                 logger.log(level: .debug, message: "Job paused - transport writer not ready, will retry: \(job.id)")
                 return .paused
             }
+            failUnboundOutboundWait(for: job, error: error)
             removeJob(id: job.id)
             logger.log(level: .error, message: "Job error: \(error)")
             await escalateTerminalFailureIfEssential(job: job, error: error)
@@ -511,11 +609,17 @@ actor TaskProcessor {
     // MARK: - Outbound lane drain
 
     private func enqueueOutboundSend(_ send: OutboundSend) {
+        bindOutboundSendWait(send: send)
         guard !isOutboundLaneShutdown else {
             logger.log(level: .debug, message: "Dropping outbound send after lane shutdown flag=\(send.task.flag) room=\(send.task.roomId)")
+            finishOutboundSend(id: send.id, result: .failure(Errors.outboundSendDropped), alreadyRemoved: true)
             return
         }
-        outboundSends.append(send)
+        let insertAt = Self.outboundSendInsertIndex(
+            existingFlags: outboundSends.map(\.task.flag),
+            incomingFlag: send.task.flag
+        )
+        outboundSends.insert(send, at: insertAt)
         startOutboundSenderIfNeeded()
     }
 
@@ -544,7 +648,7 @@ actor TaskProcessor {
             }
             do {
                 try await rtcSession.sendEncryptedPacket(packet: send.packet, call: send.task.call)
-                removeOutboundSend(id: send.id)
+                finishOutboundSend(id: send.id, result: .success(()))
             } catch {
                 // Lane cancelled mid-send (teardown/purge): remaining sends are stale, no escalation.
                 if Task.isCancelled { return }
@@ -563,15 +667,60 @@ actor TaskProcessor {
                     try? await Task.sleep(nanoseconds: Self.pausedRetryIntervalNs)
                     continue
                 }
-                removeOutboundSend(id: send.id)
+                finishOutboundSend(id: send.id, result: .failure(error))
                 logger.log(level: .error, message: "Outbound send failed flag=\(send.task.flag) room=\(send.task.roomId): \(error)")
                 await escalateSendFailureIfEssential(task: send.task, error: error)
             }
         }
     }
 
-    private func removeOutboundSend(id: UUID) {
-        outboundSends.removeAll { $0.id == id }
+    private func outboundWaitFlagKey(_ flag: PacketFlag) -> String {
+        String(describing: flag)
+    }
+
+    private func bindOutboundSendWait(send: OutboundSend) {
+        let flagKey = outboundWaitFlagKey(send.task.flag)
+        guard var tokens = pendingOutboundWaitTokensByFlag[flagKey], !tokens.isEmpty else { return }
+        let token = tokens.removeFirst()
+        pendingOutboundWaitTokensByFlag[flagKey] = tokens
+        outboundSendWaitTokenBySendId[send.id] = token
+    }
+
+    private func failUnboundOutboundWait(for job: Job, error: Error) {
+        guard case let .writeMessage(task) = job.task else { return }
+        let flagKey = outboundWaitFlagKey(task.flag)
+        guard var tokens = pendingOutboundWaitTokensByFlag[flagKey], !tokens.isEmpty else { return }
+        let token = tokens.removeFirst()
+        pendingOutboundWaitTokensByFlag[flagKey] = tokens
+        finishOutboundWait(token: token, result: .failure(error))
+    }
+
+    private func failAllUnboundOutboundWaits(error: Error) {
+        let tokens = pendingOutboundWaitTokensByFlag.values.flatMap { $0 }
+        pendingOutboundWaitTokensByFlag.removeAll()
+        for token in tokens {
+            finishOutboundWait(token: token, result: .failure(error))
+        }
+    }
+
+    private func finishOutboundSend(id: UUID, result: Result<Void, Error>, alreadyRemoved: Bool = false) {
+        if !alreadyRemoved {
+            outboundSends.removeAll { $0.id == id }
+        }
+        if let token = outboundSendWaitTokenBySendId.removeValue(forKey: id) {
+            finishOutboundWait(token: token, result: result)
+        }
+    }
+
+    private func finishOutboundWait(token: UUID, result: Result<Void, Error>) {
+        if let waiters = outboundSendWaiters.removeValue(forKey: token), !waiters.isEmpty {
+            for waiter in waiters {
+                waiter.resume(with: result)
+            }
+            outboundSendResults.removeValue(forKey: token)
+            return
+        }
+        outboundSendResults[token] = result
     }
     
     private func handleStreamMessage(inboundTask: StreamTask) async throws {

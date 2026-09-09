@@ -156,6 +156,7 @@ extension RTCSession {
                 return effectiveStallAgeMs >= prolongedStallThresholdMs
             case .advancingIngress:
                 // RTP and decode are moving; the heavy recovery path would churn live bindings.
+                // Never-attached tiles use `NeverAttachedCameraSinkRefreshPolicy` instead.
                 return false
             case .noTraffic, .stalledIngress:
                 if flow.likelyCause == "transport_or_ice_instability" {
@@ -1180,7 +1181,7 @@ extension RTCSession {
                     previous: previousInbound
                 )
 
-                let targets: AdaptiveVideoTargets
+                var targets: AdaptiveVideoTargets
                 let reportedAvailableBps: Int?
                 if let available = availableOutgoingBps, available > 0 {
                     targets = RTCAdaptiveVideoTargets.compute(
@@ -1200,20 +1201,18 @@ extension RTCSession {
                     reportedAvailableBps = nil
                 }
 
+                if SfuSignalingUplinkYieldPolicy.shouldYield(
+                    isGroupOrConference: !isOneToOneSfu,
+                    essentialInFlightCount: await self.essentialOutboundInFlightCount(for: normalizedId)
+                ) {
+                    targets = RTCAdaptiveVideoTargets.survivalTargets(cfg: cfg)
+                }
+
                 let lastApplied = await self.adaptiveVideoLastAppliedByConnectionId[normalizedId]
                 let deltaOk = RTCAdaptiveVideoTargets.shouldApply(targets, lastApplied: lastApplied)
 
                 if deltaOk {
-                    for sender in current.peerConnection.senders where sender.track?.kind == kRTCMediaStreamTrackKindVideo {
-                        var params = sender.parameters
-                        guard !params.encodings.isEmpty else { continue }
-                        for encoding in params.encodings {
-                            encoding.maxBitrateBps = NSNumber(value: targets.maxBitrateBps)
-                            encoding.maxFramerate = NSNumber(value: targets.maxFramerate)
-                            encoding.scaleResolutionDownBy = NSNumber(value: targets.scaleResolutionDownBy)
-                        }
-                        sender.parameters = params
-                    }
+                    await self.applyVideoSenderTargets(targets, connection: current)
                     await self.setAdaptiveVideoLastApplied(
                         connectionId: normalizedId,
                         bitrateBps: targets.maxBitrateBps,

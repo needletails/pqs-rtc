@@ -43,7 +43,7 @@ extension RTCSession {
                     previous: previousInbound
                 )
 
-                let targets: AdaptiveVideoTargets
+                var targets: AdaptiveVideoTargets
                 if let available = network.availableOutgoingBitrateBps, available > 0 {
                     targets = RTCAdaptiveVideoTargets.compute(
                         cfg: cfg,
@@ -60,15 +60,18 @@ extension RTCSession {
                     )
                 }
 
+                if SfuSignalingUplinkYieldPolicy.shouldYield(
+                    isGroupOrConference: !isOneToOneSfu,
+                    essentialInFlightCount: await self.essentialOutboundInFlightCount(for: normalizedId)
+                ) {
+                    targets = RTCAdaptiveVideoTargets.survivalTargets(cfg: cfg)
+                }
+
                 let lastApplied = await self.adaptiveVideoLastAppliedByConnectionId[normalizedId]
                 let deltaOk = RTCAdaptiveVideoTargets.shouldApply(targets, lastApplied: lastApplied)
 
                 if deltaOk {
-                    self.rtcClient.setVideoSenderEncodings(
-                        maxBitrateBps: targets.maxBitrateBps,
-                        maxFramerate: targets.maxFramerate,
-                        scaleResolutionDownBy: targets.scaleResolutionDownBy
-                    )
+                    await self.applyVideoSenderTargets(targets, connection: current)
                     await self.setAdaptiveVideoLastApplied(
                         connectionId: normalizedId,
                         bitrateBps: targets.maxBitrateBps,

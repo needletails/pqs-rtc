@@ -33,7 +33,7 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
         native.surfaceViewRenderer
     }
 
-    /// TextureView that actually shows local preview (public `clipToOutline`).
+    /// SurfaceView media overlay that shows local preview.
     internal var previewDisplayView: android.view.View {
         native.previewDisplayView
     }
@@ -64,7 +64,7 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
     }
 
     /// Unique name so Skip/Fuse cannot drop a `release()` mapping. Stops the
-    /// TextureView `EglRenderer("LocalPreview")` stats thread.
+    /// SurfaceView `EglRenderer("LocalPreview")` stats thread.
     public func releaseCaptureResources() {
         native.releaseLocalPreviewEgl()
     }
@@ -79,7 +79,14 @@ public final class AndroidPreviewCaptureView: @unchecked Sendable {
         native.detach(track: track)
     }
 
-    /// Applies the rounded outline on the TextureView preview and its host.
+    /// True when this PiP is already on the capturer fanout. Native Fuse
+    /// `createPreviewView` uses this so Connected sync does not rebind.
+    public func hasActiveSink() -> Bool {
+        native.hasActiveSink()
+    }
+
+    /// Rounds the local overlay. SurfaceView hole-punch ignores `clipToOutline`;
+    /// Kotlin applies `RoundedRectGlDrawer` on a translucent overlay.
     public func configureRoundedOutline(radiusDp: Float = Float(12)) {
         native.configureRoundedOutline(radiusDp: radiusDp)
     }
@@ -187,6 +194,11 @@ public final class AndroidSampleCaptureView: @unchecked Sendable, Equatable {
         native.rendererDidInitialize()
     }
 
+    /// Leave 2-up → 1:1: native letterbox stays 317×564 until scale state flips.
+    public func applySoloFullscreenLayout() {
+        native.applySoloFullscreenLayout()
+    }
+
     /// Called by Compose on renderer updates. If the backing view size changed, native code
     /// reconciles the sink against the already assigned track.
     public func rendererDidUpdateLayout() {
@@ -195,7 +207,9 @@ public final class AndroidSampleCaptureView: @unchecked Sendable, Equatable {
 
     /// Deferred layout reconcile for Compose `AndroidView.update` — avoids synchronous EGL work
     /// during the layout pass (multiparty grids were triggering main-thread ANRs).
-    public func rendererDidUpdateLayoutFromCompose() {
+    /// Returns true only when a new reconcile was posted (size or sink changed).
+    @discardableResult
+    public func rendererDidUpdateLayoutFromCompose() -> Bool {
         native.rendererDidUpdateLayoutFromCompose()
     }
 
@@ -286,6 +300,53 @@ public struct AndroidCaptureViewFactory {
     /// Creates a remote video capture view (equivalent to `SampleCaptureView`).
     public static func createSampleCaptureView(client: AndroidRTCClient) -> AndroidSampleCaptureView {
         return AndroidSampleCaptureView(client: client)
+    }
+}
+
+// MARK: - Android Call Chrome Bridge
+/// Transpiled entry point so **compiled** Fuse Swift can reach the Kotlin
+/// `AndroidCallChromeNativeSupport` object.
+///
+/// PQSRTC and the app are Skip `mode: native` modules: a `#if SKIP` block inside a
+/// compiled Swift function body is always false, so calls placed there never run.
+/// Device3 20:29–20:33: `hit layer attached` with no detach, no `reset key=`, and no
+/// `detached all call chrome overlays` at hangup. Route through this type instead.
+public struct AndroidCallChromeBridge {
+
+    /// Hangup: drop every drag session, control exclusion, tap handler and the hit layer.
+    public static func detachAllForCallEnd() {
+        AndroidCallChromeNativeSupport.detachAllForCallEnd()
+    }
+
+    /// Reset a drag session's native translation back to rest.
+    public static func resetDrag(key: String) {
+        AndroidCallChromeNativeSupport.resetNativeCallChromeDrag(key: key)
+    }
+
+    /// Detach a drag session by key (removes the hit layer when the last one goes).
+    public static func detachDrag(key: String) {
+        AndroidCallChromeNativeSupport.detachNativeCallChromeDrag(key: key)
+    }
+
+    /// Attach the native drag handle to the local preview host `TextureView`.
+    /// Returns `false` when the preview is not hosted yet.
+    public static func attachLocalPreviewDrag(captureView: AndroidPreviewCaptureView, edgeDp: Float) -> Bool {
+        guard let host = AndroidRTCViewSupport.localPreviewHostOrNull(previewView: captureView.previewDisplayView) else {
+            return false
+        }
+        AndroidCallChromeNativeSupport.resetNativeCallChromeDrag(key: "local")
+        AndroidCallChromeNativeSupport.attachNativeCallChromeDrag(
+            seed: host,
+            key: "local",
+            enableTap: false,
+            edgeDp: edgeDp
+        )
+        return true
+    }
+
+    /// Install / clear the in-app PiP tap handler.
+    public static func setInAppPipTapHandler(_ handler: (() -> Void)?) {
+        AndroidCallChromeNativeSupport.setInAppPipTapHandler(handler: handler)
     }
 }
 #endif

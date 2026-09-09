@@ -2671,6 +2671,15 @@ public final class VideoCallViewController: NSViewController {
                     )
                 }
 
+                await self.session.refreshUnansweredGroupMediaReadyIfNeeded(
+                    connectionId: normalizedConnectionId,
+                    participantId: trimmedParticipantId,
+                    inboundFlowIsAdvancing: GroupParticipantInboundAdvancingPolicy.isSourceInboundAdvancing(
+                        connectionInboundIsAdvancing: inboundFlow?.state == .advancingIngress,
+                        mappedRendererCallbackAgeMs: callbackAgeMs
+                    )
+                )
+
                 if RTCSession.inboundFlowIndicatesKeyframeStarvation(inboundFlow) {
                     // Downlink loss is destroying (key)frames; destructive re-attach loops the
                     // stall. PLI-first matched-binding recovery pulses the track and re-signals
@@ -2687,6 +2696,34 @@ public final class VideoCallViewController: NSViewController {
                     continue
                 }
 
+                if NeverAttachedCameraSinkRefreshPolicy.shouldRefreshRemoteCameraSink(
+                    inboundFlowIsAdvancing: inboundFlow?.state == .advancingIngress,
+                    hasAnyCallbacks: hasAnyCallbacks,
+                    callbackAgeMs: callbackAgeMs,
+                    expectationAgeMs: expectationAgeMs
+                ) {
+                    self.logger.log(
+                        level: .warning,
+                        message: "macOS never-attached camera sink refresh after advancing ingress participant=\(trimmedParticipantId) connectionId=\(normalizedConnectionId)"
+                    )
+                    self.lastParticipantRendererRecoveryUptimeNsByKey[key] = now
+                    await self.session.refreshNeverAttachedParticipantCameraSinkIfNeeded(
+                        connectionId: normalizedConnectionId,
+                        participantId: trimmedParticipantId
+                    )
+                    await renderer.startStream()
+                    let didAttach = await self.session.renderRemoteVideoForParticipant(
+                        to: renderer.rtcVideoRenderWrapper,
+                        connectionId: normalizedConnectionId,
+                        participantId: trimmedParticipantId,
+                        forceParticipantRendererRebind: true
+                    )
+                    if didAttach {
+                        await renderer.setRemoteVideoInboundExpected(true)
+                    }
+                    continue
+                }
+
                 let shouldRecoverRenderer = RTCSession.shouldAttemptInboundRemoteVideoRendererRecovery(
                     inboundFlow: inboundFlow,
                     callbackAgeMs: callbackAgeMs,
@@ -2697,6 +2734,14 @@ public final class VideoCallViewController: NSViewController {
                     self.logger.log(
                         level: .warning,
                         message: "macOS participant camera recovery skipped: inbound counters not advancing enough; participant=\(trimmedParticipantId) likelyCause=\(inboundFlow?.likelyCause ?? "unknown") connectionId=\(normalizedConnectionId)"
+                    )
+                    await self.session.refreshUnansweredGroupMediaReadyIfNeeded(
+                        connectionId: normalizedConnectionId,
+                        participantId: trimmedParticipantId,
+                        inboundFlowIsAdvancing: GroupParticipantInboundAdvancingPolicy.isSourceInboundAdvancing(
+                            connectionInboundIsAdvancing: inboundFlow?.state == .advancingIngress,
+                            mappedRendererCallbackAgeMs: callbackAgeMs
+                        )
                     )
                     continue
                 }

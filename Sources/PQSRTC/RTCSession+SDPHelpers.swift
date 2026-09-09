@@ -1114,6 +1114,7 @@ extension RTCSession {
             await reconcileAppleRemoteParticipantAudioTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
             await reconcileAppleRemoteScreenTracksAfterSetRemoteSDP(sdp.sdp, connectionId: connection.id)
 #if canImport(WebRTC) && !os(Android)
+            await disableLeftoverAppleSfuReceiverTracksAfterRemoteSDP(connectionId: connection.id)
             if Self.isTrueOneToOneSfuRoom(call: connection.call),
                let refreshed = await self.connectionManager.findConnection(with: connection.id) {
                 await self.ensureAppleInboundCameraReceiveAfterSfuRenegotiation(

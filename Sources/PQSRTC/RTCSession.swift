@@ -237,8 +237,8 @@ public actor RTCSession {
     // session mutation gate closes permanently and every later encrypt/decrypt throws
     // `CancellationError`. RTC call ratchets are ephemeral per call, so the session owns a
     // per-call-generation crypto stack: `shutdown(with:)` retires the current generation
-    // (terminal shutdown) and the accessors below transparently build the next generation on
-    // first use. Liveness is enforced at the access point, so no call-start path can forget it.
+    // (terminal shutdown) and rebuilds the next generation on that hangup event. Accessors
+    // still rebuild on first use if a call-start path races teardown.
     // Without this, the first call after any teardown lost all SFU signaling (offer/candidate
     // jobs died in `TaskProcessor` as "Job error: CancellationError()"), the SFU never received
     // an offer, and the call sat in "Connecting" with no media.
@@ -249,13 +249,60 @@ public actor RTCSession {
     private var _taskProcessor: TaskProcessor?
     
     /// Set by ``retireCryptoStackGeneration()`` after the current generation was terminally
-    /// shut down. The accessors build a fresh generation on next use unless the session itself
-    /// was destroyed.
+    /// shut down. Hangup rebuilds immediately via ``prepareCryptoStackForNextCallIfNeeded()``;
+    /// accessors still rebuild on first use if a call-start path races teardown.
     private var cryptoStackRetired = false
+
+    /// Incremented each time a retired stack is replaced. Leftover teardown may retire only
+    /// the generation it started with.
+    private(set) var cryptoStackGeneration: UInt64 = 0
+
+    /// True from the first line of ``shutdown(with:)`` until that teardown finishes.
+    /// Rejoin waits on this instead of racing the leftover retire.
+    var isCallTeardownInProgress = false
+    var callTeardownWaiters: [CheckedContinuation<Void, Never>] = []
     
     /// Set by ``destroySession()``. Terminal: the crypto stack is never rebuilt and every later
     /// crypto operation fails, matching DoubleRatchetKit's own post-shutdown semantics.
     public private(set) var isSessionDestroyed = false
+
+    /// Parks a new call start until leftover ``shutdown(with:)`` finishes.
+    public func waitForCallTeardownIfNeeded() async {
+        guard isCallTeardownInProgress else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            if isCallTeardownInProgress {
+                callTeardownWaiters.append(continuation)
+            } else {
+                continuation.resume()
+            }
+        }
+    }
+
+    func beginCallTeardown() {
+        isCallTeardownInProgress = true
+    }
+
+    func finishCallTeardown() {
+        isCallTeardownInProgress = false
+        let waiters = callTeardownWaiters
+        callTeardownWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    func shouldSkipShutdownForLiveAttempt(_ endingCall: Call?) async -> Bool {
+        guard let endingCall,
+              let liveCall = await callState.currentCall else {
+            return false
+        }
+        return CallTeardownOwnershipPolicy.shouldSkipShutdownForLiveAttempt(
+            endingCallId: endingCall.id,
+            liveCallId: liveCall.id,
+            endingRoomId: endingCall.sharedCommunicationId,
+            liveRoomId: liveCall.sharedCommunicationId
+        )
+    }
     
     /// Manages frame/media ratchet key state for the current call generation.
     var ratchetManager: KeyRatchet {
@@ -283,9 +330,19 @@ public actor RTCSession {
         return processor
     }
     
+    /// Rebuilds a retired signaling crypto stack before the next call encrypts or provisions keys.
+    ///
+    /// Device3 18:02 rebuilt this generation *after* the local sender key was already installed and
+    /// during offer send. Hangup and new-call start call this on those events so the first
+    /// `taskProcessor` / ratchet access is not mid-setup.
+    func prepareCryptoStackForNextCallIfNeeded() {
+        rebuildRetiredCryptoStackIfNeeded()
+    }
+
     private func rebuildRetiredCryptoStackIfNeeded() {
         guard cryptoStackRetired, !isSessionDestroyed else { return }
         cryptoStackRetired = false
+        cryptoStackGeneration &+= 1
         _ratchetManager = KeyRatchet(executor: executor)
         _pcRatchetManager = MessageRatchet(executor: executor)
         Task {
@@ -303,11 +360,25 @@ public actor RTCSession {
     /// DoubleRatchetKit's deinit precondition (terminal shutdown before deallocation); the
     /// accessors build the next generation when the next call begins.
     func retireCryptoStackGeneration() async {
+        let generationToRetire = cryptoStackGeneration
+        let processor = _taskProcessor
+        let ratchet = _ratchetManager
+        let pcRatchet = _pcRatchetManager
         // Cancel the retired generation's outbound send lane first: an in-flight transport send
         // parked on a dead connection gate must not outlive its crypto generation.
-        await _taskProcessor?.shutdownOutboundLane()
-        try? await _ratchetManager.flushAndClose()
-        try? await _pcRatchetManager.flushAndClose()
+        await processor?.shutdownOutboundLane()
+        try? await ratchet.flushAndClose()
+        try? await pcRatchet.flushAndClose()
+        guard CallTeardownOwnershipPolicy.shouldRetireCryptoStack(
+            teardownGeneration: generationToRetire,
+            liveGeneration: cryptoStackGeneration
+        ) else {
+            logger.log(
+                level: .warning,
+                message: "Skipping crypto retire; live generation=\(cryptoStackGeneration) teardown generation=\(generationToRetire)"
+            )
+            return
+        }
         cryptoStackRetired = true
     }
     
@@ -391,6 +462,10 @@ public actor RTCSession {
     /// Per-connection buffer for ICE candidates generated before the connection is
     /// ready to send them.
     var iceDequeByConnectionId: [String: Deque<IceCandidate>] = [:]
+
+    /// Group connections whose ICE state is already `connected` or `completed`.
+    /// Used to drop the un-encrypted pre-connect candidate burst.
+    var iceConnectedOrCompletedConnectionIds: Set<String> = []
 
     /// Buffered ICE drains are retained so teardown can cancel blocked encryption sends.
     var bufferedCandidateDrainTasksByConnectionId: [String: Task<Void, Never>] = [:]
@@ -578,6 +653,10 @@ public actor RTCSession {
     }
 #endif
 
+    /// Advertised Android SFU audio track ids that survive connection last-write-wins during
+    /// concurrent camera/audio SDP reconcile. Used only to skip mute/reattach on wrapper rotation.
+    var androidSessionRemoteAudioResolvedTrackIdsByParticipantId: [String: String] = [:]
+
     /// Connection ids currently answering an inbound SFU renegotiation offer (serialize duplicates).
     var sfuRenegotiationInFlightConnectionIds: Set<String> = []
 
@@ -588,6 +667,10 @@ public actor RTCSession {
     /// Populated silently during in-flight renegotiation; flushed once in
     /// ``emitRemoteParticipantTrackRefreshAfterSfuRenegotiation``.
     var sfuRenegotiationReboundParticipantIdsByConnectionId: [String: Set<String>] = [:]
+
+    /// True after ICE `disconnected`/`failed` on this PeerConnection until the next recovered state.
+    /// Join-path `checking` → `connected` never sets this, so first connect does not settle tiles.
+    var iceHadMediaPathDisruptionByConnectionId: [String: Bool] = [:]
 
     /// Active camera track-add events already delivered for the current SFU settlement window.
     /// Suppresses duplicate peer-notification emits until the next renegotiation starts or the
@@ -600,6 +683,20 @@ public actor RTCSession {
     /// Single-flight cooldown for matched-binding decode-stall PLI/mediaReady recovery (poll + event).
     var lastMatchedBindingDecodeStallRecoveryUptimeNsByKey: [String: UInt64] = [:]
     static let matchedBindingDecodeStallRecoveryCooldownNs: UInt64 = 15_000_000_000
+
+    /// One-shot unanswered `mediaReady` resend per source generation (`connection|participant`).
+    /// Cleared when inbound flow starts advancing so a later hold-off can send again.
+    var unansweredGroupMediaReadyResentKeys: Set<String> = []
+
+    /// Sources whose `mediaReady` IRC PRIVMSG write completed. Stall recovery must not
+    /// encrypt another packet for these — that advances the ratchet past the SFU.
+    var confirmedSfuGroupMediaReadyKeys: Set<String> = []
+
+    /// Sources whose `mediaReady` write is still in the outbound wait.
+    var pendingSfuGroupMediaReadyKeys: Set<String> = []
+
+    /// Group/SFU essential outbound packets (offer/answer/mediaReady) in flight.
+    var essentialOutboundInFlightCountByConnectionId: [String: Int] = [:]
 
     /// Shared inbound-flow sampler tasks keyed by connection id.
     var inboundVideoFlowSamplerTasksByConnectionId: [String: Task<Void, Never>] = [:]

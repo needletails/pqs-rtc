@@ -46,6 +46,25 @@ struct OutboundSignalingTransportRetryTests {
             attempt: 0))
     }
 
+    @Test("mediaReady retries transient transport like answer")
+    func mediaReadyRetriesTransientTransport() {
+        #expect(TaskProcessor.shouldRetryOutboundTransportSend(
+            flag: .mediaReady,
+            isWriterNotReady: false,
+            isTransientTransportFailure: true,
+            attempt: 0))
+        #expect(TaskProcessor.shouldRetryOutboundTransportSend(
+            flag: .mediaReady,
+            isWriterNotReady: false,
+            isTransientTransportFailure: true,
+            attempt: 23))
+        #expect(!TaskProcessor.shouldRetryOutboundTransportSend(
+            flag: .mediaReady,
+            isWriterNotReady: false,
+            isTransientTransportFailure: true,
+            attempt: 24))
+    }
+
     private struct StubError: Error, LocalizedError {
         let text: String
         var errorDescription: String? { text }

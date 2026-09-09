@@ -81,6 +81,8 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var reportedComposeLayoutParticipantKeys: Set<String> = []
     /// Single generation owner for remote screen-share layout recovery and activation replay.
     private var remoteScreenShareLayoutGeneration: UInt64 = 0
+    /// Independent 1-up ↔ N-up grid resize wait; must not steal screen-share generations.
+    private var gridSlotLayoutTransitionState = GridSlotLayoutTransitionState.idle
     private var pendingRemoteScreenShareActivation: RemoteScreenTrackEvent?
     private var sfuGroupSignalingStableStreamTask: Task<Void, Never>?
     /// Post-SFU renegotiation attach episode currently owned by the coordinator.
@@ -110,6 +112,8 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private var postCoordinatorPendingWrapperApplyParticipantKeys: Set<String> = []
     /// Participants confirmed media-ready during the current finalize pass (before final sweep).
     private var coordinatorFinalizeMediaReadyConfirmedKeys: Set<String> = []
+    /// Leave / pruned-map ids that must not be re-assigned from stale `videoEnabled`.
+    private var departedParticipantKeysWithoutMappedCamera: Set<String> = []
     /// Serializes bind/EGL work per participant tile during a post-renegotiation episode.
     private var participantAttachLaneBusyKeys: Set<String> = []
     private var participantAttachLaneWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
@@ -291,12 +295,74 @@ public actor AndroidVideoCallController: CallActionDelegate {
         let roomId = currentCall?.resolvedChannelWireId
             ?? currentCall?.sharedCommunicationId
             ?? connectionId
-        guard let group = await session.groupCallForRoom(roomId) else {
+        guard await session.groupCallForRoom(roomId) != nil else {
             return true
         }
-        return await group.currentParticipants().contains { participant in
-            participant.id == participantId || participantAssignmentKey(participant.id) == participantKey
+        let hasMappedCamera = await participantHasMappedCamera(
+            connectionId: connectionId,
+            participantId: participantId
+        )
+        if hasMappedCamera {
+            departedParticipantKeysWithoutMappedCamera.remove(participantAssignmentKey(participantId))
         }
+        return GroupSfuVideoAttachPolicy.shouldSurfaceParticipantCameraTile(
+            hasMappedCamera: hasMappedCamera,
+            conferenceVideoEnabled: await participantConferenceVideoEnabled(participantId),
+            explicitlyDeparted: isExplicitlyDepartedParticipant(participantId)
+        )
+    }
+
+    private func isExplicitlyDepartedParticipant(_ participantId: String) -> Bool {
+        departedParticipantKeysWithoutMappedCamera.contains(participantAssignmentKey(participantId))
+    }
+
+    private func rememberDepartedParticipantWithoutMappedCamera(_ participantId: String) {
+        departedParticipantKeysWithoutMappedCamera.insert(participantAssignmentKey(participantId))
+    }
+
+    private func participantHasMappedCamera(connectionId: String, participantId: String) async -> Bool {
+        if await session.androidMappedLiveRemoteCameraTrack(
+            connectionId: connectionId,
+            participantId: participantId,
+            preferFreshFromPeerConnection: false
+        ) != nil {
+            return true
+        }
+        let eventKey = participantAssignmentKey(participantId)
+        guard let connection = await session.connectionManager.findConnection(
+            with: connectionId.normalizedConnectionId
+        ) else {
+            return false
+        }
+        return connection.remoteVideoTracksByParticipantId.contains { mappedId, _ in
+            mappedId == participantId || participantAssignmentKey(mappedId) == eventKey
+        }
+    }
+
+    private func participantConferenceVideoEnabled(_ participantId: String) async -> Bool {
+        let eventKey = participantAssignmentKey(participantId)
+        return await session.conferencePermissions.participantVideoEnabled.contains { key, enabled in
+            enabled && (key == participantId || participantAssignmentKey(key) == eventKey)
+        }
+    }
+
+    private func participantHasLiveCameraPresence(
+        connectionId: String,
+        participantId: String
+    ) async -> Bool {
+        if await participantHasMappedCamera(connectionId: connectionId, participantId: participantId) {
+            return true
+        }
+        return await participantConferenceVideoEnabled(participantId)
+    }
+
+    private func mappedCameraParticipantIds(connectionId: String) async -> Set<String> {
+        guard let connection = await session.connectionManager.findConnection(
+            with: connectionId.normalizedConnectionId
+        ) else {
+            return []
+        }
+        return Set(connection.remoteVideoTracksByParticipantId.keys)
     }
 
     /// Returns the lowest-index renderer slot that is not already bound to another participant.
@@ -306,14 +372,18 @@ public actor AndroidVideoCallController: CallActionDelegate {
         }
     }
 
-    /// Keeps renderer slots reserved across SFU renegotiation, but frees them once the SFU roster
-    /// no longer includes the participant.
-    /// SFU renegotiation can emit transient `isActive: false` track events while a participant
-    /// remains in the roster. Keep the assigned tile and recover the sink instead of tearing down.
+    /// Keeps renderer slots reserved across SFU wrapper rotation, but frees them when
+    /// live camera presence is gone. Channel roster is not the owner — Device3 kept
+    /// `nudge` in a 317×564 tile after `Conference participant left` because
+    /// `currentParticipants()` and an in-flight episode still listed them.
     private func shouldRetainParticipantTileAcrossTransientTrackRemoval(
         connectionId: String,
         participantId: String
     ) async -> Bool {
+        let hasPresence = await participantHasLiveCameraPresence(
+            connectionId: connectionId,
+            participantId: participantId
+        )
         guard !(await shouldReleaseParticipantViewAssignment(
             connectionId: connectionId,
             participantId: participantId
@@ -321,33 +391,113 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return false
         }
         let norm = connectionId.normalizedConnectionId
-        if isPostRenegotiationAttachEpisodeActive(for: norm) {
-            return true
-        }
-        if await session.shouldDeferSfuGroupParticipantVideoAttach(for: norm) {
-            return true
-        }
-        if hasActiveRemoteScreenShare {
-            return true
-        }
-        return false
+        return GroupSfuVideoAttachPolicy.shouldRetainParticipantTileAcrossTransientTrackRemoval(
+            hasMappedOrAdvertisedCamera: hasPresence,
+            episodeActive: isPostRenegotiationAttachEpisodeActive(for: norm),
+            deferAttach: await session.shouldDeferSfuGroupParticipantVideoAttach(for: norm),
+            hasActiveRemoteScreenShare: hasActiveRemoteScreenShare
+        )
     }
 
     private func shouldReleaseParticipantViewAssignment(
         connectionId: String,
         participantId: String
     ) async -> Bool {
+        if isExplicitlyDepartedParticipant(participantId) {
+            return true
+        }
+        let hasPresence = await participantHasLiveCameraPresence(
+            connectionId: connectionId,
+            participantId: participantId
+        )
         let roomId = currentCall?.resolvedChannelWireId
             ?? currentCall?.sharedCommunicationId
             ?? connectionId
         guard let group = await session.groupCallForRoom(roomId) else {
-            return true
+            return GroupSfuVideoAttachPolicy.shouldReleaseParticipantViewAssignment(
+                hasMappedOrAdvertisedCamera: hasPresence,
+                stillInRoster: false
+            )
         }
         let eventKey = participantAssignmentKey(participantId)
         let stillPresent = await group.currentParticipants().contains { participant in
             participant.id == participantId || participantAssignmentKey(participant.id) == eventKey
         }
-        return !stillPresent
+        return GroupSfuVideoAttachPolicy.shouldReleaseParticipantViewAssignment(
+            hasMappedOrAdvertisedCamera: hasPresence,
+            stillInRoster: stillPresent
+        )
+    }
+
+    private func teardownParticipantTileIfAssigned(
+        connectionId: String,
+        participantId: String,
+        forceRelease: Bool = false
+    ) async {
+        let eventKey = RTCSession.conferenceParticipantIdentityKey(participantId)
+        let assignmentKey = participantViewAssignments.keys.first { assignedId in
+            assignedId == participantId
+                || (!eventKey.isEmpty && RTCSession.conferenceParticipantIdentityKey(assignedId) == eventKey)
+        }
+        guard let assignmentKey,
+              let view = participantViewAssignments[assignmentKey] else {
+            return
+        }
+        await session.removeRemoteForParticipant(
+            view: view,
+            connectionId: connectionId,
+            participantId: participantId
+        )
+        participantAttachedTrackIdsByKey.removeValue(forKey: participantAssignmentKey(assignmentKey))
+        participantCoordinatorSettledKeys.remove(participantAssignmentKey(assignmentKey))
+        postRenegotiationEpisodeParticipantIds = postRenegotiationEpisodeParticipantIds.filter { candidate in
+            candidate != participantId
+                && (eventKey.isEmpty || RTCSession.conferenceParticipantIdentityKey(candidate) != eventKey)
+        }
+        let shouldUnassign: Bool
+        if forceRelease {
+            shouldUnassign = true
+        } else {
+            shouldUnassign = await shouldReleaseParticipantViewAssignment(
+                connectionId: connectionId,
+                participantId: participantId
+            )
+        }
+        guard shouldUnassign else { return }
+        logger.log(
+            level: .info,
+            message: "Releasing departed Android remote tile participant=\(participantId)"
+        )
+        if forceRelease {
+            rememberDepartedParticipantWithoutMappedCamera(participantId)
+        }
+        participantViewAssignments.removeValue(forKey: assignmentKey)
+        if !unassignedViews.contains(where: { $0 === view }) {
+            unassignedViews.append(view)
+        }
+        if !forceRelease {
+            await assignExistingParticipantTracks(connectionId: connectionId)
+        }
+    }
+
+    private func releaseAssignmentsWithoutLiveCameraPresence(connectionId: String) async {
+        var didRelease = false
+        for participantId in Array(participantViewAssignments.keys) {
+            guard await shouldReleaseParticipantViewAssignment(
+                connectionId: connectionId,
+                participantId: participantId
+            ) else {
+                continue
+            }
+            await teardownParticipantTileIfAssigned(
+                connectionId: connectionId,
+                participantId: participantId
+            )
+            didRelease = true
+        }
+        if didRelease {
+            await videoCallDelegate?.remoteParticipantTilesDidChange()
+        }
     }
 
     private func mappedCameraTrackId(connectionId: String, participantId: String) async -> String? {
@@ -905,6 +1055,18 @@ public actor AndroidVideoCallController: CallActionDelegate {
             logger.log(level: .debug, message: "AndroidVideoCallController sync skipped (\(reason)): no current state")
             return
         }
+        if !isRunning {
+            switch state {
+            case .ended, .failed, .callAnsweredAuxDevice:
+                break
+            default:
+                logger.log(
+                    level: .debug,
+                    message: "AndroidVideoCallController sync skipped (\(reason)): controller already ended"
+                )
+                return
+            }
+        }
         logger.log(level: .info, message: "AndroidVideoCallController syncing with state (\(reason)): \(state)")
         await handleObservedState(state)
     }
@@ -1353,7 +1515,14 @@ public actor AndroidVideoCallController: CallActionDelegate {
         }
         let previousParticipantIds = postRenegotiationEpisodeParticipantIds
         postRenegotiationEpisodeConnectionId = episode.connectionId.normalizedConnectionId
-        postRenegotiationEpisodeParticipantIds.formUnion(episode.participantIds)
+        let mappedCameraIds = await mappedCameraParticipantIds(connectionId: episode.connectionId)
+        postRenegotiationEpisodeParticipantIds = GroupSfuVideoAttachPolicy.episodeParticipantIdsAfterRefresh(
+            previousIds: previousParticipantIds,
+            refreshIds: Set(episode.participantIds),
+            mappedCameraIds: mappedCameraIds,
+            identityKey: RTCSession.conferenceParticipantIdentityKey
+        )
+        await releaseAssignmentsWithoutLiveCameraPresence(connectionId: episode.connectionId)
         let participantSetGrew = !Set(episode.participantIds).isSubset(of: previousParticipantIds)
         logger.log(
             level: .info,
@@ -1370,16 +1539,21 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return
         }
         if await shouldSkipPostRenegotiationAttachEpisodeCoordinator(
-            participantIds: episode.participantIds,
+            participantIds: Array(postRenegotiationEpisodeParticipantIds),
             connectionId: episode.connectionId
         ) {
             logger.log(
                 level: .info,
                 message: """
                 Skipping post-renegotiation attach coordinator; episode participants already settled \
-                participants=\(episode.participantIds.sorted().joined(separator: ",")) connection=\(episode.connectionId)
+                participants=\(Array(postRenegotiationEpisodeParticipantIds).sorted().joined(separator: ",")) connection=\(episode.connectionId)
                 """
             )
+            if AndroidGroupPostRenegotiationAttachCoordinator.shouldClearSettledPostRenegotiationEpisode(
+                episodeParticipantsAlreadySettled: true
+            ) {
+                clearPostRenegotiationAttachEpisode()
+            }
             return
         }
         requestPostRenegotiationAttachCoordinator(connectionId: episode.connectionId)
@@ -1414,10 +1588,14 @@ public actor AndroidVideoCallController: CallActionDelegate {
     private func requestPostRenegotiationAttachCoordinator(connectionId: String) {
         guard isRunning, isGroupCall else { return }
         if postRenegotiationCoordinatorInFlight {
-            postRenegotiationCoordinatorRerunNeeded = true
+            // Remount / grid-layout / stale-wrapper must not spin the in-flight
+            // pass. Participant-set growth sets rerunNeeded from the pass itself.
             logger.log(
                 level: .info,
-                message: "Queued post-renegotiation attach coordinator rerun connection=\(connectionId.normalizedConnectionId)"
+                message: """
+                Ignoring coordinator request; already in-flight \
+                connection=\(connectionId.normalizedConnectionId)
+                """
             )
             return
         }
@@ -1590,12 +1768,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 }
             }
         }
-        let eventKey = RTCSession.conferenceParticipantIdentityKey(participantId)
-        return postRenegotiationEpisodeParticipantIds.contains { candidate in
-            candidate == participantId
-                || (!eventKey.isEmpty
-                    && RTCSession.conferenceParticipantIdentityKey(candidate) == eventKey)
-        }
+        return false
     }
 
     private func coordinatorParticipantsAllMediaReady(
@@ -1773,7 +1946,8 @@ public actor AndroidVideoCallController: CallActionDelegate {
             }
             if AndroidGroupPostRenegotiationAttachCoordinator
                 .postCoordinatorRecoveryShouldDeferToPendingLiveWrapperRebind(
-                    hasPendingLiveWrapperRebind: view.hasPendingLiveWrapperRebind()
+                    hasPendingLiveWrapperRebind: view.hasPendingLiveWrapperRebind(),
+                    attachedTrackIsLive: view.attachedTrackIsLive()
                 ) {
                 logger.log(
                     level: .info,
@@ -2257,11 +2431,17 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 probe: probe,
                 connectionId: connectionId
             ) {
-                view.requestPendingLiveWrapperRebind()
+                if AndroidGroupParticipantRendererAttachPolicy
+                    .shouldQueuePendingLiveWrapperRebindAfterSettledSkip(
+                        tileAttachedTrackIsLive: view.attachedTrackIsLive(),
+                        probeBoundTrackSharesRendererSinkWithTarget: probe.boundTrackSharesRendererSinkWithTarget
+                    ) {
+                    view.requestPendingLiveWrapperRebind()
+                }
                 logger.log(
                     level: .info,
                     message: """
-                    Deferred settled wrapper sync until stale wrapper stalls participant=\(participantId) \
+                    Skipping settled wrapper sync; shared live sink still rendering participant=\(participantId) \
                     diagnostics=\(view.rendererAttachDiagnosticSummary())
                     """
                 )
@@ -2290,11 +2470,17 @@ public actor AndroidVideoCallController: CallActionDelegate {
             probe: probe,
             connectionId: connectionId
         ) {
-            view.requestPendingLiveWrapperRebind()
+            if AndroidGroupParticipantRendererAttachPolicy
+                .shouldQueuePendingLiveWrapperRebindAfterSettledSkip(
+                    tileAttachedTrackIsLive: view.attachedTrackIsLive(),
+                    probeBoundTrackSharesRendererSinkWithTarget: probe.boundTrackSharesRendererSinkWithTarget
+                ) {
+                view.requestPendingLiveWrapperRebind()
+            }
             logger.log(
                 level: .info,
                 message: """
-                Deferred settled wrapper sync until stale wrapper stalls participant=\(participantId) \
+                Skipping settled wrapper sync; shared live sink still rendering participant=\(participantId) \
                 diagnostics=\(view.rendererAttachDiagnosticSummary())
                 """
             )
@@ -2409,8 +2595,8 @@ public actor AndroidVideoCallController: CallActionDelegate {
         let settlementKey = participantAssignmentKey(participantId)
         let layoutNeedsSinkReconcile = view.rendererLayoutNeedsSinkReconcile()
         if view.hasPendingLiveWrapperRebind() {
-            if forceLiveWrapperRecovery,
-               !isPostRenegotiationAttachEpisodeActive(for: norm) {
+            let attachedIsLive = view.attachedTrackIsLive()
+            if forceLiveWrapperRecovery || !attachedIsLive {
                 if await applyPendingLiveWrapperRebindIfEligible(
                     participantId: participantId,
                     view: view,
@@ -2420,21 +2606,37 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 ) {
                     return true
                 }
-                return await bindParticipantLiveWrapperFromSessionStoreAfterEpisode(
-                    participantId: participantId,
-                    view: view,
-                    connectionId: connectionId,
-                    reason: reason
-                )
+                if !attachedIsLive {
+                    // Dead Java wrapper (leave / SFU prune): swap now. If the session store has
+                    // no live track yet, fall through to the normal resolve path below, which can
+                    // pull a fresh receiver from the peer connection instead of reporting failure.
+                    if await bindParticipantLiveWrapperFromSessionStoreAfterEpisode(
+                        participantId: participantId,
+                        view: view,
+                        connectionId: connectionId,
+                        reason: reason
+                    ) {
+                        return true
+                    }
+                } else if !isPostRenegotiationAttachEpisodeActive(for: norm) {
+                    return await bindParticipantLiveWrapperFromSessionStoreAfterEpisode(
+                        participantId: participantId,
+                        view: view,
+                        connectionId: connectionId,
+                        reason: reason
+                    )
+                }
             }
-            logger.log(
-                level: .info,
-                message: """
-                Skipped coordinator sink rebind; live wrapper swap already deferred participant=\(participantId) \
-                reason=\(reason) diagnostics=\(view.rendererAttachDiagnosticSummary())
-                """
-            )
-            return true
+            if attachedIsLive {
+                logger.log(
+                    level: .info,
+                    message: """
+                    Skipped coordinator sink rebind; live wrapper swap already deferred participant=\(participantId) \
+                    reason=\(reason) diagnostics=\(view.rendererAttachDiagnosticSummary())
+                    """
+                )
+                return true
+            }
         }
         let preferFreshWhenAttachedWrapperDead = forceLiveWrapperRecovery
             || ignoreSfuDeferForSurfaceLayoutRecovery
@@ -2501,11 +2703,17 @@ public actor AndroidVideoCallController: CallActionDelegate {
             probe: probe,
             connectionId: connectionId
         ) {
-            view.requestPendingLiveWrapperRebind()
+            if AndroidGroupParticipantRendererAttachPolicy
+                .shouldQueuePendingLiveWrapperRebindAfterSettledSkip(
+                    tileAttachedTrackIsLive: view.attachedTrackIsLive(),
+                    probeBoundTrackSharesRendererSinkWithTarget: probe.boundTrackSharesRendererSinkWithTarget
+                ) {
+                view.requestPendingLiveWrapperRebind()
+            }
             logger.log(
                 level: .info,
                 message: """
-                Deferred live wrapper rebind until stale wrapper stalls participant=\(participantId) \
+                Skipping live wrapper rebind; shared live sink still rendering participant=\(participantId) \
                 reason=\(reason) trackId=\(liveTrack.trackIdIfAvailable ?? "<unknown>") \
                 diagnostics=\(view.rendererAttachDiagnosticSummary())
                 """
@@ -2536,11 +2744,24 @@ public actor AndroidVideoCallController: CallActionDelegate {
             )
             await recordAttachedTrack(connectionId: connectionId, participantId: participantId)
             postRenegotiationCoordinatorSinkReboundParticipantKeys.insert(settlementKey)
-        } else if view.hasPendingLiveWrapperRebind() {
+            return true
+        }
+        if view.hasPendingLiveWrapperRebind(), !attachedLiveAfterBind {
+            if await applyPendingLiveWrapperRebindIfEligible(
+                participantId: participantId,
+                view: view,
+                connectionId: connectionId,
+                reason: reason,
+                forceApply: true
+            ) {
+                return true
+            }
+        }
+        if view.hasPendingLiveWrapperRebind(), attachedLiveAfterBind {
             logger.log(
                 level: .info,
                 message: """
-                Deferred live wrapper rebind until stale wrapper stalls participant=\(participantId) \
+                Skipping live wrapper rebind; attach left a live pending sink participant=\(participantId) \
                 reason=\(reason) trackId=\(liveTrack.trackIdIfAvailable ?? "<unknown>") \
                 diagnostics=\(view.rendererAttachDiagnosticSummary())
                 """
@@ -2967,11 +3188,20 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 )
             }
             if didRebind {
+                if view.hasPendingLiveWrapperRebind(), !view.attachedTrackIsLive() {
+                    _ = await applyPendingLiveWrapperRebindIfEligible(
+                        participantId: participantId,
+                        view: view,
+                        connectionId: connectionId,
+                        reason: reason,
+                        forceApply: true
+                    )
+                }
                 if view.hasPendingLiveWrapperRebind() {
                     logger.log(
                         level: .info,
                         message: """
-                        Coordinator settled sink rebind deferred until stale wrapper stalls \
+                        Coordinator settled sink rebind left a live pending sink \
                         participant=\(participantId) reason=\(reason) \
                         diagnostics=\(view.rendererAttachDiagnosticSummary())
                         """
@@ -4060,10 +4290,6 @@ public actor AndroidVideoCallController: CallActionDelegate {
             )
         }
 
-        for view in participantViewAssignments.values {
-            view.rendererDidUpdateLayout()
-        }
-
         let attachParticipantIds = await coordinatorAttachParticipantIds(connectionId: connectionId)
         await ensureViewsAssignedForCoordinatorParticipants(
             participantIds: attachParticipantIds,
@@ -4214,7 +4440,11 @@ public actor AndroidVideoCallController: CallActionDelegate {
         }
 
         let finalParticipantIds = await coordinatorAttachParticipantIds(connectionId: connectionId)
-        if Set(finalParticipantIds) != Set(attachParticipantIds) {
+        let participantSetGrew = Set(finalParticipantIds) != Set(attachParticipantIds)
+        if AndroidGroupPostRenegotiationAttachCoordinator.shouldQueueCoordinatorRerunWhileInFlight(
+            participantSetGrew: participantSetGrew,
+            episodeParticipantsAlreadySettled: false
+        ) {
             postRenegotiationCoordinatorRerunNeeded = true
             logger.log(
                 level: .info,
@@ -4725,21 +4955,22 @@ public actor AndroidVideoCallController: CallActionDelegate {
             await videoCallDelegate?.remoteParticipantTilesDidChange()
         } else {
             logger.log(level: .info, message: "Participant track removed: participant=\(event.participantId)")
-            guard await shouldSurfaceParticipantTrack(connectionId: connectionId, participantId: event.participantId) else {
-                logger.log(
-                    level: .info,
-                    message: "Ignoring stale participant track removal participant=\(event.participantId) connection=\(connectionId)"
-                )
-                return
-            }
-            if await shouldRetainParticipantTileAcrossTransientTrackRemoval(
+            let hasMappedCamera = await participantHasMappedCamera(
                 connectionId: connectionId,
                 participantId: event.participantId
-            ) {
+            )
+            let forceRelease = GroupSfuVideoAttachPolicy.shouldForceReleaseAssignmentAfterTrackRemoved(
+                hasMappedCamera: hasMappedCamera
+            )
+            if !forceRelease,
+               await shouldRetainParticipantTileAcrossTransientTrackRemoval(
+                connectionId: connectionId,
+                participantId: event.participantId
+               ) {
                 logger.log(
                     level: .info,
                     message: """
-                    Deferred participant track removal teardown; participant still in roster \
+                    Deferred participant track removal teardown; live camera still present \
                     participant=\(event.participantId)
                     """
                 )
@@ -4755,32 +4986,11 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 await videoCallDelegate?.remoteParticipantTilesDidChange()
                 return
             }
-            let eventKey = RTCSession.conferenceParticipantIdentityKey(event.participantId)
-            let assignmentKey = participantViewAssignments.keys.first { participantId in
-                participantId == event.participantId
-                    || (!eventKey.isEmpty && RTCSession.conferenceParticipantIdentityKey(participantId) == eventKey)
-            }
-            guard let assignmentKey,
-                  let view = participantViewAssignments[assignmentKey] else {
-                return
-            }
-            await session.removeRemoteForParticipant(
-                view: view,
+            await teardownParticipantTileIfAssigned(
                 connectionId: connectionId,
-                participantId: event.participantId
+                participantId: event.participantId,
+                forceRelease: forceRelease
             )
-            participantAttachedTrackIdsByKey.removeValue(forKey: participantAssignmentKey(assignmentKey))
-            participantCoordinatorSettledKeys.remove(participantAssignmentKey(assignmentKey))
-            if await shouldReleaseParticipantViewAssignment(
-                connectionId: connectionId,
-                participantId: event.participantId
-            ) {
-                participantViewAssignments.removeValue(forKey: assignmentKey)
-                if !unassignedViews.contains(where: { $0 === view }) {
-                    unassignedViews.append(view)
-                }
-                await assignExistingParticipantTracks(connectionId: connectionId)
-            }
             await videoCallDelegate?.remoteParticipantTilesDidChange()
         }
     }
@@ -4877,37 +5087,77 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return
         }
         let identity = participantAssignmentKey(participantId)
-        guard ScreenShareLayoutTransitionPolicy.shouldAcceptSurfaceReport(
+        if ScreenShareLayoutTransitionPolicy.shouldAcceptSurfaceReport(
             capturedGeneration: generation,
             identity: identity,
             state: screenShareLayoutTransitionState
+        ) {
+            let wasStarting: Bool
+            switch screenShareLayoutTransitionState.phase {
+            case .awaitingStartLayout:
+                wasStarting = true
+            case .awaitingStopLayout:
+                wasStarting = false
+            case .idle, .active:
+                return
+            }
+            screenShareLayoutTransitionState = ScreenShareLayoutTransitionPolicy.applyingSurfaceReport(
+                capturedGeneration: generation,
+                identity: identity,
+                state: screenShareLayoutTransitionState
+            )
+            expectedComposeLayoutParticipantKeys = screenShareLayoutTransitionState.expectedIdentities
+            reportedComposeLayoutParticipantKeys = screenShareLayoutTransitionState.reportedIdentities
+            guard !screenShareLayoutTransitionState.isAwaitingLayout,
+                  expectedComposeLayoutParticipantKeys.isSubset(of: reportedComposeLayoutParticipantKeys) else {
+                return
+            }
+            await performParticipantVideoReconcileAfterScreenShareLayoutChange(
+                isSharing: wasStarting,
+                layoutGeneration: generation
+            )
+            return
+        }
+
+        guard AndroidRemoteGridTransitionPolicy.shouldAcceptGridSlotSurfaceReport(
+            capturedGeneration: generation,
+            identity: identity,
+            state: gridSlotLayoutTransitionState
         ) else {
             return
         }
-        let wasStarting: Bool
-        switch screenShareLayoutTransitionState.phase {
-        case .awaitingStartLayout:
-            wasStarting = true
-        case .awaitingStopLayout:
-            wasStarting = false
-        case .idle, .active:
-            return
-        }
-        screenShareLayoutTransitionState = ScreenShareLayoutTransitionPolicy.applyingSurfaceReport(
+        gridSlotLayoutTransitionState = AndroidRemoteGridTransitionPolicy.applyingGridSlotSurfaceReport(
             capturedGeneration: generation,
             identity: identity,
-            state: screenShareLayoutTransitionState
+            state: gridSlotLayoutTransitionState
         )
-        expectedComposeLayoutParticipantKeys = screenShareLayoutTransitionState.expectedIdentities
-        reportedComposeLayoutParticipantKeys = screenShareLayoutTransitionState.reportedIdentities
-        guard !screenShareLayoutTransitionState.isAwaitingLayout,
-              expectedComposeLayoutParticipantKeys.isSubset(of: reportedComposeLayoutParticipantKeys) else {
-            return
+        guard !gridSlotLayoutTransitionState.isAwaiting else { return }
+        await reattachAssignedParticipantVideoIfNeeded()
+    }
+
+    /// Wait for Compose to report the resized surfaces after a 1-up ↔ N-up slot change.
+    func beginParticipantVideoReconcileAfterGridSlotLayoutChange(
+        visibleViews: [AndroidSampleCaptureView]
+    ) async -> UInt64 {
+        let expectedIdentities = Set(
+            participantViewAssignments.compactMap { participantId, assignedView in
+                visibleViews.contains(where: { $0 === assignedView })
+                    ? participantAssignmentKey(participantId)
+                    : nil
+            }
+        )
+        gridSlotLayoutTransitionState = AndroidRemoteGridTransitionPolicy.beginGridSlotTransition(
+            state: gridSlotLayoutTransitionState,
+            expectedIdentities: expectedIdentities
+        )
+        logger.log(
+            level: .info,
+            message: "Waiting for Compose grid-slot layout generation=\(gridSlotLayoutTransitionState.generation) expected=\(expectedIdentities.count)"
+        )
+        if !gridSlotLayoutTransitionState.isAwaiting {
+            await reattachAssignedParticipantVideoIfNeeded()
         }
-        await performParticipantVideoReconcileAfterScreenShareLayoutChange(
-            isSharing: wasStarting,
-            layoutGeneration: generation
-        )
+        return gridSlotLayoutTransitionState.generation
     }
 
     private func performParticipantVideoReconcileAfterScreenShareLayoutChange(
@@ -5051,8 +5301,8 @@ public actor AndroidVideoCallController: CallActionDelegate {
         keepRemoteSurfacesVisibleForSystemPiP = keepVisible
     }
 
-    /// In-app and system PiP are remote-only. Survives `setVideoSurfacesHidden(false)`
-    /// so a chrome restore or system-PiP exit cannot bring local back over the floating remote.
+    /// Survives `setVideoSurfacesHidden(false)` so hangup cannot flash local
+    /// after chrome reset. In-app / system PiP keep local visible and filling.
     public func setKeepLocalPreviewHiddenForPictureInPicture(_ hidden: Bool) {
         if !hidden && !isCallActiveForSurfaceUnhide() {
             keepLocalPreviewHiddenForPictureInPicture = true
@@ -5248,6 +5498,10 @@ public actor AndroidVideoCallController: CallActionDelegate {
     // MARK: - View Management
 
     private func createPreviewView(shouldQuery: Bool = true) async {
+        guard isRunning else {
+            logger.log(level: .debug, message: "createPreviewView skipped: controller already ended")
+            return
+        }
         guard let connectionId = currentCall?.sharedCommunicationId else {
             logger.log(level: .debug, message: "createPreviewView skipped: missing currentCall")
             return
@@ -5256,12 +5510,23 @@ public actor AndroidVideoCallController: CallActionDelegate {
             logger.log(level: .debug, message: "createPreviewView skipped: missing localView")
             return
         }
+        if localView.hasActiveSink() {
+            logger.log(
+                level: .debug,
+                message: "createPreviewView skipped: local preview already bound connection=\(connectionId)"
+            )
+            return
+        }
         logger.log(level: .info, message: "AndroidVideoCallController creating preview for connection: \(connectionId)")
         await session.renderLocalVideo(to: localView, connectionId: connectionId)
         await session.setVideoTrack(isEnabled: true, connectionId: connectionId)
     }
 
     private func createSampleView() async {
+        guard isRunning else {
+            logger.log(level: .debug, message: "createSampleView skipped: controller already ended")
+            return
+        }
         guard let connectionId = currentCall?.sharedCommunicationId else {
             logger.log(level: .debug, message: "createSampleView skipped: missing currentCall")
             return
@@ -5299,6 +5564,15 @@ public actor AndroidVideoCallController: CallActionDelegate {
                 level: .info,
                 message: "Deferred grid-layout reattach to post-renegotiation coordinator connection=\(connectionId)"
             )
+            if postRenegotiationCoordinatorInFlight {
+                return
+            }
+            if await shouldSkipPostRenegotiationAttachEpisodeCoordinator(
+                participantIds: Array(postRenegotiationEpisodeParticipantIds),
+                connectionId: connectionId
+            ) {
+                return
+            }
             schedulePostRenegotiationAttachCoordinator(connectionId: connectionId)
             return
         }
@@ -5452,8 +5726,10 @@ public actor AndroidVideoCallController: CallActionDelegate {
         )
         expectedComposeLayoutParticipantKeys.removeAll()
         reportedComposeLayoutParticipantKeys.removeAll()
+        departedParticipantKeysWithoutMappedCamera.removeAll()
         pendingRemoteScreenShareActivation = nil
         remoteScreenShareLayoutGeneration &+= 1
+        gridSlotLayoutTransitionState = .idle
         stateStreamTask?.cancel()
         stateStreamTask = nil
         screenView = nil
