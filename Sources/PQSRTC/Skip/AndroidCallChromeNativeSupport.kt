@@ -15,7 +15,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.ViewParent
-import android.view.ViewTreeObserver
 import java.util.WeakHashMap
 
 /**
@@ -36,14 +35,36 @@ object AndroidCallChromeNativeSupport {
 
     @Volatile
     private var inAppPipTapHandler: (() -> Unit)? = null
+    private val tileTapHandlers = LinkedHashMap<String, () -> Unit>()
 
     private var hitLayer: CallChromeHitLayer? = null
     private var hitLayerParent: ViewGroup? = null
-    private var keepHitLayerFrontListener: ViewTreeObserver.OnGlobalLayoutListener? = null
+    private var keepHitLayerFrontListener: ViewGroup.OnHierarchyChangeListener? = null
     private var activityTouchSession: DragSession? = null
+    private var swallowUnderlyingTouches = false
+
+    private data class PendingDragAttach(
+        val key: String,
+        val enableTap: Boolean,
+        val edgeDp: Float,
+        val listener: View.OnLayoutChangeListener,
+    )
+
+    private val pendingDragAttach = WeakHashMap<View, PendingDragAttach>()
 
     fun setInAppPipTapHandler(handler: (() -> Unit)?) {
-        inAppPipTapHandler = handler
+        setTileTapHandler("pip", handler)
+    }
+
+    fun setTileTapHandler(key: String, handler: (() -> Unit)?) {
+        if (handler == null) {
+            tileTapHandlers.remove(key)
+        } else {
+            tileTapHandlers[key] = handler
+        }
+        if (key == "pip") {
+            inAppPipTapHandler = handler
+        }
     }
 
     /**
@@ -56,6 +77,15 @@ object AndroidCallChromeNativeSupport {
             TAG,
             "exclusion attached key=$key ${view.width}x${view.height}",
         )
+        if (view.width <= 0 || view.height <= 0) {
+            view.addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
+                val width = right - left
+                val height = bottom - top
+                if (width > 0 && height > 0) {
+                    Log.i(TAG, "exclusion laid out key=$key ${width}x${height}")
+                }
+            }
+        }
     }
 
     fun detachControlExclusion(key: String) {
@@ -70,13 +100,20 @@ object AndroidCallChromeNativeSupport {
         enableTap: Boolean,
         edgeDp: Float,
     ) {
-        if (isNearlyFullScreen(seed)) {
+        if (seed.width <= 0 || seed.height <= 0 || isNearlyFullScreen(seed)) {
             Log.w(
                 TAG,
-                "refusing full-screen seed key=$key ${seed.width}x${seed.height}",
+                "deferring full-screen seed key=$key ${seed.width}x${seed.height}",
+            )
+            rememberPendingDragAttach(
+                seed = seed,
+                key = key,
+                enableTap = enableTap,
+                edgeDp = edgeDp,
             )
             return
         }
+        clearPendingDragAttach(seed)
 
         val edgePx = edgeDp * seed.resources.displayMetrics.density
         val existing = dragSessions[key]
@@ -109,13 +146,20 @@ object AndroidCallChromeNativeSupport {
     }
 
     fun detachNativeCallChromeDrag(key: String, seed: View? = null) {
-        val session = dragSessions[key] ?: return
-        if (seed != null && session.seed !== seed) {
-            return
+        val session = dragSessions[key]
+        if (session != null) {
+            if (seed != null && session.seed !== seed) {
+                return
+            }
+            dragSessions.remove(key)?.detach()
+            if (activityTouchSession === session) {
+                activityTouchSession = null
+            }
         }
-        dragSessions.remove(key)?.detach()
-        if (activityTouchSession === session) {
-            activityTouchSession = null
+        if (seed != null) {
+            clearPendingDragAttach(seed)
+        } else {
+            clearPendingDragAttach(key = key)
         }
         if (dragSessions.isEmpty()) {
             removeHitLayer()
@@ -134,8 +178,11 @@ object AndroidCallChromeNativeSupport {
             dragSessions.remove(key)?.detach()
         }
         activityTouchSession = null
+        swallowUnderlyingTouches = false
         controlExclusions.clear()
         inAppPipTapHandler = null
+        tileTapHandlers.clear()
+        clearAllPendingDragAttach()
         removeHitLayer()
         Log.i(
             TAG,
@@ -146,14 +193,49 @@ object AndroidCallChromeNativeSupport {
 
     /**
      * MainActivity calls this before normal dispatch. SurfaceView and Skip/Compose
-     * cannot swallow a tile gesture before this owner sees it; non-tile touches
-     * return false immediately and continue through the app normally.
+     * cannot swallow a tile gesture before this owner sees it.
+     *
+     * Chrome taps return false so SwiftUI / Compose controls receive them.
+     * Other full-screen call taps are consumed so they cannot reach chat
+     * under a pass-through SurfaceView (Device3 13:03 opened contact profile).
      */
     fun dispatchActivityTouchEvent(event: MotionEvent): Boolean {
+        return handleOwnerTouch(event)
+    }
+
+    private fun handleOwnerTouch(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             val session = sessionAt(event.rawX, event.rawY)
             activityTouchSession = session
-            return session?.handleTouch(event) ?: false
+            swallowUnderlyingTouches = false
+            if (session != null) {
+                return session.handleTouch(event)
+            }
+            if (hitsControlExclusion(event.rawX, event.rawY)) {
+                Log.i(
+                    TAG,
+                    "down ignored over call chrome raw=${event.rawX.toInt()},${event.rawY.toInt()}",
+                )
+                return false
+            }
+            if (shouldSwallowUnderlyingContentTouches()) {
+                swallowUnderlyingTouches = true
+                Log.i(
+                    TAG,
+                    "down swallowed over call surface raw=${event.rawX.toInt()},${event.rawY.toInt()}",
+                )
+                return true
+            }
+            return false
+        }
+
+        if (swallowUnderlyingTouches) {
+            if (event.actionMasked == MotionEvent.ACTION_UP ||
+                event.actionMasked == MotionEvent.ACTION_CANCEL
+            ) {
+                swallowUnderlyingTouches = false
+            }
+            return true
         }
 
         val session = activityTouchSession ?: return false
@@ -164,6 +246,72 @@ object AndroidCallChromeNativeSupport {
             activityTouchSession = null
         }
         return handled
+    }
+
+    private fun shouldSwallowUnderlyingContentTouches(): Boolean {
+        if (hitLayer == null) return false
+        return controlExclusions.keys.any { key ->
+            key == "call-controls" || key.endsWith("top") || key.endsWith("bottom")
+        }
+    }
+
+    private fun rememberPendingDragAttach(
+        seed: View,
+        key: String,
+        enableTap: Boolean,
+        edgeDp: Float,
+    ) {
+        val existing = pendingDragAttach[seed]
+        if (existing != null &&
+            existing.key == key &&
+            existing.enableTap == enableTap
+        ) {
+            return
+        }
+        clearPendingDragAttach(seed)
+        val listener = View.OnLayoutChangeListener { view, left, top, right, bottom, _, _, _, _ ->
+            val width = right - left
+            val height = bottom - top
+            if (width <= 0 || height <= 0) return@OnLayoutChangeListener
+            if (isNearlyFullScreen(view) || !isCallChromeTileSize(view)) {
+                return@OnLayoutChangeListener
+            }
+            clearPendingDragAttach(view)
+            attachNativeCallChromeDrag(
+                seed = view,
+                key = key,
+                enableTap = enableTap,
+                edgeDp = edgeDp,
+            )
+        }
+        pendingDragAttach[seed] = PendingDragAttach(
+            key = key,
+            enableTap = enableTap,
+            edgeDp = edgeDp,
+            listener = listener,
+        )
+        seed.addOnLayoutChangeListener(listener)
+    }
+
+    private fun clearPendingDragAttach(seed: View) {
+        val pending = pendingDragAttach.remove(seed) ?: return
+        seed.removeOnLayoutChangeListener(pending.listener)
+    }
+
+    private fun clearPendingDragAttach(key: String) {
+        val seeds = ArrayList(pendingDragAttach.keys)
+        for (seed in seeds) {
+            if (pendingDragAttach[seed]?.key == key) {
+                clearPendingDragAttach(seed)
+            }
+        }
+    }
+
+    private fun clearAllPendingDragAttach() {
+        val seeds = ArrayList(pendingDragAttach.keys)
+        for (seed in seeds) {
+            clearPendingDragAttach(seed)
+        }
     }
 
     private fun ensureHitLayer(seed: View) {
@@ -190,29 +338,35 @@ object AndroidCallChromeNativeSupport {
                 ViewGroup.LayoutParams.MATCH_PARENT,
             ),
         )
-        val listener = ViewTreeObserver.OnGlobalLayoutListener {
-            val parent = hitLayerParent ?: return@OnGlobalLayoutListener
-            val overlay = hitLayer ?: return@OnGlobalLayoutListener
-            if (overlay.parent === parent &&
-                parent.childCount > 0 &&
-                parent.getChildAt(parent.childCount - 1) !== overlay
-            ) {
-                overlay.bringToFront()
+        val listener = object : ViewGroup.OnHierarchyChangeListener {
+            override fun onChildViewAdded(parent: View, child: View) {
+                val overlay = hitLayer ?: return
+                if (child === overlay) return
+                overlay.post { bringHitLayerToFrontIfNeeded() }
             }
+
+            override fun onChildViewRemoved(parent: View, child: View) {}
         }
         keepHitLayerFrontListener = listener
-        content.viewTreeObserver.addOnGlobalLayoutListener(listener)
+        content.setOnHierarchyChangeListener(listener)
         Log.i(TAG, "hit layer attached")
+    }
+
+    private fun bringHitLayerToFrontIfNeeded() {
+        val parent = hitLayerParent ?: return
+        val overlay = hitLayer ?: return
+        if (overlay.parent === parent &&
+            parent.childCount > 0 &&
+            parent.getChildAt(parent.childCount - 1) !== overlay
+        ) {
+            overlay.bringToFront()
+        }
     }
 
     private fun removeHitLayer() {
         val parent = hitLayerParent
-        val listener = keepHitLayerFrontListener
-        if (parent != null && listener != null) {
-            val observer = parent.viewTreeObserver
-            if (observer.isAlive) {
-                observer.removeOnGlobalLayoutListener(listener)
-            }
+        if (parent != null && keepHitLayerFrontListener != null) {
+            parent.setOnHierarchyChangeListener(null)
         }
         keepHitLayerFrontListener = null
         val layer = hitLayer
@@ -234,6 +388,10 @@ object AndroidCallChromeNativeSupport {
             if (!session.isHitEnabled()) continue
             val bounds = session.screenBounds() ?: continue
             if (!bounds.contains(rawX, rawY)) continue
+            // Tile hit boxes can extend into the control strip. A point in the
+            // reserved chrome area must stay with hangup / mute / minimize.
+            val available = availableScreenBounds(session.translationTarget())
+            if (!available.contains(rawX, rawY)) continue
             val area = bounds.width() * bounds.height()
             if (selected == null || area < selectedArea) {
                 selected = session
@@ -245,14 +403,53 @@ object AndroidCallChromeNativeSupport {
 
     private fun hitsControlExclusion(rawX: Float, rawY: Float): Boolean {
         val visible = Rect()
+        var hadLaidOutExclusion = false
         for (view in controlExclusions.values) {
             if (!view.isAttachedToWindow || !view.isShown) continue
             if (!view.getGlobalVisibleRect(visible) || visible.isEmpty) continue
+            hadLaidOutExclusion = true
             if (visible.contains(rawX.toInt(), rawY.toInt())) {
                 return true
             }
         }
+        // Skip Compose probes often register at 0x0 and never report a rect.
+        // Still protect the chrome strip so a bottom-trailing local tile cannot
+        // swallow minimize / hide-controls / hangup.
+        if (!hadLaidOutExclusion && hitsReservedChromeStrip(rawX, rawY)) {
+            return true
+        }
         return false
+    }
+
+    private fun hitsReservedChromeStrip(rawX: Float, rawY: Float): Boolean {
+        val layer = hitLayer ?: return false
+        if (!layer.isAttachedToWindow || layer.width <= 0 || layer.height <= 0) {
+            return false
+        }
+        val screen = rawScreenBounds(layer)
+        if (!screen.contains(rawX, rawY)) return false
+        val density = layer.resources.displayMetrics.density
+        val keys = controlExclusions.keys
+        if (keys.any { it == "call-controls" || it.endsWith("bottom") }) {
+            if (rawY >= screen.bottom - reservedBottomChromeDp(keys) * density) {
+                return true
+            }
+        }
+        if (keys.contains("call-chip") && rawY >= screen.bottom - 116f * density) {
+            return true
+        }
+        if (keys.any { it.endsWith("top") } && rawY <= screen.top + 96f * density) {
+            return true
+        }
+        return false
+    }
+
+    private fun reservedBottomChromeDp(keys: Set<String>): Float {
+        return when {
+            keys.contains("call-chip") -> 116f
+            keys.contains("call-controls") -> 220f
+            else -> 128f
+        }
     }
 
     private fun rawScreenBounds(view: View): RectF {
@@ -319,7 +516,7 @@ object AndroidCallChromeNativeSupport {
                 it == "call-controls" || it == "call-chip" || it.endsWith("bottom")
             }
         ) {
-            val reserveDp = if (controlExclusions.containsKey("call-chip")) 116f else 128f
+            val reserveDp = reservedBottomChromeDp(controlExclusions.keys)
             screen.bottom -= reserveDp * density
             if (controlExclusions.containsKey("call-chip")) {
                 appliedChipGap = 12f * density
@@ -432,6 +629,8 @@ object AndroidCallChromeNativeSupport {
             target.translationY = 0f
         }
 
+        fun translationTarget(): View = target
+
         fun isHitEnabled(): Boolean {
             if (!seed.isAttachedToWindow || !seed.isShown || seed.alpha <= 0.01f) {
                 return false
@@ -531,7 +730,8 @@ object AndroidCallChromeNativeSupport {
         }
 
         private fun invokePipTap() {
-            val handler = inAppPipTapHandler
+            val handler = tileTapHandlers[key]
+                ?: if (key == "pip") inAppPipTapHandler else null
             if (handler == null) {
                 Log.w(TAG, "tap key=$key ignored (no handler)")
                 return
@@ -730,8 +930,6 @@ object AndroidCallChromeNativeSupport {
     }
 
     private class CallChromeHitLayer(context: Context) : View(context) {
-        private var activeSession: DragSession? = null
-
         init {
             setBackgroundColor(Color.TRANSPARENT)
             isClickable = false
@@ -741,25 +939,7 @@ object AndroidCallChromeNativeSupport {
         }
 
         override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                val session = sessionAt(event.rawX, event.rawY)
-                activeSession = session
-                return session?.handleTouch(event) ?: false
-            }
-
-            val session = activeSession ?: return false
-            val handled = session.handleTouch(event)
-            if (event.actionMasked == MotionEvent.ACTION_UP ||
-                event.actionMasked == MotionEvent.ACTION_CANCEL
-            ) {
-                activeSession = null
-            }
-            return handled
-        }
-
-        override fun onDetachedFromWindow() {
-            activeSession = null
-            super.onDetachedFromWindow()
+            return handleOwnerTouch(event)
         }
     }
 }

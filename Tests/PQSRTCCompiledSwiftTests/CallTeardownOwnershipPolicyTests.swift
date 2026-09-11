@@ -122,6 +122,7 @@ struct CallTeardownOwnershipPolicyTests {
         #expect(shutdown.contains("waitForCallTeardownIfNeeded"))
         #expect(shutdown.contains("prepareCryptoStackForNextCallIfNeeded()"))
         #expect(shutdown.contains("resetFrameKeyProviderForHangup()"))
+        #expect(shutdown.contains("clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()"))
         #expect(groupCall.contains("waitForCallTeardownIfNeeded"))
         #expect(oneToOne.contains("waitForCallTeardownIfNeeded"))
         #expect(ice.contains("prepareCryptoStackForNextCallIfNeeded()"))

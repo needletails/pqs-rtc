@@ -60,12 +60,22 @@ extension RTCSession {
                     )
                 }
 
-                if SfuSignalingUplinkYieldPolicy.shouldYield(
+                let essentialInFlight = await self.essentialOutboundInFlightCount(for: normalizedId)
+                let shouldYield = SfuSignalingUplinkYieldPolicy.shouldYield(
                     isGroupOrConference: !isOneToOneSfu,
-                    essentialInFlightCount: await self.essentialOutboundInFlightCount(for: normalizedId)
-                ) {
+                    essentialInFlightCount: essentialInFlight
+                )
+                if shouldYield {
                     targets = RTCAdaptiveVideoTargets.survivalTargets(cfg: cfg)
                 }
+
+                await self.logAndroidAdaptiveVideoTargetIfChanged(
+                    connectionId: normalizedId,
+                    fps: targets.maxFramerate,
+                    scale: targets.scaleResolutionDownBy,
+                    shouldYield: shouldYield,
+                    essentialInFlightCount: essentialInFlight
+                )
 
                 let lastApplied = await self.adaptiveVideoLastAppliedByConnectionId[normalizedId]
                 let deltaOk = RTCAdaptiveVideoTargets.shouldApply(targets, lastApplied: lastApplied)
@@ -125,7 +135,30 @@ extension RTCSession {
             task.cancel()
         }
         adaptiveVideoLastAppliedByConnectionId.removeValue(forKey: normalizedId)
+        adaptiveVideoLastLoggedYieldByConnectionId.removeValue(forKey: normalizedId)
         adaptiveInboundVideoRtpTotalsByConnectionId.removeValue(forKey: normalizedId)
+    }
+
+    private func logAndroidAdaptiveVideoTargetIfChanged(
+        connectionId: String,
+        fps: Int,
+        scale: Double,
+        shouldYield: Bool,
+        essentialInFlightCount: Int
+    ) {
+        let next = (fps: fps, scale: scale, yield: shouldYield, inFlight: essentialInFlightCount)
+        if let previous = adaptiveVideoLastLoggedYieldByConnectionId[connectionId],
+           previous == next {
+            return
+        }
+        adaptiveVideoLastLoggedYieldByConnectionId[connectionId] = next
+        logger.log(
+            level: .info,
+            message: """
+            Android adaptive video target fps=\(fps) scale=\(scale) \
+            essentialInFlightCount=\(essentialInFlightCount) shouldYield=\(shouldYield)
+            """
+        )
     }
 
     private func setAdaptiveVideoLastApplied(connectionId: String, bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double) {

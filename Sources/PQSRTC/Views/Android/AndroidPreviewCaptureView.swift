@@ -199,6 +199,20 @@ public final class AndroidSampleCaptureView: @unchecked Sendable, Equatable {
         native.applySoloFullscreenLayout()
     }
 
+    /// Join 1:1 → 2-up: leftover fullscreen fill stays until conference scale flips.
+    public func applyConferenceGridLayout() {
+        native.applyConferenceGridLayout()
+    }
+
+    /// Compose 16:9 cell size is the leftover letterbox viewport.
+    @discardableResult
+    public func applyConferenceLetterboxForComposeTile(tileWidthPx: Int, tileHeightPx: Int) -> Bool {
+        native.applyConferenceLetterboxForComposeTile(
+            tileWidthPx: tileWidthPx,
+            tileHeightPx: tileHeightPx
+        )
+    }
+
     /// Called by Compose on renderer updates. If the backing view size changed, native code
     /// reconciles the sink against the already assigned track.
     public func rendererDidUpdateLayout() {
@@ -211,6 +225,26 @@ public final class AndroidSampleCaptureView: @unchecked Sendable, Equatable {
     @discardableResult
     public func rendererDidUpdateLayoutFromCompose() -> Bool {
         native.rendererDidUpdateLayoutFromCompose()
+    }
+
+    public func hasAssignedTrackForRendererInit() -> Bool {
+        native.hasAssignedTrackForRendererInit()
+    }
+
+    public func markSurfaceRendererInitialized() {
+        native.markSurfaceRendererInitialized()
+    }
+
+    public func noteIdlePoolFactorySkippedEgl() {
+        native.noteIdlePoolFactorySkippedEgl()
+    }
+
+    public func conferenceTileComposeUpdateIsNoOp() -> Bool {
+        native.conferenceTileComposeUpdateIsNoOp()
+    }
+
+    public func rememberConferenceTileComposeHost() {
+        native.rememberConferenceTileComposeHost()
     }
 
     /// True when the tile has a live sink but the renderer dimensions changed since the last bind.
@@ -338,7 +372,21 @@ public struct AndroidCallChromeBridge {
         AndroidCallChromeNativeSupport.attachNativeCallChromeDrag(
             seed: host,
             key: "local",
-            enableTap: false,
+            enableTap: true,
+            edgeDp: edgeDp
+        )
+        return true
+    }
+
+    /// Attach native drag + tap to the remote in-app PiP host. Full-screen seeds
+    /// defer until the tile is boxed; returns `false` only when the renderer is gone.
+    public static func attachRemotePipDrag(captureView: AndroidSampleCaptureView, edgeDp: Float) -> Bool {
+        let renderer = captureView.surfaceViewRenderer
+        let host = AndroidRTCViewSupport.aspectFitContainerOrNull(renderer: renderer) ?? renderer
+        AndroidCallChromeNativeSupport.attachNativeCallChromeDrag(
+            seed: host,
+            key: "pip",
+            enableTap: true,
             edgeDp: edgeDp
         )
         return true
@@ -347,6 +395,12 @@ public struct AndroidCallChromeBridge {
     /// Install / clear the in-app PiP tap handler.
     public static func setInAppPipTapHandler(_ handler: (() -> Void)?) {
         AndroidCallChromeNativeSupport.setInAppPipTapHandler(handler: handler)
+    }
+
+    /// Per-tile tap. `local` shrinks/grows the in-call overlay; `pip` shrinks/grows
+    /// the floating remote window. Restore stays on the return chip.
+    public static func setTileTapHandler(key: String, handler: (() -> Void)?) {
+        AndroidCallChromeNativeSupport.setTileTapHandler(key: key, handler: handler)
     }
 }
 #endif

@@ -529,6 +529,14 @@ struct GroupCallVideoLayoutTests {
                     let fraction: Double = isTablet ? 0.28 : 0.34
                     #expect(expected.width <= maxWidth + 0.01)
                     #expect(expected.width <= container.minSide * fraction + 0.01)
+                    let minimized = GroupCallVideoLayoutPolicy.localPreviewOverlaySize(
+                        platform: .android,
+                        containerSize: container,
+                        isTablet: isTablet,
+                        isMinimized: true
+                    )
+                    #expect(minimized.width < expected.width)
+                    #expect(minimized.height < expected.height)
                 }
             }
         }

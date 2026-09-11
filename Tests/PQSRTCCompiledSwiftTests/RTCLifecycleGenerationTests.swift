@@ -190,7 +190,7 @@ struct RTCLifecycleGenerationTests {
         #expect(source.contains("private var postRenegotiationCoordinatorTask: Task<Void, Never>?"))
         #expect(source.contains("private var postRenegotiationCoordinatorGeneration: UInt64 = 0"))
         let request = try sourceBody(of: "requestPostRenegotiationAttachCoordinator", in: source)
-        #expect(request.contains("guard isRunning, isGroupCall else { return }"))
+        #expect(request.contains("guard isRunning, isGroupCall, !attachWorkAborted else { return }"))
         let cancellation = try sourceBody(of: "cancelPostRenegotiationAttachCoordinator", in: source)
         #expect(cancellation.contains("postRenegotiationCoordinatorGeneration &+= 1"))
         #expect(cancellation.contains("postRenegotiationCoordinatorTask?.cancel()"))

@@ -2882,6 +2882,9 @@ extension RTCSession {
         advertisedMid: String?,
         connection: RTCConnection
     ) -> RTCVideoTrack? {
+        guard rtcClient.peerConnectionIsUsableForTrackResolution(connection.peerConnection) else {
+            return nil
+        }
         if let advertisedMid = advertisedMid?.trimmingCharacters(in: .whitespacesAndNewlines),
            !advertisedMid.isEmpty,
            let midTrack = rtcClient.getRemoteVideoTrackByMid(
@@ -2915,6 +2918,11 @@ extension RTCSession {
     ) -> RTCVideoTrack? {
         let participantKey = Self.conferenceParticipantIdentityKey(participantId)
         guard !participantKey.isEmpty else { return nil }
+        guard SfuDepartedReceiverTrackPolicy.shouldRematerializePrunedAndroidCameraMapping(
+            participantWasPruned: androidRemoteCameraParticipantWasPruned(participantId)
+        ) else {
+            return nil
+        }
 
         if let remoteSdp = remoteSdp?.trimmingCharacters(in: .whitespacesAndNewlines),
            !remoteSdp.isEmpty {
@@ -3262,9 +3270,11 @@ extension RTCSession {
             let existing = connection.remoteAudioTracksByParticipantId[label.participantId]
             let rememberedTrackId = existing?.trackIdIfAvailable
                 ?? androidResolvedRemoteAudioTrackId(participantId: label.participantId, in: connection)
+            let hasLiveReceiverCryptor = rtcClient.hasAudioReceiverCryptor(for: label.participantId)
             if !AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
                 existingTrackId: rememberedTrackId,
-                advertisedTrackId: audioTrackId
+                advertisedTrackId: audioTrackId,
+                hasLiveReceiverCryptor: hasLiveReceiverCryptor
             ) {
                 rememberAndroidResolvedRemoteAudioTrackId(
                     participantId: label.participantId,
@@ -3305,9 +3315,17 @@ extension RTCSession {
                     trackId: audioTrackId
                 )
             }
+            let attachReason: String
+            if rememberedTrackId == nil {
+                attachReason = "first map"
+            } else if rememberedTrackId != audioTrackId {
+                attachReason = "track id changed"
+            } else {
+                attachReason = "no live cryptor"
+            }
             logger.log(
                 level: .info,
-                message: "Mapped Android SFU audio receiver to participant=\(label.participantId) trackId=\(audioTrackId) connection=\(connection.id)"
+                message: "Mapped Android SFU audio receiver to participant=\(label.participantId) trackId=\(audioTrackId) connection=\(connection.id) reason=\(attachReason)"
             )
         }
     }
@@ -5284,7 +5302,11 @@ extension RTCSession {
                         guard self.isGroupCallConnection(connection.id) else {
                             return participantId
                         }
-                        for label in streamIds + [trackId, participantId] {
+                        let labels = AndroidReceiverCryptorPolicy.preferredAndroidDidAddReceiverParticipantLabels(
+                            streamIds: streamIds,
+                            trackId: trackId
+                        ) + [participantId]
+                        for label in labels {
                             if let normalized = androidNormalizedRemoteParticipantIdFromSfuStreamLabel(
                                 label,
                                 connection: connection
@@ -5456,12 +5478,21 @@ extension RTCSession {
                             message: "Skipping Android group \(receiverTrackKind) receiver FrameCryptor until stable participant id is known trackId=\(trackId) participantId='\(receiverParticipantId)' connId=\(connection.id)"
                         )
                     } else if enableEncryption, !receiverParticipantId.isEmpty {
-                        rtcClient.createReceiverEncryptedFrame(
-                            participant: receiverParticipantId,
-                            connectionId: connection.id,
-                            trackKind: receiverTrackKind,
-                            trackId: trackId
-                        )
+                        if trackKind == "audio",
+                           self.isGroupCallConnection(connection.id),
+                           !isScreenTrack {
+                            logger.log(
+                                level: .info,
+                                message: "Skipping Android group audio receiver FrameCryptor in didAddReceiver; SDP reconcile owns attach trackId=\(trackId) participantId='\(receiverParticipantId)' connId=\(connection.id)"
+                            )
+                        } else {
+                            rtcClient.createReceiverEncryptedFrame(
+                                participant: receiverParticipantId,
+                                connectionId: connection.id,
+                                trackKind: receiverTrackKind,
+                                trackId: trackId
+                            )
+                        }
                     }
 #elseif canImport(WebRTC)
                 do {

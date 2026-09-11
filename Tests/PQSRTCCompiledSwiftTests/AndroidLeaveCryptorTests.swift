@@ -42,14 +42,21 @@ struct AndroidLeaveCryptorTests {
 
         #expect(shutdown.contains("resetFrameKeyProviderForHangup()"))
         #expect(shutdown.contains("prepareCryptoStackForNextCallIfNeeded()"))
+        #expect(shutdown.contains("clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()"))
+        #expect(shutdown.contains("androidRemoteAudioResolvedTrackIdsByParticipantId.removeAll()"))
+
+        let iceReset = try SourceContract.sourceBody(of: "resetAttemptFlagsForNewCall", in: ice)
+        #expect(iceReset.contains("clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()"))
 
         let cipher = try source("Sources/PQSRTC/RTCSession+RTCCipherTransport.swift")
         #expect(cipher.contains("func resetFrameEncryptionKeyProviderForNewCallAttempt()"))
         #expect(cipher.contains("resetFrameKeyProviderForHangup()"))
+        #expect(cipher.contains("clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()"))
 
         let iceRetryBody = try SourceContract.sourceBody(of: "discardPeerConnectionAttemptForRetry", in: ice)
         #expect(iceRetryBody.contains("resetPeerConnectionForRetry()"))
         #expect(!iceRetryBody.contains("resetFrameKeyProviderForHangup()"))
+        #expect(!iceRetryBody.contains("clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()"))
     }
 
     private func source(_ relativePath: String) throws -> String {

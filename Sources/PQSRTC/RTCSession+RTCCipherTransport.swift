@@ -1402,6 +1402,7 @@ extension RTCSession {
 #endif
         lastFrameKeyIndexByParticipantId.removeAll()
         lastSharedFrameKeyIndex = 0
+        clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()
         logger.log(level: .info, message: "Reset FrameCryptor key provider for new call attempt")
     }
 

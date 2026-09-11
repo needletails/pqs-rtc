@@ -560,6 +560,8 @@ public actor RTCSession {
     // Mirrors the Apple implementation but uses `org.webrtc.PeerConnection.getStats`.
     var adaptiveVideoSendTasksByConnectionId: [String: Task<Void, Never>] = [:]
     var adaptiveVideoLastAppliedByConnectionId: [String: (bitrateBps: Int, framerate: Int, scaleResolutionDownBy: Double)] = [:]
+    /// Last logged adaptive yield / fps / scale transition (info, once per change).
+    var adaptiveVideoLastLoggedYieldByConnectionId: [String: (fps: Int, scale: Double, yield: Bool, inFlight: Int)] = [:]
     /// Prior inbound video RTP totals for recent loss-fraction in adaptive survival.
     var adaptiveInboundVideoRtpTotalsByConnectionId: [String: (packetsReceived: Int64, packetsLost: Int64)] = [:]
     /// Last inbound video counters snapshot per connection (Android renderer recovery sampler).
@@ -654,8 +656,37 @@ public actor RTCSession {
 #endif
 
     /// Advertised Android SFU audio track ids that survive connection last-write-wins during
-    /// concurrent camera/audio SDP reconcile. Used only to skip mute/reattach on wrapper rotation.
+    /// concurrent camera/audio SDP reconcile. Used only to skip mute/reattach on wrapper rotation
+    /// while a live audio receiver cryptor still exists. Cleared on hangup / new call attempt
+    /// because same-room SFU track ids (`audio_<participant>_<room>`) are stable across calls.
     var androidSessionRemoteAudioResolvedTrackIdsByParticipantId: [String: String] = [:]
+
+    /// Camera publishers pruned after SFU PART. Leftover SDP / remembered
+    /// track ids must not rematerialize them until conference camera is on again.
+    var androidPrunedRemoteCameraParticipantKeys: Set<String> = []
+
+    func clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall() {
+        androidSessionRemoteAudioResolvedTrackIdsByParticipantId.removeAll()
+        androidPrunedRemoteCameraParticipantKeys.removeAll()
+    }
+
+    func noteAndroidRemoteCameraParticipantPruned(_ participantId: String) {
+        let key = Self.conferenceParticipantIdentityKey(participantId)
+        guard !key.isEmpty else { return }
+        androidPrunedRemoteCameraParticipantKeys.insert(key)
+    }
+
+    func noteAndroidRemoteCameraParticipantEligible(_ participantId: String) {
+        let key = Self.conferenceParticipantIdentityKey(participantId)
+        guard !key.isEmpty else { return }
+        androidPrunedRemoteCameraParticipantKeys.remove(key)
+    }
+
+    func androidRemoteCameraParticipantWasPruned(_ participantId: String) -> Bool {
+        let key = Self.conferenceParticipantIdentityKey(participantId)
+        guard !key.isEmpty else { return false }
+        return androidPrunedRemoteCameraParticipantKeys.contains(key)
+    }
 
     /// Connection ids currently answering an inbound SFU renegotiation offer (serialize duplicates).
     var sfuRenegotiationInFlightConnectionIds: Set<String> = []
@@ -1695,6 +1726,7 @@ public actor RTCSession {
         )
         guard updated != conferencePermissions else { return }
         conferencePermissions = updated
+        noteAndroidRemoteCameraParticipantPruned(participantId)
         notifyConferencePermissionsChanged()
     }
 
@@ -1831,6 +1863,9 @@ public actor RTCSession {
             }
             if let videoEnabled {
                 permissions.participantVideoEnabled[key] = videoEnabled
+                if videoEnabled {
+                    noteAndroidRemoteCameraParticipantEligible(key)
+                }
             }
         }
 

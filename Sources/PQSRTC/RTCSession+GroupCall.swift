@@ -1102,6 +1102,7 @@ extension RTCSession {
                 }
             }
             connection.videoReceiverCryptorBindingsByParticipantId.removeValue(forKey: participantId)
+            noteAndroidRemoteCameraParticipantPruned(participantId)
             result.removedVideoParticipants.append(participantId)
             result.didUpdate = true
         }
@@ -1306,8 +1307,11 @@ extension RTCSession {
             removedAudioParticipants.append(participantId)
         }
         rtcClient.disposeReceiverCryptors(forParticipant: participantId)
+        clearAndroidResolvedRemoteCameraMedia(participantId: participantId, in: &connection)
+        noteAndroidRemoteCameraParticipantPruned(participantId)
 
         guard !removedVideoParticipants.isEmpty || !removedScreenParticipants.isEmpty || !removedAudioParticipants.isEmpty else {
+            await connectionManager.updateConnection(id: connection.id, with: connection)
             notifyRemoteParticipantTrackChanged(
                 RemoteParticipantTrackEvent(connectionId: connection.id, participantId: participantId, kind: "video", isActive: false)
             )

@@ -151,6 +151,10 @@ Consequently, on Android:
   teardown. The next resolution after invalidation refreshes exactly once; the post-renegotiation
   attach episode then re-attaches every tile with the new wrappers.
 - No other code may call `getTransceivers()`, `getReceivers()`, or `getSenders()` per-probe.
+- Hangup must **retire** the Java `PeerConnection` before `close()`/`dispose()`.
+  `peerConnectionIsUsableForTransceiverLookup` reads only that retired set. Querying
+  `signalingState()` after native teardown SIGSEGVs (`nativeSignalingState`, fault `0xd4`).
+  In-flight ``renderRemoteVideoForParticipant`` after local-media release must abort.
 
 ## Apple architecture
 
@@ -218,15 +222,79 @@ Visible Android tiles follow **live camera presence** (session map or conference
 `videoEnabled`), not the channel roster. A participant-left / pruned-map event must
 release the assignment immediately so 2-up returns to 1:1 — `videoEnabled` and the
 channel roster must not keep the departed tile, and a skip-already-settled episode
-must **clear** so the coordinator does not run for minutes. An in-flight episode
+must **clear** so the coordinator does not run for minutes. An explicit leave
+(`explicitlyDeparted`) wins over a leftover mapped camera — Device3 08:21
+re-assigned `mm26` from the session map after `Releasing departed` and stayed in
+the 16:9 grid with one live remote. Device3 16:17 then returned to 1:1 and
+flipped back to 16:9 because inbound recovery and a post-leave `track added`
+cleared departed while leftover SDP rematerialized `nudge`. Remember departed
+when conference camera is already off, skip recovery/attach for that id, and
+do not rematerialize a pruned Android camera mapping until conference camera
+is on again. Clear departed only on a later live-camera rejoin that is not
+still pruned: conference `video=true` and the prune set was cleared.
+Android post-SFU settlement emits a ``PostSfuRenegotiationAttachEpisode``
+and does **not** deliver controller `track added`, so the episode refresh
+must apply that same gate. An in-flight leave-offer episode must not ignore
+a grown rejoin refresh (`Ignoring coordinator request`) or
+`stabilizeEpisodeForClear` against the finalize-start snapshot while the
+new id is mapped and unassigned (Device3 07:53:14–22). An in-flight episode
 must not `formUnion` a departed id back onto the grid, and remount / grid-layout
 must not queue coordinator reruns while a pass is in flight. Leave 2-up → 1:1
 must reattach the remaining sink immediately — do not wait for Compose
-`layoutGeneration` (parallel `tilesDidChange` stomps the generation and the
-leftover remote stays frozen). Compose must also remount the remaining
-`AndroidView` when `itemCount` crosses 1 (`composeTileKey`); Skip key reuse
-kept the 317×564 letterbox after `mounted count=1`. A leftover remote that
-still renders at conference-tile size is not 1:1. A shared live sink must not
+`layoutGeneration` and do not defer that leftover into an in-flight leave-offer
+episode (Device3 17:23 remounted at 317×564, then the coordinator skipped).
+Overlapping `tilesDidChange` refreshes must drop stale generations so only the
+latest publish remounts. Do **not** remount the leftover `AndroidView` when
+`itemCount` crosses 1 (`composeTileKey` is stable per renderer) — Device3
+22:18:41 first-measured the remount at 317×564 and stayed there. Do **not**
+remount the `AndroidRemoteGrid` `ComposeView` on 1↔N (`composeGridIdentity` is
+stable). `applySolo` / `applyConference` + `fillMaxSize` ↔ 16:9 own the hop.
+A conference lock on a still-fullscreen leftover must MATCH_PARENT the
+SurfaceView — keeping the 1:1 exact letterbox (1080×607) overflowed the 16:9
+cell and left the second remote at 0×0 (Device3 22:16:47–22:18:25). Do not
+re-call attach while that surface is still queued. A solo lock on a still-16:9
+leftover must MATCH_PARENT — letterboxing against that cell (317×564) is not
+1:1 (Device3 22:45:36–22:47:51). 1-up Compose must not keep the leftover in a
+Column/Row `aspectRatio` cell. Do not `egl_reinit_with_track` while the
+surface is 0×0. A leftover remote that
+still renders at conference-tile size is not 1:1. Join 1:1 → 2-up must
+letterbox the first remote inside the settled 16:9 cell (`applyConferenceGridLayout`)
+— do not guess a fullscreen viewport from the Compose tile’s `rootView`
+(1002×564 looks “fullscreen” against itself) or `SCALE_ASPECT_FILL` the leftover
+1:1 host (Device3 10:55 / 14:39: leftover BLAST-rejected at 1002×564).
+`SCALE_ASPECT_FIT` on a MATCH_PARENT SurfaceView still FILLs the tile; the
+leftover child must be the exact letterbox (317×564) in that apply. A 16:9
+`aspectRatio` cell is never the activity window and never a rotation fragment.
+`applyConferenceGridLayout` often runs while the leftover host is still
+1080×2520 — the 16:9 cell size is the viewport
+(`applyConferenceLetterboxForComposeTile`). Do not call
+`remoteCameraHostContainer` after that letterbox: stale leftover 1:1
+`container.width` MATCH_PARENT-FILLs 1002×564 (Device3 16:46:48 → BLAST
+16:49:07). Keep an existing 317×564 conference letterbox when a later
+apply still reads 1080×2520. A 9:16 camera buffer with rotation 90/270
+must not swap to landscape and FILL that cell. Same-size OnLayout must
+re-apply when the conference renderer is still MATCH_PARENT. Do not
+letterbox from Compose `onSizeChanged` during `PerformTraversals`.
+Leftover `Surface changed: 1080×2520 → 1002×564` is the conference cell —
+`surface_holder_rotation_skip` must still exact-letterbox that MATCH_PARENT
+surface (`maybeLetterboxConferenceSurface`), even if leftover is still
+SOLO-locked from 1-up (Device3 19:19:56 rejoin stayed `1002` FILL after the
+first hop letterboxed). 1-up fullscreen is never 16:9 (`1080×2520`).
+`applySolo` itself must still MATCH_PARENT against a leftover 16:9 *host*
+(do not compute 317 from `applySolo`). Do not leave the first remote
+FILL at 1002×564 until the second tile’s first frame. Compose `update`
+must letterbox from the SurfaceView size when the host still reads leftover
+1:1. Do not skip a last-applied 317×564 apply while the renderer is
+MATCH_PARENT again after remount. A 16:9 leftover surface letterboxes
+even when layoutParams are wrap-content (parent EXACT-measured the cell).
+`applyConference` on leftover 1:1 host must use the last settled 16:9 cell
+from the previous 2-up **only when that cell matches the current window
+orientation**. A portrait leftover cell (1002×564 → 317×564) must not be
+kept or remembered after the window is landscape (Device3 23:05:32: 317
+wrap while chrome was already 2394×231; return overflow `362×644` at
+`y=-40`). MATCH_PARENT until the current-orientation 16:9 cell lands, then
+one exact wrap. If apply still FILLs that cell, force the exact wrap.
+Window size is the activity decor / display, not the 16:9 cell. A shared live sink must not
 `requestPendingLiveWrapperRebind`; that queues an EGL tear after the next
 frame stall. A dead Java wrapper must force-apply the live receiver on the
 leave offer, not wait for tail frames.
@@ -248,6 +316,16 @@ Hangup dismisses the call view after chrome already sets `showsLocalPreview=fals
 leaves `EglRenderer: LocalPreviewDuration` running after camera stop. Rotation remounts
 keep `showsLocalPreview=true` and must not release.
 
+In-app minimize is a **remote-only** floating tile. Keep ``AndroidLocalVideoView``
+mounted and hide its surface (`INVISIBLE`); do not remount the call and do not
+fill local into the boxed window. Attach native drag/tap on the remote host from
+Compose `update` after the tile is boxed — the fullscreen factory never registers
+`key=pip`. A still-fullscreen seed must defer until layout, not refuse forever.
+Tap the floating remote tile to shrink/grow it; the return chip restores
+full-screen chrome. During the full-screen call, tap the local overlay to
+shrink/grow it (Apple `tapPreviewView` / `isMinimized`). That tap does not hide
+local — in-app minimize is what hides local, and it does **not** hide remote.
+
 Local preview pixels are **not** a `VideoTrack` sink. The send track shares a `VideoSource`
 with the encoder; WebRTC's adapter (CPU overuse / `maxFramerate` sink wants) drops frames
 for every sink on that source. Device3 showed `CameraStatistics: 15` fps while
@@ -262,12 +340,11 @@ skipped while GC freed ~70MB every ~3s. Android local preview fans the camera
 `TextureBuffer` to `EglRenderer` on the **shared** factory `EglBase` (required
 to draw the OES texture). Do not `toI420` for the PiP — lesson 26 was
 TextureBuffer **plus** readback on the same context, not TextureBuffer alone.
-VideoSource keeps the same `TextureBuffer` when Settings softening is off.
-When “Soften video appearance” is on, a worker `toI420`s after the TextureBuffer
-is no longer drawn (lesson 26) and both preview and send get the softened I420.
-A full-res 5-tap is invisible once the overlay downscales (~367 px); the worker
-blurs a 1/4 luma plane and upsamples so the in-call local tile matches iOS
-Gaussian σ≈min(w,h)/240. Capture fps is owned in Kotlin
+VideoSource and local preview both keep the camera `TextureBuffer`. Do not
+`toI420` the send path or the PiP when Settings softening is on — Device3
+13:03 dumped ~3M objects / 80MB every ~7s and skipped 30–46 frames (lesson 46).
+“Soften video appearance” is a viewport-resolution mix in `RoundedRectGlDrawer`
+(`uSoften`), not a full-res I420 worker. Capture fps is owned in Kotlin
 (`AndroidRTCViewSupport.startLocalCameraCapture` at 30). WebRTC still prefers
 `[15.0:30.0]`; first frame rewrites AE to `[30:30]` only — it must not recreate
 the session onto the TextureView. Local overlay is a SurfaceView media overlay
@@ -277,8 +354,13 @@ on TextureView. Round that overlay in the public EGL drawer (`RoundedRectGlDrawe
 with a translucent `SurfaceView` so corner alpha composites over the remote.
 `clipToOutline` and Compose `.clip` do not clip the hole-punch. Do not call
 `SurfaceView` / `SurfaceControl.Transaction` corner APIs — they are not in the
-public compileSdk 36 stubs (lesson 17). Send encodings still follow
-``RTCVideoQualityProfile``.
+public compileSdk 36 stubs (lesson 17). N-up remote grid tiles still match
+Apple `RemoteViewItem` chrome (12 dp continuous corner, 1 dp white 12%
+stroke) with a Compose `.border` **outside** a 1 dp `AndroidView` inset so
+the hole-punch does not erase the stroke. Do not make remotes translucent
+or `setZOrderMediaOverlay` to fake rounded video — transparent GL corners
+would show chat through the hole. 1-up stays full-bleed. Send encodings
+still follow ``RTCVideoQualityProfile``.
 
 ### Components
 
@@ -337,7 +419,8 @@ Finalize
   → promote tiles toward media-ready (rebind/attach when needed)
   → **await ``onFirstFrameRendered``** for bound tiles still warming up
   → clearPostRenegotiationAttachEpisode only when every surfaced tile is media-ready
-  → if the participant set grows during finalize, cancel first-frame waits and rerun the coordinator pass
+  → if the participant set grows during finalize or stabilize, cancel first-frame waits and rerun the coordinator pass
+  → do not clear after stabilize while `rerunNeeded` or a grown episode id is not media-ready
 ```
 
 **Phase ordering matters:** new participants receive full attach before settled participants receive
@@ -407,6 +490,14 @@ so tiles cannot stall waiting for a 6s stale threshold after the episode ends.
   requestLayouts forever and ANRs the call UI.
   Compose `AndroidView.update` reports a layout event only when the renderer
   size changes. A missing sink is an attach event, not a layout event.
+  `OnLayoutChangeListener` must **post** reconcile (never `egl_reinit` inside
+  `PerformTraversals`). Same-size OnLayout is a no-op. Coordinator attach
+  posts one main-looper bind; it must not `runOnMainThreadSync` N tiles during
+  an SFU episode. Unchanged assignment signatures must not republish
+  `tilesDidChange` while the episode is in flight. Idle pool slots must not
+  initialize EGL or EglRenderer stats until a track is assigned. Settings
+  appearance softening is GL `uSoften` on the overlay and a latest-frame
+  send TextureBuffer blit — never CPU `toI420` into `VideoSource`.
 - Same-track-id wrapper rotation via remove stale sink → attach live track → optional EGL reinit
   when first frame was already confirmed
 - ``requestPendingLiveWrapperRebind`` / ``applyPendingLiveWrapperRebindIfEligible`` for the narrow
@@ -472,6 +563,9 @@ To be a **well-designed client** of PQSRTC group/conference video:
 - [ ] On hangup, detach native call-chrome overlays (the `android.R.id.content` hit
       layer and control exclusions). Leaving them after `showCallView` becomes false
       keeps HWUI drawing (`OpenGLRenderer` / `Choreographer`) on the chat window.
+- [ ] On hangup, retire the Android `PeerConnection` before `close()`/`dispose()`.
+      Do not call `signalingState()` to decide usability — that JNI SIGSEGVs after
+      native teardown. In-flight ``renderRemoteVideoForParticipant`` must abort.
 - [ ] Reach Kotlin call-chrome support from **compiled** Swift only through
       `AndroidCallChromeBridge` (transpiled). PQSRTC and the host app are Skip
       `mode: native`; an `#if SKIP` block inside a compiled function body is always

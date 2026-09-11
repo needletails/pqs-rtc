@@ -72,6 +72,9 @@ import kotlin.__
 // SKIP INSERT:
 // SKIP INSERT:     override fun onSignalingChange(newState: org.webrtc.PeerConnection.SignalingState) {
 // SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "Signaling state changed to: $newState")
+// SKIP INSERT:         if (newState == org.webrtc.PeerConnection.SignalingState.CLOSED) {
+// SKIP INSERT:             client.retireCurrentNativePeerConnection()
+// SKIP INSERT:         }
 // SKIP INSERT:         val state = convertSignalingState(newState)
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.signalingStateChange(state))
 // SKIP INSERT:     }
@@ -90,6 +93,9 @@ import kotlin.__
 // SKIP INSERT:
 // SKIP INSERT:     override fun onConnectionChange(newState: org.webrtc.PeerConnection.PeerConnectionState) {
 // SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "Peer connection state changed to: $newState")
+// SKIP INSERT:         if (newState == org.webrtc.PeerConnection.PeerConnectionState.CLOSED) {
+// SKIP INSERT:             client.retireCurrentNativePeerConnection()
+// SKIP INSERT:         }
 // SKIP INSERT:         val state = convertPeerConnectionState(newState)
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.peerConnectionStateChange(state))
 // SKIP INSERT:     }
@@ -537,12 +543,18 @@ public final class AndroidRTCClient: @unchecked Sendable {
         case .audioTrack(let audioTrack):
             delegate.handleRemoteAudioTrackEvent(audioTrack)
         case .signalingStateChange(let stateDesc):
+            if stateDesc == "closed" {
+                retireCurrentNativePeerConnection()
+            }
             delegate.handleSignalingStateChangeEvent(stateDesc)
         case .iceConnectionStateChange(let stateDesc):
             delegate.handleIceConnectionStateChangeEvent(stateDesc)
         case .standardizedIceConnectionStateChange(let stateDesc):
             delegate.handleStandardizedIceConnectionStateChangeEvent(stateDesc)
         case .peerConnectionStateChange(let stateDesc):
+            if stateDesc == "closed" {
+                retireCurrentNativePeerConnection()
+            }
             delegate.handlePeerConnectionStateChangeEvent(stateDesc)
         case .iceConnectionReceivingChange(let receiving):
             delegate.handleIceConnectionReceivingChangeEvent(receiving)
@@ -762,11 +774,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   android.util.Log.e("AndroidRTCClient", "Android context not available for WebRTC init")
         // SKIP INSERT:   return false
         // SKIP INSERT: }
-        // SKIP INSERT: val init = org.webrtc.PeerConnectionFactory.InitializationOptions
-        // SKIP INSERT:   .builder(app)
-        // SKIP INSERT:   .setEnableInternalTracer(false)
-        // SKIP INSERT:   .setFieldTrials("WebRTC-H264HighProfile/Enabled/")
-        // SKIP INSERT:   .createInitializationOptions()
+        // SKIP INSERT: val init = AndroidRTCViewSupport.peerConnectionInitializationOptions(app)
         // SKIP INSERT: try {
         // SKIP INSERT:   synchronized(AndroidRTCClient::class.java) {
         // SKIP INSERT:     val alreadyInitialized = java.lang.System.getProperty("pqsrtc.webrtc.initialized") == "1"
@@ -1182,6 +1190,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
         frameCryptorSupport.disposeReceiverCryptors(forParticipant: participantId)
     }
 
+    public func hasAudioReceiverCryptor(for participant: String) -> Bool {
+        frameCryptorSupport.hasAudioReceiverCryptor(participant)
+    }
+
     public func createReceiverEncryptedFrame(participant: String, connectionId: String, trackKind: String? = nil, trackId: String? = nil) {
         lock.lock()
         let canAttach = !isClosed && !frameCryptorUnavailable && keyProviderReady
@@ -1259,6 +1271,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
                 throw RTCClientErrors.peerConnectionError("Failed to create EGL base")
             }
         }
+        // SKIP INSERT: this@AndroidRTCClient.eglBase?.let { AndroidRTCViewSupport.rememberSharedCaptureEglBase(it) }
     }
     
     /// Creates (or returns) the `PeerConnectionFactory` for this client.
@@ -1288,11 +1301,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       return null
         // SKIP INSERT:     }
         // SKIP INSERT:     
-        // SKIP INSERT:     val init = org.webrtc.PeerConnectionFactory.InitializationOptions
-        // SKIP INSERT:       .builder(app)
-        // SKIP INSERT:       .setEnableInternalTracer(false)
-        // SKIP INSERT:       .setFieldTrials("WebRTC-H264HighProfile/Enabled/")
-        // SKIP INSERT:       .createInitializationOptions()
+        // SKIP INSERT:     val init = AndroidRTCViewSupport.peerConnectionInitializationOptions(app)
         // SKIP INSERT:     try {
         // SKIP INSERT:       // WebRTC native bootstrap is process-global; serialize it, but do not
         // SKIP INSERT:       // bounce through the main thread. Blocking on a main-thread Handler here
@@ -1339,6 +1348,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       }
         // SKIP INSERT:     }
         // SKIP INSERT:     this@AndroidRTCClient.eglBase = egl
+        // SKIP INSERT:     AndroidRTCViewSupport.rememberSharedCaptureEglBase(egl)
         // SKIP INSERT:
         // SKIP INSERT:     val enc = org.webrtc.DefaultVideoEncoderFactory(egl.eglBaseContext, true, true)
         // SKIP INSERT:     val dec = org.webrtc.DefaultVideoDecoderFactory(egl.eglBaseContext)
@@ -1827,12 +1837,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Returns the first remote screen video track by finding a transceiver whose track ID starts with `screen_`.
     /// For 1:1 calls — group calls should use ``getRemoteScreenVideoTrackById``.
     public func getRemoteScreenVideoTrack(peerConnection: RTCPeerConnection) -> RTCVideoTrack? {
-        lock.lock()
-        let isClosedCheck = isClosed
-        lock.unlock()
-        guard !isClosedCheck else { return nil }
-
-        guard let pc = peerConnection.platformPeerConnection else { return nil }
+        guard let pc = usablePlatformPeerConnection(for: peerConnection) else { return nil }
         return AndroidWebRTCTrackResolver.firstRemoteScreenTrack(peerConnection: pc)
     }
 
@@ -2566,8 +2571,30 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// This uses transceivers (Unified Plan) and returns the receiver's track if present.
     /// For 1:1 calls only — group calls should use ``getRemoteVideoTrackById``.
     public func peerConnectionIsUsableForTrackResolution(_ peerConnection: RTCPeerConnection) -> Bool {
-        guard let pc = peerConnection.platformPeerConnection else { return false }
-        return AndroidWebRTCTrackResolver.peerConnectionIsUsableForTransceiverLookup(peerConnection: pc)
+        usablePlatformPeerConnection(for: peerConnection) != nil
+    }
+
+    /// Marks the live native PeerConnection retired so later track lookups never call
+    /// `signalingState()` / `getTransceivers()` after hangup close/dispose.
+    public func retireCurrentNativePeerConnection() {
+        lock.lock()
+        let pc = peerConnection?.platformPeerConnection
+        lock.unlock()
+        AndroidWebRTCTrackResolver.markPeerConnectionRetired(peerConnection: pc)
+    }
+
+    private func usablePlatformPeerConnection(for peerConnection: RTCPeerConnection) -> org.webrtc.PeerConnection? {
+        lock.lock()
+        let closed = isClosed
+        let hasLiveClientPeerConnection = self.peerConnection != nil
+        lock.unlock()
+
+        guard !closed, hasLiveClientPeerConnection else { return nil }
+        guard let pc = peerConnection.platformPeerConnection else { return nil }
+        guard AndroidWebRTCTrackResolver.peerConnectionIsUsableForTransceiverLookup(peerConnection: pc) else {
+            return nil
+        }
+        return pc
     }
 
     public func peerConnectionTransportIsEstablished(_ peerConnection: RTCPeerConnection) -> Bool {
@@ -2576,16 +2603,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     }
 
     public func getRemoteVideoTrack(peerConnection: RTCPeerConnection) -> RTCVideoTrack? {
-        lock.lock()
-        let isClosedCheck = isClosed
-        lock.unlock()
-
-        guard !isClosedCheck else { return nil }
-        
-        guard let pc = peerConnection.platformPeerConnection else { return nil }
-        guard AndroidWebRTCTrackResolver.peerConnectionIsUsableForTransceiverLookup(peerConnection: pc) else {
-            return nil
-        }
+        guard let pc = usablePlatformPeerConnection(for: peerConnection) else { return nil }
         return AndroidWebRTCTrackResolver.firstRemoteCameraTrack(peerConnection: pc)
     }
 
@@ -2594,15 +2612,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// For SFU group calls where multiple remote participants each have their own video
     /// transceiver, this method finds the exact track rather than returning the first one.
     public func getRemoteVideoTrackById(peerConnection: RTCPeerConnection, trackId: String) -> RTCVideoTrack? {
-        lock.lock()
-        let isClosedCheck = isClosed
-        lock.unlock()
-
-        guard !isClosedCheck else { return nil }
-        guard let pc = peerConnection.platformPeerConnection else { return nil }
-        guard AndroidWebRTCTrackResolver.peerConnectionIsUsableForTransceiverLookup(peerConnection: pc) else {
-            return nil
-        }
+        guard let pc = usablePlatformPeerConnection(for: peerConnection) else { return nil }
         return AndroidWebRTCTrackResolver.remoteCameraTrackById(peerConnection: pc, trackId: trackId)
     }
 
@@ -2618,26 +2628,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
         guard !wantedMid.isEmpty else { return nil }
 #endif
 
-        lock.lock()
-        let isClosedCheck = isClosed
-        lock.unlock()
-
-        guard !isClosedCheck else { return nil }
-        guard let pc = peerConnection.platformPeerConnection else { return nil }
-        guard AndroidWebRTCTrackResolver.peerConnectionIsUsableForTransceiverLookup(peerConnection: pc) else {
-            return nil
-        }
+        guard let pc = usablePlatformPeerConnection(for: peerConnection) else { return nil }
         return AndroidWebRTCTrackResolver.remoteCameraTrackByMid(peerConnection: pc, mid: mid)
     }
 
     /// Returns the remote audio track matching a specific trackId.
     public func getRemoteAudioTrackById(peerConnection: RTCPeerConnection, trackId: String) -> RTCAudioTrack? {
-        lock.lock()
-        let isClosedCheck = isClosed
-        lock.unlock()
-
-        guard !isClosedCheck else { return nil }
-        guard let pc = peerConnection.platformPeerConnection else { return nil }
+        guard let pc = usablePlatformPeerConnection(for: peerConnection) else { return nil }
         return AndroidWebRTCTrackResolver.remoteAudioTrackById(peerConnection: pc, trackId: trackId)
     }
 
@@ -2648,23 +2645,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
         guard !wantedMid.isEmpty else { return nil }
 #endif
 
-        lock.lock()
-        let isClosedCheck = isClosed
-        lock.unlock()
-
-        guard !isClosedCheck else { return nil }
-        guard let pc = peerConnection.platformPeerConnection else { return nil }
+        guard let pc = usablePlatformPeerConnection(for: peerConnection) else { return nil }
         return AndroidWebRTCTrackResolver.remoteAudioTrackByMid(peerConnection: pc, mid: mid)
     }
 
     /// Returns the remote screen video track matching a specific trackId.
     public func getRemoteScreenVideoTrackById(peerConnection: RTCPeerConnection, trackId: String) -> RTCVideoTrack? {
-        lock.lock()
-        let isClosedCheck = isClosed
-        lock.unlock()
-
-        guard !isClosedCheck else { return nil }
-        guard let pc = peerConnection.platformPeerConnection else { return nil }
+        guard let pc = usablePlatformPeerConnection(for: peerConnection) else { return nil }
         return AndroidWebRTCTrackResolver.remoteScreenTrackById(peerConnection: pc, trackId: trackId)
     }
 
@@ -2674,12 +2661,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// `screen_` id nor the msid track token from a later renegotiation. Callers resolve the
     /// screen mid from the remote SDP and look the receiver up by mid instead.
     public func getRemoteScreenVideoTrackByMid(peerConnection: RTCPeerConnection, mid: String) -> RTCVideoTrack? {
-        lock.lock()
-        let isClosedCheck = isClosed
-        lock.unlock()
-
-        guard !isClosedCheck else { return nil }
-        guard let pc = peerConnection.platformPeerConnection else { return nil }
+        guard let pc = usablePlatformPeerConnection(for: peerConnection) else { return nil }
         return AndroidWebRTCTrackResolver.remoteScreenTrackByMid(peerConnection: pc, mid: mid)
     }
    
@@ -2948,6 +2930,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         screenSurfaceTextureHelperToDispose = screenSurfaceTextureHelper
         renderersToDetach = Array(activeSurfaceRenderers)
         peerConnectionToClose = peerConnection?.platformPeerConnection
+        AndroidWebRTCTrackResolver.markPeerConnectionRetired(peerConnection: peerConnectionToClose)
         localVideoTrackToDispose = localVideoTrack
         screenVideoTrackToDispose = screenVideoTrack
         localAudioTrackToDispose = localAudioTrack
@@ -2992,7 +2975,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         surfaceTextureHelperToDispose?.dispose()
         screenSurfaceTextureHelperToDispose?.dispose()
 
-        AndroidWebRTCTrackResolver.invalidateTransceiverSnapshot(peerConnection: peerConnectionToClose)
+        AndroidWebRTCTrackResolver.markPeerConnectionRetired(peerConnection: peerConnectionToClose)
         peerConnectionToClose?.close()
         peerConnectionToClose?.dispose()
 
@@ -3059,6 +3042,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         screenSurfaceTextureHelperToDispose = screenSurfaceTextureHelper
         renderersToRelease = Array(activeSurfaceRenderers)
         peerConnectionToClose = peerConnection?.platformPeerConnection
+        AndroidWebRTCTrackResolver.markPeerConnectionRetired(peerConnection: peerConnectionToClose)
         localVideoTrackToDispose = localVideoTrack
         screenVideoTrackToDispose = screenVideoTrack
         localAudioTrackToDispose = localAudioTrack
@@ -3116,7 +3100,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
         releaseSurfaceRendererInstances(renderersToRelease)
 
-        AndroidWebRTCTrackResolver.invalidateTransceiverSnapshot(peerConnection: peerConnectionToClose)
+        AndroidWebRTCTrackResolver.markPeerConnectionRetired(peerConnection: peerConnectionToClose)
         peerConnectionToClose?.close()
         peerConnectionToClose?.dispose()
 

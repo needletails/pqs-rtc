@@ -1036,6 +1036,16 @@ extension RTCSession {
         await rebindAndroidGroupRemoteParticipantVideoAfterSfuRenegotiationIfNeeded(connectionId: norm)
     }
 
+#if os(Android)
+    func shouldAbortAndroidRemoteCameraAttach(
+        connectionId: String,
+        peerConnection: RTCPeerConnection
+    ) -> Bool {
+        isConnectionFinishingOrEnded(connectionId)
+            || !rtcClient.peerConnectionIsUsableForTrackResolution(peerConnection)
+    }
+#endif
+
     /// Render a specific participant's video to an Android view (for group/conference calls).
     @discardableResult
     func renderRemoteVideoForParticipant(
@@ -1045,7 +1055,6 @@ extension RTCSession {
         preferFreshPeerConnectionTrack: Bool = true
     ) async -> Bool {
         let normalizedId = connectionId.normalizedConnectionId
-        logger.log(level: .info, message: "Rendering remote video for participant=\(participantId) connection=\(connectionId)")
         let manager = connectionManager as RTCConnectionManager
 
         guard !isConnectionFinishingOrEnded(normalizedId) else {
@@ -1053,13 +1062,15 @@ extension RTCSession {
             return false
         }
 
+        logger.log(level: .info, message: "Rendering remote video for participant=\(participantId) connection=\(connectionId)")
+
         guard var connection: RTCConnection = await manager.findConnection(with: normalizedId) else {
             logger.log(level: .error, message: "No connection found for participant render: \(connectionId)")
             return false
         }
 
 #if os(Android)
-        guard rtcClient.peerConnectionIsUsableForTrackResolution(connection.peerConnection) else {
+        guard !shouldAbortAndroidRemoteCameraAttach(connectionId: normalizedId, peerConnection: connection.peerConnection) else {
             logger.log(
                 level: .info,
                 message: "Skipping Android participant renderer attach — peer connection closed participant=\(participantId) connection=\(normalizedId)"
@@ -1188,6 +1199,15 @@ extension RTCSession {
                 remoteSdp,
                 connectionId: normalizedId
             )
+#if os(Android)
+            if shouldAbortAndroidRemoteCameraAttach(connectionId: normalizedId, peerConnection: connection.peerConnection) {
+                logger.log(
+                    level: .info,
+                    message: "Skipping Android participant renderer attach after reconcile — call ending participant=\(participantId) connection=\(normalizedId)"
+                )
+                return false
+            }
+#endif
             if let refreshed: RTCConnection = await manager.findConnection(with: normalizedId) {
                 connection = refreshed
                 videoTrack = resolveLiveAttachTrack(from: &connection)
@@ -1203,6 +1223,15 @@ extension RTCSession {
 
         if videoTrack != nil, persistMapUpdates, connectionMutatedDuringResolve {
             await manager.updateConnection(id: connection.id, with: connection)
+#if os(Android)
+            if shouldAbortAndroidRemoteCameraAttach(connectionId: normalizedId, peerConnection: connection.peerConnection) {
+                logger.log(
+                    level: .info,
+                    message: "Skipping Android participant renderer attach after map persist — call ending participant=\(participantId) connection=\(normalizedId)"
+                )
+                return false
+            }
+#endif
         }
 
         guard var attachTrack = videoTrack else {

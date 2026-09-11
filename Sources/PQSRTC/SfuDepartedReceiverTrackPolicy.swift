@@ -42,4 +42,13 @@ enum SfuDepartedReceiverTrackPolicy {
     ) -> Bool {
         !existingTrackIsEnded && existingTrackIsReceivingCandidate
     }
+
+    /// After PART, leftover SDP labels / remembered Android camera ids must not
+    /// put the departed publisher back on the connection map (Device3 16:17:
+    /// 1:1 then `track added` remounted the 16:9 grid).
+    static func shouldRematerializePrunedAndroidCameraMapping(
+        participantWasPruned: Bool
+    ) -> Bool {
+        !participantWasPruned
+    }
 }

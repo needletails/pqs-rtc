@@ -104,6 +104,7 @@ extension RTCSession {
         rtcClient.stopLocalVideo()
         rtcClient.stopScreenCapture()
         rtcClient.releaseAllSurfaceRenderers()
+        rtcClient.retireCurrentNativePeerConnection()
 #endif
 
         logger.log(level: .info, message: "Released local media resources for ending call: \(call?.sharedCommunicationId ?? "<none>")")
@@ -893,17 +894,25 @@ extension RTCSession {
         clearFallbackState(connectionId: connectionIdKey)
         cancelDisconnectGraceTask()
 
-        if !force {
-            if let connectionIdKey, !connectionIdKey.isEmpty {
+        if let connectionIdKey, !connectionIdKey.isEmpty {
+            if !force {
                 if !beginEnding(connectionId: connectionIdKey) {
                     logger.log(level: .debug, message: "Skipping duplicate finishEndConnection for connectionId: \(connectionIdKey)")
                     return
                 }
-            } else if let callKey {
+            } else {
+                // Shutdown uses force so a prior end still resets. Still publish finishing
+                // so in-flight Android attach cannot query a disposing PeerConnection.
+                _ = beginEnding(connectionId: connectionIdKey)
+            }
+        } else if let callKey {
+            if !force {
                 if !beginEnding(callKey: callKey) {
                     logger.log(level: .debug, message: "Skipping duplicate finishEndConnection for callKey: \(callKey)")
                     return
                 }
+            } else {
+                _ = beginEnding(callKey: callKey)
             }
         }
 
@@ -1097,6 +1106,8 @@ extension RTCSession {
             connection.remoteVideoTracksByParticipantId.removeAll()
             connection.remoteVideoTrack = nil
             connection.remoteAudioTracksByParticipantId.removeAll()
+            connection.androidRemoteAudioResolvedTrackIdsByParticipantId.removeAll()
+            clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()
 
             await connectionManager.updateConnection(id: connectionId, with: connection)
 #endif
@@ -1231,6 +1242,7 @@ extension RTCSession {
         oneToOneSfuLockedRemoteDeviceIdByNormalizedConnectionId.removeAll()
         lastFrameKeyIndexByParticipantId.removeAll()
         lastSharedFrameKeyIndex = 0
+        clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()
 #if canImport(WebRTC) && !os(Android)
         keyProvider = nil
 #endif

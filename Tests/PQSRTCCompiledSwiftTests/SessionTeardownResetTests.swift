@@ -11,6 +11,7 @@ struct SessionTeardownResetTests {
         #expect(peer.contains("pendingDeferredSfuRenegotiationOffers.removeAll()"))
         #expect(peer.contains("groupCalls.removeAll()"))
         #expect(peer.contains("mediaDelegate = nil"))
+        #expect(peer.contains("clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()"))
     }
 
     @Test("shutdown uses force true so duplicate end still resets")
@@ -18,6 +19,8 @@ struct SessionTeardownResetTests {
         let peer = try source("Sources/PQSRTC/RTCSession+PeerConnection.swift")
         let shutdown = try sourceBody(of: "shutdown", in: peer)
         #expect(shutdown.contains("finishEndConnection(currentCall: call, force: true"))
+        #expect(peer.contains("_ = beginEnding(connectionId: connectionIdKey)"))
+        #expect(peer.contains("_ = beginEnding(callKey: callKey)"))
     }
 
     @Test("answerCall resets attempt flags")

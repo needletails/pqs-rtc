@@ -469,8 +469,15 @@ public enum GroupCallVideoLayoutPolicy {
         case .android:
             let minSide = containerSize.minSide
             let tablet = isTablet || minSide >= 450
-            let maxOverlayWidth: Double = tablet ? 240 : 180
-            let widthFraction: Double = tablet ? 0.28 : 0.34
+            let maxOverlayWidth: Double
+            let widthFraction: Double
+            if isMinimized {
+                maxOverlayWidth = tablet ? 150 : 108
+                widthFraction = tablet ? 0.18 : 0.22
+            } else {
+                maxOverlayWidth = tablet ? 240 : 180
+                widthFraction = tablet ? 0.28 : 0.34
+            }
             let overlayWidth = min(maxOverlayWidth, minSide * widthFraction)
             let overlayHeight = containerSize.isLandscape
                 ? overlayWidth * (9.0 / 16.0)

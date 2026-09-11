@@ -124,9 +124,30 @@ enum GroupSfuVideoAttachPolicy {
         conferenceVideoEnabled: Bool,
         explicitlyDeparted: Bool = false
     ) -> Bool {
-        if hasMappedCamera { return true }
         if explicitlyDeparted { return false }
+        if hasMappedCamera { return true }
         return conferenceVideoEnabled
+    }
+
+    /// Leave clears conference video before the session map is pruned. Remember
+    /// departed then, even if a leftover wrapper is still mapped. Wrapper
+    /// rotation keeps both flags true and must not mark departed.
+    static func shouldRememberDepartedOnTrackRemoved(
+        hasMappedCamera: Bool,
+        conferenceVideoEnabled: Bool
+    ) -> Bool {
+        !hasMappedCamera || !conferenceVideoEnabled
+    }
+
+    /// Post-leave SFU remap can rematerialize a leftover camera. Clear
+    /// departed only when conference camera is on again and the session is
+    /// no longer treating them as pruned. Android settlement delivers this
+    /// as a post-SFU episode, not a controller `track added`.
+    static func shouldClearExplicitlyDepartedOnTrackAdded(
+        conferenceVideoEnabled: Bool,
+        cameraMappingWasPruned: Bool
+    ) -> Bool {
+        conferenceVideoEnabled && !cameraMappingWasPruned
     }
 
     /// Track-removed after the session map is pruned is a leave, not wrapper
@@ -154,10 +175,26 @@ enum GroupSfuVideoAttachPolicy {
         hasMappedOrAdvertisedCamera: Bool,
         stillInRoster: Bool
     ) -> Bool {
-        if !hasMappedOrAdvertisedCamera {
-            return true
-        }
-        return !stillInRoster
+        shouldReleaseParticipantViewAssignment(
+            hasMappedCamera: hasMappedOrAdvertisedCamera,
+            conferenceVideoEnabled: hasMappedOrAdvertisedCamera,
+            stillInRoster: stillInRoster
+        )
+    }
+
+    /// Mapped camera owns the tile. A joiner may wait with `videoEnabled` while
+    /// still in roster. A leave that only left `videoEnabled` / roster behind
+    /// must not keep a second grid tile (Device3 08:21:18–29).
+    static func shouldReleaseParticipantViewAssignment(
+        hasMappedCamera: Bool,
+        conferenceVideoEnabled: Bool,
+        stillInRoster: Bool,
+        explicitlyDeparted: Bool = false
+    ) -> Bool {
+        if explicitlyDeparted { return true }
+        if hasMappedCamera { return !stillInRoster }
+        if conferenceVideoEnabled && stillInRoster { return false }
+        return true
     }
 
     /// A leave refresh is only the remaining remotes. Do not `formUnion` the
@@ -264,18 +301,36 @@ enum AndroidGroupPostRenegotiationAttachCoordinator {
     }
 
     /// Grid relayout during an active episode should be folded into the coordinator pass.
-    static func shouldDeferGridLayoutReattach(episodeActive: Bool) -> Bool {
-        episodeActive
+    /// Leave 2-up → 1:1 must not wait: Device3 17:23 deferred the leftover into an
+    /// in-flight leave-offer episode, remounted at 317×564, then the coordinator
+    /// skipped because the sink looked healthy.
+    static func shouldDeferGridLayoutReattach(
+        episodeActive: Bool,
+        assignedVisibleCount: Int
+    ) -> Bool {
+        episodeActive && assignedVisibleCount > 1
     }
 
     /// In-flight coordinator must not queue a rerun for remount / already-settled
     /// / stale-wrapper defer (Device3 17:48–17:51: three-minute begin/end loop).
-    /// Only a grown participant set needs another pass.
+    /// Only a grown participant set needs another pass. A leave-offer episode
+    /// that is already finalizing must not ignore a later rejoin refresh
+    /// (Device3 07:53:14 `Ignoring coordinator request` then 07:53:22 clear).
     static func shouldQueueCoordinatorRerunWhileInFlight(
         participantSetGrew: Bool,
         episodeParticipantsAlreadySettled: Bool
     ) -> Bool {
         participantSetGrew && !episodeParticipantsAlreadySettled
+    }
+
+    /// Stabilize binds the snapshot captured at finalize start. A grown
+    /// rejoin (or a surfaced id that still has no live tile) must rerun
+    /// instead of `cleared after stabilization without coordinator rerun`.
+    static func shouldDeferEpisodeClearAfterStabilization(
+        coordinatorRerunNeeded: Bool,
+        grownParticipantNotMediaReady: Bool
+    ) -> Bool {
+        coordinatorRerunNeeded || grownParticipantNotMediaReady
     }
 
     /// Skip-already-settled must clear the episode. Leaving it active lets every
@@ -1302,15 +1357,70 @@ struct GridSlotLayoutTransitionState: Equatable, Sendable {
 }
 
 enum AndroidRemoteGridTransitionPolicy {
-    /// Skip `AndroidView` identity for one SurfaceView. Solo and grid must differ
-    /// so 2-up → 1:1 remounts the view under `fillMaxSize`. Keying only the
-    /// renderer hash reused the 317×564 letterbox after `mounted count=1`
-    /// (Device3 21:35:50–21:36:17).
+    /// Skip `AndroidView` identity for one SurfaceView. Keep this stable across
+    /// 1↔N. Remounting the leftover on shrink first-measured 317×564 and stayed
+    /// there (Device3 22:18:41). `applySolo` / `applyConference` + `fillMaxSize`
+    /// ↔ 16:9 own the hop. New remotes still get a new key (different renderer).
     static func composeTileKey(rendererIdentity: Int, itemCount: Int) -> Int {
-        if itemCount <= 1 {
-            return rendererIdentity
-        }
+        _ = itemCount
         return rendererIdentity &* 31 &+ 2
+    }
+
+    /// Skip `ComposeView` identity for the remote grid. Keep this stable across
+    /// 1↔N. Remounting the whole tree on shrink first-measured 317×564 and tore
+    /// EGL (Device3 17:23). `composeTileKey` + `applySoloFullscreenLayout` own
+    /// the `fillMaxSize` hop. Do not `.id()` the call view.
+    static func composeGridIdentity(itemCount: Int, prefersAspectFit: Bool) -> String {
+        _ = itemCount
+        _ = prefersAspectFit
+        return "android-remote-grid"
+    }
+
+    /// Overlapping `tilesDidChange` refreshes must drop stale generations so
+    /// only the latest publish remounts (Device3 17:23: two
+    /// `mounted count=1 previous=2` five seconds apart).
+    static func nextVisibleRemoteRefreshGeneration(current: UInt) -> UInt {
+        current &+ 1
+    }
+
+    static func shouldCommitVisibleRemoteRefresh(
+        startedGeneration: UInt,
+        currentGeneration: UInt
+    ) -> Bool {
+        startedGeneration == currentGeneration
+    }
+
+    /// In-flight SFU episodes must not republish Compose when assigned keys are unchanged.
+    /// Publishing + attach in the same frame is the Device3 Davey sandwich (lesson 9 / 20).
+    static func shouldSkipRemoteTilesDidChangeDuringInFlightEpisode(
+        episodeInFlight: Bool,
+        previousSignature: String,
+        nextSignature: String
+    ) -> Bool {
+        episodeInFlight && previousSignature == nextSignature && !previousSignature.isEmpty
+    }
+
+    /// Lock leftover native scale before publishing the new visible list.
+    /// Assigning `@State` first lets Compose remount the leftover 1:1 tile into
+    /// a 16:9 cell with `SCALE_ASPECT_FILL` (Device3 15:17:23: 1080×2520 →
+    /// 1002×564, then `BLASTBufferQueue` rejected the 1080 buffer).
+    static func shouldApplyNativeGridLayoutBeforePublishingVisibleViews(
+        previousVisibleCount: Int,
+        nextVisibleCount: Int
+    ) -> Bool {
+        previousVisibleCount > 0
+            && nextVisibleCount > 0
+            && previousVisibleCount != nextVisibleCount
+    }
+
+    /// ConferenceTile `update` reads `layoutGeneration`. Shrink does not wait
+    /// for Compose layout, so bump generation after publishing so the leftover
+    /// `AndroidView` restyles once `fillMaxSize` is in the composition.
+    static func shouldBumpComposeLayoutGenerationOnVisibleCountChange(
+        previousVisibleCount: Int,
+        nextVisibleCount: Int
+    ) -> Bool {
+        previousVisibleCount != nextVisibleCount
     }
 
     /// Wait only when the grid *grows*. Shrink (2-up → 1:1) keeps the remaining
@@ -1436,15 +1546,38 @@ enum AndroidReceiverCryptorPolicy {
         return existingTrackId == newTrackId
     }
 
-    /// Audio FrameCryptor attach after an SFU offer. Same advertised track id means the live
-    /// cryptor is already bound; calling attach again mutes playout for a Java wrapper refresh.
+    /// Audio FrameCryptor attach after an SFU offer.
+    ///
+    /// Same advertised track id plus a **live** cryptor means the binding is already correct;
+    /// calling attach again mutes playout for a Java wrapper refresh. Same-room rejoin keeps
+    /// `audio_<participant>_<room>` ids in the session remember map after hangup disposed every
+    /// native cryptor (Device3 23:05: `Kept … cryptor unchanged` for `nudge`, no attach).
     static func shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
         existingTrackId: String?,
-        advertisedTrackId: String
+        advertisedTrackId: String,
+        hasLiveReceiverCryptor: Bool
     ) -> Bool {
         guard !advertisedTrackId.isEmpty else { return false }
         guard let existingTrackId, !existingTrackId.isEmpty else { return true }
-        return existingTrackId != advertisedTrackId
+        if existingTrackId != advertisedTrackId { return true }
+        return !hasLiveReceiverCryptor
+    }
+
+    /// WebRTC can report another publisher's leftover stream id while the negotiated track id
+    /// already encodes the real owner (`audio_nudge_<room>` with `streamIds=["mm26"]`).
+    static func preferredAndroidDidAddReceiverParticipantLabels(
+        streamIds: [String],
+        trackId: String
+    ) -> [String] {
+        let trimmedTrack = trackId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let streams = streamIds
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if trimmedTrack.hasPrefix("audio_") || trimmedTrack.hasPrefix("video_") {
+            return [trimmedTrack] + streams
+        }
+        if trimmedTrack.isEmpty { return streams }
+        return streams + [trimmedTrack]
     }
 }
 
@@ -1584,6 +1717,26 @@ enum AndroidRemoteVideoRenderPolicy {
 
 /// Native renderer layout reconcile policy for Android sample capture views.
 enum AndroidRendererLayoutPolicy {
+    /// ConferenceTile `AndroidView.update` must match local preview: skip host restyle,
+    /// scale, and layout notify when lock + host size are unchanged.
+    static func shouldSkipConferenceTileComposeUpdate(
+        hostWidth: Int,
+        hostHeight: Int,
+        layoutLock: Int,
+        lastHostWidth: Int,
+        lastHostHeight: Int,
+        lastLayoutLock: Int,
+        rendererEglNeedsSurfaceResync: Bool,
+        conferenceRendererFillsHost: Bool = false
+    ) -> Bool {
+        if conferenceRendererFillsHost { return false }
+        guard hostWidth > 0, hostHeight > 0 else { return false }
+        if rendererEglNeedsSurfaceResync { return false }
+        return hostWidth == lastHostWidth
+            && hostHeight == lastHostHeight
+            && layoutLock == lastLayoutLock
+    }
+
     static func shouldReconcileAfterLayoutChange(
         previousWidth: Int,
         previousHeight: Int,
@@ -1670,14 +1823,56 @@ enum AndroidRendererLayoutPolicy {
         guard hostWidth > 0, hostHeight > 0, windowWidth > 0, windowHeight > 0 else {
             return true
         }
+        if isLikelySettledSixteenByNineCell(hostWidth: hostWidth, hostHeight: hostHeight) {
+            return false
+        }
         return hostWidth * hostHeight * 8 < windowWidth * windowHeight
     }
 
-    /// Keep MATCH_PARENT during rotation fragments and 1-up leftover fullscreen.
-    /// A settled 16:9 conference tile (Device3 1002×564) must letterbox in that
-    /// same apply — dual-axis from 1080×2520 used to defer, then hop 1002 fill → 317.
+    /// Compose conference cells are `aspectRatio(16/9)` (Device3 1002×564).
+    /// Phone fullscreen is never this (1080×2520 ≈ 9:21).
+    static func isLikelySettledSixteenByNineCell(
+        hostWidth: Int,
+        hostHeight: Int
+    ) -> Bool {
+        guard hostWidth > 0, hostHeight > 0 else { return false }
+        let widthByNine = hostWidth * 9
+        let heightBySixteen = hostHeight * 16
+        let delta = abs(widthByNine - heightBySixteen)
+        return delta * 10 <= max(widthByNine, heightBySixteen)
+    }
+
+    /// Portrait 16:9 row tracks the short window side (Device3 1002 vs 1080).
+    /// Landscape 16:9 row tracks the short window height (Device3 644 vs 1080).
+    /// Portrait leftover 564/1080 is not the landscape cell (Device3 23:05:32).
+    static func conferenceCellMatchesWindow(
+        cellWidth: Int,
+        cellHeight: Int,
+        windowWidth: Int,
+        windowHeight: Int
+    ) -> Bool {
+        guard cellWidth > 0, cellHeight > 0, windowWidth > 0, windowHeight > 0 else {
+            return false
+        }
+        guard isLikelySettledSixteenByNineCell(
+            hostWidth: cellWidth,
+            hostHeight: cellHeight
+        ) else { return false }
+        if windowHeight > windowWidth {
+            return cellWidth <= windowWidth && cellWidth * 5 >= windowWidth * 4
+        }
+        return cellHeight <= windowHeight && cellHeight * 20 >= windowHeight * 11
+    }
+
+    /// Keep MATCH_PARENT during rotation fragments and **conference** 1-up leftover
+    /// fullscreen (Compose still window-sized before the 16:9 tile lands).
+    ///
+    /// True 1:1 (`forceFit == false`) must letterbox a mismatched portrait remote on a
+    /// landscape fullscreen pane. Treating that host as leftover applied
+    /// `SCALE_ASPECT_FILL` and cropped the remote.
     static func shouldDeferAspectFitWrapContent(
         preferFit: Bool,
+        forceFit: Bool = false,
         windowOrientationMatchesConfiguration: Bool,
         hostWidth: Int,
         hostHeight: Int,
@@ -1689,6 +1884,21 @@ enum AndroidRendererLayoutPolicy {
         _ = previousHostWidth
         _ = previousHostHeight
         if !preferFit { return false }
+        if forceFit && isLikelySettledSixteenByNineCell(
+            hostWidth: hostWidth,
+            hostHeight: hostHeight
+        ) {
+            guard windowWidth > 0, windowHeight > 0 else { return false }
+            if conferenceCellMatchesWindow(
+                cellWidth: hostWidth,
+                cellHeight: hostHeight,
+                windowWidth: windowWidth,
+                windowHeight: windowHeight
+            ) {
+                return false
+            }
+            return true
+        }
         if !windowOrientationMatchesConfiguration { return true }
         if hostWidth <= 0 || hostHeight <= 0 { return true }
         if isLikelyFullscreenHost(
@@ -1697,7 +1907,7 @@ enum AndroidRendererLayoutPolicy {
             windowWidth: windowWidth,
             windowHeight: windowHeight
         ) {
-            return true
+            return forceFit
         }
         if isLikelyUnsettledFragmentHost(
             hostWidth: hostWidth,
@@ -1707,7 +1917,48 @@ enum AndroidRendererLayoutPolicy {
         ) {
             return true
         }
-        return false
+        // applySolo while Compose is still the 16:9 cell (Device3 22:45:36:
+        // leftover letterboxed to 317×564 and never left that size).
+        return shouldDeferSoloExactLetterboxOnNonFullscreenHost(
+            forceFit: forceFit,
+            hostIsFullscreen: false
+        )
+    }
+
+    /// 2→1 `applySolo` runs before Compose `fillMaxSize`. Exact letterbox
+    /// against the leftover 16:9 cell is 317×564, not 1:1.
+    static func shouldDeferSoloExactLetterboxOnNonFullscreenHost(
+        forceFit: Bool,
+        hostIsFullscreen: Bool
+    ) -> Bool {
+        !forceFit && !hostIsFullscreen
+    }
+
+    /// Conference lock on a still-fullscreen leftover must drop the 1:1 exact
+    /// letterbox (Device3 22:16: 1080×607 child overflowed the 16:9 cell and
+    /// the second tile stayed 0×0). MATCH_PARENT until the cell settles.
+    static func shouldResetMatchParentWhenDeferringConferenceLetterbox() -> Bool {
+        true
+    }
+
+    /// `reinitializeRendererSurfaceForLayoutChange` at 0×0 tears EGL on main
+    /// and cannot create a holder (Device3 22:43:57 nudge).
+    static func shouldAllowEglReinitWhileSurfaceNotReady() -> Bool {
+        false
+    }
+
+    /// Re-calling attach while the tile is already queued and the surface is
+    /// still 0×0 storms main (Device3 22:16:45–22:18:25). Wait for surface created.
+    static func shouldSkipRedundantAttachWhileSurfaceNotReady(
+        surfaceReady: Bool,
+        alreadyQueuedSameLiveTrack: Bool
+    ) -> Bool {
+        !surfaceReady && alreadyQueuedSameLiveTrack
+    }
+
+    /// A 0×0 remount must not guess display metrics. OnLayout applies scale.
+    static func shouldApplyRemoteCameraScale(hostWidth: Int, hostHeight: Int) -> Bool {
+        hostWidth > 0 && hostHeight > 0
     }
 
     /// Fitted letterbox size so the SurfaceView can use EXACT pixels instead of
@@ -1732,6 +1983,370 @@ enum AndroidRendererLayoutPolicy {
         }
         let fittedWidth = max(1, hostHeight * uprightWidth / uprightHeight)
         return (min(hostWidth, fittedWidth), hostHeight)
+    }
+
+    /// Settled 16:9 conference cell. Letterbox in this apply — do not treat the
+    /// Compose tile as the window and MATCH_PARENT-FILL (Device3 10:55).
+    static func shouldLetterboxSettledConferenceCell(
+        forceFit: Bool,
+        hostWidth: Int,
+        hostHeight: Int,
+        windowWidth: Int,
+        windowHeight: Int
+    ) -> Bool {
+        guard forceFit, hostWidth > 0, hostHeight > 0 else {
+            return false
+        }
+        if isLikelySettledSixteenByNineCell(hostWidth: hostWidth, hostHeight: hostHeight) {
+            guard windowWidth > 0, windowHeight > 0 else { return true }
+            return conferenceCellMatchesWindow(
+                cellWidth: hostWidth,
+                cellHeight: hostHeight,
+                windowWidth: windowWidth,
+                windowHeight: windowHeight
+            )
+        }
+        guard windowWidth > 0, windowHeight > 0 else {
+            return false
+        }
+        if isLikelyFullscreenHost(
+            hostWidth: hostWidth,
+            hostHeight: hostHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+        ) {
+            return false
+        }
+        if isLikelyUnsettledFragmentHost(
+            hostWidth: hostWidth,
+            hostHeight: hostHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+        ) {
+            return false
+        }
+        return true
+    }
+
+    /// Same-size OnLayout skipped leftover letterbox after MATCH_PARENT
+    /// (Device3 14:41:58: 317 then 1002).
+    static func shouldReapplyConferenceLetterboxOnSameSizeLayout(
+        forceFit: Bool,
+        hostWidth: Int,
+        hostHeight: Int,
+        rendererUsesMatchParent: Bool,
+        rendererFillsHost: Bool = false,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0
+    ) -> Bool {
+        _ = forceFit
+        guard isLikelySettledSixteenByNineCell(
+            hostWidth: hostWidth,
+            hostHeight: hostHeight
+        ) else { return false }
+        if windowWidth > 0, windowHeight > 0,
+           !conferenceCellMatchesWindow(
+            cellWidth: hostWidth,
+            cellHeight: hostHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+           )
+        {
+            return false
+        }
+        return rendererUsesMatchParent || rendererFillsHost
+    }
+
+    /// Unknown inbound frame still letterboxes a portrait camera (9:16 → 317×564
+    /// in Device3's 1002×564 cell) instead of filling the tile.
+    static func letterboxExactSizeOrPortraitFallback(
+        frameWidth: Int,
+        frameHeight: Int,
+        frameRotation: Int,
+        hostWidth: Int,
+        hostHeight: Int
+    ) -> (width: Int, height: Int) {
+        let exact = letterboxExactSize(
+            frameWidth: frameWidth,
+            frameHeight: frameHeight,
+            frameRotation: frameRotation,
+            hostWidth: hostWidth,
+            hostHeight: hostHeight
+        )
+        if exact.width > 0 && exact.height > 0 {
+            return exact
+        }
+        return letterboxExactSize(
+            frameWidth: 9,
+            frameHeight: 16,
+            frameRotation: 0,
+            hostWidth: hostWidth,
+            hostHeight: hostHeight
+        )
+    }
+
+    /// Leftover `1080×2520 → 1002×564` is the 16:9 cell. Dual-axis
+    /// `surface_holder_rotation_skip` must still letterbox (Device3 17:49:34).
+    /// Rejoin leftover can still be SOLO-locked from 1-up (Device3 19:19:56).
+    /// 1-up fullscreen is never 16:9 (`1080×2520`).
+    static func shouldLetterboxConferenceSurface(
+        forceFit: Bool,
+        soloLocked: Bool,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        rendererUsesMatchParent: Bool,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0
+    ) -> Bool {
+        _ = forceFit
+        _ = soloLocked
+        _ = rendererUsesMatchParent
+        guard isLikelySettledSixteenByNineCell(
+            hostWidth: surfaceWidth,
+            hostHeight: surfaceHeight
+        ) else { return false }
+        guard windowWidth > 0, windowHeight > 0 else { return true }
+        return conferenceCellMatchesWindow(
+            cellWidth: surfaceWidth,
+            cellHeight: surfaceHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+        )
+    }
+
+    /// `applyConference` often runs while leftover host is still 1:1. Use the
+    /// last settled 16:9 cell from the previous 2-up (Device3 22:11:15 rejoin).
+    /// Do not reuse a portrait cell after the window is landscape (Device3 23:05:32).
+    static func shouldUseRememberedSettledConferenceTile(
+        hostWidth: Int,
+        hostHeight: Int,
+        rememberedWidth: Int,
+        rememberedHeight: Int,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0
+    ) -> Bool {
+        guard isLikelySettledSixteenByNineCell(
+            hostWidth: rememberedWidth,
+            hostHeight: rememberedHeight
+        ) else { return false }
+        if isLikelySettledSixteenByNineCell(
+            hostWidth: hostWidth,
+            hostHeight: hostHeight
+        ) {
+            return false
+        }
+        if windowWidth > 0, windowHeight > 0,
+           !conferenceCellMatchesWindow(
+            cellWidth: rememberedWidth,
+            cellHeight: rememberedHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+           )
+        {
+            return false
+        }
+        return true
+    }
+
+    /// Apply left the leftover FILLING the 16:9 cell. Force the exact wrap.
+    static func shouldForceConferenceLetterboxExactSize(
+        rendererUsesMatchParent: Bool,
+        rendererWidth: Int,
+        rendererHeight: Int,
+        tileWidth: Int,
+        tileHeight: Int,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0
+    ) -> Bool {
+        guard isLikelySettledSixteenByNineCell(
+            hostWidth: tileWidth,
+            hostHeight: tileHeight
+        ) else { return false }
+        if windowWidth > 0, windowHeight > 0,
+           !conferenceCellMatchesWindow(
+            cellWidth: tileWidth,
+            cellHeight: tileHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+           )
+        {
+            return false
+        }
+        if rendererUsesMatchParent { return true }
+        return rendererWidth == tileWidth && rendererHeight == tileHeight
+    }
+
+    /// Remount / MATCH_PARENT-FILL can leave `lastApplied` at 317×564 while
+    /// the SurfaceView is MATCH_PARENT again (Device3 19:19:56 rejoin leftover).
+    static func shouldSkipUnchangedConferenceLetterboxApply(
+        lastPreferFit: Bool?,
+        lastDeferredFill: Bool,
+        lastLocalWidth: Int,
+        lastLocalHeight: Int,
+        lastExactWidth: Int,
+        lastExactHeight: Int,
+        preferFit: Bool,
+        localWidth: Int,
+        localHeight: Int,
+        exactWidth: Int,
+        exactHeight: Int,
+        rendererParentIsContainer: Bool,
+        rendererUsesMatchParent: Bool
+    ) -> Bool {
+        guard rendererParentIsContainer else { return false }
+        guard lastPreferFit == preferFit else { return false }
+        guard !lastDeferredFill else { return false }
+        guard lastLocalWidth == localWidth, lastLocalHeight == localHeight else { return false }
+        guard lastExactWidth == exactWidth, lastExactHeight == exactHeight else { return false }
+        if exactWidth > 0 && exactHeight > 0 && rendererUsesMatchParent {
+            return false
+        }
+        return true
+    }
+
+    /// Leftover already letterboxed in the 16:9 cell. A later apply that still
+    /// reads leftover 1:1 host size must not MATCH_PARENT-FILL.
+    static func shouldKeepExistingConferenceLetterbox(
+        forceFit: Bool,
+        hostWidth: Int,
+        hostHeight: Int,
+        lastExactWidth: Int,
+        lastExactHeight: Int,
+        lastLocalWidth: Int,
+        lastLocalHeight: Int,
+        rendererUsesMatchParent: Bool,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0,
+        windowOrientationMatchesConfiguration: Bool = true
+    ) -> Bool {
+        guard forceFit, windowOrientationMatchesConfiguration, !rendererUsesMatchParent else {
+            return false
+        }
+        guard lastExactWidth > 0, lastExactHeight > 0 else { return false }
+        guard isLikelySettledSixteenByNineCell(
+            hostWidth: lastLocalWidth,
+            hostHeight: lastLocalHeight
+        ) else { return false }
+        if letterboxFillsSettledSixteenByNineCell(
+            exactWidth: lastExactWidth,
+            exactHeight: lastExactHeight,
+            hostWidth: lastLocalWidth,
+            hostHeight: lastLocalHeight
+        ) {
+            return false
+        }
+        if isLikelySettledSixteenByNineCell(hostWidth: hostWidth, hostHeight: hostHeight) {
+            return false
+        }
+        if windowWidth > 0, windowHeight > 0,
+           !conferenceCellMatchesWindow(
+            cellWidth: lastLocalWidth,
+            cellHeight: lastLocalHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+           )
+        {
+            return false
+        }
+        if lastExactWidth > hostWidth || lastExactHeight > hostHeight {
+            return false
+        }
+        return hostWidth > lastLocalWidth || hostHeight > lastLocalHeight
+    }
+
+    /// Compose tile size is the 16:9 cell. Native host width can still
+    /// be leftover 1:1 (1080×2520) so apply MATCH_PARENT-FILLs.
+    static func shouldApplyConferenceLetterboxForComposeTile(
+        tileWidth: Int,
+        tileHeight: Int,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0
+    ) -> Bool {
+        guard isLikelySettledSixteenByNineCell(
+            hostWidth: tileWidth,
+            hostHeight: tileHeight
+        ) else { return false }
+        guard windowWidth > 0, windowHeight > 0 else { return true }
+        return conferenceCellMatchesWindow(
+            cellWidth: tileWidth,
+            cellHeight: tileHeight,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight
+        )
+    }
+
+    /// Portrait camera buffers often arrive as 180×320 rot=90. Swapping to
+    /// landscape FILLs the 16:9 cell. Keep the buffer portrait.
+    static func conferenceLetterboxFrameRotation(
+        frameWidth: Int,
+        frameHeight: Int,
+        frameRotation: Int
+    ) -> Int {
+        guard frameWidth > 0, frameHeight > 0 else { return 0 }
+        guard frameHeight > frameWidth else { return frameRotation }
+        var rotation = frameRotation % 360
+        if rotation < 0 { rotation += 360 }
+        return (rotation == 90 || rotation == 270) ? 0 : frameRotation
+    }
+
+    static func letterboxFillsSettledSixteenByNineCell(
+        exactWidth: Int,
+        exactHeight: Int,
+        hostWidth: Int,
+        hostHeight: Int
+    ) -> Bool {
+        guard isLikelySettledSixteenByNineCell(hostWidth: hostWidth, hostHeight: hostHeight) else {
+            return false
+        }
+        guard exactWidth > 0, exactHeight > 0 else { return true }
+        return exactWidth * 20 >= hostWidth * 19 && exactHeight * 20 >= hostHeight * 19
+    }
+
+    static func letterboxExactSizeForSettledConferenceCell(
+        frameWidth: Int,
+        frameHeight: Int,
+        frameRotation: Int,
+        hostWidth: Int,
+        hostHeight: Int
+    ) -> (width: Int, height: Int) {
+        let rotation = conferenceLetterboxFrameRotation(
+            frameWidth: frameWidth,
+            frameHeight: frameHeight,
+            frameRotation: frameRotation
+        )
+        let exact = letterboxExactSizeOrPortraitFallback(
+            frameWidth: frameWidth,
+            frameHeight: frameHeight,
+            frameRotation: rotation,
+            hostWidth: hostWidth,
+            hostHeight: hostHeight
+        )
+        let uprightIsSixteenByNine: Bool
+        if frameWidth > 0 && frameHeight > 0 {
+            let uprightWidth = (rotation == 90 || rotation == 270) ? frameHeight : frameWidth
+            let uprightHeight = (rotation == 90 || rotation == 270) ? frameWidth : frameHeight
+            uprightIsSixteenByNine = isLikelySettledSixteenByNineCell(
+                hostWidth: uprightWidth,
+                hostHeight: uprightHeight
+            )
+        } else {
+            uprightIsSixteenByNine = false
+        }
+        if letterboxFillsSettledSixteenByNineCell(
+            exactWidth: exact.width,
+            exactHeight: exact.height,
+            hostWidth: hostWidth,
+            hostHeight: hostHeight
+        ) && !uprightIsSixteenByNine {
+            return letterboxExactSize(
+                frameWidth: 9,
+                frameHeight: 16,
+                frameRotation: 0,
+                hostWidth: hostWidth,
+                hostHeight: hostHeight
+            )
+        }
+        return exact
     }
 
     /// Wrap-content letterbox inside a 16:9 Compose tile (Device3: host 1002×564,

@@ -322,7 +322,14 @@ struct GroupCallVideoRegressionTests {
             participantId: "echo",
             episodeParticipantIds: ["echo"]))
         #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldDeferGridLayoutReattach(
-            episodeActive: true))
+            episodeActive: true,
+            assignedVisibleCount: 2))
+        #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldDeferGridLayoutReattach(
+            episodeActive: true,
+            assignedVisibleCount: 1))
+        #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldDeferGridLayoutReattach(
+            episodeActive: false,
+            assignedVisibleCount: 2))
         #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldQueueCoordinatorRerunWhileInFlight(
             participantSetGrew: false,
             episodeParticipantsAlreadySettled: true))
@@ -335,6 +342,15 @@ struct GroupCallVideoRegressionTests {
         #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldQueueCoordinatorRerunWhileInFlight(
             participantSetGrew: true,
             episodeParticipantsAlreadySettled: false))
+        #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldDeferEpisodeClearAfterStabilization(
+            coordinatorRerunNeeded: true,
+            grownParticipantNotMediaReady: false))
+        #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldDeferEpisodeClearAfterStabilization(
+            coordinatorRerunNeeded: false,
+            grownParticipantNotMediaReady: true))
+        #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldDeferEpisodeClearAfterStabilization(
+            coordinatorRerunNeeded: false,
+            grownParticipantNotMediaReady: false))
         #expect(AndroidGroupPostRenegotiationAttachCoordinator.shouldClearSettledPostRenegotiationEpisode(
             episodeParticipantsAlreadySettled: true))
         #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldClearSettledPostRenegotiationEpisode(
@@ -685,6 +701,44 @@ struct GroupCallVideoRegressionTests {
             hasMappedCamera: false,
             conferenceVideoEnabled: true,
             explicitlyDeparted: true))
+        #expect(!GroupSfuVideoAttachPolicy.shouldSurfaceParticipantCameraTile(
+            hasMappedCamera: true,
+            conferenceVideoEnabled: true,
+            explicitlyDeparted: true))
+        #expect(GroupSfuVideoAttachPolicy.shouldRememberDepartedOnTrackRemoved(
+            hasMappedCamera: true,
+            conferenceVideoEnabled: false))
+        #expect(GroupSfuVideoAttachPolicy.shouldRememberDepartedOnTrackRemoved(
+            hasMappedCamera: false,
+            conferenceVideoEnabled: true))
+        #expect(!GroupSfuVideoAttachPolicy.shouldRememberDepartedOnTrackRemoved(
+            hasMappedCamera: true,
+            conferenceVideoEnabled: true))
+        #expect(!GroupSfuVideoAttachPolicy.shouldClearExplicitlyDepartedOnTrackAdded(
+            conferenceVideoEnabled: true,
+            cameraMappingWasPruned: true))
+        #expect(GroupSfuVideoAttachPolicy.shouldClearExplicitlyDepartedOnTrackAdded(
+            conferenceVideoEnabled: true,
+            cameraMappingWasPruned: false))
+        #expect(!GroupSfuVideoAttachPolicy.shouldClearExplicitlyDepartedOnTrackAdded(
+            conferenceVideoEnabled: false,
+            cameraMappingWasPruned: false))
+        #expect(GroupSfuVideoAttachPolicy.shouldReleaseParticipantViewAssignment(
+            hasMappedCamera: false,
+            conferenceVideoEnabled: true,
+            stillInRoster: true,
+            explicitlyDeparted: true))
+        #expect(!GroupSfuVideoAttachPolicy.shouldReleaseParticipantViewAssignment(
+            hasMappedCamera: false,
+            conferenceVideoEnabled: true,
+            stillInRoster: true,
+            explicitlyDeparted: false))
+        #expect(AndroidRendererLayoutPolicy.shouldApplyRemoteCameraScale(
+            hostWidth: 1002,
+            hostHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.shouldApplyRemoteCameraScale(
+            hostWidth: 0,
+            hostHeight: 0))
         #expect(GroupSfuVideoAttachPolicy.shouldForceReleaseAssignmentAfterTrackRemoved(
             hasMappedCamera: false))
         #expect(!GroupSfuVideoAttachPolicy.shouldForceReleaseAssignmentAfterTrackRemoved(
@@ -1824,6 +1878,43 @@ struct GroupCallVideoRegressionTests {
 
     @Test("layout reconcile reattaches sinks after resize and skips unchanged healthy sinks")
     func shouldReconcileRendererLayoutOnlyForPendingOrInactiveSink() {
+        #expect(AndroidRendererLayoutPolicy.shouldSkipConferenceTileComposeUpdate(
+            hostWidth: 317,
+            hostHeight: 564,
+            layoutLock: 2,
+            lastHostWidth: 317,
+            lastHostHeight: 564,
+            lastLayoutLock: 2,
+            rendererEglNeedsSurfaceResync: false
+        ))
+        #expect(!AndroidRendererLayoutPolicy.shouldSkipConferenceTileComposeUpdate(
+            hostWidth: 1002,
+            hostHeight: 564,
+            layoutLock: 2,
+            lastHostWidth: 1002,
+            lastHostHeight: 564,
+            lastLayoutLock: 2,
+            rendererEglNeedsSurfaceResync: false,
+            conferenceRendererFillsHost: true
+        ))
+        #expect(!AndroidRendererLayoutPolicy.shouldSkipConferenceTileComposeUpdate(
+            hostWidth: 317,
+            hostHeight: 564,
+            layoutLock: 1,
+            lastHostWidth: 317,
+            lastHostHeight: 564,
+            lastLayoutLock: 2,
+            rendererEglNeedsSurfaceResync: false
+        ))
+        #expect(!AndroidRendererLayoutPolicy.shouldSkipConferenceTileComposeUpdate(
+            hostWidth: 0,
+            hostHeight: 0,
+            layoutLock: 2,
+            lastHostWidth: 0,
+            lastHostHeight: 0,
+            lastLayoutLock: 2,
+            rendererEglNeedsSurfaceResync: false
+        ))
         #expect(AndroidRendererLayoutPolicy.shouldReconcileAfterLayoutChange(
             previousWidth: 1002,
             previousHeight: 1213,
@@ -2038,8 +2129,9 @@ struct GroupCallVideoRegressionTests {
         #expect(AndroidRendererLayoutPolicy.androidLocksCamera2FixedCaptureFps)
         #expect(AndroidRendererLayoutPolicy.androidLocalPreviewTextureViewIsOpaque)
         #expect(AndroidRendererLayoutPolicy.androidLocalPreviewUsesSurfaceViewOverlay)
-        #expect(AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+        #expect(!AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
             preferFit: true,
+            forceFit: true,
             windowOrientationMatchesConfiguration: false,
             hostWidth: 1002,
             hostHeight: 564,
@@ -2049,6 +2141,7 @@ struct GroupCallVideoRegressionTests {
             previousHostHeight: 564))
         #expect(!AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
             preferFit: false,
+            forceFit: false,
             windowOrientationMatchesConfiguration: false,
             hostWidth: 1080,
             hostHeight: 2520,
@@ -2058,6 +2151,7 @@ struct GroupCallVideoRegressionTests {
             previousHostHeight: 2520))
         #expect(AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
             preferFit: true,
+            forceFit: true,
             windowOrientationMatchesConfiguration: true,
             hostWidth: 1080,
             hostHeight: 2520,
@@ -2065,8 +2159,19 @@ struct GroupCallVideoRegressionTests {
             windowHeight: 2520,
             previousHostWidth: 1080,
             previousHostHeight: 2520))
+        #expect(!AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: true,
+            forceFit: false,
+            windowOrientationMatchesConfiguration: true,
+            hostWidth: 2520,
+            hostHeight: 1080,
+            windowWidth: 2520,
+            windowHeight: 1080,
+            previousHostWidth: 1080,
+            previousHostHeight: 2520))
         #expect(AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
             preferFit: true,
+            forceFit: true,
             windowOrientationMatchesConfiguration: true,
             hostWidth: 155,
             hostHeight: 275,
@@ -2076,6 +2181,7 @@ struct GroupCallVideoRegressionTests {
             previousHostHeight: 564))
         #expect(!AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
             preferFit: true,
+            forceFit: true,
             windowOrientationMatchesConfiguration: true,
             hostWidth: 1002,
             hostHeight: 564,
@@ -2085,6 +2191,7 @@ struct GroupCallVideoRegressionTests {
             previousHostHeight: 2520))
         #expect(!AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
             preferFit: true,
+            forceFit: true,
             windowOrientationMatchesConfiguration: true,
             hostWidth: 1002,
             hostHeight: 564,
@@ -2092,12 +2199,377 @@ struct GroupCallVideoRegressionTests {
             windowHeight: 2520,
             previousHostWidth: 1002,
             previousHostHeight: 564))
+        #expect(AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: true,
+            forceFit: false,
+            windowOrientationMatchesConfiguration: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 1080,
+            windowHeight: 2520,
+            previousHostWidth: 1002,
+            previousHostHeight: 564))
+        #expect(AndroidRendererLayoutPolicy.shouldDeferSoloExactLetterboxOnNonFullscreenHost(
+            forceFit: false,
+            hostIsFullscreen: false))
+        #expect(!AndroidRendererLayoutPolicy.shouldDeferSoloExactLetterboxOnNonFullscreenHost(
+            forceFit: false,
+            hostIsFullscreen: true))
+        #expect(!AndroidRendererLayoutPolicy.shouldDeferSoloExactLetterboxOnNonFullscreenHost(
+            forceFit: true,
+            hostIsFullscreen: false))
+        #expect(!AndroidRendererLayoutPolicy.shouldAllowEglReinitWhileSurfaceNotReady())
+        #expect(AndroidRendererLayoutPolicy.shouldLetterboxSettledConferenceCell(
+            forceFit: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(AndroidRendererLayoutPolicy.shouldLetterboxSettledConferenceCell(
+            forceFit: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 1002,
+            windowHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.shouldLetterboxSettledConferenceCell(
+            forceFit: true,
+            hostWidth: 1080,
+            hostHeight: 2520,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(!AndroidRendererLayoutPolicy.shouldLetterboxSettledConferenceCell(
+            forceFit: false,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(!AndroidRendererLayoutPolicy.shouldLetterboxSettledConferenceCell(
+            forceFit: true,
+            hostWidth: 155,
+            hostHeight: 275,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(AndroidRendererLayoutPolicy.isLikelySettledSixteenByNineCell(
+            hostWidth: 1002,
+            hostHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.isLikelySettledSixteenByNineCell(
+            hostWidth: 1080,
+            hostHeight: 2520))
+        #expect(!AndroidRendererLayoutPolicy.isLikelySettledSixteenByNineCell(
+            hostWidth: 317,
+            hostHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.isLikelyUnsettledFragmentHost(
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(!AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: true,
+            forceFit: true,
+            windowOrientationMatchesConfiguration: false,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 1002,
+            windowHeight: 564,
+            previousHostWidth: 1080,
+            previousHostHeight: 2520))
+        #expect(AndroidRendererLayoutPolicy.shouldReapplyConferenceLetterboxOnSameSizeLayout(
+            forceFit: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            rendererUsesMatchParent: true))
+        #expect(!AndroidRendererLayoutPolicy.shouldReapplyConferenceLetterboxOnSameSizeLayout(
+            forceFit: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            rendererUsesMatchParent: false))
+        #expect(AndroidRendererLayoutPolicy.shouldReapplyConferenceLetterboxOnSameSizeLayout(
+            forceFit: false,
+            hostWidth: 1002,
+            hostHeight: 564,
+            rendererUsesMatchParent: false,
+            rendererFillsHost: true))
+        #expect(AndroidRendererLayoutPolicy.letterboxExactSizeOrPortraitFallback(
+            frameWidth: 0,
+            frameHeight: 0,
+            frameRotation: 0,
+            hostWidth: 1002,
+            hostHeight: 564) == (317, 564))
+        #expect(AndroidRendererLayoutPolicy.letterboxExactSizeOrPortraitFallback(
+            frameWidth: 180,
+            frameHeight: 320,
+            frameRotation: 0,
+            hostWidth: 1002,
+            hostHeight: 564) == (317, 564))
+        #expect(AndroidRendererLayoutPolicy.shouldApplyConferenceLetterboxForComposeTile(
+            tileWidth: 1002,
+            tileHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.shouldApplyConferenceLetterboxForComposeTile(
+            tileWidth: 1080,
+            tileHeight: 2520))
+        #expect(AndroidRendererLayoutPolicy.conferenceLetterboxFrameRotation(
+            frameWidth: 180,
+            frameHeight: 320,
+            frameRotation: 90) == 0)
+        #expect(AndroidRendererLayoutPolicy.letterboxExactSizeForSettledConferenceCell(
+            frameWidth: 180,
+            frameHeight: 320,
+            frameRotation: 90,
+            hostWidth: 1002,
+            hostHeight: 564) == (317, 564))
+        #expect(AndroidRendererLayoutPolicy.letterboxExactSizeForSettledConferenceCell(
+            frameWidth: 180,
+            frameHeight: 320,
+            frameRotation: 0,
+            hostWidth: 1002,
+            hostHeight: 564) == (317, 564))
+        #expect(AndroidRendererLayoutPolicy.letterboxFillsSettledSixteenByNineCell(
+            exactWidth: 1002,
+            exactHeight: 563,
+            hostWidth: 1002,
+            hostHeight: 564))
+        #expect(AndroidRendererLayoutPolicy.shouldKeepExistingConferenceLetterbox(
+            forceFit: true,
+            hostWidth: 1080,
+            hostHeight: 2520,
+            lastExactWidth: 317,
+            lastExactHeight: 564,
+            lastLocalWidth: 1002,
+            lastLocalHeight: 564,
+            rendererUsesMatchParent: false))
+        #expect(!AndroidRendererLayoutPolicy.shouldKeepExistingConferenceLetterbox(
+            forceFit: false,
+            hostWidth: 1080,
+            hostHeight: 2520,
+            lastExactWidth: 317,
+            lastExactHeight: 564,
+            lastLocalWidth: 1002,
+            lastLocalHeight: 564,
+            rendererUsesMatchParent: false))
+        #expect(!AndroidRendererLayoutPolicy.shouldKeepExistingConferenceLetterbox(
+            forceFit: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            lastExactWidth: 317,
+            lastExactHeight: 564,
+            lastLocalWidth: 1002,
+            lastLocalHeight: 564,
+            rendererUsesMatchParent: false))
+        #expect(AndroidRendererLayoutPolicy.shouldLetterboxConferenceSurface(
+            forceFit: true,
+            soloLocked: false,
+            surfaceWidth: 1002,
+            surfaceHeight: 564,
+            rendererUsesMatchParent: true))
+        #expect(AndroidRendererLayoutPolicy.shouldLetterboxConferenceSurface(
+            forceFit: false,
+            soloLocked: true,
+            surfaceWidth: 1002,
+            surfaceHeight: 564,
+            rendererUsesMatchParent: false))
+        #expect(!AndroidRendererLayoutPolicy.shouldLetterboxConferenceSurface(
+            forceFit: true,
+            soloLocked: false,
+            surfaceWidth: 1080,
+            surfaceHeight: 2520,
+            rendererUsesMatchParent: true))
+        #expect(AndroidRendererLayoutPolicy.shouldUseRememberedSettledConferenceTile(
+            hostWidth: 1080,
+            hostHeight: 2520,
+            rememberedWidth: 1002,
+            rememberedHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.shouldUseRememberedSettledConferenceTile(
+            hostWidth: 1002,
+            hostHeight: 564,
+            rememberedWidth: 1002,
+            rememberedHeight: 564))
+        #expect(AndroidRendererLayoutPolicy.conferenceCellMatchesWindow(
+            cellWidth: 1002,
+            cellHeight: 564,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(!AndroidRendererLayoutPolicy.conferenceCellMatchesWindow(
+            cellWidth: 1002,
+            cellHeight: 564,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(AndroidRendererLayoutPolicy.conferenceCellMatchesWindow(
+            cellWidth: 1145,
+            cellHeight: 644,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(!AndroidRendererLayoutPolicy.conferenceCellMatchesWindow(
+            cellWidth: 1145,
+            cellHeight: 644,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(!AndroidRendererLayoutPolicy.shouldKeepExistingConferenceLetterbox(
+            forceFit: true,
+            hostWidth: 2520,
+            hostHeight: 1080,
+            lastExactWidth: 317,
+            lastExactHeight: 564,
+            lastLocalWidth: 1002,
+            lastLocalHeight: 564,
+            rendererUsesMatchParent: false,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(!AndroidRendererLayoutPolicy.shouldKeepExistingConferenceLetterbox(
+            forceFit: true,
+            hostWidth: 1080,
+            hostHeight: 2520,
+            lastExactWidth: 362,
+            lastExactHeight: 644,
+            lastLocalWidth: 1145,
+            lastLocalHeight: 644,
+            rendererUsesMatchParent: false,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(AndroidRendererLayoutPolicy.shouldKeepExistingConferenceLetterbox(
+            forceFit: true,
+            hostWidth: 1080,
+            hostHeight: 2520,
+            lastExactWidth: 317,
+            lastExactHeight: 564,
+            lastLocalWidth: 1002,
+            lastLocalHeight: 564,
+            rendererUsesMatchParent: false,
+            windowWidth: 1080,
+            windowHeight: 2520))
+        #expect(!AndroidRendererLayoutPolicy.shouldKeepExistingConferenceLetterbox(
+            forceFit: true,
+            hostWidth: 1080,
+            hostHeight: 2520,
+            lastExactWidth: 317,
+            lastExactHeight: 564,
+            lastLocalWidth: 1002,
+            lastLocalHeight: 564,
+            rendererUsesMatchParent: false,
+            windowWidth: 1080,
+            windowHeight: 2520,
+            windowOrientationMatchesConfiguration: false))
+        #expect(!AndroidRendererLayoutPolicy.shouldUseRememberedSettledConferenceTile(
+            hostWidth: 2520,
+            hostHeight: 1080,
+            rememberedWidth: 1002,
+            rememberedHeight: 564,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(AndroidRendererLayoutPolicy.shouldUseRememberedSettledConferenceTile(
+            hostWidth: 2520,
+            hostHeight: 1080,
+            rememberedWidth: 1145,
+            rememberedHeight: 644,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(!AndroidRendererLayoutPolicy.shouldLetterboxSettledConferenceCell(
+            forceFit: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(AndroidRendererLayoutPolicy.shouldLetterboxSettledConferenceCell(
+            forceFit: true,
+            hostWidth: 1145,
+            hostHeight: 644,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+            preferFit: true,
+            forceFit: true,
+            windowOrientationMatchesConfiguration: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            windowWidth: 2520,
+            windowHeight: 1080,
+            previousHostWidth: 1002,
+            previousHostHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.shouldLetterboxConferenceSurface(
+            forceFit: true,
+            soloLocked: false,
+            surfaceWidth: 1002,
+            surfaceHeight: 564,
+            rendererUsesMatchParent: false,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(!AndroidRendererLayoutPolicy.shouldApplyConferenceLetterboxForComposeTile(
+            tileWidth: 1002,
+            tileHeight: 564,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(!AndroidRendererLayoutPolicy.shouldForceConferenceLetterboxExactSize(
+            rendererUsesMatchParent: true,
+            rendererWidth: 1002,
+            rendererHeight: 564,
+            tileWidth: 1002,
+            tileHeight: 564,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(!AndroidRendererLayoutPolicy.shouldReapplyConferenceLetterboxOnSameSizeLayout(
+            forceFit: true,
+            hostWidth: 1002,
+            hostHeight: 564,
+            rendererUsesMatchParent: true,
+            windowWidth: 2520,
+            windowHeight: 1080))
+        #expect(AndroidRendererLayoutPolicy.shouldForceConferenceLetterboxExactSize(
+            rendererUsesMatchParent: true,
+            rendererWidth: 1002,
+            rendererHeight: 564,
+            tileWidth: 1002,
+            tileHeight: 564))
+        #expect(AndroidRendererLayoutPolicy.shouldForceConferenceLetterboxExactSize(
+            rendererUsesMatchParent: false,
+            rendererWidth: 1002,
+            rendererHeight: 564,
+            tileWidth: 1002,
+            tileHeight: 564))
+        #expect(!AndroidRendererLayoutPolicy.shouldForceConferenceLetterboxExactSize(
+            rendererUsesMatchParent: false,
+            rendererWidth: 317,
+            rendererHeight: 564,
+            tileWidth: 1002,
+            tileHeight: 564))
+        #expect(AndroidRendererLayoutPolicy.shouldSkipUnchangedConferenceLetterboxApply(
+            lastPreferFit: true,
+            lastDeferredFill: false,
+            lastLocalWidth: 1002,
+            lastLocalHeight: 564,
+            lastExactWidth: 317,
+            lastExactHeight: 564,
+            preferFit: true,
+            localWidth: 1002,
+            localHeight: 564,
+            exactWidth: 317,
+            exactHeight: 564,
+            rendererParentIsContainer: true,
+            rendererUsesMatchParent: false))
+        #expect(!AndroidRendererLayoutPolicy.shouldSkipUnchangedConferenceLetterboxApply(
+            lastPreferFit: true,
+            lastDeferredFill: false,
+            lastLocalWidth: 1002,
+            lastLocalHeight: 564,
+            lastExactWidth: 317,
+            lastExactHeight: 564,
+            preferFit: true,
+            localWidth: 1002,
+            localHeight: 564,
+            exactWidth: 317,
+            exactHeight: 564,
+            rendererParentIsContainer: true,
+            rendererUsesMatchParent: true))
         #expect(AndroidRendererLayoutPolicy.letterboxExactSize(
             frameWidth: 180,
             frameHeight: 320,
             frameRotation: 0,
             hostWidth: 1002,
             hostHeight: 564) == (317, 564))
+        #expect(AndroidRendererLayoutPolicy.letterboxExactSize(
+            frameWidth: 180,
+            frameHeight: 320,
+            frameRotation: 0,
+            hostWidth: 2520,
+            hostHeight: 1080) == (607, 1080))
         #expect(AndroidRendererLayoutPolicy.isLikelyFullscreenHost(
             hostWidth: 1080,
             hostHeight: 2520,
@@ -2150,20 +2622,40 @@ struct GroupCallVideoRegressionTests {
             newReceiverKey: "") == false)
     }
 
-    @Test("Android SFU audio cryptor attach runs only when the advertised track id changes")
+    @Test("Android SFU audio cryptor attach skips only when the advertised track id is unchanged and a live cryptor exists")
     func androidSfuAudioCryptorAttachRunsOnlyWhenAdvertisedTrackIdChanges() {
         #expect(AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
             existingTrackId: nil,
-            advertisedTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00"))
+            advertisedTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            hasLiveReceiverCryptor: false))
         #expect(AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
             existingTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
-            advertisedTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00") == false)
+            advertisedTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            hasLiveReceiverCryptor: true) == false)
         #expect(AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
             existingTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
-            advertisedTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00"))
+            advertisedTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            hasLiveReceiverCryptor: false))
         #expect(AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
             existingTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
-            advertisedTrackId: "") == false)
+            advertisedTrackId: "audio_mm26_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            hasLiveReceiverCryptor: true))
+        #expect(AndroidReceiverCryptorPolicy.shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
+            existingTrackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00",
+            advertisedTrackId: "",
+            hasLiveReceiverCryptor: false) == false)
+    }
+
+    @Test("Android didAddReceiver prefers the advertised track id over a leftover stream id")
+    func androidDidAddReceiverPrefersAdvertisedTrackIdOverLeftoverStreamId() {
+        #expect(AndroidReceiverCryptorPolicy.preferredAndroidDidAddReceiverParticipantLabels(
+            streamIds: ["mm26"],
+            trackId: "audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00"
+        ) == ["audio_nudge_f272c4d1-5d6f-46d5-85a0-b8002a756f00", "mm26"])
+        #expect(AndroidReceiverCryptorPolicy.preferredAndroidDidAddReceiverParticipantLabels(
+            streamIds: ["mm26"],
+            trackId: "a34b52d0-31f0-4155-8a4a-2a199a995e00"
+        ) == ["mm26", "a34b52d0-31f0-4155-8a4a-2a199a995e00"])
     }
 
     @Test("Android audio receiver cryptor reuse follows stable track id across wrapper rotation")
@@ -2252,12 +2744,34 @@ struct GroupCallVideoRegressionTests {
         #expect(AndroidRemoteGridTransitionPolicy.shouldWaitForComposeLayoutBeforeReattach(
             previousVisibleCount: 2,
             nextVisibleCount: 1) == false)
+        #expect(AndroidRemoteGridTransitionPolicy.shouldApplyNativeGridLayoutBeforePublishingVisibleViews(
+            previousVisibleCount: 2,
+            nextVisibleCount: 1))
+        #expect(AndroidRemoteGridTransitionPolicy.shouldApplyNativeGridLayoutBeforePublishingVisibleViews(
+            previousVisibleCount: 1,
+            nextVisibleCount: 2))
         #expect(AndroidRemoteGridTransitionPolicy.composeTileKey(
             rendererIdentity: 7,
             itemCount: 1
-        ) != AndroidRemoteGridTransitionPolicy.composeTileKey(
+        ) == AndroidRemoteGridTransitionPolicy.composeTileKey(
             rendererIdentity: 7,
             itemCount: 2
+        ))
+        #expect(AndroidRendererLayoutPolicy.shouldResetMatchParentWhenDeferringConferenceLetterbox())
+        #expect(AndroidRendererLayoutPolicy.shouldDeferSoloExactLetterboxOnNonFullscreenHost(
+            forceFit: false,
+            hostIsFullscreen: false))
+        #expect(!AndroidRendererLayoutPolicy.shouldAllowEglReinitWhileSurfaceNotReady())
+        #expect(AndroidRemoteGridTransitionPolicy.shouldBumpComposeLayoutGenerationOnVisibleCountChange(
+            previousVisibleCount: 2,
+            nextVisibleCount: 1))
+        #expect(AndroidRendererLayoutPolicy.shouldSkipRedundantAttachWhileSurfaceNotReady(
+            surfaceReady: false,
+            alreadyQueuedSameLiveTrack: true
+        ))
+        #expect(!AndroidRendererLayoutPolicy.shouldSkipRedundantAttachWhileSurfaceNotReady(
+            surfaceReady: true,
+            alreadyQueuedSameLiveTrack: true
         ))
         #expect(AndroidRemoteGridTransitionPolicy.shouldWaitForComposeLayoutBeforeReattach(
             previousVisibleCount: 1,
@@ -2267,6 +2781,17 @@ struct GroupCallVideoRegressionTests {
             nextVisibleCount: 1,
             previousSignature: "0:mm26|1:nudge",
             nextSignature: "0:nudge"))
+        #expect(AndroidRemoteGridTransitionPolicy.composeGridIdentity(
+            itemCount: 1,
+            prefersAspectFit: false
+        ) == AndroidRemoteGridTransitionPolicy.composeGridIdentity(
+            itemCount: 2,
+            prefersAspectFit: true
+        ))
+        #expect(!AndroidGroupPostRenegotiationAttachCoordinator.shouldDeferGridLayoutReattach(
+            episodeActive: true,
+            assignedVisibleCount: 1
+        ))
         let awaiting = AndroidRemoteGridTransitionPolicy.beginGridSlotTransition(
             state: .idle,
             expectedIdentities: ["nudge"]

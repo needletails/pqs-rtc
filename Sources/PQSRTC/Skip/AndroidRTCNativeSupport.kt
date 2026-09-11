@@ -1,6 +1,7 @@
 package pqsrtc.module
 
 import android.content.res.Configuration
+import android.content.pm.ApplicationInfo
 import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.PixelFormat
@@ -36,6 +37,7 @@ import org.webrtc.FrameCryptorKeyProvider
 import org.webrtc.GlShader
 import org.webrtc.GlUtil
 import org.webrtc.JavaI420Buffer
+import org.webrtc.Logging
 import org.webrtc.MediaStreamTrack
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
@@ -48,6 +50,7 @@ import org.webrtc.SessionDescription
 import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoFrame
 import org.webrtc.VideoSink
+import org.webrtc.YuvConverter
 import org.webrtc.VideoTrack
 import org.webrtc.YuvHelper
 import skip.foundation.ProcessInfo
@@ -55,6 +58,7 @@ import java.nio.FloatBuffer
 import java.util.ConcurrentModificationException
 import java.util.WeakHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Applies local SDP on the raw Java [PeerConnection].
@@ -112,6 +116,17 @@ internal object AndroidReceiverCryptorPolicy {
     ): Boolean {
         return newTrackId.isNotEmpty() && existingTrackId == newTrackId
     }
+
+    fun shouldAttachAndroidSfuAudioReceiverCryptorAfterSdp(
+        existingTrackId: String?,
+        advertisedTrackId: String,
+        hasLiveReceiverCryptor: Boolean,
+    ): Boolean {
+        if (advertisedTrackId.isEmpty()) return false
+        if (existingTrackId.isNullOrEmpty()) return true
+        if (existingTrackId != advertisedTrackId) return true
+        return !hasLiveReceiverCryptor
+    }
 }
 
 /**
@@ -168,12 +183,21 @@ object AndroidCaptureUIPreferenceCache {
     @Volatile
     private var lastRefreshUptimeMs: Long = 0L
 
+    @Volatile
+    private var preferenceListenerRegistered = false
+
+    fun invalidateAndRefresh() {
+        lastRefreshUptimeMs = 0L
+        refreshFromStoredPreferences()
+    }
+
     fun refreshFromStoredPreferences() {
         val ctx = ProcessInfo.processInfo.androidContext
         val prefs = ctx.getSharedPreferences(
             "${ctx.packageName}_preferences",
             android.content.Context.MODE_PRIVATE,
         )
+        ensurePreferenceChangeListener(prefs)
         softeningEnabled =
             if (!prefs.contains(KEY_SOFTENING)) {
                 true
@@ -203,6 +227,17 @@ object AndroidCaptureUIPreferenceCache {
     fun isLocalVideoMirroredEnabled(): Boolean {
         refreshIfStale()
         return localMirrored
+    }
+
+    private fun ensurePreferenceChangeListener(prefs: android.content.SharedPreferences) {
+        if (preferenceListenerRegistered) return
+        preferenceListenerRegistered = true
+        prefs.registerOnSharedPreferenceChangeListener { _, key ->
+            if (key == KEY_SOFTENING || key == KEY_MIRROR) {
+                lastRefreshUptimeMs = 0L
+                refreshFromStoredPreferences()
+            }
+        }
     }
 }
 
@@ -534,10 +569,9 @@ private class VideoAppearanceFrameSoftening {
     }
 }
 
-/// Preview and VideoSource keep the camera TextureBuffer when softening is off.
-/// When Settings softening is on, the worker `toI420`s (not on the shared
-/// capturer EglBase — lesson 26) and both preview and send get I420.
-/// Device3 13:16 I420+TextureView skipped; revision-g SurfaceView is the compositor.
+/// Preview and VideoSource keep the camera TextureBuffer. CPU I420 soften is
+/// off (lesson 46 / Device3 13:03 80MB GC). Settings softening is the GL
+/// drawer on the local overlay, not a full-res worker readback.
 object CameraCaptureFrameRouter {
     private val lock = Any()
     private val softening = VideoAppearanceFrameSoftening()
@@ -556,10 +590,11 @@ object CameraCaptureFrameRouter {
         downstream: CapturerObserver,
     ) {
         val hardwarePreview = AndroidRTCViewSupport.isCamera2PreviewSurfaceAttached()
-        val soften =
-            AndroidRTCViewSupport.ANDROID_CPU_APPEARANCE_SOFTENING &&
-                allowAppearanceSoftening &&
+        val glSoften =
+            allowAppearanceSoftening &&
                 AndroidCaptureUIPreferenceCache.isVideoAppearanceSofteningEnabled()
+        val soften =
+            AndroidRTCViewSupport.ANDROID_CPU_APPEARANCE_SOFTENING && glSoften
         if (!loggedPipeline) {
             loggedPipeline = true
             val previewKind = when {
@@ -574,7 +609,8 @@ object CameraCaptureFrameRouter {
                 "Camera capture pipeline revision=" +
                     AndroidRTCViewSupport.LOCAL_PREVIEW_PIPELINE_REVISION +
                     " cpuSoften=$soften hardwarePreview=$hardwarePreview " +
-                    "fanOut=$fanOutLocalPreview preview=$previewKind send=$sendKind",
+                    "fanOut=$fanOutLocalPreview preview=$previewKind send=$sendKind " +
+                    "glSoften=$glSoften",
             )
         }
         // Soften on the worker. Do not fan the TextureBuffer and toI420 it
@@ -588,6 +624,13 @@ object CameraCaptureFrameRouter {
                 downstream,
                 fanPreview = fanOutLocalPreview && !hardwarePreview,
             )
+        } else if (glSoften && frame.buffer is VideoFrame.TextureBuffer) {
+            val egl = AndroidRTCViewSupport.sharedCaptureEglBase()
+            if (egl != null) {
+                SendTextureAppearanceSoftener.deliver(frame, downstream, egl)
+            } else {
+                downstream.onFrameCaptured(frame)
+            }
         } else {
             downstream.onFrameCaptured(frame)
         }
@@ -610,6 +653,7 @@ object CameraCaptureFrameRouter {
         }
         dropped?.release()
         worker?.quitSafely()
+        SendTextureAppearanceSoftener.stop()
     }
 
     private var pendingFanPreview = false
@@ -694,6 +738,557 @@ object CameraCaptureFrameRouter {
     }
 }
 
+/// Latest-frame GL blit of capturer OES onto an RGB TextureBuffer. Encoder stays
+/// TextureBuffer. Dedicated shared-context EglBase — never toI420 into VideoSource
+/// and never makeCurrent on the preview/root EglBase (lessons 26/46/62).
+internal object SendTextureAppearanceSoftener {
+    private val lock = Any()
+    private var thread: HandlerThread? = null
+    private var handler: Handler? = null
+    private var egl: EglBase? = null
+    private var drawer: AppearanceSoftenGlDrawer? = null
+    private var yuvConverter: YuvConverter? = null
+    private var pending: VideoFrame? = null
+    private var pendingDownstream: CapturerObserver? = null
+    private var inFlight = false
+    @Volatile
+    private var glFailed = false
+    private var fbo = 0
+    private var fboW = 0
+    private var fboH = 0
+    private val freeTextures = ArrayList<Int>()
+
+    fun deliver(frame: VideoFrame, downstream: CapturerObserver, sharedEgl: EglBase) {
+        if (frame.buffer !is VideoFrame.TextureBuffer) {
+            downstream.onFrameCaptured(frame)
+            return
+        }
+        frame.retain()
+        val posted: Boolean
+        synchronized(lock) {
+            pending?.release()
+            pending = frame
+            pendingDownstream = downstream
+            ensureThreadLocked(sharedEgl)
+            if (inFlight) {
+                posted = false
+            } else {
+                inFlight = true
+                posted = true
+            }
+        }
+        if (posted) {
+            handler?.post { drain() }
+        }
+    }
+
+    fun stop() {
+        val worker: HandlerThread?
+        val postedHandler: Handler?
+        synchronized(lock) {
+            pending?.release()
+            pending = null
+            pendingDownstream = null
+            inFlight = false
+            glFailed = false
+            postedHandler = handler
+            worker = thread
+            handler = null
+            thread = null
+        }
+        if (postedHandler != null) {
+            postedHandler.post {
+                releaseGl()
+                worker?.quitSafely()
+            }
+        } else {
+            worker?.quitSafely()
+        }
+    }
+
+    private fun ensureThreadLocked(sharedEgl: EglBase) {
+        if (handler != null) return
+        val next = HandlerThread("pqsr-gl-soften")
+        next.start()
+        thread = next
+        handler = Handler(next.looper)
+        handler?.post { ensureGl(sharedEgl) }
+    }
+
+    private fun ensureGl(sharedEgl: EglBase) {
+        if (egl != null) return
+        val created = EglBase.create(sharedEgl.eglBaseContext, EglBase.CONFIG_PIXEL_BUFFER)
+        try {
+            created.createDummyPbufferSurface()
+        } catch (_: Throwable) {
+            created.createPbufferSurface(1, 1)
+        }
+        created.makeCurrent()
+        egl = created
+        drawer = AppearanceSoftenGlDrawer()
+    }
+
+    private fun drain() {
+        while (true) {
+            val next: VideoFrame
+            val dest: CapturerObserver
+            synchronized(lock) {
+                val pendingFrame = pending
+                val pendingDest = pendingDownstream
+                if (pendingFrame == null || pendingDest == null) {
+                    inFlight = false
+                    return
+                }
+                pending = null
+                pendingDownstream = null
+                next = pendingFrame
+                dest = pendingDest
+            }
+            try {
+                val softened = blit(next)
+                dest.onFrameCaptured(softened ?: next)
+                softened?.release()
+            } catch (error: Throwable) {
+                val firstFailure: Boolean
+                synchronized(lock) {
+                    firstFailure = !glFailed
+                    glFailed = true
+                }
+                if (firstFailure) {
+                    Log.w("AndroidRTCClient", "GL appearance softening failed; sending raw TextureBuffer", error)
+                }
+                try {
+                    dest.onFrameCaptured(next)
+                } catch (_: Throwable) {
+                }
+            } finally {
+                next.release()
+            }
+        }
+    }
+
+    private fun blit(frame: VideoFrame): VideoFrame? {
+        if (glFailed) return null
+        val src = frame.buffer as? VideoFrame.TextureBuffer ?: return null
+        val gl = egl ?: return null
+        val draw = drawer ?: return null
+        gl.makeCurrent()
+        val width = src.width
+        val height = src.height
+        if (width <= 0 || height <= 0) return null
+        ensureFbo(width, height)
+        val texId = acquireTexture(width, height)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
+        GLES20.glFramebufferTexture2D(
+            GLES20.GL_FRAMEBUFFER,
+            GLES20.GL_COLOR_ATTACHMENT0,
+            GLES20.GL_TEXTURE_2D,
+            texId,
+            0,
+        )
+        val texMatrix = RendererCommon.convertMatrixFromAndroidGraphicsMatrix(src.transformMatrix)
+        when (src.type) {
+            VideoFrame.TextureBuffer.Type.OES ->
+                draw.drawOes(src.textureId, texMatrix, width, height, 0, 0, width, height)
+            VideoFrame.TextureBuffer.Type.RGB ->
+                draw.drawRgb(src.textureId, texMatrix, width, height, 0, 0, width, height)
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GlUtil.checkNoGLES2Error("SendTextureAppearanceSoftener.blit")
+        val buffer = SoftenedRgbTextureBuffer(
+            width = width,
+            height = height,
+            unscaledWidth = width,
+            unscaledHeight = height,
+            textureId = texId,
+            transform = Matrix(),
+            handler = handler ?: return null,
+            yuvConverter = yuvConverter ?: YuvConverter().also { yuvConverter = it },
+            onUnref = { recycleTexture(texId) },
+        )
+        return VideoFrame(buffer, frame.rotation, frame.timestampNs)
+    }
+
+    private fun ensureFbo(width: Int, height: Int) {
+        if (fbo != 0 && fboW == width && fboH == height) return
+        if (fbo != 0) {
+            GLES20.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
+            fbo = 0
+        }
+        for (id in freeTextures) {
+            GLES20.glDeleteTextures(1, intArrayOf(id), 0)
+        }
+        freeTextures.clear()
+        val fbos = IntArray(1)
+        GLES20.glGenFramebuffers(1, fbos, 0)
+        fbo = fbos[0]
+        fboW = width
+        fboH = height
+    }
+
+    private fun acquireTexture(width: Int, height: Int): Int {
+        if (freeTextures.isNotEmpty()) {
+            return freeTextures.removeAt(freeTextures.size - 1)
+        }
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1, ids, 0)
+        val tex = ids[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+        GLES20.glTexImage2D(
+            GLES20.GL_TEXTURE_2D,
+            0,
+            GLES20.GL_RGBA,
+            width,
+            height,
+            0,
+            GLES20.GL_RGBA,
+            GLES20.GL_UNSIGNED_BYTE,
+            null,
+        )
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        return tex
+    }
+
+    private fun recycleTexture(textureId: Int) {
+        val glHandler = handler
+        if (glHandler == null) {
+            return
+        }
+        glHandler.post {
+            synchronized(lock) {
+                if (handler == null) {
+                    GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+                } else {
+                    freeTextures.add(textureId)
+                }
+            }
+        }
+    }
+
+    private fun releaseGl() {
+        try {
+            egl?.makeCurrent()
+            if (fbo != 0) {
+                GLES20.glDeleteFramebuffers(1, intArrayOf(fbo), 0)
+                fbo = 0
+            }
+            for (id in freeTextures) {
+                GLES20.glDeleteTextures(1, intArrayOf(id), 0)
+            }
+            freeTextures.clear()
+            drawer?.release()
+            drawer = null
+            yuvConverter?.release()
+            yuvConverter = null
+            egl?.release()
+        } catch (_: Throwable) {
+        }
+        egl = null
+        fboW = 0
+        fboH = 0
+    }
+}
+
+private class SoftenedRgbTextureBuffer(
+    private val width: Int,
+    private val height: Int,
+    private val unscaledWidth: Int,
+    private val unscaledHeight: Int,
+    private val textureId: Int,
+    private val transform: Matrix,
+    private val handler: Handler,
+    private val yuvConverter: YuvConverter,
+    private val onUnref: () -> Unit,
+) : VideoFrame.TextureBuffer {
+    private val refCount = AtomicInteger(1)
+
+    override fun getWidth(): Int = width
+    override fun getHeight(): Int = height
+    override fun getUnscaledWidth(): Int = unscaledWidth
+    override fun getUnscaledHeight(): Int = unscaledHeight
+    override fun getTextureId(): Int = textureId
+    override fun getType(): VideoFrame.TextureBuffer.Type = VideoFrame.TextureBuffer.Type.RGB
+    override fun getTransformMatrix(): Matrix = Matrix(transform)
+
+    override fun retain() {
+        refCount.incrementAndGet()
+    }
+
+    override fun release() {
+        if (refCount.decrementAndGet() == 0) {
+            onUnref()
+        }
+    }
+
+    override fun applyTransformMatrix(
+        transformMatrix: Matrix,
+        newWidth: Int,
+        newHeight: Int,
+    ): VideoFrame.TextureBuffer {
+        retain()
+        val next = Matrix(transform)
+        next.preConcat(transformMatrix)
+        return SoftenedRgbTextureBuffer(
+            width = newWidth,
+            height = newHeight,
+            unscaledWidth = newWidth,
+            unscaledHeight = newHeight,
+            textureId = textureId,
+            transform = next,
+            handler = handler,
+            yuvConverter = yuvConverter,
+            onUnref = { release() },
+        )
+    }
+
+    override fun toI420(): VideoFrame.I420Buffer? {
+        if (Looper.myLooper() == handler.looper) {
+            return yuvConverter.convert(this)
+        }
+        val latch = CountDownLatch(1)
+        val result = arrayOfNulls<VideoFrame.I420Buffer>(1)
+        handler.post {
+            try {
+                result[0] = yuvConverter.convert(this)
+            } finally {
+                latch.countDown()
+            }
+        }
+        try {
+            latch.await()
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        return result[0]
+    }
+
+    override fun cropAndScale(
+        cropX: Int,
+        cropY: Int,
+        cropWidth: Int,
+        cropHeight: Int,
+        scaleWidth: Int,
+        scaleHeight: Int,
+    ): VideoFrame.Buffer {
+        val cropAndScaleMatrix = Matrix()
+        val cropYFromBottom = height - (cropY + cropHeight)
+        cropAndScaleMatrix.preTranslate(
+            cropX / width.toFloat(),
+            cropYFromBottom / height.toFloat(),
+        )
+        cropAndScaleMatrix.preScale(
+            cropWidth / width.toFloat(),
+            cropHeight / height.toFloat(),
+        )
+        return applyTransformMatrix(cropAndScaleMatrix, scaleWidth, scaleHeight)
+    }
+}
+
+/// Skin mix at the draw target resolution (overlay or send frame). Kernel is
+/// `min(viewport)/80` so PiP ~367 px is several pixels, not 1 px after a 1280
+/// downscale (lesson 52).
+private class AppearanceSoftenGlDrawer : RendererCommon.GlDrawer {
+    private var oesShader: RoundedRectGlDrawer.ShaderProgram? = null
+    private var rgbShader: RoundedRectGlDrawer.ShaderProgram? = null
+
+    override fun drawOes(
+        oesTextureId: Int,
+        texMatrix: FloatArray,
+        frameWidth: Int,
+        frameHeight: Int,
+        viewportX: Int,
+        viewportY: Int,
+        viewportWidth: Int,
+        viewportHeight: Int,
+    ) {
+        val shader = oesShader ?: AppearanceSoftenShader.create(AppearanceSoftenShader.Kind.OES).also { oesShader = it }
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
+        AppearanceSoftenShader.draw(shader, texMatrix, viewportX, viewportY, viewportWidth, viewportHeight, 1f)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+    }
+
+    override fun drawRgb(
+        textureId: Int,
+        texMatrix: FloatArray,
+        frameWidth: Int,
+        frameHeight: Int,
+        viewportX: Int,
+        viewportY: Int,
+        viewportWidth: Int,
+        viewportHeight: Int,
+    ) {
+        val shader = rgbShader ?: AppearanceSoftenShader.create(AppearanceSoftenShader.Kind.RGB).also { rgbShader = it }
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+        AppearanceSoftenShader.draw(shader, texMatrix, viewportX, viewportY, viewportWidth, viewportHeight, 1f)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+    }
+
+    override fun drawYuv(
+        yuvTextures: IntArray,
+        texMatrix: FloatArray,
+        frameWidth: Int,
+        frameHeight: Int,
+        viewportX: Int,
+        viewportY: Int,
+        viewportWidth: Int,
+        viewportHeight: Int,
+    ) {
+    }
+
+    override fun release() {
+        oesShader?.release()
+        rgbShader?.release()
+        oesShader = null
+        rgbShader = null
+    }
+}
+
+private object AppearanceSoftenShader {
+    enum class Kind { OES, RGB, YUV }
+
+    fun create(kind: Kind): RoundedRectGlDrawer.ShaderProgram {
+        // Keep rounded=true so uRadiusPx / uViewportOrigin stay live. Drivers
+        // strip unused uniforms; WebRTC GlShader.getUniformLocation then throws
+        // and the send path retried compile+log every frame (Device3 10:28).
+        val shader = GlShader(VERTEX, fragmentSource(kind, rounded = true))
+        shader.useProgram()
+        GLES20.glUniform1i(shader.getUniformLocation("tex"), 0)
+        return RoundedRectGlDrawer.ShaderProgram(
+            shader = shader,
+            texMatLoc = shader.getUniformLocation("tex_mat"),
+            radiusLoc = shader.getUniformLocation("uRadiusPx"),
+            softenLoc = shader.getUniformLocation("uSoften"),
+            originLoc = shader.getUniformLocation("uViewportOrigin"),
+            sizeLoc = shader.getUniformLocation("uViewportSize"),
+        )
+    }
+
+    fun draw(
+        shader: RoundedRectGlDrawer.ShaderProgram,
+        texMatrix: FloatArray,
+        viewportX: Int,
+        viewportY: Int,
+        viewportWidth: Int,
+        viewportHeight: Int,
+        soften: Float,
+    ) {
+        GLES20.glDisable(GLES20.GL_BLEND)
+        GLES20.glViewport(viewportX, viewportY, viewportWidth, viewportHeight)
+        shader.shader.useProgram()
+        GLES20.glUniformMatrix4fv(shader.texMatLoc, 1, false, texMatrix, 0)
+        GLES20.glUniform1f(shader.radiusLoc, 0f)
+        GLES20.glUniform1f(shader.softenLoc, if (soften > 0.5f) 1f else 0f)
+        GLES20.glUniform2f(shader.originLoc, viewportX.toFloat(), viewportY.toFloat())
+        GLES20.glUniform2f(shader.sizeLoc, viewportWidth.toFloat(), viewportHeight.toFloat())
+        shader.shader.setVertexAttribArray("in_pos", 2, NDC)
+        shader.shader.setVertexAttribArray("in_tc", 2, TEX)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GlUtil.checkNoGLES2Error("AppearanceSoftenShader.draw")
+    }
+
+    const val VERTEX =
+        "varying vec2 tc;\n" +
+            "attribute vec4 in_pos;\n" +
+            "attribute vec4 in_tc;\n" +
+            "uniform mat4 tex_mat;\n" +
+            "void main() {\n" +
+            "  gl_Position = in_pos;\n" +
+            "  tc = (tex_mat * in_tc).xy;\n" +
+            "}\n"
+
+    const val APPEARANCE =
+        "vec4 appearanceColor() {\n" +
+            "  vec4 color = sampleColor(tc);\n" +
+            "  if (uSoften <= 0.5) return color;\n" +
+            "  float px = max(2.5, min(uViewportSize.x, uViewportSize.y) / 80.0);\n" +
+            "  vec2 o = vec2(px) / max(uViewportSize, vec2(1.0));\n" +
+            "  vec4 blur = (color\n" +
+            "    + sampleColor(tc + vec2(o.x, 0.0))\n" +
+            "    + sampleColor(tc - vec2(o.x, 0.0))\n" +
+            "    + sampleColor(tc + vec2(0.0, o.y))\n" +
+            "    + sampleColor(tc - vec2(0.0, o.y))\n" +
+            "    + sampleColor(tc + vec2(o.x, o.y))\n" +
+            "    + sampleColor(tc - vec2(o.x, o.y))\n" +
+            "    + sampleColor(tc + vec2(o.x, -o.y))\n" +
+            "    + sampleColor(tc + vec2(-o.x, o.y))) * 0.111111;\n" +
+            "  float luma = dot(color.rgb, vec3(0.299, 0.587, 0.114));\n" +
+            "  float skin = smoothstep(0.15, 0.35, luma) * smoothstep(0.95, 0.75, luma);\n" +
+            "  skin *= smoothstep(0.0, 0.08, color.r - color.g);\n" +
+            "  return vec4(mix(color.rgb, blur.rgb, 0.65 * skin * uSoften), color.a);\n" +
+            "}\n"
+
+    private val NDC: FloatBuffer = GlUtil.createFloatBuffer(
+        floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
+    )
+    private val TEX: FloatBuffer = GlUtil.createFloatBuffer(
+        floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
+    )
+
+    fun fragmentSource(kind: Kind, rounded: Boolean): String {
+        val header = when (kind) {
+            Kind.OES ->
+                "#extension GL_OES_EGL_image_external : require\n" +
+                    "precision mediump float;\n" +
+                    "varying vec2 tc;\n" +
+                    "uniform samplerExternalOES tex;\n"
+            Kind.RGB ->
+                "precision mediump float;\n" +
+                    "varying vec2 tc;\n" +
+                    "uniform sampler2D tex;\n"
+            Kind.YUV ->
+                "precision mediump float;\n" +
+                    "varying vec2 tc;\n" +
+                    "uniform sampler2D y_tex;\n" +
+                    "uniform sampler2D u_tex;\n" +
+                    "uniform sampler2D v_tex;\n"
+        }
+        val sample = when (kind) {
+            Kind.OES, Kind.RGB ->
+                "vec4 sampleColor(vec2 uv) { return texture2D(tex, uv); }\n"
+            Kind.YUV ->
+                "vec4 sampleColor(vec2 uv) {\n" +
+                    "  float y = texture2D(y_tex, uv).r * 1.16438;\n" +
+                    "  float u = texture2D(u_tex, uv).r;\n" +
+                    "  float v = texture2D(v_tex, uv).r;\n" +
+                    "  return vec4(y + 1.59603 * v - 0.874202,\n" +
+                    "    y - 0.391762 * u - 0.812968 * v + 0.531668,\n" +
+                    "    y + 2.01723 * u - 1.08563, 1.0);\n" +
+                    "}\n"
+        }
+        val uniforms =
+            "uniform float uRadiusPx;\n" +
+                "uniform float uSoften;\n" +
+                "uniform vec2 uViewportOrigin;\n" +
+                "uniform vec2 uViewportSize;\n"
+        val roundedAlpha =
+            "float roundedAlpha() {\n" +
+                "  if (uRadiusPx <= 0.5) return 1.0;\n" +
+                "  vec2 p = gl_FragCoord.xy - uViewportOrigin;\n" +
+                "  vec2 halfSize = uViewportSize * 0.5;\n" +
+                "  vec2 q = abs(p - halfSize) - halfSize + vec2(uRadiusPx);\n" +
+                "  float dist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - uRadiusPx;\n" +
+                "  return 1.0 - smoothstep(-0.75, 0.75, dist);\n" +
+                "}\n"
+        val main = if (rounded) {
+            "void main() {\n" +
+                "  vec4 color = appearanceColor();\n" +
+                "  gl_FragColor = vec4(color.rgb, color.a * roundedAlpha());\n" +
+                "}\n"
+        } else {
+            "void main() {\n" +
+                "  gl_FragColor = appearanceColor();\n" +
+                "}\n"
+        }
+        return header + uniforms + (if (rounded) roundedAlpha else "") + sample + APPEARANCE + main
+    }
+}
+
 internal object AndroidRemoteVideoTrackAttachPolicy {
     fun tracksShareEffectiveSource(lhs: RTCVideoTrack, rhs: RTCVideoTrack): Boolean {
         if (lhs.platformTrack === rhs.platformTrack) return true
@@ -711,6 +1306,24 @@ internal object AndroidRemoteVideoTrackAttachPolicy {
 }
 
 internal object AndroidRendererLayoutPolicy {
+    fun shouldSkipConferenceTileComposeUpdate(
+        hostWidth: Int,
+        hostHeight: Int,
+        layoutLock: Int,
+        lastHostWidth: Int,
+        lastHostHeight: Int,
+        lastLayoutLock: Int,
+        rendererEglNeedsSurfaceResync: Boolean,
+        conferenceRendererFillsHost: Boolean = false,
+    ): Boolean {
+        if (conferenceRendererFillsHost) return false
+        if (hostWidth <= 0 || hostHeight <= 0) return false
+        if (rendererEglNeedsSurfaceResync) return false
+        return hostWidth == lastHostWidth
+            && hostHeight == lastHostHeight
+            && layoutLock == lastLayoutLock
+    }
+
     fun shouldReconcileAfterLayoutChange(
         previousWidth: Int,
         previousHeight: Int,
@@ -764,12 +1377,57 @@ internal object AndroidRendererLayoutPolicy {
         if (hostWidth <= 0 || hostHeight <= 0 || windowWidth <= 0 || windowHeight <= 0) {
             return true
         }
+        // Device3 16:9 leftover (1002×564) is ~21% of 1080×2520 — not a
+        // rotation fragment. Treating it as one MATCH_PARENT-FILLed the tile.
+        if (isLikelySettledSixteenByNineCell(hostWidth, hostHeight)) {
+            return false
+        }
         return hostWidth * hostHeight * 8 < windowWidth * windowHeight
+    }
+
+    /// Compose conference cells are `aspectRatio(16/9)` (Device3 leftover
+    /// 1002×564). A phone fullscreen pane is never this (1080×2520 ≈ 9:21).
+    fun isLikelySettledSixteenByNineCell(
+        hostWidth: Int,
+        hostHeight: Int,
+    ): Boolean {
+        if (hostWidth <= 0 || hostHeight <= 0) return false
+        val widthByNine = hostWidth * 9
+        val heightBySixteen = hostHeight * 16
+        val delta = kotlin.math.abs(widthByNine - heightBySixteen)
+        return delta * 10 <= maxOf(widthByNine, heightBySixteen)
+    }
+
+    /// Portrait 16:9 row tracks the short window side (Device3 1002 vs 1080).
+    /// Landscape 16:9 row tracks the short window height (Device3 644 vs 1080).
+    /// Portrait leftover 564/1080 must not count as the landscape cell
+    /// (Device3 23:05:32: 317×564 wrap while chrome was already 2394×231).
+    fun conferenceCellMatchesWindow(
+        cellWidth: Int,
+        cellHeight: Int,
+        windowWidth: Int,
+        windowHeight: Int,
+    ): Boolean {
+        if (cellWidth <= 0 || cellHeight <= 0 || windowWidth <= 0 || windowHeight <= 0) {
+            return false
+        }
+        if (!isLikelySettledSixteenByNineCell(cellWidth, cellHeight)) return false
+        return if (windowHeight > windowWidth) {
+            cellWidth <= windowWidth && cellWidth * 5 >= windowWidth * 4
+        } else {
+            cellHeight <= windowHeight && cellHeight * 20 >= windowHeight * 11
+        }
+    }
+
+    /// A 0×0 remount must not guess display metrics. OnLayout applies scale.
+    fun shouldApplyRemoteCameraScale(hostWidth: Int, hostHeight: Int): Boolean {
+        return hostWidth > 0 && hostHeight > 0
     }
 
     @Suppress("UNUSED_PARAMETER")
     fun shouldDeferAspectFitWrapContent(
         preferFit: Boolean,
+        forceFit: Boolean = false,
         windowOrientationMatchesConfiguration: Boolean,
         hostWidth: Int,
         hostHeight: Int,
@@ -781,16 +1439,68 @@ internal object AndroidRendererLayoutPolicy {
         // Dual-axis 1-up → 16:9 (1080×2520 → 1002×564) is a settled conference
         // tile, not a rotation fragment. Letterbox in this apply; previous size
         // is unused once fullscreen leftover and fragment hosts are filtered.
+        // True 1:1 (`forceFit == false`) letterboxes a mismatched remote on the
+        // fullscreen pane instead of SCALE_ASPECT_FILL-cropping landscape.
         if (!preferFit) return false
+        // 16:9 conference cell. Do not MATCH_PARENT-FILL while waiting for
+        // a “settled window” — Device3 14:39 leftover stayed 1002×564.
+        if (forceFit && isLikelySettledSixteenByNineCell(hostWidth, hostHeight)) {
+            if (windowWidth <= 0 || windowHeight <= 0) return false
+            if (conferenceCellMatchesWindow(
+                    hostWidth,
+                    hostHeight,
+                    windowWidth,
+                    windowHeight,
+                )
+            ) {
+                return false
+            }
+            return true
+        }
         if (!windowOrientationMatchesConfiguration) return true
         if (hostWidth <= 0 || hostHeight <= 0) return true
         if (isLikelyFullscreenHost(hostWidth, hostHeight, windowWidth, windowHeight)) {
-            return true
+            return forceFit
         }
         if (isLikelyUnsettledFragmentHost(hostWidth, hostHeight, windowWidth, windowHeight)) {
             return true
         }
+        // applySolo while Compose is still the 16:9 cell (Device3 22:45:36:
+        // leftover letterboxed to 317×564 and never left that size).
+        return shouldDeferSoloExactLetterboxOnNonFullscreenHost(
+            forceFit = forceFit,
+            hostIsFullscreen = false,
+        )
+    }
+
+    /// 2→1 `applySolo` runs before Compose `fillMaxSize`. Exact letterbox
+    /// against the leftover 16:9 cell is 317×564, not 1:1.
+    fun shouldDeferSoloExactLetterboxOnNonFullscreenHost(
+        forceFit: Boolean,
+        hostIsFullscreen: Boolean,
+    ): Boolean {
+        return !forceFit && !hostIsFullscreen
+    }
+
+    /// Conference lock on a still-fullscreen leftover must drop the 1:1 exact
+    /// letterbox (Device3 22:16: 1080×607 overflowed the 16:9 cell).
+    fun shouldResetMatchParentWhenDeferringConferenceLetterbox(): Boolean {
+        return true
+    }
+
+    /// `reinitializeRendererSurfaceForLayoutChange` at 0×0 tears EGL on main
+    /// and cannot create a holder (Device3 22:43:57 nudge).
+    fun shouldAllowEglReinitWhileSurfaceNotReady(): Boolean {
         return false
+    }
+
+    /// Re-calling attach while already queued and the surface is still 0×0
+    /// storms main (Device3 22:16:45–22:18:25).
+    fun shouldSkipRedundantAttachWhileSurfaceNotReady(
+        surfaceReady: Boolean,
+        alreadyQueuedSameLiveTrack: Boolean,
+    ): Boolean {
+        return !surfaceReady && alreadyQueuedSameLiveTrack
     }
 
     fun letterboxExactSize(
@@ -814,6 +1524,330 @@ internal object AndroidRendererLayoutPolicy {
             val fittedWidth = maxOf(1, hostHeight * uprightWidth / uprightHeight)
             Pair(minOf(hostWidth, fittedWidth), hostHeight)
         }
+    }
+
+    /// Settled 16:9 conference cell (1002×564 on Device3). Not the leftover
+    /// fullscreen pane and not a rotation fragment. Letterbox in this apply —
+    /// do not MATCH_PARENT-FILL and wait for a later 317 hop.
+    fun shouldLetterboxSettledConferenceCell(
+        forceFit: Boolean,
+        hostWidth: Int,
+        hostHeight: Int,
+        windowWidth: Int,
+        windowHeight: Int,
+    ): Boolean {
+        if (!forceFit) return false
+        if (hostWidth <= 0 || hostHeight <= 0) return false
+        // 16:9 cell even when a bad windowSize equals the tile (1002×564
+        // looks fullscreen against itself → leftover FILL). Phone 1:1 is
+        // never 16:9.
+        if (isLikelySettledSixteenByNineCell(hostWidth, hostHeight)) {
+            if (windowWidth <= 0 || windowHeight <= 0) return true
+            return conferenceCellMatchesWindow(
+                hostWidth,
+                hostHeight,
+                windowWidth,
+                windowHeight,
+            )
+        }
+        if (windowWidth <= 0 || windowHeight <= 0) return false
+        if (isLikelyFullscreenHost(hostWidth, hostHeight, windowWidth, windowHeight)) {
+            return false
+        }
+        if (isLikelyUnsettledFragmentHost(hostWidth, hostHeight, windowWidth, windowHeight)) {
+            return false
+        }
+        return true
+    }
+
+    /// Same-size OnLayout skipped leftover letterbox after a MATCH_PARENT
+    /// apply (Device3 14:41:58: 317 then 1002, stuck FILL).
+    @Suppress("UNUSED_PARAMETER")
+    fun shouldReapplyConferenceLetterboxOnSameSizeLayout(
+        forceFit: Boolean,
+        hostWidth: Int,
+        hostHeight: Int,
+        rendererUsesMatchParent: Boolean,
+        rendererFillsHost: Boolean = false,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0,
+    ): Boolean {
+        if (!isLikelySettledSixteenByNineCell(hostWidth, hostHeight)) return false
+        if (windowWidth > 0 && windowHeight > 0
+            && !conferenceCellMatchesWindow(
+                hostWidth,
+                hostHeight,
+                windowWidth,
+                windowHeight,
+            )
+        ) {
+            return false
+        }
+        return rendererUsesMatchParent || rendererFillsHost
+    }
+
+    /// Unknown inbound frame still letterboxes a portrait camera in the 16:9
+    /// cell (Device3 10:55: 1002×564 FILL until 180×320 arrived → 317×564).
+    fun letterboxExactSizeOrPortraitFallback(
+        frameWidth: Int,
+        frameHeight: Int,
+        frameRotation: Int,
+        hostWidth: Int,
+        hostHeight: Int,
+    ): Pair<Int, Int> {
+        val exact = letterboxExactSize(
+            frameWidth,
+            frameHeight,
+            frameRotation,
+            hostWidth,
+            hostHeight,
+        )
+        if (exact.first > 0 && exact.second > 0) return exact
+        return letterboxExactSize(9, 16, 0, hostWidth, hostHeight)
+    }
+
+    /// Leftover surface hop `1080×2520 → 1002×564` is the 16:9 cell. That
+    /// dual-axis change is `surface_holder_rotation_skip` (no EGL reinit) and
+    /// never letterboxed — leftover stayed MATCH_PARENT-FILL (Device3 17:49:34).
+    /// Rejoin leftover can still be SOLO-locked from 1-up when this hop
+    /// arrives (Device3 19:19:56: first 1→2 `1002 → 317`, rejoin stayed
+    /// `1002` FILL). 1-up fullscreen is never 16:9 (`1080×2520`).
+    /// Rejoin leftover can report 1002×564 with wrap-content params (parent
+    /// EXACT-measured the cell). Requiring MATCH_PARENT skipped letterbox
+    /// (Device3 22:11:15: leftover `1080 → 1002` FILL; new tile already 317).
+    @Suppress("UNUSED_PARAMETER")
+    fun shouldLetterboxConferenceSurface(
+        forceFit: Boolean,
+        soloLocked: Boolean,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        rendererUsesMatchParent: Boolean,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0,
+    ): Boolean {
+        if (!isLikelySettledSixteenByNineCell(surfaceWidth, surfaceHeight)) {
+            return false
+        }
+        if (windowWidth <= 0 || windowHeight <= 0) return true
+        return conferenceCellMatchesWindow(
+            surfaceWidth,
+            surfaceHeight,
+            windowWidth,
+            windowHeight,
+        )
+    }
+
+    /// `applyConference` often runs while leftover host is still 1:1. Use the
+    /// last settled 16:9 cell from the previous 2-up (Device3 22:11:15 rejoin).
+    /// Do not reuse a portrait cell after the window is landscape (Device3
+    /// 23:05:32: remembered 1002×564 → 317 wrap while chrome was 2394×231).
+    fun shouldUseRememberedSettledConferenceTile(
+        hostWidth: Int,
+        hostHeight: Int,
+        rememberedWidth: Int,
+        rememberedHeight: Int,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0,
+    ): Boolean {
+        if (!isLikelySettledSixteenByNineCell(rememberedWidth, rememberedHeight)) {
+            return false
+        }
+        if (isLikelySettledSixteenByNineCell(hostWidth, hostHeight)) return false
+        if (windowWidth > 0 && windowHeight > 0
+            && !conferenceCellMatchesWindow(
+                rememberedWidth,
+                rememberedHeight,
+                windowWidth,
+                windowHeight,
+            )
+        ) {
+            return false
+        }
+        return true
+    }
+
+    /// Apply left the leftover FILLING the 16:9 cell. Force the exact wrap.
+    fun shouldForceConferenceLetterboxExactSize(
+        rendererUsesMatchParent: Boolean,
+        rendererWidth: Int,
+        rendererHeight: Int,
+        tileWidth: Int,
+        tileHeight: Int,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0,
+    ): Boolean {
+        if (!isLikelySettledSixteenByNineCell(tileWidth, tileHeight)) return false
+        if (windowWidth > 0 && windowHeight > 0
+            && !conferenceCellMatchesWindow(
+                tileWidth,
+                tileHeight,
+                windowWidth,
+                windowHeight,
+            )
+        ) {
+            return false
+        }
+        if (rendererUsesMatchParent) return true
+        return rendererWidth == tileWidth && rendererHeight == tileHeight
+    }
+
+    /// Remount / MATCH_PARENT-FILL can leave `lastApplied` at 317×564 while
+    /// the SurfaceView is MATCH_PARENT again (Device3 19:19:56 rejoin leftover).
+    fun shouldSkipUnchangedConferenceLetterboxApply(
+        lastPreferFit: Boolean?,
+        lastDeferredFill: Boolean,
+        lastLocalWidth: Int,
+        lastLocalHeight: Int,
+        lastExactWidth: Int,
+        lastExactHeight: Int,
+        preferFit: Boolean,
+        localWidth: Int,
+        localHeight: Int,
+        exactWidth: Int,
+        exactHeight: Int,
+        rendererParentIsContainer: Boolean,
+        rendererUsesMatchParent: Boolean,
+    ): Boolean {
+        if (!rendererParentIsContainer) return false
+        if (lastPreferFit != preferFit) return false
+        if (lastDeferredFill) return false
+        if (lastLocalWidth != localWidth || lastLocalHeight != localHeight) return false
+        if (lastExactWidth != exactWidth || lastExactHeight != exactHeight) return false
+        if (exactWidth > 0 && exactHeight > 0 && rendererUsesMatchParent) return false
+        return true
+    }
+
+    /// Compose `onSizeChanged` reports the 16:9 cell (1002×564). Native
+    /// `container.width` can still be the leftover 1:1 pane (1080×2520) so
+    /// apply MATCH_PARENT-FILLs (Device3 15:25:18).
+    fun shouldApplyConferenceLetterboxForComposeTile(
+        tileWidth: Int,
+        tileHeight: Int,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0,
+    ): Boolean {
+        if (!isLikelySettledSixteenByNineCell(tileWidth, tileHeight)) return false
+        if (windowWidth <= 0 || windowHeight <= 0) return true
+        return conferenceCellMatchesWindow(
+            tileWidth,
+            tileHeight,
+            windowWidth,
+            windowHeight,
+        )
+    }
+
+    /// Portrait camera buffers often arrive as 180×320 rot=90. Swapping to
+    /// “upright” landscape FILLs the 16:9 cell (~1002×563). Keep the buffer
+    /// portrait so leftover matches the new tile (Device3 15:25:26 mm26
+    /// 180×320 rot=0 → 317×564; leftover stayed 1002).
+    fun conferenceLetterboxFrameRotation(
+        frameWidth: Int,
+        frameHeight: Int,
+        frameRotation: Int,
+    ): Int {
+        if (frameWidth <= 0 || frameHeight <= 0) return 0
+        if (frameHeight <= frameWidth) return frameRotation
+        var rotation = frameRotation % 360
+        if (rotation < 0) rotation += 360
+        return if (rotation == 90 || rotation == 270) 0 else frameRotation
+    }
+
+    fun letterboxFillsSettledSixteenByNineCell(
+        exactWidth: Int,
+        exactHeight: Int,
+        hostWidth: Int,
+        hostHeight: Int,
+    ): Boolean {
+        if (!isLikelySettledSixteenByNineCell(hostWidth, hostHeight)) return false
+        if (exactWidth <= 0 || exactHeight <= 0) return true
+        return exactWidth * 20 >= hostWidth * 19 && exactHeight * 20 >= hostHeight * 19
+    }
+
+    /// Leftover already letterboxed in the 16:9 cell (317×564). A later apply
+    /// that still reads leftover 1:1 `container.width` (1080×2520) must not
+    /// MATCH_PARENT-FILL (Device3 16:46:48: 317 then 1002; BLAST 16:49:07).
+    fun shouldKeepExistingConferenceLetterbox(
+        forceFit: Boolean,
+        hostWidth: Int,
+        hostHeight: Int,
+        lastExactWidth: Int,
+        lastExactHeight: Int,
+        lastLocalWidth: Int,
+        lastLocalHeight: Int,
+        rendererUsesMatchParent: Boolean,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0,
+        windowOrientationMatchesConfiguration: Boolean = true,
+    ): Boolean {
+        if (!forceFit) return false
+        if (!windowOrientationMatchesConfiguration) return false
+        if (rendererUsesMatchParent) return false
+        if (lastExactWidth <= 0 || lastExactHeight <= 0) return false
+        if (!isLikelySettledSixteenByNineCell(lastLocalWidth, lastLocalHeight)) return false
+        if (letterboxFillsSettledSixteenByNineCell(
+                lastExactWidth,
+                lastExactHeight,
+                lastLocalWidth,
+                lastLocalHeight,
+            )
+        ) {
+            return false
+        }
+        if (isLikelySettledSixteenByNineCell(hostWidth, hostHeight)) return false
+        if (windowWidth > 0 && windowHeight > 0
+            && !conferenceCellMatchesWindow(
+                lastLocalWidth,
+                lastLocalHeight,
+                windowWidth,
+                windowHeight,
+            )
+        ) {
+            return false
+        }
+        if (lastExactWidth > hostWidth || lastExactHeight > hostHeight) {
+            return false
+        }
+        return hostWidth > lastLocalWidth || hostHeight > lastLocalHeight
+    }
+
+    /// 16:9 conference cell: portrait cameras letterbox (317×564). A 16:9
+    /// landscape frame may fill. A 9:16 buffer + 90° must not fill.
+    fun letterboxExactSizeForSettledConferenceCell(
+        frameWidth: Int,
+        frameHeight: Int,
+        frameRotation: Int,
+        hostWidth: Int,
+        hostHeight: Int,
+    ): Pair<Int, Int> {
+        val rotation = conferenceLetterboxFrameRotation(
+            frameWidth,
+            frameHeight,
+            frameRotation,
+        )
+        val exact = letterboxExactSizeOrPortraitFallback(
+            frameWidth,
+            frameHeight,
+            rotation,
+            hostWidth,
+            hostHeight,
+        )
+        val uprightIsSixteenByNine = if (frameWidth > 0 && frameHeight > 0) {
+            val uprightWidth = if (rotation == 90 || rotation == 270) frameHeight else frameWidth
+            val uprightHeight = if (rotation == 90 || rotation == 270) frameWidth else frameHeight
+            isLikelySettledSixteenByNineCell(uprightWidth, uprightHeight)
+        } else {
+            false
+        }
+        if (letterboxFillsSettledSixteenByNineCell(
+                exact.first,
+                exact.second,
+                hostWidth,
+                hostHeight,
+            ) && !uprightIsSixteenByNine
+        ) {
+            return letterboxExactSize(9, 16, 0, hostWidth, hostHeight)
+        }
+        return exact
     }
 
     fun isLikelyAspectFitWrapSurfaceMeasure(
@@ -951,41 +1985,12 @@ class CustomSurfaceViewRenderer : SurfaceViewRenderer {
     override fun onFrame(frame: VideoFrame) {
         renderedFrameObserver?.invoke()
         val rot = (frame.rotation + extraRotation) % 360
-        if (normalizeToUpright && rot != 0) {
-            val src = frame.buffer.toI420() ?: run {
-                super.onFrame(frame)
-                return
-            }
-            val w = src.width
-            val h = src.height
-            val wouldSwap = rot == 90 || rot == 270
-            if (wouldSwap && w > h) {
-                super.onFrame(VideoFrame(frame.buffer, 0, frame.timestampNs))
-                src.release()
-                return
-            }
-            val outW = if (wouldSwap) h else w
-            val outH = if (wouldSwap) w else h
-            val dst = JavaI420Buffer.allocate(outW, outH)
-            YuvHelper.I420Rotate(
-                src.dataY, src.strideY,
-                src.dataU, src.strideU,
-                src.dataV, src.strideV,
-                dst.dataY, dst.strideY,
-                dst.dataU, dst.strideU,
-                dst.dataV, dst.strideV,
-                w, h, rot
-            )
-            src.release()
-            val upright = VideoFrame(dst, 0, frame.timestampNs)
-            super.onFrame(upright)
-            dst.release()
-            return
-        }
         if (rot == frame.rotation) {
             super.onFrame(frame)
             return
         }
+        // EglRenderer already applies VideoFrame.rotation in GL. Do not
+        // toI420 + I420Rotate on the render path (lesson 26 / Device3 GC).
         val corrected = VideoFrame(frame.buffer, rot, frame.timestampNs)
         super.onFrame(corrected)
         corrected.release()
@@ -1004,7 +2009,7 @@ object AndroidRTCViewSupport {
     /// 120/0/120 at 30.0 in ~500 µs and still looked skippy. The PiP was a
     /// TextureView over a full-screen remote SurfaceView hole-punch. Bump
     /// when the local capture / preview pipeline changes.
-    const val LOCAL_PREVIEW_PIPELINE_REVISION = "2026-09-09-j"
+    const val LOCAL_PREVIEW_PIPELINE_REVISION = "2026-09-11-l"
 
     /// Device3 09:49: `Attached Camera2 preview surface 1280x720` then 90° /
     /// smaller PiP; camera floated 13–26 fps; LocalPreview EGL 0 frames; GC
@@ -1012,10 +2017,66 @@ object AndroidRTCViewSupport {
     /// output again without a proven transform + fill.
     const val USE_CAMERA2_PREVIEW_SURFACE = false
 
-    /// Settings "Soften video appearance" (default on). Runs on the worker
-    /// after TextureBuffer fanout is skipped, so preview and send both get
-    /// I420 without toI420 on the shared capturer EglBase (lesson 26).
-    const val ANDROID_CPU_APPEARANCE_SOFTENING = true
+    /// Device3 13:03 pid 27401: CPU soften at 1280×720 dumped ~3M objects /
+    /// 80MB every ~7s and the UI skipped 30–46 frames. Settings softening is
+    /// honored in `RoundedRectGlDrawer` at overlay resolution. Do not send
+    /// I420 into VideoSource (lesson 46).
+    const val ANDROID_CPU_APPEARANCE_SOFTENING = false
+
+    @Volatile
+    private var sharedCaptureEglBase: EglBase? = null
+
+    fun rememberSharedCaptureEglBase(egl: EglBase) {
+        sharedCaptureEglBase = egl
+    }
+
+    fun sharedCaptureEglBase(): EglBase? = sharedCaptureEglBase
+
+    fun rendererLayoutDiagnosticsEnabled(): Boolean {
+        val ctx = ProcessInfo.processInfo.androidContext ?: return false
+        return (ctx.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+    }
+
+    /// Factory RED / TWCC overflow / Unified Plan offerToReceive are not call
+    /// bugs (Device3 11:40–11:42: `video/red/90000` with no apt, then
+    /// `transport_feedback.cc Delta value too large` at ~20 Hz). Keep
+    /// LS_WARNING for real warnings; drop this known-benign set.
+    fun isBenignWebRtcWarning(message: String): Boolean {
+        return message.contains("RED codec with no associated codecs")
+            || message.contains("Delta value too large")
+            || message.contains("Factory produced duplicate codecs")
+            || message.contains("offer_to_receive_audio is not supported")
+            || message.contains("offer_to_receive_video is not supported")
+            || message.contains("Frame has bad render timing")
+            || message.contains("Resetting jitter estimator")
+            || message.contains("Frame scheduled out of order")
+            || message.contains("no receive stream for SSRC")
+            || message.contains("OnPeriodicRttUpdate: Timeout")
+    }
+
+    fun peerConnectionInitializationOptions(
+        app: android.content.Context,
+    ): PeerConnectionFactory.InitializationOptions {
+        return PeerConnectionFactory.InitializationOptions
+            .builder(app)
+            .setEnableInternalTracer(false)
+            .setFieldTrials("WebRTC-H264HighProfile/Enabled/")
+            .setInjectableLogger(
+                { message, severity, tag ->
+                    when (severity) {
+                        Logging.Severity.LS_ERROR -> Log.e(tag, message)
+                        Logging.Severity.LS_WARNING -> {
+                            if (!isBenignWebRtcWarning(message)) {
+                                Log.w(tag, message)
+                            }
+                        }
+                        else -> Unit
+                    }
+                },
+                Logging.Severity.LS_WARNING,
+            )
+            .createInitializationOptions()
+    }
 
     @Volatile
     private var openedCameraCapturer: CameraVideoCapturer? = null
@@ -1683,6 +2744,7 @@ object AndroidRTCViewSupport {
         val handlerGeneration = synchronized(rendererFirstFrameHandlerGenerations) {
             rendererFirstFrameHandlerGenerations[renderer] ?: 0
         }
+        rememberSharedCaptureEglBase(eglBase)
         renderer.init(
             eglBase.eglBaseContext,
             object : RendererCommon.RendererEvents {
@@ -1761,9 +2823,17 @@ object AndroidRTCViewSupport {
     private val localPreviewHosts =
         WeakHashMap<View, android.widget.FrameLayout>()
 
+    private const val LAYOUT_LOCK_NONE = 0
+    private const val LAYOUT_LOCK_SOLO = 1
+    private const val LAYOUT_LOCK_CONFERENCE = 2
+
     private data class RemoteCameraScaleState(
         var forceAspectFit: Boolean = true,
         var fillWhenOrientationMatches: Boolean = false,
+        /// Compose `AndroidView.update` can replay a stale 2-up `prefersAspectFit`
+        /// after `applySoloFullscreenLayout` (Device3 15:18:15: mounted count=1
+        /// then leftover stayed 317×564). Solo/conference apply owns this lock.
+        var layoutLock: Int = LAYOUT_LOCK_NONE,
         var cornerRadiusDp: Float = 0f,
         var frameWidth: Int = 0,
         var frameHeight: Int = 0,
@@ -1782,6 +2852,43 @@ object AndroidRTCViewSupport {
         WeakHashMap<android.widget.FrameLayout, Boolean>()
     private val rendererHostLastLayoutSize =
         WeakHashMap<android.widget.FrameLayout, Pair<Int, Int>>()
+
+    @Volatile
+    private var lastSettledConferenceTileWidth = 0
+    @Volatile
+    private var lastSettledConferenceTileHeight = 0
+
+    fun noteSettledConferenceTileSize(
+        width: Int,
+        height: Int,
+        windowWidth: Int = 0,
+        windowHeight: Int = 0,
+    ) {
+        if (!AndroidRendererLayoutPolicy.isLikelySettledSixteenByNineCell(width, height)) {
+            return
+        }
+        if (windowWidth > 0 && windowHeight > 0
+            && !AndroidRendererLayoutPolicy.conferenceCellMatchesWindow(
+                width,
+                height,
+                windowWidth,
+                windowHeight,
+            )
+        ) {
+            return
+        }
+        lastSettledConferenceTileWidth = width
+        lastSettledConferenceTileHeight = height
+    }
+
+    fun rememberedSettledConferenceTileSize(): Pair<Int, Int>? {
+        val width = lastSettledConferenceTileWidth
+        val height = lastSettledConferenceTileHeight
+        if (!AndroidRendererLayoutPolicy.isLikelySettledSixteenByNineCell(width, height)) {
+            return null
+        }
+        return Pair(width, height)
+    }
 
     private fun uprightFrameDimensions(width: Int, height: Int, rotation: Int): Pair<Int, Int> {
         val rot = ((rotation % 360) + 360) % 360
@@ -1823,9 +2930,7 @@ object AndroidRTCViewSupport {
         ) {
             return true
         }
-        val root = view.rootView ?: return true
-        val rootWidth = root.width
-        val rootHeight = root.height
+        val (rootWidth, rootHeight) = windowSizeForView(view)
         if (rootWidth <= 0 || rootHeight <= 0) return false
         val rootPortrait = rootHeight >= rootWidth
         return if (orientation == Configuration.ORIENTATION_PORTRAIT) {
@@ -1842,11 +2947,33 @@ object AndroidRTCViewSupport {
         if (container.width > 0 && container.height > 0) {
             return Pair(container.width, container.height)
         }
-        if (renderer.width > 0 && renderer.height > 0) {
-            return Pair(renderer.width, renderer.height)
+        // Do not guess from renderer size or display metrics. A 0×0 remount
+        // treated leftover 1:1 as settled fullscreen and SCALE_ASPECT_FILL
+        // (Device3 22:58: 1080×2520 → 1002×564 fill of the 16:9 cell).
+        return Pair(0, 0)
+    }
+
+    fun clearRemoteCameraScaleLayoutCache(renderer: SurfaceViewRenderer) {
+        synchronized(rendererCameraScaleState) {
+            rendererCameraScaleState[renderer]?.let { state ->
+                state.lastAppliedPreferFit = null
+                state.lastAppliedLocalWidth = 0
+                state.lastAppliedLocalHeight = 0
+                state.lastAppliedExactWidth = 0
+                state.lastAppliedExactHeight = 0
+                state.lastAppliedDeferredFill = false
+            }
         }
-        val metrics = renderer.resources.displayMetrics
-        return Pair(metrics.widthPixels, metrics.heightPixels)
+        val container = synchronized(rendererAspectFitContainers) {
+            rendererAspectFitContainers[renderer]
+        } ?: return
+        rendererHostLastLayoutSize.remove(container)
+    }
+
+    fun remoteCameraCornerRadiusDp(renderer: SurfaceViewRenderer): Float {
+        return synchronized(rendererCameraScaleState) {
+            rendererCameraScaleState[renderer]?.cornerRadiusDp ?: 12f
+        }
     }
 
     private fun ensureRemoteCameraHostContainer(
@@ -1863,17 +2990,38 @@ object AndroidRTCViewSupport {
         assignMatchParentLayoutParamsIfNeeded(container)
         if (rendererHostLayoutListenerInstalled[container] != true) {
             rendererHostLayoutListenerInstalled[container] = true
-            container.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            container.addOnLayoutChangeListener { v, left, top, right, bottom, _, _, _, _ ->
                 val host = v as? android.widget.FrameLayout ?: return@addOnLayoutChangeListener
-                val newW = host.width
-                val newH = host.height
+                val newW = right - left
+                val newH = bottom - top
                 if (newW <= 0 || newH <= 0) return@addOnLayoutChangeListener
                 val previous = rendererHostLastLayoutSize[host]
+                val (windowW, windowH) = windowSizeForView(host)
+                noteSettledConferenceTileSize(newW, newH, windowW, windowH)
                 // Same-size OnLayout must not re-apply. Assigning layoutParams from
                 // apply() would requestLayout → OnLayout → apply forever (Device3 ANR:
-                // main thread 98%, GC 4–5M objects / 100MB).
+                // main thread 98%, GC 4–5M objects / 100MB). Re-apply when a
+                // 16:9 conference cell is still FILL — MATCH_PARENT or measured
+                // equal to the host (Device3 22:11:15 rejoin leftover).
                 if (previous != null && previous.first == newW && previous.second == newH) {
-                    return@addOnLayoutChangeListener
+                    val latest = synchronized(rendererCameraScaleState) {
+                        rendererCameraScaleState[renderer]
+                    } ?: return@addOnLayoutChangeListener
+                    val conference = latest.forceAspectFit
+                        || latest.layoutLock == LAYOUT_LOCK_CONFERENCE
+                    val fillsHost = renderer.width == newW && renderer.height == newH
+                    if (!AndroidRendererLayoutPolicy.shouldReapplyConferenceLetterboxOnSameSizeLayout(
+                            forceFit = conference,
+                            hostWidth = newW,
+                            hostHeight = newH,
+                            rendererUsesMatchParent = rendererUsesMatchParent(renderer),
+                            rendererFillsHost = fillsHost,
+                            windowWidth = windowW,
+                            windowHeight = windowH,
+                        )
+                    ) {
+                        return@addOnLayoutChangeListener
+                    }
                 }
                 rendererHostLastLayoutSize[host] = Pair(newW, newH)
                 val latest = synchronized(rendererCameraScaleState) {
@@ -1884,6 +3032,8 @@ object AndroidRTCViewSupport {
                     latest,
                     previousHostWidth = previous?.first,
                     previousHostHeight = previous?.second,
+                    viewportWidth = newW,
+                    viewportHeight = newH,
                 )
             }
         }
@@ -1895,13 +3045,46 @@ object AndroidRTCViewSupport {
         state: RemoteCameraScaleState,
         previousHostWidth: Int? = null,
         previousHostHeight: Int? = null,
+        viewportWidth: Int? = null,
+        viewportHeight: Int? = null,
     ): android.widget.FrameLayout {
         // Host container is always match-parent so landscape/portrait parents fill the screen;
         // the SurfaceView inside stays match-parent until the tile settles, then one exact
         // letterbox size (not WRAP_CONTENT remasure on every frame-resolution callback).
         val container = ensureRemoteCameraHostContainer(renderer)
         val windowMatches = windowOrientationMatchesConfiguration(container)
-        val (localW, localH) = localViewportSizeForRenderer(renderer, container)
+        val (localW, localH) = if (
+            viewportWidth != null
+            && viewportHeight != null
+            && AndroidRendererLayoutPolicy.shouldApplyRemoteCameraScale(
+                viewportWidth,
+                viewportHeight,
+            )
+        ) {
+            Pair(viewportWidth, viewportHeight)
+        } else {
+            localViewportSizeForRenderer(renderer, container)
+        }
+        if (!AndroidRendererLayoutPolicy.shouldApplyRemoteCameraScale(localW, localH)) {
+            // Host is still 0×0. Do not SCALE_ASPECT_FILL. MATCH_PARENT — do not
+            // keep a stale exact letterbox (Device3 22:45: applySolo left
+            // 317×564). Do not guess a viewport from display metrics (lesson 60).
+            if (state.forceAspectFit || state.layoutLock == LAYOUT_LOCK_CONFERENCE) {
+                renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+            } else {
+                renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FILL)
+            }
+            aspectFillContainer(renderer)
+            state.lastAppliedPreferFit = null
+            state.lastAppliedDeferredFill = false
+            state.lastAppliedLocalWidth = 0
+            state.lastAppliedLocalHeight = 0
+            state.lastAppliedExactWidth = 0
+            state.lastAppliedExactHeight = 0
+            applyRemoteCameraCornerStyle(container, renderer, state)
+            renderer.setZOrderOnTop(false)
+            return container
+        }
         val (windowW, windowH) = windowSizeForView(container)
         val previousW = previousHostWidth
             ?: rendererHostLastLayoutSize[container]?.first
@@ -1909,29 +3092,93 @@ object AndroidRTCViewSupport {
         val previousH = previousHostHeight
             ?: rendererHostLastLayoutSize[container]?.second
             ?: 0
-        val preferFit = prefersAspectFitForState(state, localW, localH)
-        val deferWrap = AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
-            preferFit = preferFit,
-            windowOrientationMatchesConfiguration = windowMatches,
-            hostWidth = localW,
-            hostHeight = localH,
-            windowWidth = windowW,
-            windowHeight = windowH,
-            previousHostWidth = previousW,
-            previousHostHeight = previousH,
-        )
-        val (exactW, exactH) = if (preferFit && !deferWrap) {
-            AndroidRendererLayoutPolicy.letterboxExactSize(
-                state.frameWidth,
-                state.frameHeight,
-                state.frameRotation,
-                localW,
-                localH,
+        val conferenceForceFit = state.forceAspectFit
+            || state.layoutLock == LAYOUT_LOCK_CONFERENCE
+        if (AndroidRendererLayoutPolicy.shouldKeepExistingConferenceLetterbox(
+                forceFit = conferenceForceFit,
+                hostWidth = localW,
+                hostHeight = localH,
+                lastExactWidth = state.lastAppliedExactWidth,
+                lastExactHeight = state.lastAppliedExactHeight,
+                lastLocalWidth = state.lastAppliedLocalWidth,
+                lastLocalHeight = state.lastAppliedLocalHeight,
+                rendererUsesMatchParent = rendererUsesMatchParent(renderer),
+                windowWidth = windowW,
+                windowHeight = windowH,
+                windowOrientationMatchesConfiguration = windowMatches,
             )
+        ) {
+            return container
+        }
+        val letterboxConference = windowMatches
+            && AndroidRendererLayoutPolicy.shouldLetterboxSettledConferenceCell(
+                forceFit = conferenceForceFit,
+                hostWidth = localW,
+                hostHeight = localH,
+                windowWidth = windowW,
+                windowHeight = windowH,
+            )
+        val preferFit = letterboxConference
+            || prefersAspectFitForState(state, localW, localH)
+        val deferWrap = if (letterboxConference) {
+            false
+        } else {
+            AndroidRendererLayoutPolicy.shouldDeferAspectFitWrapContent(
+                preferFit = preferFit,
+                forceFit = conferenceForceFit,
+                windowOrientationMatchesConfiguration = windowMatches,
+                hostWidth = localW,
+                hostHeight = localH,
+                windowWidth = windowW,
+                windowHeight = windowH,
+                previousHostWidth = previousW,
+                previousHostHeight = previousH,
+            )
+        }
+        val (exactW, exactH) = if (preferFit && !deferWrap) {
+            if (letterboxConference) {
+                AndroidRendererLayoutPolicy.letterboxExactSizeForSettledConferenceCell(
+                    state.frameWidth,
+                    state.frameHeight,
+                    state.frameRotation,
+                    localW,
+                    localH,
+                )
+            } else {
+                AndroidRendererLayoutPolicy.letterboxExactSizeOrPortraitFallback(
+                    state.frameWidth,
+                    state.frameHeight,
+                    state.frameRotation,
+                    localW,
+                    localH,
+                )
+            }
         } else {
             Pair(0, 0)
         }
         if (deferWrap) {
+            if (state.forceAspectFit) {
+                // Conference leftover must not SCALE_ASPECT_FILL. OnLayout of
+                // the settled 16:9 cell letterboxes. FILL here cropped the
+                // first remote at 1002×564 (Device3 22:58).
+                // Keep MATCH_PARENT — do not retain the 1:1 exact letterbox
+                // (Device3 22:16: 1080×607 child zeroed the second tile).
+                if (AndroidRendererLayoutPolicy
+                    .shouldResetMatchParentWhenDeferringConferenceLetterbox()
+                ) {
+                    renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                    aspectFillContainer(renderer)
+                    state.lastAppliedPreferFit = null
+                    state.lastAppliedDeferredFill = false
+                    state.lastAppliedLocalWidth = localW
+                    state.lastAppliedLocalHeight = localH
+                    state.lastAppliedExactWidth = 0
+                    state.lastAppliedExactHeight = 0
+                    applyRemoteCameraCornerStyle(container, renderer, state)
+                    renderer.setZOrderOnTop(false)
+                }
+                return container
+            }
             if (state.lastAppliedDeferredFill
                 && renderer.parent === container
                 && rendererUsesMatchParent(renderer)
@@ -1950,13 +3197,21 @@ object AndroidRTCViewSupport {
             renderer.setZOrderOnTop(false)
             return container
         }
-        if (state.lastAppliedPreferFit == preferFit
-            && !state.lastAppliedDeferredFill
-            && state.lastAppliedLocalWidth == localW
-            && state.lastAppliedLocalHeight == localH
-            && state.lastAppliedExactWidth == exactW
-            && state.lastAppliedExactHeight == exactH
-            && renderer.parent === container
+        if (AndroidRendererLayoutPolicy.shouldSkipUnchangedConferenceLetterboxApply(
+                lastPreferFit = state.lastAppliedPreferFit,
+                lastDeferredFill = state.lastAppliedDeferredFill,
+                lastLocalWidth = state.lastAppliedLocalWidth,
+                lastLocalHeight = state.lastAppliedLocalHeight,
+                lastExactWidth = state.lastAppliedExactWidth,
+                lastExactHeight = state.lastAppliedExactHeight,
+                preferFit = preferFit,
+                localWidth = localW,
+                localHeight = localH,
+                exactWidth = exactW,
+                exactHeight = exactH,
+                rendererParentIsContainer = renderer.parent === container,
+                rendererUsesMatchParent = rendererUsesMatchParent(renderer),
+            )
         ) {
             return container
         }
@@ -2005,13 +3260,66 @@ object AndroidRTCViewSupport {
             && params.height == ViewGroup.LayoutParams.MATCH_PARENT
     }
 
-    private fun windowSizeForView(view: View): Pair<Int, Int> {
-        val root = view.rootView
-        if (root != null && root.width > 0 && root.height > 0) {
-            return Pair(root.width, root.height)
+    private fun activityForView(view: View): android.app.Activity? {
+        var ctx: android.content.Context? = view.context
+        while (ctx is android.content.ContextWrapper) {
+            if (ctx is android.app.Activity) return ctx
+            ctx = ctx.baseContext
         }
+        return ctx as? android.app.Activity
+    }
+
+    /// Activity / display window — not `view.rootView`. Compose AndroidView
+    /// roots the leftover in the 16:9 cell (1002×564). Treating that as the
+    /// window makes `isLikelyFullscreenHost` true and MATCH_PARENT-FILLs
+    /// (Device3 10:55 / 14:39: BLAST reject 1002×564). Reject tile-sized
+    /// candidates even if they came from decor during a remount.
+    fun windowSizeForView(view: View): Pair<Int, Int> {
         val metrics = view.resources.displayMetrics
-        return Pair(metrics.widthPixels, metrics.heightPixels)
+        val displayW = metrics.widthPixels
+        val displayH = metrics.heightPixels
+        val orientation = view.resources.configuration.orientation
+        fun isPlausibleWindow(width: Int, height: Int): Boolean {
+            if (width <= 0 || height <= 0) return false
+            if (AndroidRendererLayoutPolicy.isLikelySettledSixteenByNineCell(width, height)) {
+                return false
+            }
+            if (displayW > 0 && displayH > 0) {
+                val matchesDisplay = AndroidRendererLayoutPolicy.isLikelyFullscreenHost(
+                    width,
+                    height,
+                    displayW,
+                    displayH,
+                ) || AndroidRendererLayoutPolicy.isLikelyFullscreenHost(
+                    width,
+                    height,
+                    displayH,
+                    displayW,
+                )
+                if (!matchesDisplay) return false
+            }
+            if (orientation == Configuration.ORIENTATION_PORTRAIT && height < width) {
+                return false
+            }
+            if (orientation == Configuration.ORIENTATION_LANDSCAPE && width < height) {
+                return false
+            }
+            return true
+        }
+        val decor = activityForView(view)?.window?.decorView
+        if (decor != null && isPlausibleWindow(decor.width, decor.height)) {
+            return Pair(decor.width, decor.height)
+        }
+        if (isPlausibleWindow(displayW, displayH)) {
+            return Pair(displayW, displayH)
+        }
+        if (isPlausibleWindow(displayH, displayW)) {
+            return Pair(displayH, displayW)
+        }
+        if (displayW > 0 && displayH > 0) {
+            return Pair(displayW, displayH)
+        }
+        return Pair(0, 0)
     }
 
     /// Assigning `layoutParams` always requestLayouts. Skip when already match-parent.
@@ -2133,8 +3441,16 @@ object AndroidRTCViewSupport {
     ): android.widget.FrameLayout {
         val state = synchronized(rendererCameraScaleState) {
             rendererCameraScaleState.getOrPut(renderer) { RemoteCameraScaleState() }.also {
-                val nextForceFit = prefersAspectFit
-                val nextMatchFill = fillWhenOrientationMatches && !prefersAspectFit
+                val nextForceFit = when (it.layoutLock) {
+                    LAYOUT_LOCK_SOLO -> false
+                    LAYOUT_LOCK_CONFERENCE -> true
+                    else -> prefersAspectFit
+                }
+                val nextMatchFill = when (it.layoutLock) {
+                    LAYOUT_LOCK_SOLO -> true
+                    LAYOUT_LOCK_CONFERENCE -> false
+                    else -> fillWhenOrientationMatches && !prefersAspectFit
+                }
                 if (it.forceAspectFit != nextForceFit
                     || it.fillWhenOrientationMatches != nextMatchFill
                     || it.cornerRadiusDp != cornerRadiusDp
@@ -2152,6 +3468,165 @@ object AndroidRTCViewSupport {
             }
         }
         return applyRemoteCameraScaleState(renderer, state)
+    }
+
+    /// 1-up ↔ N-up apply owns scale. Compose `update` must not replay the
+    /// previous grid's `prefersAspectFit` onto the leftover tile.
+    fun remoteCameraLayoutLock(renderer: SurfaceViewRenderer): Int {
+        return synchronized(rendererCameraScaleState) {
+            rendererCameraScaleState[renderer]?.layoutLock ?: LAYOUT_LOCK_NONE
+        }
+    }
+
+    fun remoteCameraConferenceLockFillsHost(
+        renderer: SurfaceViewRenderer,
+        layoutLock: Int,
+    ): Boolean {
+        return layoutLock == LAYOUT_LOCK_CONFERENCE && rendererUsesMatchParent(renderer)
+    }
+
+    fun remoteCameraRendererUsesMatchParent(renderer: SurfaceViewRenderer): Boolean {
+        return rendererUsesMatchParent(renderer)
+    }
+
+    fun setRemoteCameraLayoutLock(renderer: SurfaceViewRenderer, conference: Boolean) {
+        synchronized(rendererCameraScaleState) {
+            rendererCameraScaleState.getOrPut(renderer) { RemoteCameraScaleState() }.also {
+                it.layoutLock = if (conference) LAYOUT_LOCK_CONFERENCE else LAYOUT_LOCK_SOLO
+                it.forceAspectFit = conference
+                it.fillWhenOrientationMatches = !conference
+            }
+        }
+    }
+
+    /// Compose tile settled at 16:9. Use that size — not leftover 1:1
+    /// `container.width` — so the first remote letterboxes to 317×564.
+    fun shouldKeepExistingConferenceLetterbox(
+        renderer: SurfaceViewRenderer,
+        hostWidth: Int,
+        hostHeight: Int,
+    ): Boolean {
+        val state = synchronized(rendererCameraScaleState) {
+            rendererCameraScaleState[renderer]
+        } ?: return false
+        val conference = state.forceAspectFit || state.layoutLock == LAYOUT_LOCK_CONFERENCE
+        val (windowW, windowH) = windowSizeForView(renderer)
+        return AndroidRendererLayoutPolicy.shouldKeepExistingConferenceLetterbox(
+            forceFit = conference,
+            hostWidth = hostWidth,
+            hostHeight = hostHeight,
+            lastExactWidth = state.lastAppliedExactWidth,
+            lastExactHeight = state.lastAppliedExactHeight,
+            lastLocalWidth = state.lastAppliedLocalWidth,
+            lastLocalHeight = state.lastAppliedLocalHeight,
+            rendererUsesMatchParent = rendererUsesMatchParent(renderer),
+            windowWidth = windowW,
+            windowHeight = windowH,
+            windowOrientationMatchesConfiguration = windowOrientationMatchesConfiguration(renderer),
+        )
+    }
+
+    fun maybeLetterboxConferenceSurface(
+        renderer: SurfaceViewRenderer,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+    ): Boolean {
+        val state = synchronized(rendererCameraScaleState) {
+            rendererCameraScaleState[renderer]
+        }
+        val forceFit = state?.forceAspectFit == true
+            || state?.layoutLock == LAYOUT_LOCK_CONFERENCE
+        val soloLocked = state?.layoutLock == LAYOUT_LOCK_SOLO
+        val (windowW, windowH) = windowSizeForView(renderer)
+        noteSettledConferenceTileSize(surfaceWidth, surfaceHeight, windowW, windowH)
+        if (!windowOrientationMatchesConfiguration(renderer)) {
+            return false
+        }
+        if (!AndroidRendererLayoutPolicy.shouldLetterboxConferenceSurface(
+                forceFit = forceFit,
+                soloLocked = soloLocked,
+                surfaceWidth = surfaceWidth,
+                surfaceHeight = surfaceHeight,
+                rendererUsesMatchParent = rendererUsesMatchParent(renderer),
+                windowWidth = windowW,
+                windowHeight = windowH,
+            )
+        ) {
+            return false
+        }
+        return applyConferenceLetterboxForComposeTile(
+            renderer = renderer,
+            tileWidthPx = surfaceWidth,
+            tileHeightPx = surfaceHeight,
+        )
+    }
+
+    fun applyConferenceLetterboxForComposeTile(
+        renderer: SurfaceViewRenderer,
+        tileWidthPx: Int,
+        tileHeightPx: Int,
+    ): Boolean {
+        val (windowW, windowH) = windowSizeForView(renderer)
+        if (!windowOrientationMatchesConfiguration(renderer)) {
+            return false
+        }
+        if (!AndroidRendererLayoutPolicy.shouldApplyConferenceLetterboxForComposeTile(
+                tileWidthPx,
+                tileHeightPx,
+                windowW,
+                windowH,
+            )
+        ) {
+            return false
+        }
+        noteSettledConferenceTileSize(tileWidthPx, tileHeightPx, windowW, windowH)
+        setRemoteCameraLayoutLock(renderer, conference = true)
+        val state = synchronized(rendererCameraScaleState) {
+            rendererCameraScaleState[renderer]
+        } ?: return false
+        applyRemoteCameraScaleState(
+            renderer,
+            state,
+            viewportWidth = tileWidthPx,
+            viewportHeight = tileHeightPx,
+        )
+        if (AndroidRendererLayoutPolicy.shouldForceConferenceLetterboxExactSize(
+                rendererUsesMatchParent = rendererUsesMatchParent(renderer),
+                rendererWidth = renderer.width,
+                rendererHeight = renderer.height,
+                tileWidth = tileWidthPx,
+                tileHeight = tileHeightPx,
+                windowWidth = windowW,
+                windowHeight = windowH,
+            )
+        ) {
+            forceConferenceLetterboxExactSize(renderer, state, tileWidthPx, tileHeightPx)
+        }
+        return !rendererUsesMatchParent(renderer)
+    }
+
+    private fun forceConferenceLetterboxExactSize(
+        renderer: SurfaceViewRenderer,
+        state: RemoteCameraScaleState,
+        tileWidthPx: Int,
+        tileHeightPx: Int,
+    ) {
+        val (exactW, exactH) = AndroidRendererLayoutPolicy.letterboxExactSizeForSettledConferenceCell(
+            state.frameWidth,
+            state.frameHeight,
+            state.frameRotation,
+            tileWidthPx,
+            tileHeightPx,
+        )
+        if (exactW <= 0 || exactH <= 0) return
+        renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+        aspectFitContainer(renderer, exactWidth = exactW, exactHeight = exactH)
+        state.lastAppliedPreferFit = true
+        state.lastAppliedDeferredFill = false
+        state.lastAppliedLocalWidth = tileWidthPx
+        state.lastAppliedLocalHeight = tileHeightPx
+        state.lastAppliedExactWidth = exactW
+        state.lastAppliedExactHeight = exactH
     }
 
     private fun noteRendererFrameResolution(
@@ -2301,6 +3776,7 @@ object AndroidRTCViewSupport {
         eglBase: EglBase,
         mirror: Boolean,
     ) {
+        rememberSharedCaptureEglBase(eglBase)
         previewView.initialize(eglBase, mirror)
     }
 
@@ -2470,6 +3946,12 @@ class AndroidFrameCryptorSupport {
         screenReceiverTrackIdsByParticipantId.clear()
         videoReceiverFrameCryptorReadyHandler = null
         frameCryptorStateHandler = null
+    }
+
+    @Synchronized
+    fun hasAudioReceiverCryptor(participant: String): Boolean {
+        if (audioReceiverCryptorsByParticipantId[participant] != null) return true
+        return audioReceiverCryptorsByParticipantId.keys.any { it.equals(participant, ignoreCase = true) }
     }
 
     @Synchronized
@@ -2948,9 +4430,12 @@ class AndroidFrameCryptorSupport {
 /// `SurfaceControl.Transaction` corner APIs are missing from compileSdk 36
 /// stubs (hidden; reflection denied). Translucent corners show the remote
 /// video underneath.
-private class RoundedRectGlDrawer : RendererCommon.GlDrawer {
+internal class RoundedRectGlDrawer : RendererCommon.GlDrawer {
     @Volatile
     var radiusPx: Float = 0f
+
+    @Volatile
+    var soften: Float = 0f
 
     private var oesShader: ShaderProgram? = null
     private var rgbShader: ShaderProgram? = null
@@ -3041,6 +4526,7 @@ private class RoundedRectGlDrawer : RendererCommon.GlDrawer {
         shader.shader.useProgram()
         GLES20.glUniformMatrix4fv(shader.texMatLoc, 1, false, texMatrix, 0)
         GLES20.glUniform1f(shader.radiusLoc, radiusPx)
+        GLES20.glUniform1f(shader.softenLoc, if (soften > 0.5f) 1f else 0f)
         GLES20.glUniform2f(shader.originLoc, viewportX.toFloat(), viewportY.toFloat())
         GLES20.glUniform2f(shader.sizeLoc, viewportWidth.toFloat(), viewportHeight.toFloat())
         shader.shader.setVertexAttribArray("in_pos", 2, NDC)
@@ -3067,15 +4553,17 @@ private class RoundedRectGlDrawer : RendererCommon.GlDrawer {
             shader = shader,
             texMatLoc = shader.getUniformLocation("tex_mat"),
             radiusLoc = shader.getUniformLocation("uRadiusPx"),
+            softenLoc = shader.getUniformLocation("uSoften"),
             originLoc = shader.getUniformLocation("uViewportOrigin"),
             sizeLoc = shader.getUniformLocation("uViewportSize"),
         )
     }
 
-    private class ShaderProgram(
+    internal class ShaderProgram(
         val shader: GlShader,
         val texMatLoc: Int,
         val radiusLoc: Int,
+        val softenLoc: Int,
         val originLoc: Int,
         val sizeLoc: Int,
     ) {
@@ -3104,6 +4592,7 @@ private class RoundedRectGlDrawer : RendererCommon.GlDrawer {
                 "}\n"
         private const val ROUNDED_ALPHA =
             "uniform float uRadiusPx;\n" +
+                "uniform float uSoften;\n" +
                 "uniform vec2 uViewportOrigin;\n" +
                 "uniform vec2 uViewportSize;\n" +
                 "float roundedAlpha() {\n" +
@@ -3116,41 +4605,12 @@ private class RoundedRectGlDrawer : RendererCommon.GlDrawer {
                 "}\n"
 
         private fun fragmentSource(kind: ShaderKind): String {
-            val header = when (kind) {
-                ShaderKind.OES ->
-                    "#extension GL_OES_EGL_image_external : require\n" +
-                        "precision mediump float;\n" +
-                        "varying vec2 tc;\n" +
-                        "uniform samplerExternalOES tex;\n"
-                ShaderKind.RGB ->
-                    "precision mediump float;\n" +
-                        "varying vec2 tc;\n" +
-                        "uniform sampler2D tex;\n"
-                ShaderKind.YUV ->
-                    "precision mediump float;\n" +
-                        "varying vec2 tc;\n" +
-                        "uniform sampler2D y_tex;\n" +
-                        "uniform sampler2D u_tex;\n" +
-                        "uniform sampler2D v_tex;\n"
+            val mapped = when (kind) {
+                ShaderKind.OES -> AppearanceSoftenShader.Kind.OES
+                ShaderKind.RGB -> AppearanceSoftenShader.Kind.RGB
+                ShaderKind.YUV -> AppearanceSoftenShader.Kind.YUV
             }
-            val sample = when (kind) {
-                ShaderKind.OES, ShaderKind.RGB ->
-                    "vec4 sampleColor() { return texture2D(tex, tc); }\n"
-                ShaderKind.YUV ->
-                    "vec4 sampleColor() {\n" +
-                        "  float y = texture2D(y_tex, tc).r * 1.16438;\n" +
-                        "  float u = texture2D(u_tex, tc).r;\n" +
-                        "  float v = texture2D(v_tex, tc).r;\n" +
-                        "  return vec4(y + 1.59603 * v - 0.874202,\n" +
-                        "    y - 0.391762 * u - 0.812968 * v + 0.531668,\n" +
-                        "    y + 2.01723 * u - 1.08563, 1.0);\n" +
-                        "}\n"
-            }
-            return header + ROUNDED_ALPHA + sample +
-                "void main() {\n" +
-                "  vec4 color = sampleColor();\n" +
-                "  gl_FragColor = vec4(color.rgb, color.a * roundedAlpha());\n" +
-                "}\n"
+            return AppearanceSoftenShader.fragmentSource(mapped, rounded = true)
         }
     }
 }
@@ -3169,6 +4629,7 @@ class LocalPreviewTextureRenderer(
     private var pendingEglBase: EglBase? = null
     private var loggedFirstPreviewFrame = false
     private var cornerRadiusDp = 12f
+    private var loggedGlSoften: Boolean? = null
     var onReady: (() -> Unit)? = null
 
     init {
@@ -3183,6 +4644,7 @@ class LocalPreviewTextureRenderer(
         pendingMirror = mirror
         pendingEglBase = eglBase
         syncDrawerRadius()
+        syncDrawerSoften()
         if (!eglReady) {
             eglRenderer.init(eglBase.eglBaseContext, EglBase.CONFIG_RGBA, roundedDrawer)
             eglReady = true
@@ -3206,6 +4668,7 @@ class LocalPreviewTextureRenderer(
         if (eglReady || AndroidRTCViewSupport.isCamera2PreviewSurfaceAttached()) return
         val eglBase = pendingEglBase ?: return
         syncDrawerRadius()
+        syncDrawerSoften()
         eglRenderer.init(eglBase.eglBaseContext, EglBase.CONFIG_RGBA, roundedDrawer)
         eglRenderer.setMirror(pendingMirror)
         eglRenderer.disableFpsReduction()
@@ -3254,6 +4717,18 @@ class LocalPreviewTextureRenderer(
         }
     }
 
+    private fun syncDrawerSoften() {
+        val enabled = AndroidCaptureUIPreferenceCache.isVideoAppearanceSofteningEnabled()
+        roundedDrawer.soften = if (enabled) 1f else 0f
+        if (loggedGlSoften != enabled) {
+            loggedGlSoften = enabled
+            Log.i(
+                "AndroidPreviewCaptureView",
+                "LocalPreview glSoften=$enabled via=GlRoundedRect",
+            )
+        }
+    }
+
     fun currentMirror(): Boolean = pendingMirror
 
     fun setMirror(mirror: Boolean) {
@@ -3278,6 +4753,7 @@ class LocalPreviewTextureRenderer(
         surfaceBound = false
         pendingEglBase = null
         loggedFirstPreviewFrame = false
+        loggedGlSoften = null
     }
 
     fun isReady(): Boolean {
@@ -3289,6 +4765,7 @@ class LocalPreviewTextureRenderer(
 
     override fun onFrame(frame: VideoFrame) {
         if (!eglReady || AndroidRTCViewSupport.isCamera2PreviewSurfaceAttached()) return
+        syncDrawerSoften()
         if (!loggedFirstPreviewFrame) {
             loggedFirstPreviewFrame = true
             val kind = when (frame.buffer) {
@@ -3524,7 +5001,14 @@ class AndroidSampleCaptureViewNative(
     private var pendingTrack: RTCVideoTrack? = null
     private var attachedTrack: RTCVideoTrack? = null
     private var rendererHasSink = false
+    @Volatile
+    private var firstFrameNotePosted = false
+    @Volatile
     private var hasRenderedFirstFrameSinceSinkAttach = false
+        set(value) {
+            field = value
+            if (!value) firstFrameNotePosted = false
+        }
     private var surfaceReadyRetry: (() -> Unit)? = null
     private var sinkAttachFirstFrameObserver: (() -> Unit)? = null
     private var surfaceCallbackSetup = false
@@ -3543,15 +5027,24 @@ class AndroidSampleCaptureViewNative(
     private var firstFrameHandlerGeneration = 0
     private var rendererParticipantLabel = "unassigned"
     private var everConfirmedFirstFrameTrackId: String? = null
+    @Volatile
     private var lastRenderedFrameUptimeMs = 0L
+    @Volatile
     private var renderedFramesSinceSinkAttach = 0L
     private var pendingLiveWrapperRebindRequested = false
     private var released = false
 
     init {
         (surfaceViewRenderer as? CustomSurfaceViewRenderer)?.renderedFrameObserver = {
-            AndroidRTCViewSupport.postToMainThread {
-                noteRenderedFrameOnMainThread()
+            lastRenderedFrameUptimeMs = android.os.SystemClock.uptimeMillis()
+            renderedFramesSinceSinkAttach += 1
+            // First-frame confirm is the event. Do not post every remote
+            // frame onto main (Device3 14:43: 30×N Handler messages/s).
+            if (!hasRenderedFirstFrameSinceSinkAttach && !firstFrameNotePosted) {
+                firstFrameNotePosted = true
+                AndroidRTCViewSupport.postToMainThread {
+                    noteRenderedFrameOnMainThread()
+                }
             }
         }
         registerFirstFrameHandlerForCurrentEglGeneration()
@@ -3758,6 +5251,12 @@ class AndroidSampleCaptureViewNative(
         }
         AndroidRTCViewSupport.detachFromParent(surfaceViewRenderer)
         released = true
+        surfaceRendererInitialized = false
+        lastComposeHostWidth = 0
+        lastComposeHostHeight = 0
+        lastComposeLayoutLock = -1
+        queuedAttachTrack = null
+        attachPosted = false
         var releaseRendererHere = true
         try {
             releaseRendererHere = client.removeRendererIfTracked(surfaceViewRenderer)
@@ -3920,6 +5419,12 @@ class AndroidSampleCaptureViewNative(
             pendingTrack = track
             attachedTrack = track
             notifySinkAttachWaitersOnMainThread()
+            if (!isSurfaceReady()) {
+                logRendererLayoutState(
+                    "attach_queued_surface_not_ready trackId=${trackIdOrNull(track) ?: "<unknown>"}"
+                )
+                return false
+            }
             return reinitializeRendererSurfaceForLayoutChange()
         }
         if (stale != null &&
@@ -3983,6 +5488,21 @@ class AndroidSampleCaptureViewNative(
                 val dimensionsChanged = previousWidth != width || previousHeight != height
                 lastSurfaceWidth = width
                 lastSurfaceHeight = height
+                if (AndroidRTCViewSupport.maybeLetterboxConferenceSurface(
+                        renderer = surfaceViewRenderer,
+                        surfaceWidth = width,
+                        surfaceHeight = height,
+                    )
+                ) {
+                    lastEglInitSurfaceWidth = width
+                    lastEglInitSurfaceHeight = height
+                    logRendererLayoutState(
+                        "surface_holder_conference_letterbox",
+                        previousWidth,
+                        previousHeight,
+                    )
+                    return@installSurfaceReadyCallback
+                }
                 if (shouldReinitRendererEglForHolderResize(previousWidth, previousHeight, width, height)) {
                     logRendererLayoutState("surface_holder_resize_reinit", previousWidth, previousHeight)
                     reinitializeRendererSurfaceForLayoutChange()
@@ -4040,8 +5560,22 @@ class AndroidSampleCaptureViewNative(
     private fun setupLayoutCallback() {
         if (layoutCallbackSetup) return
         layoutCallbackSetup = true
-        surfaceViewRenderer.addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
-            reconcileAfterRendererLayout(right - left, bottom - top)
+        // Never EGL-reinit inside OnLayout / PerformTraversals. Same-size is a no-op (lesson 30).
+        surfaceViewRenderer.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+            val width = right - left
+            val height = bottom - top
+            val oldWidth = oldRight - oldLeft
+            val oldHeight = oldBottom - oldTop
+            if (width <= 0 || height <= 0) return@addOnLayoutChangeListener
+            if (width == oldWidth && height == oldHeight && !rendererEglNeedsSurfaceResync()) {
+                return@addOnLayoutChangeListener
+            }
+            if (layoutReconcilePosted) return@addOnLayoutChangeListener
+            layoutReconcilePosted = true
+            composeLayoutHandler.post {
+                layoutReconcilePosted = false
+                reconcileAfterRendererLayout(width, height)
+            }
         }
     }
 
@@ -4143,6 +5677,7 @@ class AndroidSampleCaptureViewNative(
     }
 
     private fun logRendererLayoutState(reason: String, previousWidth: Int = 0, previousHeight: Int = 0) {
+        if (!AndroidRTCViewSupport.rendererLayoutDiagnosticsEnabled()) return
         val transition = if (previousWidth > 0 || previousHeight > 0) {
             " transition=${previousWidth}x${previousHeight}->${lastSurfaceWidth}x${lastSurfaceHeight}"
         } else {
@@ -4155,6 +5690,9 @@ class AndroidSampleCaptureViewNative(
     }
 
     fun rendererAttachDiagnosticSummary(): String {
+        if (!AndroidRTCViewSupport.rendererLayoutDiagnosticsEnabled()) {
+            return "participant=$rendererParticipantLabel diagnostics=release"
+        }
         return AndroidRTCViewSupport.runOnMainThreadSyncStringNullable {
             rendererAttachDiagnosticSummaryOnMainThread()
         } ?: "participant=$rendererParticipantLabel diagnostics_unavailable"
@@ -4295,12 +5833,19 @@ class AndroidSampleCaptureViewNative(
             return true
         }
         if (!hasRenderedFirstFrameSinceSinkAttach) {
-            return !isSurfaceReady()
+            // Do not reinit at 0×0 (Device3 22:43:57). Surface created attaches.
+            return false
         }
         return false
     }
 
     private fun reinitializeRendererSurfaceForLayoutChange(): Boolean {
+        if (!isSurfaceReady()
+            && !AndroidRendererLayoutPolicy.shouldAllowEglReinitWhileSurfaceNotReady()
+        ) {
+            logRendererLayoutState("egl_reinit_skipped_surface_not_ready")
+            return false
+        }
         bumpRendererGeneration()
         registerFirstFrameHandlerForCurrentEglGeneration()
         val track = pendingTrack ?: attachedTrack
@@ -4622,11 +6167,16 @@ class AndroidSampleCaptureViewNative(
     }
 
     /// 2-up → 1:1: drop the 317×564 letterbox and fill the Compose tile.
-    /// Compose must also remount the AndroidView (`composeTileKey`); this
-    /// flips native scale state if the same view instance is reused.
+    /// Do not remount the leftover AndroidView (`composeTileKey` is stable);
+    /// this flips native scale state on the reused renderer.
     fun applySoloFullscreenLayout() {
         if (released) return
         AndroidRTCViewSupport.runOnMainThreadSyncUnit {
+            AndroidRTCViewSupport.setRemoteCameraLayoutLock(
+                renderer = surfaceViewRenderer,
+                conference = false,
+            )
+            AndroidRTCViewSupport.clearRemoteCameraScaleLayoutCache(surfaceViewRenderer)
             AndroidRTCViewSupport.remoteCameraHostContainer(
                 renderer = surfaceViewRenderer,
                 prefersAspectFit = false,
@@ -4636,6 +6186,81 @@ class AndroidSampleCaptureViewNative(
             surfaceViewRenderer.requestLayout()
             (surfaceViewRenderer.parent as? View)?.requestLayout()
         }
+    }
+
+    /// 1:1 → 2-up: letterbox the leftover remote in the settled 16:9 cell.
+    /// Do not SCALE_ASPECT_FILL the first remote at 1002×564 (Device3 08:17:50).
+    fun applyConferenceGridLayout() {
+        if (released) return
+        AndroidRTCViewSupport.runOnMainThreadSyncUnit {
+            val host = AndroidRTCViewSupport.aspectFitContainerOrNull(surfaceViewRenderer)
+            val tileW = host?.width ?: 0
+            val tileH = host?.height ?: 0
+            if (AndroidRTCViewSupport.applyConferenceLetterboxForComposeTile(
+                    renderer = surfaceViewRenderer,
+                    tileWidthPx = tileW,
+                    tileHeightPx = tileH,
+                )
+            ) {
+                return@runOnMainThreadSyncUnit
+            }
+            val remembered = AndroidRTCViewSupport.rememberedSettledConferenceTileSize()
+            val (windowW, windowH) = AndroidRTCViewSupport.windowSizeForView(surfaceViewRenderer)
+            if (remembered != null
+                && AndroidRendererLayoutPolicy.shouldUseRememberedSettledConferenceTile(
+                    hostWidth = tileW,
+                    hostHeight = tileH,
+                    rememberedWidth = remembered.first,
+                    rememberedHeight = remembered.second,
+                    windowWidth = windowW,
+                    windowHeight = windowH,
+                )
+                && AndroidRTCViewSupport.applyConferenceLetterboxForComposeTile(
+                    renderer = surfaceViewRenderer,
+                    tileWidthPx = remembered.first,
+                    tileHeightPx = remembered.second,
+                )
+            ) {
+                return@runOnMainThreadSyncUnit
+            }
+            AndroidRTCViewSupport.setRemoteCameraLayoutLock(
+                renderer = surfaceViewRenderer,
+                conference = true,
+            )
+            if (AndroidRTCViewSupport.shouldKeepExistingConferenceLetterbox(
+                    renderer = surfaceViewRenderer,
+                    hostWidth = tileW,
+                    hostHeight = tileH,
+                )
+            ) {
+                return@runOnMainThreadSyncUnit
+            }
+            val radius = AndroidRTCViewSupport.remoteCameraCornerRadiusDp(surfaceViewRenderer)
+            AndroidRTCViewSupport.clearRemoteCameraScaleLayoutCache(surfaceViewRenderer)
+            AndroidRTCViewSupport.remoteCameraHostContainer(
+                renderer = surfaceViewRenderer,
+                prefersAspectFit = true,
+                cornerRadiusDp = radius,
+                fillWhenOrientationMatches = false,
+            )
+            surfaceViewRenderer.requestLayout()
+            (surfaceViewRenderer.parent as? View)?.requestLayout()
+        }
+    }
+
+    /// 1:1 → 2-up leftover: 16:9 tile px is the viewport. A later apply that
+    /// still reads leftover 1:1 host width must not MATCH_PARENT-FILL.
+    fun applyConferenceLetterboxForComposeTile(tileWidthPx: Int, tileHeightPx: Int): Boolean {
+        if (released) return false
+        var applied = false
+        AndroidRTCViewSupport.runOnMainThreadSyncUnit {
+            applied = AndroidRTCViewSupport.applyConferenceLetterboxForComposeTile(
+                renderer = surfaceViewRenderer,
+                tileWidthPx = tileWidthPx,
+                tileHeightPx = tileHeightPx,
+            )
+        }
+        return applied
     }
 
     private fun rendererDidInitializeOnMainThread() {
@@ -4671,6 +6296,16 @@ class AndroidSampleCaptureViewNative(
 
     private val composeLayoutHandler = Handler(Looper.getMainLooper())
     private var composeLayoutUpdatePosted = false
+    private var layoutReconcilePosted = false
+    @Volatile
+    private var attachPosted = false
+    @Volatile
+    private var queuedAttachTrack: RTCVideoTrack? = null
+    @Volatile
+    private var surfaceRendererInitialized = false
+    private var lastComposeHostWidth = 0
+    private var lastComposeHostHeight = 0
+    private var lastComposeLayoutLock = -1
 
     fun rendererDidUpdateLayout() {
         AndroidRTCViewSupport.runOnMainThreadSyncUnit { rendererDidUpdateLayoutOnMainThread() }
@@ -4967,11 +6602,120 @@ class AndroidSampleCaptureViewNative(
     }
 
     fun attach(track: RTCVideoTrack): Boolean {
-        return AndroidRTCViewSupport.runOnMainThreadSync { attachOnMainThread(track) }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return attachOnMainThread(track)
+        }
+        queuedAttachTrack = track
+        if (attachPosted) {
+            return true
+        }
+        attachPosted = true
+        composeLayoutHandler.post {
+            attachPosted = false
+            val queued = queuedAttachTrack ?: track
+            queuedAttachTrack = null
+            attachOnMainThread(queued)
+        }
+        return true
+    }
+
+    fun hasAssignedTrackForRendererInit(): Boolean {
+        return pendingTrack != null || attachedTrack != null || queuedAttachTrack != null
+    }
+
+    fun markSurfaceRendererInitialized() {
+        surfaceRendererInitialized = true
+    }
+
+    fun noteIdlePoolFactorySkippedEgl() {
+        Log.i(
+            "AndroidSampleCaptureView",
+            "egl_init_idle_pool_factory_skipped participant=$rendererParticipantLabel",
+        )
+    }
+
+    fun conferenceTileComposeUpdateIsNoOp(): Boolean {
+        val host = AndroidRTCViewSupport.aspectFitContainerOrNull(surfaceViewRenderer)
+        val width = host?.width ?: 0
+        val height = host?.height ?: 0
+        val lock = AndroidRTCViewSupport.remoteCameraLayoutLock(surfaceViewRenderer)
+        val matchParent = AndroidRTCViewSupport.remoteCameraRendererUsesMatchParent(
+            renderer = surfaceViewRenderer,
+        )
+        val surfaceIsSettledConferenceCell =
+            AndroidRendererLayoutPolicy.isLikelySettledSixteenByNineCell(
+                surfaceViewRenderer.width,
+                surfaceViewRenderer.height,
+            )
+        val fillsHost = AndroidRTCViewSupport.remoteCameraConferenceLockFillsHost(
+            renderer = surfaceViewRenderer,
+            layoutLock = lock,
+        ) || (
+            matchParent && (
+                AndroidRendererLayoutPolicy.isLikelySettledSixteenByNineCell(width, height)
+                    || surfaceIsSettledConferenceCell
+            )
+        )
+        return AndroidRendererLayoutPolicy.shouldSkipConferenceTileComposeUpdate(
+            hostWidth = width,
+            hostHeight = height,
+            layoutLock = lock,
+            lastHostWidth = lastComposeHostWidth,
+            lastHostHeight = lastComposeHostHeight,
+            lastLayoutLock = lastComposeLayoutLock,
+            rendererEglNeedsSurfaceResync = rendererEglNeedsSurfaceResync(),
+            conferenceRendererFillsHost = fillsHost,
+        )
+    }
+
+    fun rememberConferenceTileComposeHost() {
+        val host = AndroidRTCViewSupport.aspectFitContainerOrNull(surfaceViewRenderer)
+        lastComposeHostWidth = host?.width ?: 0
+        lastComposeHostHeight = host?.height ?: 0
+        lastComposeLayoutLock = AndroidRTCViewSupport.remoteCameraLayoutLock(surfaceViewRenderer)
+    }
+
+    private fun ensureRendererInitializedForAttach(): Boolean {
+        if (surfaceRendererInitialized) return true
+        val egl = AndroidRTCViewSupport.sharedCaptureEglBase() ?: return false
+        return try {
+            AndroidRTCViewSupport.initializeSurfaceRenderer(
+                surfaceViewRenderer,
+                egl,
+                false,
+                false,
+                "AndroidSampleCaptureView",
+            )
+            surfaceRendererInitialized = true
+            rendererDidInitializeOnMainThread()
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     private fun attachOnMainThread(track: RTCVideoTrack): Boolean {
+        if (AndroidRTCViewSupport.isLiveVideoTrack(track)) {
+            ensureRendererInitializedForAttach()
+        }
         val incomingTrackId = trackIdOrNull(track)
+        val queuedSameLiveTrack = (pendingTrack ?: attachedTrack)?.let { queued ->
+            AndroidRTCViewSupport.isLiveVideoTrack(track) &&
+                AndroidRemoteVideoTrackAttachPolicy.tracksShareRendererSinkSource(queued, track)
+        } == true
+        if (AndroidRendererLayoutPolicy.shouldSkipRedundantAttachWhileSurfaceNotReady(
+                isSurfaceReady(),
+                queuedSameLiveTrack,
+            )
+        ) {
+            pendingTrack = track
+            attachedTrack = track
+            rememberAttachedTrackId(track)
+            logRendererLayoutState(
+                "attach_skipped_surface_not_ready_already_queued trackId=${incomingTrackId ?: "<unknown>"}"
+            )
+            return false
+        }
         logRendererLayoutState("attach_begin trackId=${incomingTrackId ?: "<unknown>"}")
         val incomingTrackIsLive = AndroidRTCViewSupport.isLiveVideoTrack(track)
         if (incomingTrackIsLive && isSurfaceReady()) {
@@ -5209,6 +6953,7 @@ class AndroidSampleCaptureViewNative(
  */
 object AndroidWebRTCTrackResolver {
     private val transceiverSnapshots = WeakHashMap<PeerConnection, List<RtpTransceiver>>()
+    private val retiredPeerConnections = WeakHashMap<PeerConnection, Boolean>()
 
     /** Marks the snapshot stale; the next resolution refreshes it exactly once. Never calls into WebRTC. */
     @Synchronized
@@ -5218,21 +6963,29 @@ object AndroidWebRTCTrackResolver {
     }
 
     /**
-     * Native `getTransceivers()` SIGSEGVs once signaling/connection state is CLOSED. Call this
-     * before any transceiver lookup (including cached snapshots) during teardown races.
+     * Device3 2026-09-10 hangup: `Java_org_webrtc_PeerConnection_nativeSignalingState` SIGSEGV
+     * (`fault addr 0xd4`) after `close()`/`dispose()`. Do not query native state to decide
+     * usability — mark retired on CLOSED and before dispose, then only read this set.
+     */
+    @Synchronized
+    fun markPeerConnectionRetired(peerConnection: PeerConnection?) {
+        if (peerConnection == null) return
+        retiredPeerConnections[peerConnection] = true
+        transceiverSnapshots.remove(peerConnection)
+    }
+
+    @Synchronized
+    fun isPeerConnectionRetired(peerConnection: PeerConnection?): Boolean {
+        if (peerConnection == null) return true
+        return retiredPeerConnections[peerConnection] == true
+    }
+
+    /**
+     * Native `signalingState()` / `getTransceivers()` SIGSEGV once the PeerConnection is
+     * closed or disposed. Never call into WebRTC here.
      */
     fun peerConnectionIsUsableForTransceiverLookup(peerConnection: PeerConnection): Boolean {
-        return try {
-            when (peerConnection.signalingState()) {
-                PeerConnection.SignalingState.CLOSED -> false
-                else -> when (peerConnection.connectionState()) {
-                    PeerConnection.PeerConnectionState.CLOSED -> false
-                    else -> true
-                }
-            }
-        } catch (_: IllegalStateException) {
-            false
-        }
+        return !isPeerConnectionRetired(peerConnection)
     }
 
     /** True when ICE/DTLS transport is already up; used to suppress stale relay-fallback retries. */

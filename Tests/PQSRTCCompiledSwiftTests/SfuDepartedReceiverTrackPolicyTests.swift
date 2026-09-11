@@ -50,6 +50,16 @@ struct SfuDepartedReceiverTrackPolicyTests {
         ))
     }
 
+    @Test("pruned Android camera mappings are not rematerialized from leftover SDP")
+    func prunedAndroidCameraMappingIsNotRematerialized() {
+        #expect(!SfuDepartedReceiverTrackPolicy.shouldRematerializePrunedAndroidCameraMapping(
+            participantWasPruned: true
+        ))
+        #expect(SfuDepartedReceiverTrackPolicy.shouldRematerializePrunedAndroidCameraMapping(
+            participantWasPruned: false
+        ))
+    }
+
     @Test("setRemoteSDP disables leftover enabled tracks on inactive m-lines")
     func remoteSdpDisablesLeftoverEnabledInactiveTrack() {
         #expect(SfuDepartedReceiverTrackPolicy.shouldDisableLeftoverSfuReceiverTrackAfterRemoteSDP(
@@ -81,7 +91,17 @@ struct SfuDepartedReceiverTrackPolicyTests {
         #expect(prune.contains("SfuDepartedReceiverTrackPolicy.shouldDisableDepartedSfuReceiverTrack"))
         #expect(prune.contains("remoteVideoTracksByParticipantId.removeValue"))
         #expect(prune.contains("isEnabled = false"))
+        #expect(prune.contains("noteAndroidRemoteCameraParticipantPruned"))
         #expect(!prune.contains("Task.sleep"))
+        #expect(groupCall.contains("clearAndroidResolvedRemoteCameraMedia(participantId: participantId, in: &connection)"))
+        #expect(groupCall.contains("noteAndroidRemoteCameraParticipantPruned(participantId)"))
+        let handler = try source("Sources/PQSRTC/RTCSession+PeerNotificationsHandler.swift")
+        let resolve = try SourceContract.sourceBody(
+            of: "androidResolveLiveRemoteCameraTrack(",
+            in: handler
+        )
+        #expect(resolve.contains("shouldRematerializePrunedAndroidCameraMapping"))
+        #expect(resolve.contains("androidRemoteCameraParticipantWasPruned"))
     }
 
     @Test("unresolved video fallback skips non-receiving leftover transceivers")

@@ -134,6 +134,8 @@ Do not:
 - bind only the video receiver to the stable publisher while leaving audio under the placeholder
 - recreate PeerConnections or receivers to fix a key mismatch
 - treat signaling-ratchet success as proof that media frame keys match
+- skip Android audio FrameCryptor attach after hangup just because the same-room
+  `audio_<participant>_<room>` track id is still in the session remember map
 
 Do:
 
@@ -145,6 +147,9 @@ Do:
   stable track owners appear
 - keep roster updates flowing so clients can remove departed participants' receiver tracks and
   FrameCryptors
+- on Android, attach an audio receiver FrameCryptor after SDP unless a live cryptor already
+  exists for that participant; do not treat a leftover same-room track id as proof the cryptor
+  is bound
 - preserve existing wire-field names during migrations unless both old and new clients are handled
 
 ## Relation To Signaling
@@ -176,6 +181,9 @@ Likely group sender-key regression:
   provisioned key index
 - logs show `Created receiver FrameCryptor kind=video participantId=<sender>` without a matching
   `kind=audio participantId=<sender>` after that sender key is provisioned
+- Android same-room rejoin logs `Kept Android SFU audio mapping … cryptor unchanged` for a
+  participant that never got `Mapped Android SFU audio receiver` / `Audio receiver cryptor attached`
+  on that call attempt (session-level remembered `audio_<participant>_<room>` ids survived hangup)
 
 Likely non-E2EE media regression:
 
@@ -195,6 +203,9 @@ When changing this area, update tests for:
 - sender keys are not installed under room ids
 - audio receiver owner reconciliation after stable SDP `msid` changes
 - roster/SDP cleanup removes stale receiver FrameCryptors when participants leave
+- Android audio FrameCryptor attach after SDP skips only when the advertised track id is
+  unchanged **and** a live receiver cryptor exists; hangup / new call attempt clears the
+  session-level remembered audio track ids
 
 ## Related Code
 

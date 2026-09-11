@@ -5,6 +5,38 @@ import Testing
 
 @Suite(.serialized)
 struct AndroidRemoteGridTransitionPolicyTests {
+    @Test("1-up ↔ N-up locks native scale before publishing visible views")
+    func countChangeAppliesNativeLayoutBeforePublishingVisibleViews() {
+        #expect(AndroidRemoteGridTransitionPolicy.shouldApplyNativeGridLayoutBeforePublishingVisibleViews(
+            previousVisibleCount: 1,
+            nextVisibleCount: 2
+        ))
+        #expect(AndroidRemoteGridTransitionPolicy.shouldApplyNativeGridLayoutBeforePublishingVisibleViews(
+            previousVisibleCount: 2,
+            nextVisibleCount: 1
+        ))
+        #expect(!AndroidRemoteGridTransitionPolicy.shouldApplyNativeGridLayoutBeforePublishingVisibleViews(
+            previousVisibleCount: 2,
+            nextVisibleCount: 2
+        ))
+        #expect(!AndroidRemoteGridTransitionPolicy.shouldApplyNativeGridLayoutBeforePublishingVisibleViews(
+            previousVisibleCount: 0,
+            nextVisibleCount: 1
+        ))
+        #expect(AndroidRemoteGridTransitionPolicy.shouldBumpComposeLayoutGenerationOnVisibleCountChange(
+            previousVisibleCount: 2,
+            nextVisibleCount: 1
+        ))
+        #expect(AndroidRemoteGridTransitionPolicy.shouldBumpComposeLayoutGenerationOnVisibleCountChange(
+            previousVisibleCount: 1,
+            nextVisibleCount: 2
+        ))
+        #expect(!AndroidRemoteGridTransitionPolicy.shouldBumpComposeLayoutGenerationOnVisibleCountChange(
+            previousVisibleCount: 2,
+            nextVisibleCount: 2
+        ))
+    }
+
     @Test("slot-count change with live tiles waits for Compose layout")
     func slotCountChangeWaitsForComposeLayout() {
         #expect(AndroidRemoteGridTransitionPolicy.shouldWaitForComposeLayoutBeforeReattach(
@@ -26,6 +58,46 @@ struct AndroidRemoteGridTransitionPolicyTests {
         #expect(!AndroidRemoteGridTransitionPolicy.shouldWaitForComposeLayoutBeforeReattach(
             previousVisibleCount: 2,
             nextVisibleCount: 2
+        ))
+    }
+
+    @Test("in-flight episode skips unchanged tilesDidChange publishes")
+    func inFlightEpisodeSkipsUnchangedTilesDidChange() {
+        #expect(AndroidRemoteGridTransitionPolicy.shouldSkipRemoteTilesDidChangeDuringInFlightEpisode(
+            episodeInFlight: true,
+            previousSignature: "0:mm26|1:nudge",
+            nextSignature: "0:mm26|1:nudge"
+        ))
+        #expect(!AndroidRemoteGridTransitionPolicy.shouldSkipRemoteTilesDidChangeDuringInFlightEpisode(
+            episodeInFlight: true,
+            previousSignature: "0:nudge",
+            nextSignature: "0:mm26|1:nudge"
+        ))
+        #expect(!AndroidRemoteGridTransitionPolicy.shouldSkipRemoteTilesDidChangeDuringInFlightEpisode(
+            episodeInFlight: false,
+            previousSignature: "0:nudge",
+            nextSignature: "0:nudge"
+        ))
+        #expect(!AndroidRemoteGridTransitionPolicy.shouldSkipRemoteTilesDidChangeDuringInFlightEpisode(
+            episodeInFlight: true,
+            previousSignature: "",
+            nextSignature: ""
+        ))
+    }
+
+    @Test("overlapping visible-grid refreshes drop stale generations")
+    func overlappingVisibleGridRefreshDropsStaleGeneration() {
+        let first = AndroidRemoteGridTransitionPolicy.nextVisibleRemoteRefreshGeneration(current: 0)
+        let second = AndroidRemoteGridTransitionPolicy.nextVisibleRemoteRefreshGeneration(current: first)
+        #expect(first == 1)
+        #expect(second == 2)
+        #expect(!AndroidRemoteGridTransitionPolicy.shouldCommitVisibleRemoteRefresh(
+            startedGeneration: first,
+            currentGeneration: second
+        ))
+        #expect(AndroidRemoteGridTransitionPolicy.shouldCommitVisibleRemoteRefresh(
+            startedGeneration: second,
+            currentGeneration: second
         ))
     }
 
@@ -160,14 +232,33 @@ struct AndroidRemoteGridTransitionPolicyTests {
         #expect(settled.generation > 0)
     }
 
-    @Test("Compose uses one ConferenceTile call site for 1-up and N-up")
-    func composeUsesSingleConferenceTileCallSite() throws {
+    @Test("1-up leftover uses fillMaxSize outside the 16:9 Column/Row")
+    func composeUsesDedicatedSoloFullscreenBranch() throws {
         let compose = try source(
             "Sources/PQSRTC/Views/Android/AndroidLocalVideoCompose.swift"
         )
         #expect(compose.contains("let tileModifier"))
+        #expect(compose.contains("} else if itemCount == 1 {"))
+        #expect(compose.contains("gridItemCount: itemCount"))
+        #expect(compose.contains("shouldBumpComposeLayoutGenerationOnVisibleCountChange"))
         #expect(!compose.contains("// Solo conference tile keeps the full-bleed layout."))
-        #expect(!compose.contains("if itemCount == 1 {\n                                        ConferenceTile("))
+    }
+
+    @Test("N-up conference tiles use Apple-matching Compose chrome outside the hole-punch")
+    func conferenceTilesUseComposeRoundedBorderOutsideHolePunch() throws {
+        let compose = try source(
+            "Sources/PQSRTC/Views/Android/AndroidLocalVideoCompose.swift"
+        )
+        let native = try source(
+            "Sources/PQSRTC/Skip/AndroidRTCNativeSupport.kt"
+        )
+        #expect(compose.contains("let showTileChrome = gridItemCount > 1 && !enablesPipDrag && cornerRadiusDp > 0"))
+        #expect(compose.contains("Color.White.copy(alpha: Float(0.12))"))
+        #expect(compose.contains("Modifier.fillMaxSize().padding(conferenceTileBorderWidthDp.dp)"))
+        #expect(compose.contains("conferenceTileBorderWidthDp"))
+        #expect(!compose.contains("setCornerRadius"))
+        #expect(!compose.contains("setZOrderMediaOverlay"))
+        #expect(!native.contains("SurfaceView.setCornerRadius"))
     }
 
     @Test("grid refresh waits for Compose layout instead of immediate reattach on slot change")
@@ -182,6 +273,9 @@ struct AndroidRemoteGridTransitionPolicyTests {
         #expect(refresh.contains("AndroidRemoteGridTransitionPolicy.shouldWaitForComposeLayoutBeforeReattach"))
         #expect(refresh.contains("beginParticipantVideoReconcileAfterGridSlotLayoutChange"))
         #expect(refresh.contains("AndroidRemoteGridTransitionPolicy.shouldReattachAssignedTilesImmediately"))
+        #expect(refresh.contains("AndroidRemoteGridTransitionPolicy.nextVisibleRemoteRefreshGeneration"))
+        #expect(refresh.contains("AndroidRemoteGridTransitionPolicy.shouldCommitVisibleRemoteRefresh"))
+        #expect(refresh.contains("AndroidRemoteGridTransitionPolicy.shouldBumpComposeLayoutGenerationOnVisibleCountChange"))
         #expect(!refresh.contains("Task.sleep"))
     }
 
@@ -198,6 +292,12 @@ struct AndroidRemoteGridTransitionPolicyTests {
         #expect(surface.contains("AndroidRemoteGridTransitionPolicy.shouldAcceptGridSlotSurfaceReport"))
         #expect(surface.contains("reattachAssignedParticipantVideoIfNeeded"))
         #expect(!surface.contains("Task.sleep"))
+        let reattach = try SourceContract.sourceBody(
+            of: "reattachAssignedParticipantVideoIfNeeded",
+            in: controller
+        )
+        #expect(reattach.contains("assignedVisibleCount: participantViewAssignments.count"))
+        #expect(!reattach.contains("Task.sleep"))
     }
 
     @Test("visible Android slots follow assigned remotes, not channel roster")
@@ -222,12 +322,27 @@ struct AndroidRemoteGridTransitionPolicyTests {
         #expect(compose.contains("itemCount == 1"))
         #expect(compose.contains("rendererSlotKey &* 31 &+ 2"))
         #expect(compose.contains("applySoloFullscreenLayout()"))
+        #expect(compose.contains("applyConferenceGridLayout()"))
+        #expect(compose.contains("applyConferenceLetterboxForComposeTile"))
+        #expect(compose.contains("view.surfaceViewRenderer.width"))
+        #expect(compose.contains("Do not call `remoteCameraHostContainer` after a 16:9"))
+        #expect(compose.contains("Lock conference/solo before the first host apply"))
+        #expect(compose.contains("shouldApplyNativeGridLayoutBeforePublishingVisibleViews"))
+        #expect(compose.contains("visibleRemoteCaptureViews = nextViews"))
+        #expect(compose.contains("AndroidRemoteGridTransitionPolicy.composeGridIdentity"))
         #expect(AndroidRemoteGridTransitionPolicy.composeTileKey(
             rendererIdentity: 42,
             itemCount: 1
-        ) != AndroidRemoteGridTransitionPolicy.composeTileKey(
+        ) == AndroidRemoteGridTransitionPolicy.composeTileKey(
             rendererIdentity: 42,
             itemCount: 2
+        ))
+        #expect(AndroidRemoteGridTransitionPolicy.composeGridIdentity(
+            itemCount: 1,
+            prefersAspectFit: false
+        ) == AndroidRemoteGridTransitionPolicy.composeGridIdentity(
+            itemCount: 2,
+            prefersAspectFit: true
         ))
     }
 

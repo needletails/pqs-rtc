@@ -94,6 +94,7 @@ extension RTCSession {
 
     func resetAttemptFlagsForNewCall(connectionId: String) {
         prepareCryptoStackForNextCallIfNeeded()
+        clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall()
         let normalizedId = normalizedFallbackConnectionId(for: connectionId)
         clearFallbackState(connectionId: normalizedId)
         resetTeardownIdempotency(forConnectionId: connectionId)
