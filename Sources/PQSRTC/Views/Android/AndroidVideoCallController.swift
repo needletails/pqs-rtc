@@ -36,7 +36,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
             currentCallState
         }
     }
-    private let logger = NeedleTailLogger()
+    private let logger = NeedleTailLogger(level: .info)
     private var isRunning = true
     /// Set as soon as hangup/teardown starts so an in-flight coordinator cannot
     /// attach after renderers are already released (Device3 17:53:47–17:54:05).

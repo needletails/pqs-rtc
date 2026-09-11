@@ -20,7 +20,7 @@ import NeedleTailLogger
 /// session actor. Skip can pin the main looper across `await` when this type is main-isolated,
 /// which ANRs if `RTCSession` is busy in `setLocalDescription`.
 public final class AndroidVideoCallActionBridge: CallActionDelegate, @unchecked Sendable {
-    private static let logger = NeedleTailLogger()
+    private static let logger = NeedleTailLogger(level: .info)
     private static let active = ActiveBridgeStorage()
     fileprivate var controller: AndroidVideoCallController?
 

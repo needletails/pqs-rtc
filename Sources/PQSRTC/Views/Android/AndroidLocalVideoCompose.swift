@@ -807,8 +807,8 @@ fileprivate final class AndroidVideoCallResources {
     private var _screenCaptureView: AndroidSampleCaptureView?
     private var videoRenderersReleased = false
     var isReleased: Bool { videoRenderersReleased }
-    private static let minimizeLogger = NeedleTailLogger()
-    private static let lifecycleLogger = NeedleTailLogger()
+    private static let minimizeLogger = NeedleTailLogger(level: .info)
+    private static let lifecycleLogger = NeedleTailLogger(level: .info)
     /// Lazily created view for rendering a remote screen share.
     var screenCaptureView: AndroidSampleCaptureView {
         if let existing = _screenCaptureView { return existing }
@@ -1121,7 +1121,7 @@ public struct AndroidVideoCallView: View {
 
     /// Native SurfaceView drag owns pointer move. This restores chrome on a PiP tap.
     private let onInAppPipTap: (() -> Void)?
-    private static let minimizeLogger = NeedleTailLogger()
+    private static let minimizeLogger = NeedleTailLogger(level: .info)
     /// One call UI at a time. A per-appear UUID remounts a new renderer pool on every
     /// chrome/PiP transition and releases EGL on the main thread.
     private static let activeCallResourceKey = "android-active-video-call"
@@ -1642,7 +1642,7 @@ public struct AndroidVideoCallView: View {
         ) else { return }
         let nextVisibleCount = nextViews.count
         if previousVisibleCount != nextVisibleCount {
-            NeedleTailLogger().log(
+            NeedleTailLogger(level: .info).log(
                 level: .info,
                 message: "Android remote grid mounted count=\(nextVisibleCount) previous=\(previousVisibleCount)"
             )
