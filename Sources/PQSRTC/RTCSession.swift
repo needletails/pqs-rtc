@@ -161,7 +161,7 @@ public actor RTCSession {
     let loop = NTKLoop()
     
     /// Manages the lifecycle and lookup of `RTCConnection` instances.
-    let connectionManager = RTCConnectionManager()
+    let connectionManager: RTCConnectionManager
     
     /// Key manager used for frame/media encryption identities.
     let keyManager = KeyManager()
@@ -424,7 +424,7 @@ public actor RTCSession {
     public var callAnswerState: CallAnswerState = .pending
     
     /// High-level call state machine used by the session.
-    public var callState = CallStateMachine()
+    public var callState: CallStateMachine
     
     /// Whether the 1:1 crypto handshake has completed for the active connection.
     public private(set) var handshakeComplete = false
@@ -2427,7 +2427,13 @@ public actor RTCSession {
         self.iceTransportPolicyStrategy = iceTransportPolicyStrategy
         self.iceDisconnectGracePeriodMs = iceDisconnectGracePeriodMs
         self.logger = logger
-        self.logLevel = logLevel
+        self.logLevel = RTCSessionLogFilter.resolved(sessionLogLevel: logLevel)
+        self.connectionManager = RTCConnectionManager(
+            logger: NeedleTailLogger("[RTCConnectionManager]", level: self.logLevel)
+        )
+        self.callState = CallStateMachine(
+            logger: NeedleTailLogger("[CallState]", level: self.logLevel)
+        )
         self.ratchetSalt = cryptorConfig.ratchetSalt
         self.frameEncryptionKeyMode = cryptorConfig.mode
         self.enableEncryption = cryptorConfig.mode != .none
@@ -2436,9 +2442,9 @@ public actor RTCSession {
             message: "FrameCryptor is \(self.enableEncryption ? "ENABLED" : "DISABLED") for this RTCSession.")
         self.delegate = delegate
         self._ratchetManager = KeyRatchet(executor: executor)
-        await _ratchetManager.setLogLevel(logLevel)
+        await _ratchetManager.setLogLevel(self.logLevel)
         self._pcRatchetManager = MessageRatchet(executor: executor)
-        await _pcRatchetManager.setLogLevel(logLevel)
+        await _pcRatchetManager.setLogLevel(self.logLevel)
 
 #if canImport(WebRTC)
         // FrameCryptor key provider is created lazily when encryption is enabled.

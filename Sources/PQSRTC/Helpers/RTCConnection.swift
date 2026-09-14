@@ -56,7 +56,7 @@ import FoundationEssentials
     let symmetricKey: SymmetricKey
     var sessionIdentity: SessionIdentity
     var call: Call
-    let logger = NeedleTailLogger()
+    let logger = NeedleTailLogger(level: RTCSessionLogFilter.constructionLevel)
 
     /// Semantic alias: the local participant identity for this connection.
     ///
@@ -229,7 +229,7 @@ actor RTCConnectionManager {
     private var connections = [RTCConnection]()
     let logger: NeedleTailLogger
     
-    init(logger: NeedleTailLogger = NeedleTailLogger("[RTCConnectionManager]")) {
+    init(logger: NeedleTailLogger = NeedleTailLogger("[RTCConnectionManager]", level: RTCSessionLogFilter.constructionLevel)) {
         self.logger = logger
         logger.log(level: .debug, message: "RTCConnectionManager initialized")
     }

@@ -85,7 +85,7 @@ public actor CallStateMachine {
         logger.log(level: .info, message: "Call state machine reset completed")
     }
     
-    init(logger: NeedleTailLogger = NeedleTailLogger("[CallState]")) {
+    init(logger: NeedleTailLogger = NeedleTailLogger("[CallState]", level: RTCSessionLogFilter.constructionLevel)) {
         self.logger = logger
         logger.log(level: .debug, message: "CallStateMachine initialized")
     }
