@@ -160,6 +160,65 @@ private final class VoiceCallChromeView: UIView {
     }
 }
 
+/// Clips the local preview at the UIKit compositor. `CAMetalLayer` / `AVCaptureVideoPreviewLayer`
+/// ignore `cornerRadius` until a later composition (a drag); a parent `UIView` clips immediately
+/// once Auto Layout assigns the PiP frame.
+@MainActor
+private final class LocalPreviewClipHostView: UIView {
+    var cornerRadiusValue: CGFloat = 0 {
+        didSet { applyClipIfNeeded() }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        translatesAutoresizingMaskIntoConstraints = false
+        backgroundColor = .clear
+        isOpaque = false
+        clipsToBounds = true
+        layer.needsDisplayOnBoundsChange = true
+        if #available(iOS 13.0, *) {
+            layer.cornerCurve = .continuous
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        applyClipIfNeeded()
+    }
+
+    private func applyClipIfNeeded() {
+        let hasSize = bounds.width > 1 && bounds.height > 1
+        let radius = hasSize ? cornerRadiusValue : 0
+        clipsToBounds = radius > 0
+        layer.cornerRadius = radius
+        layer.masksToBounds = radius > 0
+        if #available(iOS 13.0, *) {
+            layer.cornerCurve = .continuous
+        }
+        revealIfClipReady(hasSize: hasSize, appliedRadius: radius)
+    }
+
+    /// Stay hidden until this layout pass has a real frame and, for overlay, the rounded clip.
+    /// The first visible frame is then already clipped — not square, then rounded.
+    fileprivate func revealIfClipReady(hasSize: Bool? = nil, appliedRadius: CGFloat? = nil) {
+        guard isHidden else { return }
+        let sized = hasSize ?? (bounds.width > 1 && bounds.height > 1)
+        guard sized else { return }
+        if cornerRadiusValue > 0 {
+            let radius = appliedRadius ?? layer.cornerRadius
+            guard radius > 0 else { return }
+        }
+        isHidden = false
+        for subview in subviews {
+            subview.isHidden = false
+        }
+    }
+}
+
 @MainActor
 /// UIKit view used by the iOS in-call UI.
 ///
@@ -171,6 +230,8 @@ class ControllerView: UIView {
     
     // MARK: - Local preview layout constraints (rotation-safe)
     private weak var currentPreviewView: NTMTKView?
+    private let localPreviewClipHost = LocalPreviewClipHostView()
+    private var previewFillHostConstraints: [NSLayoutConstraint] = []
     private var previewOverlayConstraints: [NSLayoutConstraint] = []
     private var previewFullscreenConstraints: [NSLayoutConstraint] = []
     private var previewWidthConstraint: NSLayoutConstraint?
@@ -197,7 +258,7 @@ class ControllerView: UIView {
         super.layoutSubviews()
 
         guard let currentPreviewView else { return }
-        let isConnectedPreviewLayout = currentPreviewView.superview === self
+        let isConnectedPreviewLayout = currentPreviewView.superview === localPreviewClipHost
             && previewOverlayConstraints.contains(where: \.isActive)
         applyLocalPreviewCornerStyle(isConnected: isConnectedPreviewLayout, to: currentPreviewView)
     }
@@ -270,19 +331,88 @@ class ControllerView: UIView {
                 minimize: minimize,
                 containerSize: containerSize
             )
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                await updateVideoConstraints(size: size, isConnected: isConnected, view: view, animated: animated)
-            }
+            updateVideoConstraints(size: size, isConnected: isConnected, view: view, animated: animated)
         }
+    }
+
+    /// Hide the overlay until the host has a PiP frame and rounded clip, so the first
+    /// visible frame is already clipped. No-op when a clipped overlay is already on screen.
+    func hideLocalPreviewUntilOverlayClipIsReady(_ view: NTMTKView) {
+        let alreadyClipped = localPreviewClipHost.superview === self
+            && !localPreviewClipHost.isHidden
+            && localPreviewClipHost.bounds.width > 1
+            && localPreviewClipHost.bounds.height > 1
+            && localPreviewClipHost.cornerRadiusValue > 0
+            && localPreviewClipHost.layer.cornerRadius > 0
+        if alreadyClipped {
+            view.isHidden = false
+            return
+        }
+        view.isHidden = true
+        localPreviewClipHost.isHidden = true
+    }
+
+    /// Embeds the local preview in the clipping host and brings the host to the front.
+    func attachConnectedLocalPreview(_ view: NTMTKView) {
+        hideLocalPreviewUntilOverlayClipIsReady(view)
+        if localPreviewClipHost.superview !== self {
+            addSubview(localPreviewClipHost)
+        }
+        if view.superview !== localPreviewClipHost {
+            NSLayoutConstraint.deactivate(previewFillHostConstraints)
+            previewFillHostConstraints = []
+            view.removeFromSuperview()
+            view.translatesAutoresizingMaskIntoConstraints = false
+            localPreviewClipHost.addSubview(view)
+            let fill = [
+                view.topAnchor.constraint(equalTo: localPreviewClipHost.topAnchor),
+                view.leadingAnchor.constraint(equalTo: localPreviewClipHost.leadingAnchor),
+                view.bottomAnchor.constraint(equalTo: localPreviewClipHost.bottomAnchor),
+                view.trailingAnchor.constraint(equalTo: localPreviewClipHost.trailingAnchor)
+            ]
+            previewFillHostConstraints = fill
+            NSLayoutConstraint.activate(fill)
+        }
+        currentPreviewView = view
+        bringSubviewToFront(localPreviewClipHost)
+    }
+
+    func bringConnectedLocalPreviewToFront() {
+        guard localPreviewClipHost.superview === self else { return }
+        bringSubviewToFront(localPreviewClipHost)
+    }
+
+    /// The view that owns overlay position (drag / snap). Metal content is a child of this host.
+    var connectedLocalPreviewDragView: UIView? {
+        guard localPreviewClipHost.superview === self else { return currentPreviewView }
+        return localPreviewClipHost
+    }
+
+    func detachLocalPreviewFromOverlay() {
+        currentPreviewView?.removeFromSuperview()
+        localPreviewClipHost.removeFromSuperview()
+        NSLayoutConstraint.deactivate(
+            previewOverlayConstraints + previewFullscreenConstraints + previewFillHostConstraints
+        )
+        previewOverlayConstraints = []
+        previewFullscreenConstraints = []
+        previewFillHostConstraints = []
+        previewWidthConstraint = nil
+        previewHeightConstraint = nil
+        currentPreviewView = nil
+        localPreviewClipHost.cornerRadiusValue = 0
+        localPreviewClipHost.isHidden = true
     }
     
     /// Applies constraints to the preview view for connected vs. not-yet-connected layouts.
-    func updateVideoConstraints(size: CGSize, isConnected: Bool, view: NTMTKView, animated: Bool) async {
-        // Ensure we're constraining the view in the right hierarchy.
-        guard view.superview === self else { return }
-        
-        // If the preview view instance changes (new call), drop old constraint references.
+    func updateVideoConstraints(size: CGSize, isConnected: Bool, view: NTMTKView, animated: Bool) {
+        let isInHost = view.superview === localPreviewClipHost
+        guard isInHost || view.superview === self else { return }
+
+        if isConnected {
+            attachConnectedLocalPreview(view)
+        }
+
         if currentPreviewView !== view {
             NSLayoutConstraint.deactivate(previewOverlayConstraints + previewFullscreenConstraints)
             previewOverlayConstraints = []
@@ -291,20 +421,18 @@ class ControllerView: UIView {
             previewHeightConstraint = nil
             currentPreviewView = view
         }
-        
-        view.translatesAutoresizingMaskIntoConstraints = false
-        
+
+        let pinned = localPreviewClipHost.superview === self ? localPreviewClipHost : view
+        pinned.translatesAutoresizingMaskIntoConstraints = false
+        let isFirstConnectedOverlay = isConnected && previewOverlayConstraints.isEmpty
+
         if isConnected {
-            // Overlay mode: bottom-right "PiP-style" local preview.
             NSLayoutConstraint.deactivate(previewFullscreenConstraints)
-            
             if previewOverlayConstraints.isEmpty {
-                // Use safe-area so the preview never sits under the home indicator / notch.
-                let bottom = view.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -16)
-                let trailing = view.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -16)
-                let width = view.widthAnchor.constraint(equalToConstant: max(1, size.width - 5))
-                let height = view.heightAnchor.constraint(equalToConstant: max(1, size.height - 5))
-                
+                let bottom = pinned.bottomAnchor.constraint(equalTo: safeAreaLayoutGuide.bottomAnchor, constant: -16)
+                let trailing = pinned.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -16)
+                let width = pinned.widthAnchor.constraint(equalToConstant: max(1, size.width - 5))
+                let height = pinned.heightAnchor.constraint(equalToConstant: max(1, size.height - 5))
                 previewWidthConstraint = width
                 previewHeightConstraint = height
                 previewOverlayConstraints = [bottom, trailing, width, height]
@@ -313,27 +441,26 @@ class ControllerView: UIView {
                 previewWidthConstraint?.constant = max(1, size.width - 5)
                 previewHeightConstraint?.constant = max(1, size.height - 5)
             }
-            
-            applyLocalPreviewCornerStyle(isConnected: true, to: view)
         } else {
-            // Fullscreen mode (pre-connect / local-only).
             NSLayoutConstraint.deactivate(previewOverlayConstraints)
-            
             if previewFullscreenConstraints.isEmpty {
                 previewFullscreenConstraints = [
-                    view.topAnchor.constraint(equalTo: topAnchor),
-                    view.leadingAnchor.constraint(equalTo: leadingAnchor),
-                    view.bottomAnchor.constraint(equalTo: bottomAnchor),
-                    view.trailingAnchor.constraint(equalTo: trailingAnchor)
+                    pinned.topAnchor.constraint(equalTo: topAnchor),
+                    pinned.leadingAnchor.constraint(equalTo: leadingAnchor),
+                    pinned.bottomAnchor.constraint(equalTo: bottomAnchor),
+                    pinned.trailingAnchor.constraint(equalTo: trailingAnchor)
                 ]
                 NSLayoutConstraint.activate(previewFullscreenConstraints)
             }
-            
-            applyLocalPreviewCornerStyle(isConnected: false, to: view)
         }
-        
-        // Smooth resizing feels much more “polished”, especially when minimizing and rotating.
-        if animated, window != nil {
+
+        // Set the host radius before layout so the first PiP frame is already clipped.
+        localPreviewClipHost.cornerRadiusValue = isConnected ? connectedPreviewCornerRadius : 0
+
+        // First overlay pin must not animate from fullscreen: a 16pt radius on a phone-sized
+        // presentation layer looks square until the animation finishes.
+        let shouldAnimate = animated && window != nil && !isFirstConnectedOverlay
+        if shouldAnimate {
             UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseInOut, .allowUserInteraction]) {
                 self.layoutIfNeeded()
                 self.applyLocalPreviewCornerStyle(isConnected: isConnected, to: view)
@@ -354,29 +481,24 @@ class ControllerView: UIView {
 
     private func applyLocalPreviewCornerStyle(isConnected: Bool, to view: NTMTKView) {
         let radius = isConnected ? connectedPreviewCornerRadius : 0
-        view.clipsToBounds = isConnected
-        view.layer.cornerRadius = radius
-        view.layer.needsDisplayOnBoundsChange = true
-        if #available(iOS 13.0, *) {
-            view.layer.cornerCurve = .continuous
-        }
-        view.layer.masksToBounds = isConnected
-        view.layer.shadowOpacity = 0
+        localPreviewClipHost.cornerRadiusValue = radius
+        localPreviewClipHost.setNeedsLayout()
+        localPreviewClipHost.layoutIfNeeded()
         view.setNeedsLayout()
+        view.layoutIfNeeded()
+        syncLocalPreviewMediaFrames(on: view)
+        localPreviewClipHost.revealIfClipReady()
+    }
 
-        guard let captureView = view.captureView else { return }
-        captureView.clipsToBounds = isConnected
-        captureView.layer.cornerRadius = radius
-        captureView.layer.needsDisplayOnBoundsChange = true
-        if #available(iOS 13.0, *) {
-            captureView.layer.cornerCurve = .continuous
+    private func syncLocalPreviewMediaFrames(on view: NTMTKView) {
+        guard let captureView = view.captureView, captureView.superview === view else { return }
+        if captureView.frame != view.bounds {
+            captureView.frame = view.bounds
         }
-        captureView.layer.masksToBounds = isConnected
-        captureView.setNeedsLayout()
-
-        if let previewCaptureView = captureView as? PreviewCaptureView {
-            previewCaptureView.previewLayer.cornerRadius = radius
-            previewCaptureView.previewLayer.masksToBounds = isConnected
+        captureView.layer.frame = captureView.bounds
+        if let previewCaptureView = captureView as? PreviewCaptureView,
+           previewCaptureView.previewLayer.frame != previewCaptureView.bounds {
+            previewCaptureView.previewLayer.frame = previewCaptureView.bounds
         }
     }
 

@@ -75,6 +75,20 @@ extension RTCSession {
                         try setAudioMode(mode: mode)
                     } else {
                         logger.log(level: .info, message: "Audio session already active on .connected; skipping redundant setAudioMode to avoid AURemoteIO start race")
+                        let outputs = audioSession.currentRoute.outputs.map(\.portType)
+                        if mode == .videoChat {
+                            if outputs.contains(.builtInReceiver),
+                               !Self.routeHasExternalCallOutput(outputs) {
+                                try setSpeakerOutputOverride(true)
+                                logger.log(level: .info, message: "iOS video speaker override applied on connected")
+                            }
+                        } else if mode == .voiceChat {
+                            if outputs.contains(.builtInSpeaker),
+                               !Self.routeHasExternalCallOutput(outputs) {
+                                try setSpeakerOutputOverride(false)
+                                logger.log(level: .info, message: "iOS voice earpiece override applied on connected")
+                            }
+                        }
                     }
                     // Explicitly enable WebRTC audio playout/recording
                     setAudio(true)

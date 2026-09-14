@@ -818,6 +818,10 @@ fileprivate final class AndroidVideoCallResources {
         return created
     }
     var coordinator: AndroidVideoCallCoordinator?
+    /// True once this call has mapped at least one remote. Waiting-slot Compose
+    /// is only for the first join; after the last remote leaves, remounting
+    /// `pool.first` keeps a frozen 1:1 SurfaceView (Device3 pid 30600).
+    var hasPublishedAssignedRemote = false
     /// Drops overlapping `tilesDidChange` visible-grid refreshes.
     var visibleRemoteGridRefreshGeneration: UInt = 0
     private let _client: AndroidRTCClient
@@ -1130,7 +1134,6 @@ public struct AndroidVideoCallView: View {
     /// Non-zero so the local SurfaceView is never first measured at 0×0 (that skips surface
     /// creation and leaves the preview queued forever).
     @State var localViewSize: CGSize = CGSize(width: 140, height: 249)
-    @State var localPreviewContainerSize: CGSize = CGSize(width: 140, height: 249)
     @State var isLocalPreviewMinimized = false
     @State var gridRaisedHandFlags: [Bool] = []
     @State var visibleRemoteCaptureViews: [AndroidSampleCaptureView] = []
@@ -1148,6 +1151,10 @@ public struct AndroidVideoCallView: View {
     @Binding var callState: CallStateMachine.State
     @Binding var isScreenSharing: Bool
     @Binding var hasActiveRemoteScreenShare: Bool
+    /// Window size in SwiftUI points from `android.R.id.content` (px ÷ density).
+    /// Do not probe this with Skip `GeometryReader` — even a Color.clear sibling
+    /// remasures every SurfaceView (lessons 82 / 85).
+    let layoutContainerSize: CGSize
     
     public init(
         session: RTCSession,
@@ -1166,7 +1173,8 @@ public struct AndroidVideoCallView: View {
         expandsIntoSafeArea: Bool = true,
         showsLocalPreview: Bool = true,
         isSystemPictureInPicture: Bool = false,
-        onInAppPipTap: (() -> Void)? = nil
+        onInAppPipTap: (() -> Void)? = nil,
+        layoutContainerSize: CGSize = .zero
     ) {
         self.session = session
         self.remoteCount = remoteCount
@@ -1177,6 +1185,7 @@ public struct AndroidVideoCallView: View {
         self.showsLocalPreview = showsLocalPreview
         self.isSystemPictureInPicture = isSystemPictureInPicture
         self.onInAppPipTap = onInAppPipTap
+        self.layoutContainerSize = layoutContainerSize
         self._delegate = delegate
         self._errorMessage = errorMessage
         self._endedCall = endedCall
@@ -1227,14 +1236,15 @@ public struct AndroidVideoCallView: View {
             allowCreateReplacement: isLiveCallState(callState) && !endedCall
         )
         // Roster `remoteCount` only sizes the renderer pool. After refresh,
-        // `visibleRemoteCaptureViews` is assigned remotes (or one waiting slot).
-        // An empty first frame uses one pool view so we never mount leftover siblings.
-        let displayedRemoteCaptureViews = visibleRemoteCaptureViews.isEmpty
-            ? AndroidMultipartyVideoLayout.mountedRemoteViews(
-                assignedViews: [],
-                poolViews: resources.remoteCaptureViews
-            )
-            : visibleRemoteCaptureViews
+        // `visibleRemoteCaptureViews` is assigned remotes. A waiting slot is
+        // only before the first mapping this call — not after the last leave.
+        // Compute off the ViewBuilder: an `if` here is a view branch, so
+        // assigning `()` failed Android release (`type '()' cannot conform to 'View'`).
+        let displayedRemoteCaptureViews = displayedRemoteCaptureViewsForBody(
+            assignedViews: visibleRemoteCaptureViews,
+            poolViews: resources.remoteCaptureViews,
+            hasPublishedAssignedRemote: resources.hasPublishedAssignedRemote
+        )
         let remotePageSize = hasActiveRemoteScreenShare ? 8 : 12
         let remotePages = paginateRemotes(displayedRemoteCaptureViews, pageSize: remotePageSize)
         let activeRemoteCount = displayedRemoteCaptureViews.count
@@ -1260,11 +1270,17 @@ public struct AndroidVideoCallView: View {
             }
         }
 
-        ZStack {
-            GeometryReader { geo in
-                // Explicit overlay: Skip's GeometryReader can stack a ViewBuilder tuple like a
-                // column, which measures the local SurfaceView at 0×0 and never creates a surface.
-                ZStack(alignment: .bottomTrailing) {
+        let shareHeight: CGFloat? = {
+            let height = layoutContainerSize.height
+            guard hasActiveRemoteScreenShare, height > 200 else { return nil }
+            return height * screenShareHeightFraction
+        }()
+        ZStack(alignment: .bottomTrailing) {
+                // Do not wrap remotes — or this ZStack — in GeometryReader. Skip
+                // rebuilds that child on every layout pass and remasures every
+                // SurfaceView (Device3 18:18 storm; Color.clear probe leftover
+                // Device3 pid 3069). Container size comes from the activity
+                // window (px ÷ density), not a layout probe.
                     VStack(spacing: 0) {
                         if hasActiveRemoteScreenShare {
                             AndroidScreenShareView(
@@ -1283,7 +1299,7 @@ public struct AndroidVideoCallView: View {
                                 }
                             )
                             .frame(maxWidth: .infinity)
-                            .frame(height: geo.size.height * screenShareHeightFraction)
+                            .frame(minHeight: shareHeight, maxHeight: shareHeight ?? .infinity)
                             .background(Color.black)
                         }
 
@@ -1342,14 +1358,17 @@ public struct AndroidVideoCallView: View {
                     if showsLocalPreview {
                         // The local renderer is a contained overlay. Native translationX/Y owns
                         // drag so pointer movement does not recompose or resize EGL.
-                        localPreviewHost(resources: resources, geo: geo)
+                        localPreviewHost(resources: resources)
                     }
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea(.all)
+        .onAppear {
+            applyLocalPreviewOverlaySize(from: layoutContainerSize)
+        }
+        .onChange(of: layoutContainerSize) { _, newValue in
+            applyLocalPreviewOverlaySize(from: newValue)
+        }
         .onChange(of: remotePages.count) { _, newCount in
             guard newCount > 0 else {
                 currentRemotePage = 0
@@ -1423,6 +1442,7 @@ public struct AndroidVideoCallView: View {
             syncInAppPipChrome(resources: resources, fullBleed: expandsIntoSafeArea)
         }
         .onAppear {
+            AndroidCallChromeBridge.setElapsedTickingAllowed(true)
             if isLiveCallState(callState) {
                 didEnterLiveCall = true
             }
@@ -1596,20 +1616,46 @@ public struct AndroidVideoCallView: View {
         }
     }
 
+    /// Waiting slot only before the first assigned remote. After the last leave,
+    /// return empty so the leftover 1:1 SurfaceView is not remounted.
+    private func displayedRemoteCaptureViewsForBody(
+        assignedViews: [AndroidSampleCaptureView],
+        poolViews: [AndroidSampleCaptureView],
+        hasPublishedAssignedRemote: Bool
+    ) -> [AndroidSampleCaptureView] {
+        if !assignedViews.isEmpty {
+            return assignedViews
+        }
+        if hasPublishedAssignedRemote {
+            return []
+        }
+        return AndroidMultipartyVideoLayout.mountedRemoteViews(
+            assignedViews: [],
+            poolViews: poolViews,
+            allowWaitingSlot: true
+        )
+    }
+
     /// Compose `itemCount` follows assigned remotes, matching iOS live collection items.
     /// Extra pool renderers stay allocated; they are not shown as empty tiles.
     @MainActor
     private func multipartyRemoteCaptureViews(from resources: AndroidVideoCallResources) async -> [AndroidSampleCaptureView] {
         let assigned = await resources.controller.assignedRemoteViews()
         let assignedCount = await resources.controller.assignedParticipantCount()
+        if assignedCount > 0 {
+            resources.hasPublishedAssignedRemote = true
+        }
+        let allowWaitingSlot = !resources.hasPublishedAssignedRemote
         let slotCount = AndroidMultipartyVideoLayout.multipartyGridSlotCount(
             assignedParticipantCount: assignedCount,
-            poolSize: resources.remoteCaptureViews.count
+            poolSize: resources.remoteCaptureViews.count,
+            allowWaitingSlot: allowWaitingSlot
         )
         mountedMultipartyRemoteSlotCount = slotCount
         return AndroidMultipartyVideoLayout.mountedRemoteViews(
             assignedViews: assigned,
-            poolViews: resources.remoteCaptureViews
+            poolViews: resources.remoteCaptureViews,
+            allowWaitingSlot: allowWaitingSlot
         )
     }
 
@@ -1641,6 +1687,11 @@ public struct AndroidVideoCallView: View {
             currentGeneration: resources.visibleRemoteGridRefreshGeneration
         ) else { return }
         let nextVisibleCount = nextViews.count
+        if nextViews.isEmpty {
+            for view in previousViews {
+                view.detachCurrentTrack()
+            }
+        }
         if previousVisibleCount != nextVisibleCount {
             NeedleTailLogger(level: .info).log(
                 level: .info,
@@ -1752,8 +1803,7 @@ public struct AndroidVideoCallView: View {
 
     @ViewBuilder
     private func localPreviewHost(
-        resources: AndroidVideoCallResources,
-        geo: GeometryProxy
+        resources: AndroidVideoCallResources
     ) -> some View {
         if localPreviewFillsContainer {
             AndroidLocalVideoView(
@@ -1770,30 +1820,15 @@ public struct AndroidVideoCallView: View {
             )
             .frame(width: localViewSize.width, height: localViewSize.height)
             .padding(.trailing, 20)
-            .padding(.bottom, localPreviewBottomPadding(in: geo))
-            .onAppear {
-                localPreviewContainerSize = geo.size
-                localViewSize = setSize(size: geo.size)
-            }
-            .onChange(of: geo.size) { _, newValue in
-                localPreviewContainerSize = newValue
-                let proposed = setSize(size: newValue)
-                guard AndroidRendererLayoutPolicy.shouldReplaceLocalPreviewOverlaySize(
-                    currentWidth: Double(localViewSize.width),
-                    currentHeight: Double(localViewSize.height),
-                    proposedWidth: Double(proposed.width),
-                    proposedHeight: Double(proposed.height)
-                ) else {
-                    return
-                }
-                localViewSize = proposed
-            }
+            .padding(.bottom, localPreviewBottomPadding)
             .onChange(of: isLocalPreviewMinimized) { _, minimized in
                 Self.minimizeLogger.log(
                     level: .info,
                     message: "[CallChromeMinimize] local preview overlay minimized=\(minimized)"
                 )
-                localViewSize = setSize(size: localPreviewContainerSize)
+                if layoutContainerSize.width > 1, layoutContainerSize.height > 1 {
+                    localViewSize = setSize(size: layoutContainerSize)
+                }
                 AndroidCallChromeBridge.resetDrag(key: "local")
             }
         }
@@ -1876,13 +1911,27 @@ public struct AndroidVideoCallView: View {
     // MARK: - Size Management
     /// Bottom inset for the local preview so rounded corners stay above call controls
     /// and the Android system navigation bar (especially during screen share).
-    private func localPreviewBottomPadding(in geo: GeometryProxy) -> CGFloat {
+    private var localPreviewBottomPadding: CGFloat {
         if !expandsIntoSafeArea {
             return 8
         }
         let callControlsInset: CGFloat = 128
         let screenShareStripInset: CGFloat = hasActiveRemoteScreenShare ? 16 : 0
-        return callControlsInset + geo.safeAreaInsets.bottom + screenShareStripInset
+        return callControlsInset + screenShareStripInset
+    }
+
+    private func applyLocalPreviewOverlaySize(from container: CGSize) {
+        guard container.width > 1, container.height > 1 else { return }
+        let proposed = setSize(size: container)
+        guard AndroidRendererLayoutPolicy.shouldReplaceLocalPreviewOverlaySize(
+            currentWidth: Double(localViewSize.width),
+            currentHeight: Double(localViewSize.height),
+            proposedWidth: Double(proposed.width),
+            proposedHeight: Double(proposed.height)
+        ) else {
+            return
+        }
+        localViewSize = proposed
     }
 
     /// Computes an appropriate overlay size for the local preview based on container size.

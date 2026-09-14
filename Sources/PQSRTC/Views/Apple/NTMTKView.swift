@@ -197,7 +197,29 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     @MainActor
     override public func layoutSubviews() {
         super.layoutSubviews()
+        syncEmbeddedCaptureViewBounds()
         propagateRendererBoundsToAttachedRenderers()
+    }
+
+    /// Keep the embedded `PreviewCaptureView` / preview layer matched to this wrapper after
+    /// PiP resize. Without this, `AVCaptureVideoPreviewLayer` can stay square until a drag
+    /// forces another layout (macOS already syncs on every AppKit layout pass).
+    @MainActor
+    private func syncEmbeddedCaptureViewBounds() {
+        guard let captureView else { return }
+        guard captureView.superview === self else { return }
+        guard captureView.frame != bounds else {
+            if let previewCaptureView = captureView as? PreviewCaptureView,
+               previewCaptureView.previewLayer.frame != previewCaptureView.bounds {
+                previewCaptureView.previewLayer.frame = previewCaptureView.bounds
+            }
+            return
+        }
+        captureView.frame = bounds
+        captureView.layer.frame = captureView.bounds
+        if let previewCaptureView = captureView as? PreviewCaptureView {
+            previewCaptureView.previewLayer.frame = previewCaptureView.bounds
+        }
     }
 
     @MainActor

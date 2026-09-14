@@ -1249,51 +1249,65 @@ enum AndroidMultipartyVideoLayout {
     static func visibleRemoteViewCount(
         remoteSlotCount: Int,
         assignedParticipantCount: Int,
-        poolSize: Int
+        poolSize: Int,
+        allowWaitingSlot: Bool = true
     ) -> Int {
         _ = remoteSlotCount
         return multipartyGridSlotCount(
             assignedParticipantCount: assignedParticipantCount,
-            poolSize: poolSize
+            poolSize: poolSize,
+            allowWaitingSlot: allowWaitingSlot
         )
     }
 
     /// Visible slot count after a roster/SFU refresh. A leave that leaves one assigned
     /// remote must return to 1-up; keeping the previous N-up count is what stuck Android
-    /// on two 16:9 tiles with one live stream.
+    /// on two 16:9 tiles with one live stream. After the last assigned remote leaves,
+    /// do not keep a waiting slot — that remounts the leftover 1:1 SurfaceView
+    /// (Device3 pid 30600 09:04:41: `creating sample view` with no rebound).
     static func stableVisibleRemoteViewCount(
         previousVisibleCount: Int,
         requestedVisibleCount: Int,
         assignedParticipantCount: Int,
-        poolSize: Int
+        poolSize: Int,
+        allowWaitingSlot: Bool = true
     ) -> Int {
         _ = previousVisibleCount
         _ = requestedVisibleCount
         return multipartyGridSlotCount(
             assignedParticipantCount: assignedParticipantCount,
-            poolSize: poolSize
+            poolSize: poolSize,
+            allowWaitingSlot: allowWaitingSlot
         )
     }
 
     /// How many Compose tiles to mount. Extra pool renderers stay allocated off-tree.
+    /// A waiting slot is only for the pre-first-mapping window. After this call has
+    /// assigned a remote, empty assigned means zero tiles (local preview only).
     static func multipartyGridSlotCount(
         assignedParticipantCount: Int,
-        poolSize: Int
+        poolSize: Int,
+        allowWaitingSlot: Bool = true
     ) -> Int {
         guard poolSize > 0 else { return 0 }
-        return min(max(assignedParticipantCount, 1), poolSize)
+        if assignedParticipantCount <= 0 {
+            return allowWaitingSlot ? 1 : 0
+        }
+        return min(assignedParticipantCount, poolSize)
     }
 
-    /// Views Compose may mount. Assigned remotes only; if none yet, one waiting pool slot.
-    /// Never returns leftover unassigned pool siblings — those become empty 16:9 tiles.
+    /// Views Compose may mount. Assigned remotes only.
+    /// Waiting pool slot: first join, before anyone maps. Never after the last
+    /// assigned remote left — that is the frozen leftover 1:1 tile.
     static func mountedRemoteViews<View>(
         assignedViews: [View],
-        poolViews: [View]
+        poolViews: [View],
+        allowWaitingSlot: Bool = true
     ) -> [View] {
         if !assignedViews.isEmpty {
             return assignedViews
         }
-        guard let first = poolViews.first else { return [] }
+        guard allowWaitingSlot, let first = poolViews.first else { return [] }
         return [first]
     }
 

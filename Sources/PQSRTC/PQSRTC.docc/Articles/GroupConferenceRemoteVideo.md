@@ -243,6 +243,11 @@ must not queue coordinator reruns while a pass is in flight. Leave 2-up → 1:1
 must reattach the remaining sink immediately — do not wait for Compose
 `layoutGeneration` and do not defer that leftover into an in-flight leave-offer
 episode (Device3 17:23 remounted at 317×564, then the coordinator skipped).
+After the last assigned remote leaves, mount **zero** tiles. A waiting pool
+slot is only for the first join, before anyone maps. Remounting `pool.first`
+after everyone left keeps a frozen 1:1 SurfaceView (Device3 pid 30600
+09:04:41: `Releasing departed` then `creating sample view` / no
+`mounted count=0`).
 Overlapping `tilesDidChange` refreshes must drop stale generations so only the
 latest publish remounts. Do **not** remount the leftover `AndroidView` when
 `itemCount` crosses 1 (`composeTileKey` is stable per renderer) — Device3

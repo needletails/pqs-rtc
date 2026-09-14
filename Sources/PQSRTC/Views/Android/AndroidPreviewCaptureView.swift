@@ -345,11 +345,28 @@ public struct AndroidCaptureViewFactory {
 /// compiled Swift function body is always false, so calls placed there never run.
 /// Device3 20:29–20:33: `hit layer attached` with no detach, no `reset key=`, and no
 /// `detached all call chrome overlays` at hangup. Route through this type instead.
+///
+/// Stops leftover Compose `delay(1000)` clocks after hangup (Device3 18:22 pid 17442).
+public enum AndroidCallElapsedTickGate {
+    public static var isAllowed = false
+}
+
 public struct AndroidCallChromeBridge {
 
     /// Hangup: drop every drag session, control exclusion, tap handler and the hit layer.
     public static func detachAllForCallEnd() {
+        AndroidCallElapsedTickGate.isAllowed = false
         AndroidCallChromeNativeSupport.detachAllForCallEnd()
+    }
+
+    /// Compose elapsed labels may outlive SwiftUI unmount. Hangup must stop the 1s tick
+    /// so a leaked ComposeView cannot keep requesting `PerformTraversals`.
+    public static func setElapsedTickingAllowed(_ allowed: Bool) {
+        AndroidCallElapsedTickGate.isAllowed = allowed
+    }
+
+    public static func elapsedTickingAllowed() -> Bool {
+        AndroidCallElapsedTickGate.isAllowed
     }
 
     /// Reset a drag session's native translation back to rest.

@@ -71,7 +71,7 @@ import kotlin.__
 // SKIP INSERT: ) : org.webrtc.PeerConnection.Observer {
 // SKIP INSERT:
 // SKIP INSERT:     override fun onSignalingChange(newState: org.webrtc.PeerConnection.SignalingState) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "Signaling state changed to: $newState")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Signaling state changed to: $newState")
 // SKIP INSERT:         if (newState == org.webrtc.PeerConnection.SignalingState.CLOSED) {
 // SKIP INSERT:             client.retireCurrentNativePeerConnection()
 // SKIP INSERT:         }
@@ -80,19 +80,19 @@ import kotlin.__
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceConnectionChange(newState: org.webrtc.PeerConnection.IceConnectionState) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "ICE connection state changed to: $newState")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "ICE connection state changed to: $newState")
 // SKIP INSERT:         val state = convertIceConnectionState(newState)
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceConnectionStateChange(state))
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onStandardizedIceConnectionChange(newState: org.webrtc.PeerConnection.IceConnectionState) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "Standardized ICE connection state changed to: $newState")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Standardized ICE connection state changed to: $newState")
 // SKIP INSERT:         val state = convertIceConnectionState(newState)
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.standardizedIceConnectionStateChange(state))
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onConnectionChange(newState: org.webrtc.PeerConnection.PeerConnectionState) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "Peer connection state changed to: $newState")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Peer connection state changed to: $newState")
 // SKIP INSERT:         if (newState == org.webrtc.PeerConnection.PeerConnectionState.CLOSED) {
 // SKIP INSERT:             client.retireCurrentNativePeerConnection()
 // SKIP INSERT:         }
@@ -101,18 +101,18 @@ import kotlin.__
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceConnectionReceivingChange(receiving: Boolean) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "ICE connection receiving changed to: $receiving")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "ICE connection receiving changed to: $receiving")
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceConnectionReceivingChange(receiving))
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceGatheringChange(newState: org.webrtc.PeerConnection.IceGatheringState) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "ICE gathering state changed to: $newState")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "ICE gathering state changed to: $newState")
 // SKIP INSERT:         val state = convertIceGatheringState(newState)
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceGatheringStateChange(state))
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceCandidate(candidate: org.webrtc.IceCandidate) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "ICE candidate generated: ${candidate.sdp}")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "ICE candidate generated: ${candidate.sdp}")
 // SKIP INSERT:         val ice = RTCIceCandidate(
 // SKIP INSERT:             sdp = candidate.sdp,
 // SKIP INSERT:             sdpMLineIndex = candidate.sdpMLineIndex.toInt(),
@@ -122,39 +122,39 @@ import kotlin.__
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceCandidatesRemoved(candidates: kotlin.Array<org.webrtc.IceCandidate>) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "Removed ${candidates.size} ICE candidates")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Removed ${candidates.size} ICE candidates")
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceCandidatesRemoved(candidates.size))
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onAddStream(stream: org.webrtc.MediaStream) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "Stream added: ${stream.id}")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Stream added: ${stream.id}")
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.addStream(stream.id))
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onRemoveStream(stream: org.webrtc.MediaStream) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "Stream removed: ${stream.id}")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Stream removed: ${stream.id}")
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.removeStream(stream.id))
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onDataChannel(dataChannel: org.webrtc.DataChannel) {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "Data channel opened: ${dataChannel.label()}")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Data channel opened: ${dataChannel.label()}")
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.dataChannel(dataChannel.label()))
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onRenegotiationNeeded() {
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "PeerConnection renegotiation needed")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "PeerConnection renegotiation needed")
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.shouldNegotiate)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onAddTrack(receiver: org.webrtc.RtpReceiver, mediaStreams: kotlin.Array<org.webrtc.MediaStream>) {
 // SKIP INSERT:         val trackKind = receiver.track()?.kind() ?: "unknown"
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "On Add Track: $trackKind")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "On Add Track: $trackKind")
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.addTrack(trackKind))
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onRemoveTrack(receiver: org.webrtc.RtpReceiver) {
 // SKIP INSERT:         val trackKind = receiver.track()?.kind() ?: "unknown"
-// SKIP INSERT:         android.util.Log.d("RTCClientPeerObserver", "On Removed Track: $trackKind")
+// SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "On Removed Track: $trackKind")
 // SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.removeTrack(trackKind))
 // SKIP INSERT:     }
 // SKIP INSERT:
@@ -163,11 +163,11 @@ import kotlin.__
 // SKIP INSERT:         when (track) {
 // SKIP INSERT:             is org.webrtc.AudioTrack -> {
 // SKIP INSERT:                 client.triggerRTCEvent(ClientPCEvent.audioTrack(RTCAudioTrack(track)))
-// SKIP INSERT:                 android.util.Log.d("RTCClientPeerObserver", "Started receiving on transceiver: audioTrack")
+// SKIP INSERT:                 if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Started receiving on transceiver: audioTrack")
 // SKIP INSERT:             }
 // SKIP INSERT:             is org.webrtc.VideoTrack -> {
 // SKIP INSERT:                 client.triggerRTCEvent(ClientPCEvent.videoTrack(RTCVideoTrack(track)))
-// SKIP INSERT:                 android.util.Log.d("RTCClientPeerObserver", "Started receiving on transceiver: videoTrack")
+// SKIP INSERT:                 if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Started receiving on transceiver: videoTrack")
 // SKIP INSERT:             }
 // SKIP INSERT:         }
 // SKIP INSERT:     }
@@ -684,7 +684,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     if (ok) {
         // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKey = null
         // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKeyIndex = null
-        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "✅ Shared media key set at index $index")
+        // SKIP INSERT:       if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "✅ Shared media key set at index $index")
         // SKIP INSERT:     } else android.util.Log.e("AndroidRTCClient", "❌ Failed to set shared media key at index $index")
         // SKIP INSERT:   }
         // SKIP INSERT:   if (android.os.Looper.myLooper() == mainLooper) apply()
@@ -750,7 +750,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     if (ok) {
         // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKey = null
         // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKeyIndex = null
-        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "✅ Shared media key set at index $index")
+        // SKIP INSERT:       if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "✅ Shared media key set at index $index")
         // SKIP INSERT:     } else android.util.Log.e("AndroidRTCClient", "❌ Failed to set shared media key at index $index")
         // SKIP INSERT:   }
         // SKIP INSERT:   if (android.os.Looper.myLooper() == mainLooper) apply()
@@ -779,7 +779,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   synchronized(AndroidRTCClient::class.java) {
         // SKIP INSERT:     val alreadyInitialized = java.lang.System.getProperty("pqsrtc.webrtc.initialized") == "1"
         // SKIP INSERT:     if (!alreadyInitialized) {
-        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "Bootstrapping WebRTC natives before FrameCryptor on ${java.lang.Thread.currentThread().name}")
+        // SKIP INSERT:       if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Bootstrapping WebRTC natives before FrameCryptor on ${java.lang.Thread.currentThread().name}")
         // SKIP INSERT:       org.webrtc.PeerConnectionFactory.initialize(init)
         // SKIP INSERT:       java.lang.System.setProperty("pqsrtc.webrtc.initialized", "1")
         // SKIP INSERT:     }
@@ -853,7 +853,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderIsSharedKeyMode = sharedKeyMode
         // SKIP INSERT:     this@AndroidRTCClient.frameCryptorSupport.setKeyProvider(keyProvider)
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyMode)")
+        // SKIP INSERT:     if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyMode)")
         // SKIP INSERT:     } catch (e: java.lang.UnsatisfiedLinkError) {
         // SKIP INSERT:         this@AndroidRTCClient.keyProvider = null
         // SKIP INSERT:         this@AndroidRTCClient.keyProviderReady = false
@@ -892,7 +892,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       false
         // SKIP INSERT:     }
         // SKIP INSERT:     if (ok) {
-        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "✅ Applied stashed shared media key at index $pendingIndex")
+        // SKIP INSERT:       if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "✅ Applied stashed shared media key at index $pendingIndex")
         // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKey = null
         // SKIP INSERT:       this@AndroidRTCClient.pendingSharedKeyIndex = null
         // SKIP INSERT:     } else android.util.Log.e("AndroidRTCClient", "❌ Failed to apply stashed shared media key at index $pendingIndex")
@@ -958,7 +958,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderIsSharedKeyMode = sharedKeyModeK
         // SKIP INSERT:     this@AndroidRTCClient.frameCryptorSupport.setKeyProvider(keyProvider)
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyModeK)")
+        // SKIP INSERT:     if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyModeK)")
         // SKIP INSERT:     } catch (e: java.lang.UnsatisfiedLinkError) {
         // SKIP INSERT:         this@AndroidRTCClient.keyProvider = null
         // SKIP INSERT:         this@AndroidRTCClient.keyProviderReady = false
@@ -1007,7 +1007,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     val m = keyProvider.javaClass.methods.firstOrNull { it.name == "setKey" && it.parameterTypes.size == 3 }
         // SKIP INSERT:     val success = if (m != null) (m.invoke(keyProvider, participantId, index.toInt(), keyBytes) as? Boolean) ?: false else false
         // SKIP INSERT:     if (!success) android.util.Log.e("AndroidRTCClient", "❌ Failed to set stashed per-participant key for '$participantId' index $index")
-        // SKIP INSERT:     else android.util.Log.i("AndroidRTCClient", "✅ Applied stashed per-participant key for '$participantId' index $index")
+        // SKIP INSERT:     else if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "✅ Applied stashed per-participant key for '$participantId' index $index")
         // SKIP INSERT:   } catch (e: java.lang.Exception) { android.util.Log.e("AndroidRTCClient", "❌ Exception applying stashed per-participant key: ${e.message}", e) }
         // SKIP INSERT: }
         // SKIP INSERT: val mainLooper = android.os.Looper.getMainLooper()
@@ -1050,7 +1050,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     val m = keyProvider.javaClass.methods.firstOrNull { it.name == "setKey" && it.parameterTypes.size == 3 }
         // SKIP INSERT:     val success = if (m != null) (m.invoke(keyProvider, participantId, index.toInt(), keyBytes) as? Boolean) ?: false else false
         // SKIP INSERT:     if (!success) android.util.Log.e("AndroidRTCClient", "❌ Failed to set per-participant key for '$participantId' index $index")
-        // SKIP INSERT:     else android.util.Log.i("AndroidRTCClient", "✅ Per-participant key set for '$participantId' index $index")
+        // SKIP INSERT:     else if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "✅ Per-participant key set for '$participantId' index $index")
         // SKIP INSERT:   } catch (e: java.lang.Exception) { android.util.Log.e("AndroidRTCClient", "❌ Exception setting per-participant key: ${e.message}", e) }
         // SKIP INSERT: }
         // SKIP INSERT: val mainLooper = android.os.Looper.getMainLooper()
@@ -1239,7 +1239,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       android.util.Log.e("AndroidRTCClient", "❌ Exception in ratchet setSharedKey: ${e.message}", e)
         // SKIP INSERT:       false
         // SKIP INSERT:     }
-        // SKIP INSERT:     if (success) android.util.Log.i("AndroidRTCClient", "🔑 Updated shared media key index $index")
+        // SKIP INSERT:     if (success) { if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "🔑 Updated shared media key index $index") }
         // SKIP INSERT:     else android.util.Log.e("AndroidRTCClient", "❌ Failed to update shared media key index $index")
         // SKIP INSERT:   }
         // SKIP INSERT:   if (android.os.Looper.myLooper() == mainLooper) doRatchet()
@@ -1310,10 +1310,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:       synchronized(AndroidRTCClient::class.java) {
         // SKIP INSERT:         val alreadyInitialized = java.lang.System.getProperty("pqsrtc.webrtc.initialized") == "1"
         // SKIP INSERT:         if (!alreadyInitialized) {
-        // SKIP INSERT:           android.util.Log.i("AndroidRTCClient", "Initializing PeerConnectionFactory on ${java.lang.Thread.currentThread().name}")
+        // SKIP INSERT:           if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Initializing PeerConnectionFactory on ${java.lang.Thread.currentThread().name}")
         // SKIP INSERT:           org.webrtc.PeerConnectionFactory.initialize(init)
         // SKIP INSERT:           java.lang.System.setProperty("pqsrtc.webrtc.initialized", "1")
-        // SKIP INSERT:           android.util.Log.i("AndroidRTCClient", "PeerConnectionFactory process init complete")
+        // SKIP INSERT:           if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "PeerConnectionFactory process init complete")
         // SKIP INSERT:         }
         // SKIP INSERT:       }
         // SKIP INSERT:     } catch (e: java.lang.ClassNotFoundException) {
@@ -1337,10 +1337,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     // with buffer=TextureBuffer and a black PiP.
         // SKIP INSERT:     val existingEgl = this@AndroidRTCClient.eglBase
         // SKIP INSERT:     val egl = if (existingEgl != null) {
-        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "Reusing EGL base for PeerConnectionFactory")
+        // SKIP INSERT:       if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Reusing EGL base for PeerConnectionFactory")
         // SKIP INSERT:       existingEgl
         // SKIP INSERT:     } else {
-        // SKIP INSERT:       android.util.Log.i("AndroidRTCClient", "Creating EGL base")
+        // SKIP INSERT:       if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Creating EGL base")
         // SKIP INSERT:       org.webrtc.EglBase.create() ?: run {
         // SKIP INSERT:         android.util.Log.e("AndroidRTCClient", "Failed to create EGL base")
         // SKIP INSERT:         this@AndroidRTCClient.initializationFailed = true
@@ -1353,13 +1353,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     val enc = org.webrtc.DefaultVideoEncoderFactory(egl.eglBaseContext, true, true)
         // SKIP INSERT:     val dec = org.webrtc.DefaultVideoDecoderFactory(egl.eglBaseContext)
         // SKIP INSERT:     
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "Creating PeerConnectionFactory instance")
+        // SKIP INSERT:     if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Creating PeerConnectionFactory instance")
         // SKIP INSERT:     val fac = org.webrtc.PeerConnectionFactory.builder()
         // SKIP INSERT:         .setVideoEncoderFactory(enc)
         // SKIP INSERT:         .setVideoDecoderFactory(dec)
         // SKIP INSERT:         .createPeerConnectionFactory()
         // SKIP INSERT:     this@AndroidRTCClient.factory = fac
-        // SKIP INSERT:     android.util.Log.i("AndroidRTCClient", "PeerConnectionFactory instance ready")
+        // SKIP INSERT:     if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "PeerConnectionFactory instance ready")
         // SKIP INSERT:   }
         // SKIP INSERT:   return this@AndroidRTCClient.factory
         // SKIP INSERT: } catch (e: Throwable) {
@@ -1396,9 +1396,9 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:   config.continualGatheringPolicy = org.webrtc.PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
         // SKIP INSERT:   val obs = RTCClientPeerObserver(this@AndroidRTCClient)
         // SKIP INSERT:   this@AndroidRTCClient.observer = obs
-        // SKIP INSERT:   android.util.Log.i("AndroidRTCClient", "Creating native PeerConnection iceServers=${servers.size} policy=${config.iceTransportsType}")
+        // SKIP INSERT:   if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Creating native PeerConnection iceServers=${servers.size} policy=${config.iceTransportsType}")
         // SKIP INSERT:   val pc = factory.createPeerConnection(config, obs)
-        // SKIP INSERT:   android.util.Log.i("AndroidRTCClient", "Native PeerConnection created=${pc != null}")
+        // SKIP INSERT:   if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Native PeerConnection created=${pc != null}")
         // SKIP INSERT:   this@AndroidRTCClient.factory = factory
         // SKIP INSERT:   return pc
         // SKIP INSERT: } catch (e: Throwable) {
@@ -1661,7 +1661,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         }
 
         if shouldStartCapture {
-            // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Launching async screen capture startup")
+            // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Launching async screen capture startup")
             let capturedResultCode = resultCode
             let capturedWidth = width
             let capturedHeight = height
@@ -1675,7 +1675,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
                         height: capturedHeight,
                         fps: capturedFps
                     )
-                    // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Screen capture started")
+                    // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Screen capture started")
                 } catch {
                     // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Failed to start screen capture: ${error}")
                     self.dispatchScreenCaptureStarted(false)
@@ -1769,7 +1769,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: val ctx = ProcessInfo.processInfo.androidContext
         // SKIP INSERT:     ?: throw IllegalStateException("Android context not available")
         // SKIP INSERT: capturer.initialize(helper, ctx, lifecycleObserver)
-        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Starting screen capture at ${width}x${height}@${fps}fps")
+        // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Starting screen capture at ${width}x${height}@${fps}fps")
         // SKIP INSERT: capturer.startCapture(width, height, fps)
 
         lock.lock()
@@ -2120,13 +2120,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
         localVideoCaptureStartInFlight = true
         lock.unlock()
 
-        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Launching deferred local video capture startup")
+        // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Launching deferred local video capture startup")
         Task.detached { [weak self] in
             guard let self else { return }
             defer { self.markLocalVideoCaptureStartFinished() }
             do {
                 try self.startLocalVideo(useFrontCamera: useFrontCamera)
-                // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Deferred local video capture started")
+                // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Deferred local video capture started")
             } catch {
                 // SKIP INSERT: android.util.Log.e("AndroidRTCClient", "Failed to start deferred local video capture")
             }
@@ -2237,7 +2237,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
             downstream: downstream,
             normalizeToUpright: true,
             fanOutLocalPreview: true)
-        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "Initializing camera capturer")
+        // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Initializing camera capturer")
         capturer.initialize(helper, ctx, proxy)
 
         guard let supportedFormats = enumerator.getSupportedFormats(cameraName) else {
@@ -3005,7 +3005,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         pendingPerParticipantKeys.removeAll()
         pendingSharedKey = nil
         pendingSharedKeyIndex = nil
-        // SKIP INSERT: android.util.Log.i("AndroidRTCClient", "🔐 Reset FrameCryptorKeyProvider after hangup; next call will create a fresh provider")
+        // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "🔐 Reset FrameCryptorKeyProvider after hangup; next call will create a fresh provider")
     }
     
     /// Closes the peer connection and releases all WebRTC resources owned by this client.

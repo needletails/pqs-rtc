@@ -448,6 +448,10 @@ struct GroupCallVideoRegressionTests {
             assignedParticipantCount: 0,
             poolSize: 3) == 1)
         #expect(AndroidMultipartyVideoLayout.multipartyGridSlotCount(
+            assignedParticipantCount: 0,
+            poolSize: 3,
+            allowWaitingSlot: false) == 0)
+        #expect(AndroidMultipartyVideoLayout.multipartyGridSlotCount(
             assignedParticipantCount: 3,
             poolSize: 2) == 2)
     }
@@ -485,6 +489,12 @@ struct GroupCallVideoRegressionTests {
             requestedVisibleCount: 1,
             assignedParticipantCount: 0,
             poolSize: 3) == 1)
+        #expect(AndroidMultipartyVideoLayout.stableVisibleRemoteViewCount(
+            previousVisibleCount: 1,
+            requestedVisibleCount: 1,
+            assignedParticipantCount: 0,
+            poolSize: 3,
+            allowWaitingSlot: false) == 0)
         #expect(AndroidMultipartyVideoLayout.mountedRemoteViews(
             assignedViews: ["nudge"],
             poolViews: ["nudge", "empty"]
@@ -493,6 +503,11 @@ struct GroupCallVideoRegressionTests {
             assignedViews: [String](),
             poolViews: ["nudge", "empty"]
         ) == ["nudge"])
+        #expect(AndroidMultipartyVideoLayout.mountedRemoteViews(
+            assignedViews: [String](),
+            poolViews: ["nudge", "empty"],
+            allowWaitingSlot: false
+        ) == [String]())
         #expect(AndroidMultipartyVideoLayout.mountedRemoteViews(
             assignedViews: ["nudge", "mm26"],
             poolViews: ["nudge", "mm26", "empty"]

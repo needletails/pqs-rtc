@@ -802,7 +802,8 @@ public final class VideoCallViewController: UICollectionViewController {
         }
         
         // Remove any remaining local preview view from the hierarchy
-        if let localView = localPreviewView() {
+        controllerView.detachLocalPreviewFromOverlay()
+        if let localView = localPreviewView(), localView.superview != nil {
             localView.removeFromSuperview()
         }
         
@@ -2087,10 +2088,8 @@ public final class VideoCallViewController: UICollectionViewController {
 
         // Self-heal: keep detached preview pinned in the overlay after collection churn.
         if previewDetachedToOverlay, let localView = localPreviewView() {
-            if localView.superview !== controllerView {
-                controllerView.addSubview(localView)
-            }
-            controllerView.bringSubviewToFront(localView)
+            controllerView.attachConnectedLocalPreview(localView)
+            controllerView.bringConnectedLocalPreviewToFront()
             bringControlsToFront()
             scheduleConnectedLocalPreviewStyleReapply()
         }
@@ -2106,6 +2105,8 @@ public final class VideoCallViewController: UICollectionViewController {
         guard let localView = localPreviewView() else { return }
         detachedPreviewView = localView
         previewDetachedToOverlay = true
+        // Hide before the collection snapshot drops the cell so a square preview never flashes.
+        controllerView.hideLocalPreviewUntilOverlayClipIsReady(localView)
     }
     
     /// Ensures the local preview view is attached, gesture-enabled, and sized.
@@ -2113,10 +2114,7 @@ public final class VideoCallViewController: UICollectionViewController {
         guard previewDetachedToOverlay || isConnected() else { return }
         guard let localView = localPreviewView() else { return }
         
-        if localView.superview !== controllerView {
-            controllerView.addSubview(localView)
-        }
-        controllerView.applyConnectedLocalPreviewCornerStyle(to: localView)
+        controllerView.attachConnectedLocalPreview(localView)
         localView.isAccessibilityElement = true
         localView.accessibilityLabel = "Local preview"
         
@@ -2142,8 +2140,8 @@ public final class VideoCallViewController: UICollectionViewController {
             should: false,
             isConnected: isConnected(),
             view: localView,
-            animated: true)
-        controllerView.bringSubviewToFront(localView)
+            animated: false)
+        controllerView.bringConnectedLocalPreviewToFront()
         controllerView.setNeedsLayout()
         controllerView.layoutIfNeeded()
         controllerView.applyConnectedLocalPreviewCornerStyle(to: localView)
@@ -3088,18 +3086,19 @@ public final class VideoCallViewController: UICollectionViewController {
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard let localView = localPreviewView() else { return }
-            controllerView.bringSubviewToFront(localView)
+            let dragView = controllerView.connectedLocalPreviewDragView ?? localView
+            controllerView.bringConnectedLocalPreviewToFront()
             let translation = sender.translation(in: self.view)
             // Keep the preview within safe bounds (feels “tight” and prevents losing the preview off-screen).
-            let proposed = CGPoint(x: localView.center.x + translation.x, y: localView.center.y + translation.y)
+            let proposed = CGPoint(x: dragView.center.x + translation.x, y: dragView.center.y + translation.y)
             let safe = controllerView.safeAreaLayoutGuide.layoutFrame
-            let halfW = localView.bounds.width / 2
-            let halfH = localView.bounds.height / 2
+            let halfW = dragView.bounds.width / 2
+            let halfH = dragView.bounds.height / 2
             let minX = safe.minX + halfW
             let maxX = safe.maxX - halfW
             let minY = safe.minY + halfH
             let maxY = safe.maxY - halfH
-            localView.center = CGPoint(
+            dragView.center = CGPoint(
                 x: min(max(proposed.x, minX), maxX),
                 y: min(max(proposed.y, minY), maxY)
             )
@@ -3113,7 +3112,7 @@ public final class VideoCallViewController: UICollectionViewController {
                     CGPoint(x: minX, y: maxY),
                     CGPoint(x: maxX, y: maxY)
                 ]
-                let current = localView.center
+                let current = dragView.center
                 let target = candidates.min(by: { a, b in
                     hypot(a.x - current.x, a.y - current.y) < hypot(b.x - current.x, b.y - current.y)
                 }) ?? current
@@ -3122,7 +3121,7 @@ public final class VideoCallViewController: UICollectionViewController {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 }
                 UIView.animate(withDuration: 0.18, delay: 0, options: [.curveEaseOut, .allowUserInteraction]) {
-                    localView.center = target
+                    dragView.center = target
                 }
             }
         }

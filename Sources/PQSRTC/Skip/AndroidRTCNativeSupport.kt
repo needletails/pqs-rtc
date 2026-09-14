@@ -73,7 +73,7 @@ object AndroidNativeSetLocalDescription {
         val latch = CountDownLatch(1)
         val observer = object : SdpObserver {
             override fun onSetSuccess() {
-                Log.i("AndroidRTCClient", "setLocalDescription completed via kotlin-observer")
+                AndroidRTCViewSupport.logD("AndroidRTCClient", "setLocalDescription completed via kotlin-observer")
                 latch.countDown()
             }
 
@@ -284,7 +284,7 @@ private class VideoAppearanceFrameSoftening {
                 i++
             }
             val skinPct = if (n > 0) (skin * 100) / n else 0
-            Log.i(
+            AndroidRTCViewSupport.logD(
                 "AndroidRTCClient",
                 "Appearance softening first frame ${w}x${h} down=${dw}x${dh} skinPct=$skinPct",
             )
@@ -604,7 +604,7 @@ object CameraCaptureFrameRouter {
                 else -> "none"
             }
             val sendKind = if (soften) "I420Softened" else "TextureBuffer"
-            Log.i(
+            AndroidRTCViewSupport.logD(
                 "AndroidRTCClient",
                 "Camera capture pipeline revision=" +
                     AndroidRTCViewSupport.LOCAL_PREVIEW_PIPELINE_REVISION +
@@ -2009,7 +2009,7 @@ object AndroidRTCViewSupport {
     /// 120/0/120 at 30.0 in ~500 µs and still looked skippy. The PiP was a
     /// TextureView over a full-screen remote SurfaceView hole-punch. Bump
     /// when the local capture / preview pipeline changes.
-    const val LOCAL_PREVIEW_PIPELINE_REVISION = "2026-09-11-l"
+    const val LOCAL_PREVIEW_PIPELINE_REVISION = "2026-09-12-a"
 
     /// Device3 09:49: `Attached Camera2 preview surface 1280x720` then 90° /
     /// smaller PiP; camera floated 13–26 fps; LocalPreview EGL 0 frames; GC
@@ -2032,9 +2032,26 @@ object AndroidRTCViewSupport {
 
     fun sharedCaptureEglBase(): EglBase? = sharedCaptureEglBase
 
-    fun rendererLayoutDiagnosticsEnabled(): Boolean {
+    @Volatile
+    private var cachedDebuggable: Boolean? = null
+
+    /// Direct/release APKs are not `FLAG_DEBUGGABLE`. Debug/`Log.d` stays off there.
+    fun verboseNativeLogsEnabled(): Boolean {
+        cachedDebuggable?.let { return it }
         val ctx = ProcessInfo.processInfo.androidContext ?: return false
-        return (ctx.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        val enabled = (ctx.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        cachedDebuggable = enabled
+        return enabled
+    }
+
+    fun logD(tag: String, message: String) {
+        if (verboseNativeLogsEnabled()) {
+            Log.d(tag, message)
+        }
+    }
+
+    fun rendererLayoutDiagnosticsEnabled(): Boolean {
+        return verboseNativeLogsEnabled()
     }
 
     /// Factory RED / TWCC overflow / Unified Plan offerToReceive are not call
@@ -2131,7 +2148,7 @@ object AndroidRTCViewSupport {
         camera2OutputGeneration += 1
         openedPreviewSurface?.release()
         openedPreviewSurface = null
-        Log.i("AndroidRTCClient", "Starting camera capture: ${width}x${height}@${fps}fps")
+        AndroidRTCViewSupport.logD("AndroidRTCClient", "Starting camera capture: ${width}x${height}@${fps}fps")
         capturer.startCapture(width, height, fps)
     }
 
@@ -2232,7 +2249,7 @@ object AndroidRTCViewSupport {
         val restoreWebrtcOnly = camera2SessionNeedsWebrtcOnlyRestore
         camera2SessionNeedsWebrtcOnlyRestore = false
         val wantFps = !lockedOpenedCamera2Fps
-        Log.i(
+        AndroidRTCViewSupport.logD(
             "AndroidRTCClient",
             "applyOpenedCamera2Outputs revision=$LOCAL_PREVIEW_PIPELINE_REVISION " +
                 "wantPreview=$wantPreview hasTexture=${openedPreviewTexture != null} " +
@@ -2313,11 +2330,11 @@ object AndroidRTCViewSupport {
                         lockedOpenedCamera2Fps = true
                         camera2PreviewAttached = previewSurface != null
                         if (previewSurface != null) {
-                            Log.i(
+                            AndroidRTCViewSupport.logD(
                                 "AndroidRTCClient",
                                 "Attached Camera2 preview surface ${bufferWidth}x${bufferHeight}",
                             )
-                            Log.i(
+                            AndroidRTCViewSupport.logD(
                                 "AndroidRTCClient",
                                 "Locked Camera2 AE fps range to [$LOCAL_CAMERA_CAPTURE_FPS:$LOCAL_CAMERA_CAPTURE_FPS]",
                             )
@@ -2326,7 +2343,7 @@ object AndroidRTCViewSupport {
                                 renderer?.markCamera2PreviewAttached()
                             }
                         } else {
-                            Log.i(
+                            AndroidRTCViewSupport.logD(
                                 "AndroidRTCClient",
                                 "Locked Camera2 AE fps range to [$LOCAL_CAMERA_CAPTURE_FPS:$LOCAL_CAMERA_CAPTURE_FPS]",
                             )
@@ -2471,7 +2488,7 @@ object AndroidRTCViewSupport {
                 extraPreview = null,
             )
             lockedOpenedCamera2Fps = true
-            Log.i(
+            AndroidRTCViewSupport.logD(
                 "AndroidRTCClient",
                 "Locked Camera2 AE fps range to [$LOCAL_CAMERA_CAPTURE_FPS:$LOCAL_CAMERA_CAPTURE_FPS]",
             )
@@ -2562,7 +2579,7 @@ object AndroidRTCViewSupport {
         renderer.setNormalizeToUpright(normalizeToUpright)
         renderer.setExtraRotation(extraRotation)
         renderer.setId(android.view.View.generateViewId())
-        Log.d(logTag, "INITIALIZED")
+        AndroidRTCViewSupport.logD(logTag, "INITIALIZED")
         return renderer
     }
 
@@ -2587,7 +2604,7 @@ object AndroidRTCViewSupport {
             view.alpha = 1f
             view.visibility = android.view.View.VISIBLE
         }
-        Log.d(
+        AndroidRTCViewSupport.logD(
             logTag,
             "[CallChromeMinimize] setViewHiddenForCallChromeMinimize hidden=$hidden " +
                 "visibility=${view.visibility} alpha=${view.alpha}"
@@ -2632,18 +2649,18 @@ object AndroidRTCViewSupport {
         return try {
             val callback = object : SurfaceHolder.Callback {
                 override fun surfaceCreated(holder: SurfaceHolder) {
-                    Log.d(logTag, "Surface created")
+                    AndroidRTCViewSupport.logD(logTag, "Surface created")
                     onReady()
                 }
 
                 override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                    Log.d(logTag, "Surface changed: ${width}x${height}")
+                    AndroidRTCViewSupport.logD(logTag, "Surface changed: ${width}x${height}")
                     onDimensionsChanged?.invoke(width, height)
                     onReady()
                 }
 
                 override fun surfaceDestroyed(holder: SurfaceHolder) {
-                    Log.d(logTag, "Surface destroyed")
+                    AndroidRTCViewSupport.logD(logTag, "Surface destroyed")
                     onDestroyed?.invoke()
                 }
             }
@@ -2697,7 +2714,7 @@ object AndroidRTCViewSupport {
     fun addTrackSink(track: RTCVideoTrack, sink: VideoSink, logTag: String, message: String): Boolean {
         return try {
             track.platformTrack.addSink(sink)
-            Log.d(logTag, message)
+            AndroidRTCViewSupport.logD(logTag, message)
             true
         } catch (e: IllegalStateException) {
             Log.w(logTag, "Attempted to attach disposed track: ${e.message}")
@@ -2749,13 +2766,13 @@ object AndroidRTCViewSupport {
             eglBase.eglBaseContext,
             object : RendererCommon.RendererEvents {
                 override fun onFirstFrameRendered() {
-                    Log.d(logTag, "Renderer first frame rendered")
+                    AndroidRTCViewSupport.logD(logTag, "Renderer first frame rendered")
                     notifyRendererFirstFrame(renderer, handlerGeneration)
                     rendererFirstFrameCallback(renderer)?.invoke()
                 }
 
                 override fun onFrameResolutionChanged(width: Int, height: Int, rotation: Int) {
-                    Log.d(logTag, "Renderer resolution: ${width}x${height}, rot=${rotation}")
+                    AndroidRTCViewSupport.logD(logTag, "Renderer resolution: ${width}x${height}, rot=${rotation}")
                     noteRendererFrameResolution(renderer, width, height, rotation)
                 }
             }
@@ -4047,7 +4064,7 @@ class AndroidFrameCryptorSupport {
         }
 
         if (videoSenderCryptor != null) {
-            Log.i("AndroidRTCClient", "Video sender cryptor already attached; keeping live cryptor")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "Video sender cryptor already attached; keeping live cryptor")
         } else if (videoSender != null) {
             videoSenderCryptor = createSenderCryptor(
                 factory = factory,
@@ -4056,11 +4073,11 @@ class AndroidFrameCryptorSupport {
                 provider = provider,
                 tag = "video-sender"
             )
-            Log.i("AndroidRTCClient", "✅ Video sender cryptor attached")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "✅ Video sender cryptor attached")
         }
 
         if (audioSenderCryptor != null) {
-            Log.i("AndroidRTCClient", "Audio sender cryptor already attached; keeping live cryptor")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "Audio sender cryptor already attached; keeping live cryptor")
         } else if (audioSender != null) {
             audioSenderCryptor = createSenderCryptor(
                 factory = factory,
@@ -4069,7 +4086,7 @@ class AndroidFrameCryptorSupport {
                 provider = provider,
                 tag = "audio-sender"
             )
-            Log.i("AndroidRTCClient", "✅ Audio sender cryptor attached")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "✅ Audio sender cryptor attached")
         }
     }
 
@@ -4109,7 +4126,7 @@ class AndroidFrameCryptorSupport {
             provider = provider,
             tag = "screen-sender"
         )
-        Log.i("AndroidRTCClient", "✅ Screen sender cryptor attached (trackId=${sender.track()?.id() ?: "unknown"})")
+        AndroidRTCViewSupport.logD("AndroidRTCClient", "✅ Screen sender cryptor attached (trackId=${sender.track()?.id() ?: "unknown"})")
     }
 
     @Synchronized
@@ -4193,13 +4210,13 @@ class AndroidFrameCryptorSupport {
             )
         ) {
             videoReceiverCryptor = existingCryptor
-            Log.i("AndroidRTCClient", "Video receiver cryptor already attached for '$participant' receiverKey=$receiverKey trackId=$trackId; keeping live cryptor")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "Video receiver cryptor already attached for '$participant' receiverKey=$receiverKey trackId=$trackId; keeping live cryptor")
             return
         }
 
         existingCryptor?.dispose()
         if (existingCryptor != null) {
-            Log.i("AndroidRTCClient", "Rebinding video receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$receiverKey newTrackId=$trackId")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "Rebinding video receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$receiverKey newTrackId=$trackId")
         }
 
         val cryptor = FrameCryptorFactory.createFrameCryptorForRtpReceiver(
@@ -4216,7 +4233,7 @@ class AndroidFrameCryptorSupport {
             videoReceiverKeysByParticipantId[participant] = receiverKey
             videoReceiverTrackIdsByParticipantId[participant] = trackId
             videoReceiverCryptor = cryptor
-            Log.i("AndroidRTCClient", "✅ Video receiver cryptor attached receiverKey=$receiverKey trackId=$trackId")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "✅ Video receiver cryptor attached receiverKey=$receiverKey trackId=$trackId")
         }
     }
 
@@ -4240,14 +4257,14 @@ class AndroidFrameCryptorSupport {
             audioReceiverCryptor = existingCryptor
             audioReceiverKeysByParticipantId[participant] = receiverKey
             enableAndroidRemoteAudioReceiverTrack(receiver)
-            Log.i("AndroidRTCClient", "Audio receiver cryptor already attached for '$participant' receiverKey=$receiverKey trackId=$trackId; keeping live cryptor")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "Audio receiver cryptor already attached for '$participant' receiverKey=$receiverKey trackId=$trackId; keeping live cryptor")
             return
         }
 
         holdAndroidRemoteAudioReceiverTrack(receiver)
         existingCryptor?.dispose()
         if (existingCryptor != null) {
-            Log.i("AndroidRTCClient", "Rebinding audio receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$receiverKey newTrackId=$trackId")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "Rebinding audio receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$receiverKey newTrackId=$trackId")
         }
 
         var cryptor: FrameCryptor? = null
@@ -4267,7 +4284,7 @@ class AndroidFrameCryptorSupport {
                 audioReceiverTrackIdsByParticipantId[participant] = trackId
                 audioReceiverCryptor = cryptor
                 enableAndroidRemoteAudioReceiverTrack(receiver)
-                Log.i("AndroidRTCClient", "✅ Audio receiver cryptor attached receiverKey=$receiverKey trackId=$trackId")
+                AndroidRTCViewSupport.logD("AndroidRTCClient", "✅ Audio receiver cryptor attached receiverKey=$receiverKey trackId=$trackId")
             }
         } finally {
             if (cryptor == null) {
@@ -4310,13 +4327,13 @@ class AndroidFrameCryptorSupport {
             )
         ) {
             screenReceiverCryptor = existingCryptor
-            Log.i("AndroidRTCClient", "Screen receiver cryptor already attached for '$participant' receiverKey=$receiverKey trackId=$trackId; keeping live cryptor")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "Screen receiver cryptor already attached for '$participant' receiverKey=$receiverKey trackId=$trackId; keeping live cryptor")
             return
         }
 
         existingCryptor?.dispose()
         if (existingCryptor != null) {
-            Log.i("AndroidRTCClient", "Rebinding screen receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$receiverKey newTrackId=$trackId")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "Rebinding screen receiver cryptor for '$participant' oldReceiverKey=${existingReceiverKey ?: "<nil>"} oldTrackId=${existingTrackId ?: "<nil>"} newReceiverKey=$receiverKey newTrackId=$trackId")
         }
 
         val cryptor = FrameCryptorFactory.createFrameCryptorForRtpReceiver(
@@ -4333,7 +4350,7 @@ class AndroidFrameCryptorSupport {
             screenReceiverKeysByParticipantId[participant] = receiverKey
             screenReceiverTrackIdsByParticipantId[participant] = trackId
             screenReceiverCryptor = cryptor
-            Log.i("AndroidRTCClient", "✅ Screen receiver cryptor attached receiverKey=$receiverKey trackId=$trackId")
+            AndroidRTCViewSupport.logD("AndroidRTCClient", "✅ Screen receiver cryptor attached receiverKey=$receiverKey trackId=$trackId")
         }
     }
 
@@ -4649,7 +4666,7 @@ class LocalPreviewTextureRenderer(
             eglRenderer.init(eglBase.eglBaseContext, EglBase.CONFIG_RGBA, roundedDrawer)
             eglReady = true
         }
-        Log.i(
+        AndroidRTCViewSupport.logD(
             "AndroidPreviewCaptureView",
             "LocalPreviewInitializing EglRenderer revision=" +
                 AndroidRTCViewSupport.LOCAL_PREVIEW_PIPELINE_REVISION +
@@ -4677,7 +4694,7 @@ class LocalPreviewTextureRenderer(
         if (isReady()) {
             onReady?.invoke()
         }
-        Log.i(
+        AndroidRTCViewSupport.logD(
             "AndroidPreviewCaptureView",
             "Local preview EGL rebound sharedEgl=true compositor=SurfaceView corner=GlRoundedRect",
         )
@@ -4708,7 +4725,7 @@ class LocalPreviewTextureRenderer(
         val next = cornerRadiusDp * density
         if (kotlin.math.abs(roundedDrawer.radiusPx - next) > 0.5f) {
             roundedDrawer.radiusPx = next
-            Log.i(
+            AndroidRTCViewSupport.logD(
                 "AndroidPreviewCaptureView",
                 "LocalPreview surface cornerRadiusPx=$next via=GlRoundedRect",
             )
@@ -4722,7 +4739,7 @@ class LocalPreviewTextureRenderer(
         roundedDrawer.soften = if (enabled) 1f else 0f
         if (loggedGlSoften != enabled) {
             loggedGlSoften = enabled
-            Log.i(
+            AndroidRTCViewSupport.logD(
                 "AndroidPreviewCaptureView",
                 "LocalPreview glSoften=$enabled via=GlRoundedRect",
             )
@@ -4743,7 +4760,7 @@ class LocalPreviewTextureRenderer(
     }
 
     fun releaseRenderer() {
-        Log.i("AndroidPreviewCaptureView", "LocalPreviewTextureRenderer.releaseRenderer eglReady=$eglReady")
+        AndroidRTCViewSupport.logD("AndroidPreviewCaptureView", "LocalPreviewTextureRenderer.releaseRenderer eglReady=$eglReady")
         AndroidRTCViewSupport.unregisterLocalPreviewCameraSurface(this)
         try {
             eglRenderer.release()
@@ -4773,7 +4790,7 @@ class LocalPreviewTextureRenderer(
                 is VideoFrame.I420Buffer -> "I420"
                 else -> frame.buffer.javaClass.simpleName
             }
-            Log.i(
+            AndroidRTCViewSupport.logD(
                 "AndroidPreviewCaptureView",
                 "LocalPreview first frame buffer=$kind rotation=${frame.rotation} " +
                     "${frame.buffer.width}x${frame.buffer.height}",
@@ -4860,7 +4877,7 @@ class AndroidPreviewCaptureViewNative(
     }
 
     fun initializePreview(eglBase: EglBase, mirror: Boolean) {
-        Log.i(
+        AndroidRTCViewSupport.logD(
             "AndroidPreviewCaptureView",
             "initializePreview sidecar revision=" +
                 AndroidRTCViewSupport.LOCAL_PREVIEW_PIPELINE_REVISION,
@@ -4917,7 +4934,7 @@ class AndroidPreviewCaptureViewNative(
         released = true
         try {
             if (client.removeRendererIfTracked(surfaceViewRenderer)) {
-                Log.i(
+                AndroidRTCViewSupport.logD(
                     "AndroidPreviewCaptureView",
                     "unregistered leftover local SurfaceView from client",
                 )
@@ -4968,7 +4985,7 @@ class AndroidPreviewCaptureViewNative(
         // isReady() left Device3 at LocalPreview 0 fps (`Texture not ready, queued`)
         // while the camera ran at 15. EGL drops until the surface exists.
         bindLocalPreviewCaptureFanout()
-        Log.i(
+        AndroidRTCViewSupport.logD(
             "AndroidPreviewCaptureView",
             "Bound local preview to capturer fanout (not VideoTrack sink)"
         )
@@ -5074,7 +5091,7 @@ class AndroidSampleCaptureViewNative(
                     logTag = "AndroidSampleCaptureView"
                 )
             }
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "[CallChromeMinimize] setHidden hidden=$hidden participant=$rendererParticipantLabel onMainThread=$onMainThread"
             )
@@ -5099,7 +5116,7 @@ class AndroidSampleCaptureViewNative(
         if (!sinkMatchesCurrentRendererGeneration()) return
         hasRenderedFirstFrameSinceSinkAttach = true
         lastAttachedTrackId?.let { everConfirmedFirstFrameTrackId = it }
-        Log.d(
+        AndroidRTCViewSupport.logD(
             "AndroidSampleCaptureView",
             "Confirmed first rendered frame participant=$rendererParticipantLabel trackId=${lastAttachedTrackId ?: "<unknown>"} " +
                 "rendererGen=$rendererGeneration handlerGen=$firstFrameHandlerGeneration trigger=$trigger"
@@ -5145,7 +5162,7 @@ class AndroidSampleCaptureViewNative(
                 return@runOnMainThreadSync false
             }
             if (!AndroidRTCViewSupport.isLiveVideoTrack(track)) return@runOnMainThreadSync false
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "Forcing renderer EGL reinit before first frame participant=$rendererParticipantLabel " +
                     "trackId=${lastAttachedTrackId ?: trackIdOrNull(track) ?: "<unknown>"} " +
@@ -5170,7 +5187,7 @@ class AndroidSampleCaptureViewNative(
                 return@runOnMainThreadSync false
             }
             if (!AndroidRTCViewSupport.isLiveVideoTrack(track)) return@runOnMainThreadSync false
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "Forcing renderer EGL reinit after stale frames participant=$rendererParticipantLabel " +
                     "trackId=${lastAttachedTrackId ?: trackIdOrNull(track) ?: "<unknown>"} " +
@@ -5269,7 +5286,7 @@ class AndroidSampleCaptureViewNative(
         if (releaseRendererHere) {
             AndroidRTCViewSupport.releaseRenderer(surfaceViewRenderer, "AndroidSampleCaptureView")
         } else {
-            Log.i(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "renderer already released by client reset or never initialized",
             )
@@ -5308,7 +5325,7 @@ class AndroidSampleCaptureViewNative(
 
     private fun onEglFirstFrameRenderedOnMainThread(handlerGeneration: Int) {
         if (handlerGeneration != firstFrameHandlerGeneration) {
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "Ignored stale EGL first-frame callback participant=$rendererParticipantLabel handlerGen=$handlerGeneration current=$firstFrameHandlerGeneration " +
                     "rendererGen=$rendererGeneration sinkGen=$sinkBoundGeneration trackId=${lastAttachedTrackId ?: "<unknown>"}"
@@ -5316,7 +5333,7 @@ class AndroidSampleCaptureViewNative(
             return
         }
         if (!sinkMatchesCurrentRendererGeneration()) {
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "Ignored EGL first-frame callback for mismatched sink generation participant=$rendererParticipantLabel " +
                     "rendererGen=$rendererGeneration sinkGen=$sinkBoundGeneration trackId=${lastAttachedTrackId ?: "<unknown>"}"
@@ -5378,7 +5395,7 @@ class AndroidSampleCaptureViewNative(
 
     private fun requestPendingLiveWrapperRebindOnMainThread() {
         pendingLiveWrapperRebindRequested = true
-        Log.d(
+        AndroidRTCViewSupport.logD(
             "AndroidSampleCaptureView",
             "Deferred live wrapper rebind until stale wrapper stops delivering frames " +
                 "participant=$rendererParticipantLabel trackId=${lastAttachedTrackId ?: "<unknown>"}"
@@ -5398,7 +5415,7 @@ class AndroidSampleCaptureViewNative(
         }
         pendingLiveWrapperRebindRequested = false
         val stale = attachedTrack
-        Log.d(
+        AndroidRTCViewSupport.logD(
             "AndroidSampleCaptureView",
             "Applying deferred live wrapper rebind after stale wrapper stopped delivering frames " +
                 "participant=$rendererParticipantLabel trackId=${trackIdOrNull(track) ?: lastAttachedTrackId ?: "<unknown>"}"
@@ -5407,7 +5424,7 @@ class AndroidSampleCaptureViewNative(
             !AndroidRTCViewSupport.isLiveVideoTrack(stale) &&
             shouldRebindSameTrackIdStaleWrapper(trackIdOrNull(track), lastAttachedTrackId)
         ) {
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "Applying deferred live wrapper rebind via EGL reinit " +
                     "participant=$rendererParticipantLabel trackId=${trackIdOrNull(track) ?: lastAttachedTrackId ?: "<unknown>"}"
@@ -5683,7 +5700,7 @@ class AndroidSampleCaptureViewNative(
         } else {
             ""
         }
-        Log.d(
+        AndroidRTCViewSupport.logD(
             "AndroidSampleCaptureView",
             "Renderer layout [$reason]$transition ${rendererAttachDiagnosticSummaryOnMainThread()}"
         )
@@ -5940,7 +5957,7 @@ class AndroidSampleCaptureViewNative(
             return false
         }
         if (!AndroidRTCViewSupport.isLiveVideoTrack(previousTrack)) {
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "Rebinding renderer sink after dead wrapper refresh requires renderer surface reinit " +
                     "participant=$rendererParticipantLabel trackId=${lastAttachedTrackId ?: trackIdOrNull(track) ?: "<unknown>"} " +
@@ -5960,7 +5977,7 @@ class AndroidSampleCaptureViewNative(
             return false
         }
         if (sinkRebindRequiresEglReinit(reason)) {
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "Rebinding renderer sink after $reason requires renderer surface reinit " +
                     "participant=$rendererParticipantLabel trackId=${lastAttachedTrackId ?: trackIdOrNull(track) ?: "<unknown>"} " +
@@ -5973,7 +5990,7 @@ class AndroidSampleCaptureViewNative(
             return reinitializeRendererSurfaceForLayoutChange()
         }
 
-        Log.d(
+        AndroidRTCViewSupport.logD(
             "AndroidSampleCaptureView",
             "Rebinding renderer sink after $reason with sink-only swap " +
                 "participant=$rendererParticipantLabel trackId=${lastAttachedTrackId ?: trackIdOrNull(track) ?: "<unknown>"} " +
@@ -6485,7 +6502,7 @@ class AndroidSampleCaptureViewNative(
     private fun removeStaleRendererSinkIfNeeded(): RTCVideoTrack? {
         val staleTrack = attachedTrack ?: return null
         if (AndroidRTCViewSupport.isLiveVideoTrack(staleTrack)) return null
-        Log.d(
+        AndroidRTCViewSupport.logD(
             "AndroidSampleCaptureView",
             "Removing stale renderer sink during attach trackId=${lastAttachedTrackId ?: trackIdOrNull(staleTrack) ?: "<unknown>"}"
         )
@@ -6628,7 +6645,7 @@ class AndroidSampleCaptureViewNative(
     }
 
     fun noteIdlePoolFactorySkippedEgl() {
-        Log.i(
+        AndroidRTCViewSupport.logD(
             "AndroidSampleCaptureView",
             "egl_init_idle_pool_factory_skipped participant=$rendererParticipantLabel",
         )
@@ -6734,13 +6751,13 @@ class AndroidSampleCaptureViewNative(
                         requestPendingLiveWrapperRebindOnMainThread()
                         return hasActiveSinkOnMainThread()
                     }
-                    Log.d(
+                    AndroidRTCViewSupport.logD(
                         "AndroidSampleCaptureView",
                         "Skipping stale-frame defer; confirmed frames require live wrapper EGL swap " +
                             "participant=$rendererParticipantLabel trackId=${reboundTrackId ?: "<unknown>"}"
                     )
                 }
-                Log.d(
+                AndroidRTCViewSupport.logD(
                     "AndroidSampleCaptureView",
                     "Rebinding live wrapper via EGL reinit after stale wrapper rotation " +
                         "participant=$rendererParticipantLabel trackId=${reboundTrackId ?: "<unknown>"} " +
@@ -6795,7 +6812,7 @@ class AndroidSampleCaptureViewNative(
                 return hasActiveSinkOnMainThread()
             }
             if (isSurfaceReady()) {
-                Log.d(
+                AndroidRTCViewSupport.logD(
                     "AndroidSampleCaptureView",
                     "Rebinding renderer sink after SFU track wrapper refresh trackId=${lastAttachedTrackId ?: incomingTrackId ?: "<unknown>"}"
                 )
@@ -6825,7 +6842,7 @@ class AndroidSampleCaptureViewNative(
             rememberAttachedTrackId(track)
             pendingTrack = null
             surfaceReadyRetry = null
-            Log.d("AndroidSampleCaptureView", "Track already attached - surface ready")
+            AndroidRTCViewSupport.logD("AndroidSampleCaptureView", "Track already attached - surface ready")
             val width = surfaceViewRenderer.width
             val height = surfaceViewRenderer.height
             if (requiresRendererEglReinitForLayout(lastRendererWidth, lastRendererHeight, width, height)) {
@@ -6843,7 +6860,7 @@ class AndroidSampleCaptureViewNative(
             AndroidRTCViewSupport.isLiveVideoTrack(track) &&
             AndroidRemoteVideoTrackAttachPolicy.tracksShareRendererSinkSource(attached, track)
         ) {
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "Rebinding renderer sink after inactive sink state trackId=${lastAttachedTrackId ?: incomingTrackId ?: "<unknown>"}"
             )
@@ -6864,7 +6881,7 @@ class AndroidSampleCaptureViewNative(
             rememberAttachedTrackId(track)
             pendingTrack = null
             surfaceReadyRetry = null
-            Log.d(
+            AndroidRTCViewSupport.logD(
                 "AndroidSampleCaptureView",
                 "Track sink already bound - waiting for first rendered frame trackId=${lastAttachedTrackId ?: incomingTrackId ?: "<unknown>"}"
             )
@@ -6907,7 +6924,7 @@ class AndroidSampleCaptureViewNative(
         rendererHasSink = false
         hasRenderedFirstFrameSinceSinkAttach = false
         logRendererLayoutState("attach_queued_surface_not_ready trackId=${incomingTrackId ?: "<unknown>"}")
-        Log.d("AndroidSampleCaptureView", "Surface not ready, queued track for later attachment")
+        AndroidRTCViewSupport.logD("AndroidSampleCaptureView", "Surface not ready, queued track for later attachment")
         AndroidRTCViewSupport.postToMainThread { reconcileAttachedSinkAfterSurfaceEvent() }
         return false
     }

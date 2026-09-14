@@ -181,9 +181,12 @@ extension RTCSession {
             }
             
             let mode: AVAudioSession.Mode = supportsVideo ? .videoChat : .voiceChat
-            try audioSession.setCategory(.playAndRecord)
-            try audioSession.setMode(mode)
-            
+            pinWebRTCAudioConfiguration(mode: mode)
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: mode,
+                options: callAudioCategoryOptions(for: mode)
+            )
             logger.log(level: .info, message: "Successfully configured audio session mode=\(mode.rawValue)")
             
         } catch {
@@ -267,30 +270,40 @@ extension RTCSession {
             // The IOThread then exits and outbound/inbound audio packets stay at zero
             // even though video continues to flow. To avoid this, only mutate the
             // session when the requested values differ from the current ones.
+            pinWebRTCAudioConfiguration(mode: mode)
+            let desiredOptions = callAudioCategoryOptions(for: mode)
             let categoryNeedsUpdate = audioSession.category != desiredCategory.rawValue
             let modeNeedsUpdate = audioSession.mode != mode.rawValue
-            if categoryNeedsUpdate || modeNeedsUpdate {
-                try audioSession.setCategory(desiredCategory, mode: mode)
+            let optionsNeedUpdate = audioSession.categoryOptions != desiredOptions
+                || audioSession.categoryOptions.contains(.defaultToSpeaker)
+            if categoryNeedsUpdate || modeNeedsUpdate || optionsNeedUpdate {
+                try audioSession.setCategory(desiredCategory, mode: mode, options: desiredOptions)
             }
 
-            // Log current state
             logger.log(level: .info, message: "Current audio session category: \(audioSession.category)")
             logger.log(level: .info, message: "Current audio session mode: \(audioSession.mode)")
+            logger.log(
+                level: .info,
+                message: "Current audio session options defaultToSpeaker=\(audioSession.categoryOptions.contains(.defaultToSpeaker))"
+            )
 
-            // Output port: only override when the route doesn't already match the
-            // desired override. Calling `overrideOutputAudioPort` while the audio
-            // unit is starting is the most common trigger for the `'what'` error
-            // above, so it must remain idempotent.
             let currentOutputs = audioSession.currentRoute.outputs.map(\.portType)
             let isCurrentlyOnSpeaker = currentOutputs.contains(.builtInSpeaker)
-            if mode == .videoChat {
-                if !isCurrentlyOnSpeaker {
-                    try audioSession.overrideOutputAudioPort(.speaker)
-                }
-            } else {
-                if isCurrentlyOnSpeaker {
-                    try audioSession.overrideOutputAudioPort(.none)
-                }
+            let usingHeadset = Self.routeHasExternalCallOutput(currentOutputs)
+            if usingHeadset {
+                try audioSession.overrideOutputAudioPort(.none)
+                logger.log(level: .info, message: "Call audio using external headset mode=\(mode.rawValue)")
+            } else if mode == .videoChat {
+                // Speaker is the port override only. Do not use `.defaultToSpeaker`:
+                // that option latches and the next VoiceChat stays on speaker
+                // (Device2 09:07 after VideoChat).
+                try audioSession.overrideOutputAudioPort(.speaker)
+                logger.log(level: .info, message: "VideoChat speaker override applied")
+            } else if mode == .voiceChat {
+                try audioSession.overrideOutputAudioPort(.none)
+                logger.log(level: .info, message: "VoiceChat earpiece override applied")
+            } else if isCurrentlyOnSpeaker {
+                try audioSession.overrideOutputAudioPort(.none)
             }
 
             // Only activate if it wasn't already active
@@ -333,6 +346,44 @@ extension RTCSession {
 
         logger.log(level: .info, message: "Successfully activated audio session (preserving category/mode)")
     }
+
+    /// Never include `.defaultToSpeaker`. Video speaker is `overrideOutputAudioPort(.speaker)`.
+    /// WebRTC's stock config re-adds that option when the audio unit starts and leaves
+    /// the next 1:1 voice call on speaker.
+    nonisolated func callAudioCategoryOptions(for mode: AVAudioSession.Mode) -> AVAudioSession.CategoryOptions {
+        var options = audioSession.categoryOptions
+        options.remove(.defaultToSpeaker)
+        if mode == .videoChat || mode == .voiceChat {
+            options.insert(.allowBluetoothHFP)
+        }
+        return options
+    }
+
+    nonisolated func pinWebRTCAudioConfiguration(mode: AVAudioSession.Mode) {
+        let config = RTCAudioSessionConfiguration.webRTC()
+        config.category = AVAudioSession.Category.playAndRecord.rawValue
+        config.mode = mode.rawValue
+        var options = config.categoryOptions
+        options.remove(.defaultToSpeaker)
+        options.insert(.allowBluetoothHFP)
+        config.categoryOptions = options
+        RTCAudioSessionConfiguration.setWebRTC(config)
+    }
+
+    public nonisolated static func currentRouteHasExternalCallOutput() -> Bool {
+        routeHasExternalCallOutput(AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType))
+    }
+
+    public nonisolated static func routeHasExternalCallOutput(_ outputs: [AVAudioSession.Port]) -> Bool {
+        outputs.contains {
+            $0 == .bluetoothA2DP
+                || $0 == .bluetoothHFP
+                || $0 == .bluetoothLE
+                || $0 == .headphones
+                || $0 == .airPlay
+                || $0 == .carAudio
+        }
+    }
     
     /// Deactivates the audio session with proper error handling
     /// - Parameter session: The AVAudioSession to deactivate
@@ -356,6 +407,16 @@ extension RTCSession {
         isAudioActivated = false
         audioSession.audioSessionDidDeactivate(session)
         audioSession.isAudioEnabled = false
+        try? audioSession.overrideOutputAudioPort(.none)
+        if audioSession.categoryOptions.contains(.defaultToSpeaker) {
+            var options = audioSession.categoryOptions
+            options.remove(.defaultToSpeaker)
+            try? audioSession.setCategory(
+                AVAudioSession.Category.playAndRecord,
+                mode: .voiceChat,
+                options: options
+            )
+        }
         
         logger.log(level: .info, message: "Successfully deactivated audio session")
     }

@@ -38,8 +38,6 @@ object AndroidCallChromeNativeSupport {
     private val tileTapHandlers = LinkedHashMap<String, () -> Unit>()
 
     private var hitLayer: CallChromeHitLayer? = null
-    private var hitLayerParent: ViewGroup? = null
-    private var keepHitLayerFrontListener: ViewGroup.OnHierarchyChangeListener? = null
     private var activityTouchSession: DragSession? = null
     private var swallowUnderlyingTouches = false
 
@@ -73,24 +71,38 @@ object AndroidCallChromeNativeSupport {
      */
     fun registerControlExclusion(key: String, view: View) {
         controlExclusions[key] = view
-        Log.i(
+        AndroidRTCViewSupport.logD(
             TAG,
             "exclusion attached key=$key ${view.width}x${view.height}",
         )
         if (view.width <= 0 || view.height <= 0) {
-            view.addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
-                val width = right - left
-                val height = bottom - top
-                if (width > 0 && height > 0) {
-                    Log.i(TAG, "exclusion laid out key=$key ${width}x${height}")
+            val listener = object : View.OnLayoutChangeListener {
+                override fun onLayoutChange(
+                    v: View,
+                    left: Int,
+                    top: Int,
+                    right: Int,
+                    bottom: Int,
+                    oldLeft: Int,
+                    oldTop: Int,
+                    oldRight: Int,
+                    oldBottom: Int,
+                ) {
+                    val width = right - left
+                    val height = bottom - top
+                    if (width > 0 && height > 0) {
+                        v.removeOnLayoutChangeListener(this)
+                        AndroidRTCViewSupport.logD(TAG, "exclusion laid out key=$key ${width}x${height}")
+                    }
                 }
             }
+            view.addOnLayoutChangeListener(listener)
         }
     }
 
     fun detachControlExclusion(key: String) {
         if (controlExclusions.remove(key) != null) {
-            Log.i(TAG, "exclusion detached key=$key")
+            AndroidRTCViewSupport.logD(TAG, "exclusion detached key=$key")
         }
     }
 
@@ -132,7 +144,7 @@ object AndroidCallChromeNativeSupport {
         dragSessions[key] = session
         session.attach()
         ensureHitLayer(seed)
-        Log.i(
+        AndroidRTCViewSupport.logD(
             TAG,
             "attached key=$key enableTap=$enableTap edgePx=${edgePx.toInt()} " +
                 "seed=${seed.width}x${seed.height}",
@@ -142,7 +154,7 @@ object AndroidCallChromeNativeSupport {
     fun resetNativeCallChromeDrag(key: String) {
         val session = dragSessions[key] ?: return
         session.resetTranslation()
-        Log.i(TAG, "reset key=$key")
+        AndroidRTCViewSupport.logD(TAG, "reset key=$key")
     }
 
     fun detachNativeCallChromeDrag(key: String, seed: View? = null) {
@@ -212,7 +224,7 @@ object AndroidCallChromeNativeSupport {
                 return session.handleTouch(event)
             }
             if (hitsControlExclusion(event.rawX, event.rawY)) {
-                Log.i(
+                AndroidRTCViewSupport.logD(
                     TAG,
                     "down ignored over call chrome raw=${event.rawX.toInt()},${event.rawY.toInt()}",
                 )
@@ -220,7 +232,7 @@ object AndroidCallChromeNativeSupport {
             }
             if (shouldSwallowUnderlyingContentTouches()) {
                 swallowUnderlyingTouches = true
-                Log.i(
+                AndroidRTCViewSupport.logD(
                     TAG,
                     "down swallowed over call surface raw=${event.rawX.toInt()},${event.rawY.toInt()}",
                 )
@@ -330,7 +342,6 @@ object AndroidCallChromeNativeSupport {
         removeHitLayer()
         val layer = CallChromeHitLayer(activity)
         hitLayer = layer
-        hitLayerParent = content
         content.addView(
             layer,
             ViewGroup.LayoutParams(
@@ -338,43 +349,19 @@ object AndroidCallChromeNativeSupport {
                 ViewGroup.LayoutParams.MATCH_PARENT,
             ),
         )
-        val listener = object : ViewGroup.OnHierarchyChangeListener {
-            override fun onChildViewAdded(parent: View, child: View) {
-                val overlay = hitLayer ?: return
-                if (child === overlay) return
-                overlay.post { bringHitLayerToFrontIfNeeded() }
-            }
-
-            override fun onChildViewRemoved(parent: View, child: View) {}
-        }
-        keepHitLayerFrontListener = listener
-        content.setOnHierarchyChangeListener(listener)
-        Log.i(TAG, "hit layer attached")
-    }
-
-    private fun bringHitLayerToFrontIfNeeded() {
-        val parent = hitLayerParent ?: return
-        val overlay = hitLayer ?: return
-        if (overlay.parent === parent &&
-            parent.childCount > 0 &&
-            parent.getChildAt(parent.childCount - 1) !== overlay
-        ) {
-            overlay.bringToFront()
-        }
+        // Elevation already keeps the layer above Compose. `bringToFront()` on
+        // every `android.R.id.content` child add remasured the full window
+        // (SurfaceViews + chat) and restarted leftover PerformTraversals
+        // (Device3 pid 25788: settled quiet ~96s, then metronomic Davey).
+        AndroidRTCViewSupport.logD(TAG, "hit layer attached")
     }
 
     private fun removeHitLayer() {
-        val parent = hitLayerParent
-        if (parent != null && keepHitLayerFrontListener != null) {
-            parent.setOnHierarchyChangeListener(null)
-        }
-        keepHitLayerFrontListener = null
         val layer = hitLayer
         (layer?.parent as? ViewGroup)?.removeView(layer)
         hitLayer = null
-        hitLayerParent = null
         if (layer != null) {
-            Log.i(TAG, "hit layer detached")
+            AndroidRTCViewSupport.logD(TAG, "hit layer detached")
         }
     }
 
@@ -684,7 +671,7 @@ object AndroidCallChromeNativeSupport {
                     cacheDragLimits()
                     target.setLayerType(View.LAYER_TYPE_HARDWARE, null)
                     disallowParentIntercept(true)
-                    Log.i(
+                    AndroidRTCViewSupport.logD(
                         TAG,
                         "down key=$key raw=${event.rawX.toInt()},${event.rawY.toInt()} " +
                             "target=${target.width}x${target.height}",
@@ -736,7 +723,7 @@ object AndroidCallChromeNativeSupport {
                 Log.w(TAG, "tap key=$key ignored (no handler)")
                 return
             }
-            Log.i(TAG, "tap key=$key")
+            AndroidRTCViewSupport.logD(TAG, "tap key=$key")
             handler.invoke()
         }
 
@@ -826,7 +813,7 @@ object AndroidCallChromeNativeSupport {
             val clamped = clampTranslation(destTx, destTy) ?: return
             committedTx = clamped.first
             committedTy = clamped.second
-            Log.i(
+            AndroidRTCViewSupport.logD(
                 TAG,
                 "snap key=$key corner=${if (centerX < midX) "leading" else "trailing"}-" +
                     "${if (centerY < midY) "top" else "bottom"}",
@@ -879,7 +866,7 @@ object AndroidCallChromeNativeSupport {
             !isNearlyFullScreen(parent) &&
             isCallChromeTileSize(parent)
         ) {
-            Log.i(
+            AndroidRTCViewSupport.logD(
                 TAG,
                 "tile target ${parent.width}x${parent.height} from seed ${seed.width}x${seed.height}",
             )

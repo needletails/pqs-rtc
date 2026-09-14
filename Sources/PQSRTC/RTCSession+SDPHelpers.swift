@@ -1147,13 +1147,13 @@ extension RTCSession {
             
             let client: AndroidRTCClient = self.rtcClient
             
-            // SKIP INSERT: android.util.Log.d("AndroidRTCClient", "Android: Starting createOffer in SDPHandler")
-            // SKIP INSERT: android.util.Log.d("AndroidRTCClient", "Android: Connection ID: " + connection.id)
+            // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Android: Starting createOffer in SDPHandler")
+            // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Android: Connection ID: " + connection.id)
             
             let description: RTCSessionDescription = try await client.createOffer(constraints: constraints)
             
-            // SKIP INSERT: android.util.Log.d("AndroidRTCClient", "Android: createOffer completed in SDPHandler")
-            // SKIP INSERT: android.util.Log.d("AndroidRTCClient", "Android Offer SDP:\n" + description.sdp)
+            // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Android: createOffer completed in SDPHandler")
+            // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Android Offer SDP:\n" + description.sdp)
             
             self.logger.log(level: .info, message: "Android Offer SDP summary connection=\(connection.id): \(RTCSdpDiagnostics.summary(description.sdp))")
             
