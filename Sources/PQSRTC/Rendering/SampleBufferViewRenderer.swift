@@ -93,8 +93,8 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     // MARK: - Properties
     private var streamTask: Task<Void, Error>?
     private let metalProcessor = MetalProcessor()
-    private let logger: NeedleTailLogger
-    let rtcVideoRenderWrapper: RTCVideoRenderWrapper
+    nonisolated private let logger: NeedleTailLogger
+    nonisolated let rtcVideoRenderWrapper: RTCVideoRenderWrapper
     private let layerBox: SampleBufferDisplayLayerBox
     private let ciContext: CIContext
     private let rendersScreenShare: Bool
@@ -427,14 +427,14 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                     // - if frames are not arriving for > 1500ms, warn
                     // - if frames arrive but enqueue stalls for > 1500ms, warn
                     if snap.cbAgeMs > 1500 || (snap.cbAgeMs >= 0 && snap.enqAgeMs > 1500) {
-                        await self.logger.log(
+                        self.logger.log(
                             level: .warning,
                             message: "Render telemetry: lastFrameCallbackMsAgo=\(snap.cbAgeMs) lastEnqueueMsAgo=\(snap.enqAgeMs) lastOutputMsAgo=\(snap.outputAgeMs) received=\(snap.received) enqueued=\(snap.enqueued) dropped=\(snap.dropped) pauseMetal=\(snap.pauseMetal) layerStatus=\(snap.layerStatusRaw)"
                         )
                     } else if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled,
                               snap.received > 0, snap.received % 600 == 0 {
                         // Roughly every ~20s at 30fps.
-                        await self.logger.log(
+                        self.logger.log(
                             level: .trace,
                             message: "Render telemetry: OK received=\(snap.received) enqueued=\(snap.enqueued) dropped=\(snap.dropped)"
                         )
@@ -537,6 +537,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 continuation.finish()
                 return
             }
+            let logger = self.logger
             
             self.streamContinuation = continuation
             
@@ -547,10 +548,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 // First-frame callback signal (runs on WebRTC callback thread).
                 if PQSRTCDiagnostics.remoteVideoTraceLoggingEnabled, self.didLogFirstFrameCallback == false {
                     self.didLogFirstFrameCallback = true
-                    Task { [weak self] in
-                        guard let self else { return }
-                        await self.logger.log(level: .trace, message: "First remote video frame received by renderer callback")
-                    }
+                    logger.log(level: .trace, message: "First remote video frame received by renderer callback")
                 }
                 
                 if let packet = packet {
@@ -599,7 +597,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         let enqAgeMs = ageMsSince(lastEnq)
         let lastOut = lastSuccessfulRemoteVideoOutputUptimeNs
         let outputAgeMs = ageMsSince(lastOut)
-        let statusRaw = await MainActor.run { layerBox.layer.status.rawValue }
+        let statusRaw = await MainActor.run { layerBox.layer.sampleBufferRenderer.status.rawValue }
         return TelemetrySnapshot(
             cbAgeMs: cbAgeMs,
             enqAgeMs: enqAgeMs,
@@ -624,7 +622,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
                 let elapsedMs = Int64((now - since) / 1_000_000)
                 if elapsedMs > 5_000, now &- lastLogRemoteExpectedNoCallbacksUptimeNs >= 8_000_000_000 {
                     lastLogRemoteExpectedNoCallbacksUptimeNs = now
-                    await logger.log(
+                    logger.log(
                         level: .warning,
                         message: "Remote video health: INBOUND EXPECTED (track attached to this renderer) but ZERO WebRTC frame callbacks after \(elapsedMs)ms — check remote camera, transceiver direction, mute, packet loss, or decoder"
                     )
@@ -635,7 +633,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         guard snap.received > 0 else { return }
 
         if snap.cbAgeMs > 1_500 {
-            await logger.log(
+            logger.log(
                 level: .warning,
                 message: "Remote video health: WebRTC frame callbacks STALLED (lastFrameCallbackMsAgo=\(snap.cbAgeMs)) received=\(snap.received) pauseMetal=\(snap.pauseMetal)\(expectHint)"
             )
@@ -646,20 +644,20 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
 
         if snap.pauseMetal {
             if snap.enqAgeMs > 1_500 {
-                await logger.log(
+                logger.log(
                     level: .warning,
                     message: "Remote video health: callbacks OK but SAMPLE-BUFFER enqueue STALLED (lastEnqueueMsAgo=\(snap.enqAgeMs)) received=\(snap.received) enqueued=\(snap.enqueued) dropped=\(snap.dropped) layerStatus=\(snap.layerStatusRaw)\(expectHint)"
                 )
             }
         } else {
             if snap.outputAgeMs > 1_500 {
-                await logger.log(
+                logger.log(
                     level: .warning,
                     message: "Remote video health: callbacks OK but RENDERER OUTPUT STALLED — no successful Metal passTexture / display path (lastOutputMsAgo=\(snap.outputAgeMs)) received=\(snap.received) pauseMetal=\(snap.pauseMetal)\(expectHint)"
                 )
             } else if snap.received > 45, snap.outputAgeMs < 0, didLogRemoteNeverOutputWarning == false {
                 didLogRemoteNeverOutputWarning = true
-                await logger.log(
+                logger.log(
                     level: .warning,
                     message: "Remote video health: many frames received (\(snap.received)) but NEVER recorded a successful display output (check Metal errors / delegate)"
                 )
@@ -1081,12 +1079,11 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
 
         // Decide whether we need to flush to resume decoding (failed state, requiresFlush, or long stall).
         let recoveryReason = await MainActor.run { () -> String? in
-            if layerBox.layer.status == .failed { return "layerFailed" }
+            let renderer = layerBox.layer.sampleBufferRenderer
+            if renderer.status == .failed { return "layerFailed" }
             if didStallLongEnoughToRebase { return "stallGap" }
             // Some Fig failures set requiresFlushToResumeDecoding without flipping `status` to `.failed`.
-            if #available(iOS 11.0, macOS 10.13, *) {
-                if layerBox.layer.requiresFlushToResumeDecoding { return "requiresFlushToResumeDecoding" }
-            }
+            if renderer.requiresFlushToResumeDecoding { return "requiresFlushToResumeDecoding" }
             return nil
         }
 
@@ -1094,7 +1091,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             await recoverSampleBufferLayerIfNeeded(reason: reason, nowUptimeNs: nowUptimeNs)
         }
         
-        let ready = await MainActor.run { layerBox.layer.isReadyForMoreMediaData }
+        let ready = await MainActor.run { layerBox.layer.sampleBufferRenderer.isReadyForMoreMediaData }
         guard ready else {
             droppedSampleFrames += 1
             consecutiveNotReadyDrops += 1
@@ -1112,7 +1109,7 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
             return
         }
         
-        await MainActor.run { layerBox.layer.enqueue(sampleBuffer) }
+        await MainActor.run { layerBox.layer.sampleBufferRenderer.enqueue(sampleBuffer) }
         let outNow = DispatchTime.now().uptimeNanoseconds
         lastEnqueueUptimeNs = outNow
         lastSuccessfulRemoteVideoOutputUptimeNs = outNow
@@ -1143,9 +1140,10 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         lastPresentationNs = -1
 
         await MainActor.run {
-            // Stronger than `flush()`; clears the last displayed image as well.
-            layerBox.layer.flushAndRemoveImage()
-            layerBox.layer.flush()
+            layerBox.layer.sampleBufferRenderer.flush(
+                removingDisplayedImage: true,
+                completionHandler: nil
+            )
         }
 
         logger.log(level: .info, message: "Recovered AVSampleBufferDisplayLayer to resume rendering (reason=\(reason))")

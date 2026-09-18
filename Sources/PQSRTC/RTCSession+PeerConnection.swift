@@ -47,7 +47,7 @@ extension RTCSession {
             isOneToOneSfu: isOneToOneSfu
         )
 
-        var params = sender.parameters
+        let params = sender.parameters
         guard !params.encodings.isEmpty else { return }
 
         for encoding in params.encodings {
@@ -171,7 +171,7 @@ extension RTCSession {
                   kind == kRTCMediaStreamTrackKindAudio || kind == kRTCMediaStreamTrackKindVideo
             else { continue }
 
-            var params = sender.parameters
+            let params = sender.parameters
             if !params.encodings.isEmpty {
                 for encoding in params.encodings {
                     encoding.isActive = false

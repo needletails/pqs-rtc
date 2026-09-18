@@ -67,7 +67,7 @@ extension RTCSession {
         )
 #elseif canImport(WebRTC)
         for sender in connection.peerConnection.senders where sender.track?.kind == kRTCMediaStreamTrackKindVideo {
-            var params = sender.parameters
+            let params = sender.parameters
             guard !params.encodings.isEmpty else { continue }
             for encoding in params.encodings {
                 encoding.maxBitrateBps = NSNumber(value: targets.maxBitrateBps)

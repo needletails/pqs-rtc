@@ -3297,7 +3297,7 @@ public final class VideoCallViewController: UICollectionViewController {
         await pipRenderer.startStream()
         self.pipSampleRenderer = pipRenderer
 
-        let pipWrapper = await pipRenderer.rtcVideoRenderWrapper
+        let pipWrapper = pipRenderer.rtcVideoRenderWrapper
         let didBindAuxiliaryRenderer: Bool
         if let participantId = pipBinding.participantId {
             didBindAuxiliaryRenderer = await session.addAuxiliaryRemoteVideoRenderer(
@@ -3403,14 +3403,14 @@ public final class VideoCallViewController: UICollectionViewController {
                 }
             } else if let pipView = pipMetalView,
                       let pipRenderer = pipView.renderer as? SampleBufferViewRenderer {
-                let wrapper = await pipRenderer.rtcVideoRenderWrapper
+                let wrapper = pipRenderer.rtcVideoRenderWrapper
                 if let participantId = pipAuxiliaryParticipantId {
                     await session.removeAuxiliaryRemoteVideoRenderer(wrapper, connectionId: raw, participantId: participantId)
                 } else {
                     await session.removeAuxiliaryRemoteVideoRenderer(wrapper, connectionId: raw)
                 }
             } else if let pipRenderer {
-                let wrapper = await pipRenderer.rtcVideoRenderWrapper
+                let wrapper = pipRenderer.rtcVideoRenderWrapper
                 if let participantId = pipAuxiliaryParticipantId {
                     await session.removeAuxiliaryRemoteVideoRenderer(wrapper, connectionId: raw, participantId: participantId)
                 } else {
@@ -3453,72 +3453,64 @@ extension VideoCallViewController: AVPictureInPictureControllerDelegate, AVPictu
     /// This uses `AVPictureInPictureVideoCallViewController` plus a sample-buffer host view so
     /// AVKit does not traverse an actor-isolated `NTMTKView` subtree during PiP visibility checks.
     func showPip(show: Bool) async {
-        do {
-            if show {
-                if let existing = pipController, existing.isPictureInPictureActive { return }
-                guard !pipStopInFlight else {
-                    logger.log(level: .debug, message: "showPip: stop already in progress, ignoring start request")
-                    return
-                }
-                guard let rawConnection = currentCall?.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines), !rawConnection.isEmpty else {
-                    logger.log(level: .warning, message: "showPip: missing connection id")
-                    return
-                }
-                guard videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) else {
-                    logger.log(level: .warning, message: "showPip: local preview not ready (video UI not fully up)")
-                    return
-                }
-                guard AVPictureInPictureController.isPictureInPictureSupported() else {
-                    logger.log(level: .notice, message: "PiP not supported on this device")
-                    return
-                }
-                guard !hasVisibleScreenShareForPiP() else {
-                    logger.log(level: .info, message: "showPip: skipped while screen share is visible")
-                    await stopPictureInPictureForScreenShareIfNeeded()
-                    return
-                }
-                guard !pipStartInFlight else {
-                    logger.log(level: .debug, message: "showPip: start already in progress, ignoring duplicate request")
-                    return
-                }
-                pipStartInFlight = true
-                defer { pipStartInFlight = false }
-                guard let pipController = await preparePictureInPictureIfNeeded() else {
-                    logger.log(level: .error, message: "showPip: PiP controller could not be prepared")
-                    return
-                }
-                guard pipController.isPictureInPicturePossible else {
-                    logger.log(
-                        level: .error,
-                        message: "showPip: isPictureInPicturePossible is false — the controller must already be inline/ready before start; ensure the call is visibly active on a physical device with an active VoIP audio session."
-                    )
-                    return
-                }
-                // Defer one run-loop turn so AVKit/Pegasus XPC is not started synchronously from SwiftUI `body` / gesture updates.
-                await Task.yield()
-                if pipController.isPictureInPictureActive {
-                    return
-                }
-                await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-                    self.pipStartWaiters.append(continuation)
-                    pipController.startPictureInPicture()
-                }
-            } else {
-                guard !pipStopInFlight else { return }
-                if let pipController, pipController.isPictureInPictureActive {
-                    pipStopInFlight = true
-                    pipController.stopPictureInPicture()
-                } else {
-                    await dismantlePiPRenderingAndAuxiliaryTrack()
-                    self.pipController = nil
-                }
+        if show {
+            if let existing = pipController, existing.isPictureInPictureActive { return }
+            guard !pipStopInFlight else {
+                logger.log(level: .debug, message: "showPip: stop already in progress, ignoring start request")
+                return
             }
-        } catch {
-            self.logger.log(level: .error, message: "Error showing PIP: \(error.localizedDescription)")
-            pipStopInFlight = false
-            resumePictureInPictureStartWaiters(success: false)
-            await dismantlePiPRenderingAndAuxiliaryTrack()
-            pipController = nil
+            guard let rawConnection = currentCall?.sharedCommunicationId.trimmingCharacters(in: .whitespacesAndNewlines), !rawConnection.isEmpty else {
+                logger.log(level: .warning, message: "showPip: missing connection id")
+                return
+            }
+            guard videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) else {
+                logger.log(level: .warning, message: "showPip: local preview not ready (video UI not fully up)")
+                return
+            }
+            guard AVPictureInPictureController.isPictureInPictureSupported() else {
+                logger.log(level: .notice, message: "PiP not supported on this device")
+                return
+            }
+            guard !hasVisibleScreenShareForPiP() else {
+                logger.log(level: .info, message: "showPip: skipped while screen share is visible")
+                await stopPictureInPictureForScreenShareIfNeeded()
+                return
+            }
+            guard !pipStartInFlight else {
+                logger.log(level: .debug, message: "showPip: start already in progress, ignoring duplicate request")
+                return
+            }
+            pipStartInFlight = true
+            defer { pipStartInFlight = false }
+            guard let pipController = await preparePictureInPictureIfNeeded() else {
+                logger.log(level: .error, message: "showPip: PiP controller could not be prepared")
+                return
+            }
+            guard pipController.isPictureInPicturePossible else {
+                logger.log(
+                    level: .error,
+                    message: "showPip: isPictureInPicturePossible is false — the controller must already be inline/ready before start; ensure the call is visibly active on a physical device with an active VoIP audio session."
+                )
+                return
+            }
+            // Defer one run-loop turn so AVKit/Pegasus XPC is not started synchronously from SwiftUI `body` / gesture updates.
+            await Task.yield()
+            if pipController.isPictureInPictureActive {
+                return
+            }
+            _ = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                self.pipStartWaiters.append(continuation)
+                pipController.startPictureInPicture()
+            }
+        } else {
+            guard !pipStopInFlight else { return }
+            if let pipController, pipController.isPictureInPictureActive {
+                pipStopInFlight = true
+                pipController.stopPictureInPicture()
+            } else {
+                await dismantlePiPRenderingAndAuxiliaryTrack()
+                self.pipController = nil
+            }
         }
     }
     
@@ -3711,5 +3703,4 @@ extension VideoCallViewController: CallActionDelegate {
         await session.removeScreenTrackFromStream(connectionId: connectionId)
     }
 }
-extension AVCaptureVideoPreviewLayer: @retroactive @unchecked Sendable {}
 #endif

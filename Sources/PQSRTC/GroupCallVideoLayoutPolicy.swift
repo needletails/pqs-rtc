@@ -399,7 +399,6 @@ public enum GroupCallVideoLayoutPolicy {
             tiles = tiles.map {
                 GroupCallLayoutSize(width: $0.width * scale, height: $0.height * scale)
             }
-            let usedHeight = tiles.reduce(0.0) { $0 + $1.height } + Double(max(0, count - 1)) * spacing
             var y = insets.top
             return tiles.map { tile in
                 let frame = GroupCallLayoutRect(
@@ -644,7 +643,6 @@ public enum GroupCallVideoLayoutPolicy {
         let columns = max(1, grid.columns)
         let rows = max(1, grid.rows)
         let totalHorizontalSpacing = Double(columns - 1) * spacing
-        let totalVerticalSpacing = Double(rows - 1) * spacing
         let tile = conferenceTileSize(
             columns: columns,
             rows: rows,
@@ -655,7 +653,6 @@ public enum GroupCallVideoLayoutPolicy {
         let tileWidth = tile.width
         let tileHeight = tile.height
         let gridWidth = Double(columns) * tileWidth + totalHorizontalSpacing
-        let gridHeight = Double(rows) * tileHeight + totalVerticalSpacing
         let originX = insets.leading + max(0, availableWidth - gridWidth) / 2
         let originY = insets.top
 

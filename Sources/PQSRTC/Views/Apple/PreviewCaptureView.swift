@@ -19,6 +19,11 @@
 import AVKit
 import NeedleTailLogger
 
+/// Lets deinit hop an `AVCaptureVideoPreviewLayer` to the main queue without a retroactive Sendable conformance.
+private struct PreviewLayerTeardown: @unchecked Sendable {
+    let layer: AVCaptureVideoPreviewLayer?
+}
+
 #if os(iOS)
 import UIKit
 
@@ -33,6 +38,7 @@ internal class PreviewCaptureView: UIView {
         return layer as! AVCaptureVideoPreviewLayer
     }
     nonisolated(unsafe) private var didShutdown = false
+    nonisolated(unsafe) private var sessionPreviewLayer: AVCaptureVideoPreviewLayer?
     /// Logger for production debugging
     private let logger: NeedleTailLogger
     
@@ -57,6 +63,7 @@ internal class PreviewCaptureView: UIView {
     }
     
     private func setupPreviewLayer() {
+        sessionPreviewLayer = previewLayer
         previewLayer.videoGravity = .resizeAspectFill
         if let connection = previewLayer.connection {
             if #available(iOS 17.0, *) {
@@ -101,18 +108,19 @@ internal class PreviewCaptureView: UIView {
         // the capture session attached to a deallocating preview layer.
         let wasShutdown = didShutdown
         if !didShutdown {
+            didShutdown = true
+            let teardown = PreviewLayerTeardown(layer: sessionPreviewLayer)
+            sessionPreviewLayer = nil
             if Thread.isMainThread {
-                previewLayer.session = nil
+                teardown.layer?.session = nil
             } else {
                 // Avoid blocking here. Deinit can occur on WebRTC/crypto queues; synchronously
                 // waiting for main can cause watchdog "hang detected" and can deadlock if main is
                 // awaiting teardown work scheduled from those same queues.
-                let layer = previewLayer
                 DispatchQueue.main.async {
-                    layer.session = nil
+                    teardown.layer?.session = nil
                 }
             }
-            didShutdown = true
         }
         #if DEBUG
         if !wasShutdown {
@@ -136,6 +144,7 @@ internal class PreviewCaptureView: NSView {
     var previewLayer: AVCaptureVideoPreviewLayer {
         return layer as! AVCaptureVideoPreviewLayer
     }
+    nonisolated(unsafe) private var sessionPreviewLayer: AVCaptureVideoPreviewLayer?
     
     /// Logger for production debugging
     private let logger: NeedleTailLogger
@@ -164,6 +173,7 @@ internal class PreviewCaptureView: NSView {
         layer.videoGravity = .resizeAspect
         layer.masksToBounds = true
         self.layer = layer
+        sessionPreviewLayer = layer
         layerContentsRedrawPolicy = .onSetNeedsDisplay
         
         #if DEBUG
@@ -182,9 +192,9 @@ internal class PreviewCaptureView: NSView {
     /// - Parameter session: The AVCaptureSession to display
     func configure(with session: AVCaptureSession) {
         // Capture the layer reference to avoid weak self issues during deallocation
-        let layer = self.previewLayer
+        let teardown = PreviewLayerTeardown(layer: previewLayer)
         DispatchQueue.main.async {
-            layer.session = session
+            teardown.layer?.session = session
             
             #if DEBUG
             self.logger.log(level: .debug, message: "PreviewCaptureView configured with session")
@@ -195,9 +205,9 @@ internal class PreviewCaptureView: NSView {
     /// Removes the capture session from the preview layer
     func removeSession() {
         // Capture the layer reference to avoid weak self issues during deallocation
-        let layer = self.previewLayer
+        let teardown = PreviewLayerTeardown(layer: previewLayer)
         DispatchQueue.main.async {
-            layer.session = nil
+            teardown.layer?.session = nil
             
             #if DEBUG
             self.logger.log(level: .debug, message: "PreviewCaptureView session removed")
@@ -211,12 +221,13 @@ internal class PreviewCaptureView: NSView {
         // NSView deinit may not be on main thread.
         // Avoid `DispatchQueue.main.sync` here: if deinit happens on main (or if the main
         // thread is blocked by WebRTC work), this can deadlock and trigger libdispatch breakpoints.
-        let layer = self.previewLayer
+        let teardown = PreviewLayerTeardown(layer: sessionPreviewLayer)
+        sessionPreviewLayer = nil
         if Thread.isMainThread {
-            layer.session = nil
+            teardown.layer?.session = nil
         } else {
             DispatchQueue.main.async {
-                layer.session = nil
+                teardown.layer?.session = nil
             }
         }
         

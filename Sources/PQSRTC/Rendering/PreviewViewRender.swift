@@ -28,7 +28,7 @@ actor PreviewViewRender: RendererDelegate {
     private let logger: NeedleTailLogger
     let metalProcessor = MetalProcessor()
     private let captureOutputWrapper = CaptureOutputWrapper()
-    let layer: AVCaptureVideoPreviewLayer
+    nonisolated(unsafe) let layer: AVCaptureVideoPreviewLayer
     private let ciContext: CIContext
     var streamTask: Task<Void, Error>?
     

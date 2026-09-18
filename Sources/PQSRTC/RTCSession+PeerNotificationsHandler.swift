@@ -2976,9 +2976,9 @@ extension RTCSession {
             return exact
         }
         let participantKey = Self.conferenceParticipantIdentityKey(participantId)
-        if let fromConnection = connection.androidRemoteAudioResolvedTrackIdsByParticipantId.first { key, _ in
+        if let fromConnection = connection.androidRemoteAudioResolvedTrackIdsByParticipantId.first(where: { key, _ in
             Self.conferenceParticipantIdentityKey(key) == participantKey
-        }?.value {
+        })?.value {
             return fromConnection
         }
         if let exact = androidSessionRemoteAudioResolvedTrackIdsByParticipantId[participantId] {
@@ -3798,7 +3798,11 @@ extension RTCSession {
             return false
         }
 
+#if os(Android)
         let sourceKey = await exportFrameEncryptionKey(index: sourceIndex, for: source)
+#else
+        let sourceKey = exportFrameEncryptionKey(index: sourceIndex, for: source)
+#endif
         guard !sourceKey.isEmpty else { return false }
         await setFrameEncryptionKey(sourceKey, index: sourceIndex, for: target)
         logger.log(

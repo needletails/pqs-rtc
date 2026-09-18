@@ -82,12 +82,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf 'y\n' | skip android sdk install
+          # Host OSS toolchain on macos-26 is 6.3.3; 6.3-RELEASE modules
+          # cannot be imported by that compiler.
+          printf 'y\n' | skip android sdk install --version 6.3.3 --swift-version 6.3.3
 
       - name: Build Android
         timeout-minutes: 8
-        run: skip android build
+        run: skip android build --swift-version 6.3.3
 
       - name: Build Android test targets
         timeout-minutes: 8
-        run: skip android build --build-tests
+        run: skip android build --swift-version 6.3.3 --build-tests

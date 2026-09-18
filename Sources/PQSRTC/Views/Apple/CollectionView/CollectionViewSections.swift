@@ -321,7 +321,7 @@ public struct CollectionViewSections {
         return section
     }
 
-    nonisolated private static func makeConferenceCustomGroup(
+    private static func makeConferenceCustomGroup(
         groupSize: NSCollectionLayoutSize,
         resolvedContainerSize: CGSize?,
         layoutItemCount: Int,
@@ -329,20 +329,22 @@ public struct CollectionViewSections {
         targetAspect: CGFloat
     ) -> NSCollectionLayoutGroup {
         NSCollectionLayoutGroup.custom(layoutSize: groupSize) { environment in
-            let containerWidth = resolvedContainerSize?.width
-                ?? environment.container.effectiveContentSize.width
-            let containerHeight = resolvedContainerSize?.height
-                ?? environment.container.effectiveContentSize.height
-            return conferenceCustomItems(
-                itemCount: layoutItemCount,
-                containerSize: CGSize(width: containerWidth, height: containerHeight),
-                insets: insets,
-                targetAspect: targetAspect
-            )
+            MainActor.assumeIsolated {
+                let containerWidth = resolvedContainerSize?.width
+                    ?? environment.container.effectiveContentSize.width
+                let containerHeight = resolvedContainerSize?.height
+                    ?? environment.container.effectiveContentSize.height
+                return conferenceCustomItems(
+                    itemCount: layoutItemCount,
+                    containerSize: CGSize(width: containerWidth, height: containerHeight),
+                    insets: insets,
+                    targetAspect: targetAspect
+                )
+            }
         }
     }
 
-    nonisolated private static func conferenceCustomItems(
+    private static func conferenceCustomItems(
         itemCount: Int,
         containerSize: CGSize,
         insets: NSDirectionalEdgeInsets,
@@ -382,10 +384,6 @@ public struct CollectionViewSections {
         let rows = max(1, grid.rows)
 
         let totalHorizontalSpacing = CGFloat(columns - 1) * spacing
-        let totalVerticalSpacing = CGFloat(rows - 1) * spacing
-
-        let maxTileWidth = (availableWidth - totalHorizontalSpacing) / CGFloat(columns)
-        let maxTileHeight = (availableHeight - totalVerticalSpacing) / CGFloat(rows)
 
         let tile = conferenceTileSize(
             columns: columns,
@@ -399,7 +397,6 @@ public struct CollectionViewSections {
         let tileHeight = tile.height
 
         let gridWidth = CGFloat(columns) * tileWidth + totalHorizontalSpacing
-        let gridHeight = CGFloat(rows) * tileHeight + totalVerticalSpacing
 
         let originX = insets.leading + max(0, availableWidth - gridWidth) / 2
         let originY = insets.top

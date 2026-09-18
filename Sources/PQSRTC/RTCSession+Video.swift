@@ -2523,7 +2523,7 @@ extension RTCSession {
     public func recoverInboundRemoteScreenAfterDecodeStall(connectionId: String) async {
 #if canImport(WebRTC) && !os(Android)
         guard await isConnectionStillActiveForRecovery(connectionId) else { return }
-        guard var connection = await connectionManager.findConnection(with: connectionId) else { return }
+        guard let connection = await connectionManager.findConnection(with: connectionId) else { return }
 
         if connection.localScreenTrack != nil {
             await restoreAppleOutboundScreenShareTransceiver(
@@ -3482,7 +3482,7 @@ extension RTCSession {
         ) {
             logger.log(
                 level: .info,
-                message: "SFU renegotiation: skipping remote video renderer rebind that would downgrade from SFU relay track oldTrackId=\(previousTrackId ?? "nil") placeholderTrackId=\(resolvedTrackId ?? "nil") conn=\(norm)"
+                message: "SFU renegotiation: skipping remote video renderer rebind that would downgrade from SFU relay track oldTrackId=\(previousTrackId ?? "nil") placeholderTrackId=\(resolvedTrackId as String? ?? "nil") conn=\(norm)"
             )
 #if os(Android)
             if let previous, previous.isLiveVideoTrack,
@@ -3514,7 +3514,7 @@ extension RTCSession {
 
         logger.log(
             level: .info,
-            message: "SFU renegotiation: rebinding remote video renderers oldTrackId=\(previousTrackId ?? "nil") newTrackId=\(resolvedTrackId ?? "<unknown>") conn=\(norm)"
+            message: "SFU renegotiation: rebinding remote video renderers oldTrackId=\(previousTrackId ?? "nil") newTrackId=\(resolvedTrackId as String? ?? "<unknown>") conn=\(norm)"
         )
 
         let rendererRebindNeeded: Bool
@@ -3673,7 +3673,7 @@ extension RTCSession {
         var touchedAnyVideoSender = false
         for sender in connection.peerConnection.senders where sender.track?.kind == kRTCMediaStreamTrackKindVideo {
             sender.track = newVideoTrack
-            var params = sender.parameters
+            let params = sender.parameters
             if !params.encodings.isEmpty {
                 for encoding in params.encodings {
                     encoding.isActive = true
@@ -3815,7 +3815,7 @@ extension RTCSession {
             }
             for sender in connection.peerConnection.senders {
                 guard sender.track?.kind == kRTCMediaStreamTrackKindAudio else { continue }
-                var params = sender.parameters
+                let params = sender.parameters
                 if !params.encodings.isEmpty {
                     for encoding in params.encodings {
                         encoding.isActive = isEnabled

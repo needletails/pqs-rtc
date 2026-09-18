@@ -1786,7 +1786,6 @@ extension RTCSession {
         mediaKind: String,
         reason: String
     ) async throws -> Never {
-        var connection = connection
         if let track = sender?.track {
             track.isEnabled = false
         }

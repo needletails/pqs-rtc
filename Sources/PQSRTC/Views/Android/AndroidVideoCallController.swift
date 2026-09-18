@@ -2836,7 +2836,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
             """
         )
         if reason == "screen-share-layout-reattach" {
-            view.rendererDidUpdateLayoutFromCompose()
+            _ = view.rendererDidUpdateLayoutFromCompose()
         } else {
             view.rendererDidUpdateLayout()
         }
@@ -5338,7 +5338,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
             """
         )
         for view in participantViewAssignments.values {
-            view.rendererDidUpdateLayoutFromCompose()
+            _ = view.rendererDidUpdateLayoutFromCompose()
         }
         for (participantId, view) in participantViewAssignments {
             let didRebind = await rebindParticipantRendererSinkIfNeeded(
@@ -5385,7 +5385,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
             message: "Screen-share layout participant sink reattach connection=\(connectionId) tiles=\(participantViewAssignments.count)"
         )
         for view in participantViewAssignments.values {
-            view.rendererDidUpdateLayoutFromCompose()
+            _ = view.rendererDidUpdateLayoutFromCompose()
         }
         for (participantId, view) in participantViewAssignments {
             guard layoutGeneration == remoteScreenShareLayoutGeneration, hasActiveRemoteScreenShare else {
@@ -5514,13 +5514,13 @@ public actor AndroidVideoCallController: CallActionDelegate {
 
         if isGroupCall {
             for view in remoteViews {
-                view.rendererDidUpdateLayoutFromCompose()
+                _ = view.rendererDidUpdateLayoutFromCompose()
             }
-            screenView?.rendererDidUpdateLayoutFromCompose()
+            _ = screenView?.rendererDidUpdateLayoutFromCompose()
             await reattachAssignedParticipantVideoIfNeeded()
         } else {
             for view in remoteViews {
-                view.rendererDidUpdateLayoutFromCompose()
+                _ = view.rendererDidUpdateLayoutFromCompose()
                 guard view.rendererLayoutNeedsSinkReconcile() else { continue }
                 view.rendererDidUpdateLayout()
                 await session.renderRemoteVideo(to: view, connectionId: connectionId)
@@ -5553,9 +5553,9 @@ public actor AndroidVideoCallController: CallActionDelegate {
         )
 
         for view in remoteViews {
-            view.rendererDidUpdateLayoutFromCompose()
+            _ = view.rendererDidUpdateLayoutFromCompose()
         }
-        screenView?.rendererDidUpdateLayoutFromCompose()
+        _ = screenView?.rendererDidUpdateLayoutFromCompose()
 
         await createPreviewView()
 
@@ -5702,7 +5702,7 @@ public actor AndroidVideoCallController: CallActionDelegate {
             return
         }
         for view in participantViewAssignments.values {
-            view.rendererDidUpdateLayoutFromCompose()
+            _ = view.rendererDidUpdateLayoutFromCompose()
         }
         if await session.shouldDeferSfuGroupParticipantVideoAttach(for: connectionId) {
             return

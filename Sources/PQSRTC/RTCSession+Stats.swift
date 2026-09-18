@@ -641,7 +641,7 @@ extension RTCSession {
             return
         }
         
-        guard let connection = await connectionManager.findConnection(with: normalizedId) else {
+        guard await connectionManager.findConnection(with: normalizedId) != nil else {
             logger.log(level: .warning, message: "Stats logging skipped: no connection for id=\(normalizedId)")
             return
         }
@@ -1563,6 +1563,6 @@ extension RTCSession {
     }
 }
 
-extension RTCStatisticsReport: @unchecked Sendable {}
+extension RTCStatisticsReport: @retroactive @unchecked Sendable {}
 
 #endif

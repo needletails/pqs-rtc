@@ -134,7 +134,7 @@ public struct AndroidRemoteVideoCompose: ContentComposer {
                 },
                 modifier: Modifier.fillMaxSize(),
                 update: { _ in
-                    captureView.rendererDidUpdateLayoutFromCompose()
+                    _ = captureView.rendererDidUpdateLayoutFromCompose()
                 }
             )
         }
@@ -185,7 +185,7 @@ public struct AndroidScreenShareCompose: ContentComposer {
                 },
                 modifier: Modifier.fillMaxSize(),
                 update: { _ in
-                    captureView.rendererDidUpdateLayoutFromCompose()
+                    _ = captureView.rendererDidUpdateLayoutFromCompose()
                     onSurfaceLayout()
                 }
             )
@@ -1733,7 +1733,7 @@ public struct AndroidVideoCallView: View {
             )
         if waitForComposeLayout {
             for view in visibleRemoteCaptureViews {
-                view.rendererDidUpdateLayoutFromCompose()
+                _ = view.rendererDidUpdateLayoutFromCompose()
             }
             let generation = await resources.controller.beginParticipantVideoReconcileAfterGridSlotLayoutChange(
                 visibleViews: visibleRemoteCaptureViews
@@ -1749,7 +1749,7 @@ public struct AndroidVideoCallView: View {
         )
         if gridLayoutChanged {
             for view in visibleRemoteCaptureViews {
-                view.rendererDidUpdateLayoutFromCompose()
+                _ = view.rendererDidUpdateLayoutFromCompose()
             }
             await resources.controller.reattachAssignedParticipantVideoIfNeeded()
         }
