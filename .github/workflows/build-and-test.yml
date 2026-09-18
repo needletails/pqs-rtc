@@ -74,9 +74,11 @@ jobs:
       # Do not `swift build --build-tests` then `--skip-build`: that library
       # is not testable. Swift Testing parallelizes in-process unless
       # --no-parallel is set; parallel RTCPeerConnections deadlock on GHA.
+      # Swift 6.4 defaults to swiftbuild, which errors on Skip/MediaKit diamond
+      # static products. Native still links that graph (deprecated, required).
       - name: Test (native Swift)
         timeout-minutes: 15
-        run: swift test --configuration release --filter PQSRTCCompiledSwiftTests --skip XCSkipTests --no-parallel --experimental-maximum-parallelization-width 1
+        run: swift test --build-system native --configuration release --filter PQSRTCCompiledSwiftTests --skip XCSkipTests --no-parallel --experimental-maximum-parallelization-width 1
 
       - name: Install Swift Android SDK
         shell: bash

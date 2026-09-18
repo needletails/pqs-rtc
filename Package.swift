@@ -67,6 +67,7 @@ if skipBridge {
 } else {
     // Apple-only (WebRTC, CoreGraphics, CoreImage). Keep this off the
     // `skip android build --build-tests` graph.
+    // Swift 6.4 `swift test` must pass `--build-system native` (see README).
     package.targets.append(
         .testTarget(
             name: "PQSRTCCompiledSwiftTests",

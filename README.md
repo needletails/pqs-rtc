@@ -63,10 +63,14 @@ Single catalog: [`Sources/PQSRTC/PQSRTC.docc/`](Sources/PQSRTC/PQSRTC.docc/). In
 
 ## Building and testing
 
+Swift 6.4 defaults to the `swiftbuild` engine, which refuses Skip and NeedleTailMediaKit diamond static products (`SkipLib`, `NeedleTailLogger`, `Logging`, …). Use the native engine until those packages ship non-duplicated products:
+
 ```sh
-swift build
-swift test
+swift build --build-system native
+swift test --build-system native --skip XCSkipTests --no-parallel
 ```
+
+`--build-system native` is deprecated by SwiftPM; it is required here. Do not omit it on Swift 6.4 (`swift test` alone fails at link planning).
 
 Android parity (Skip):
 

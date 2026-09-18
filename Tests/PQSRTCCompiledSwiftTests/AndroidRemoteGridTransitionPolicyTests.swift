@@ -351,14 +351,14 @@ struct AndroidRemoteGridTransitionPolicyTests {
 
     @Test("conference host does not remount AndroidVideoCallView when remoteCount changes")
     func conferenceHostDoesNotRemountOnRemoteCount() throws {
-        let conference = try appSource(
-            "Sources/Nudge/Views/Conference/ConferenceCallView.swift"
+        let compose = try source(
+            "Sources/PQSRTC/Views/Android/AndroidLocalVideoCompose.swift"
         )
-        #expect(!conference.contains(".id(remoteParticipantCount)"))
-        #expect(conference.contains("WindowInsetsCompat.Type.statusBars()"))
-        #expect(conference.contains("rememberedStatusTopDp"))
-        #expect(conference.contains("last non-zero inset"))
-        #expect(AndroidRemoteGridTransitionPolicy.shouldResetVideoCallViewIdentityOnRemoteCountChange() == false)
+        #expect(!compose.contains(".id(remoteParticipantCount)"))
+        #expect(compose.contains("WindowInsetsCompat.Type.statusBars()"))
+        #expect(compose.contains("rememberedStatusTopDp"))
+        #expect(compose.contains("last non-zero inset"))
+        #expect(!AndroidRemoteGridTransitionPolicy.shouldResetVideoCallViewIdentityOnRemoteCountChange())
     }
 
     private func source(_ relativePath: String) throws -> String {
@@ -367,17 +367,5 @@ struct AndroidRemoteGridTransitionPolicyTests {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         return try String(contentsOf: packageRoot.appendingPathComponent(relativePath), encoding: .utf8)
-    }
-
-    private func appSource(_ relativePath: String) throws -> String {
-        let packageRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let appRoot = packageRoot
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Apps/nudge-app")
-        return try String(contentsOf: appRoot.appendingPathComponent(relativePath), encoding: .utf8)
     }
 }
