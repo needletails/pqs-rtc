@@ -2978,6 +2978,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         AndroidWebRTCTrackResolver.markPeerConnectionRetired(peerConnection: peerConnectionToClose)
         peerConnectionToClose?.close()
         peerConnectionToClose?.dispose()
+        AndroidRTCViewSupport.releaseCaptureFrameRouter()
 
         localVideoTrackToDispose?.dispose()
         screenVideoTrackToDispose?.dispose()
@@ -3103,6 +3104,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         AndroidWebRTCTrackResolver.markPeerConnectionRetired(peerConnection: peerConnectionToClose)
         peerConnectionToClose?.close()
         peerConnectionToClose?.dispose()
+        AndroidRTCViewSupport.releaseCaptureFrameRouter()
 
         localVideoTrackToDispose?.dispose()
         screenVideoTrackToDispose?.dispose()

@@ -58,6 +58,7 @@ import java.nio.FloatBuffer
 import java.util.ConcurrentModificationException
 import java.util.WeakHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -636,9 +637,9 @@ object CameraCaptureFrameRouter {
         }
     }
 
+    /// Drop pending frames only. Do not quit the worker — encoder may still toI420.
     fun stop() {
         val dropped: VideoFrame?
-        val worker: HandlerThread?
         synchronized(lock) {
             dropped = pending
             pending = null
@@ -647,13 +648,22 @@ object CameraCaptureFrameRouter {
             inFlight = false
             loggedPipeline = false
             softening.resetDiagnostics()
+        }
+        dropped?.release()
+        SendTextureAppearanceSoftener.stop()
+    }
+
+    /// Quit workers after PeerConnection close/dispose.
+    fun release() {
+        stop()
+        val worker: HandlerThread?
+        synchronized(lock) {
             worker = thread
             thread = null
             handler = null
         }
-        dropped?.release()
         worker?.quitSafely()
-        SendTextureAppearanceSoftener.stop()
+        SendTextureAppearanceSoftener.release()
     }
 
     private var pendingFanPreview = false
@@ -782,7 +792,19 @@ internal object SendTextureAppearanceSoftener {
         }
     }
 
+    /// Drop pending frames only. Do not quit the worker — encoder may still toI420.
     fun stop() {
+        synchronized(lock) {
+            pending?.release()
+            pending = null
+            pendingDownstream = null
+            inFlight = false
+            glFailed = false
+        }
+    }
+
+    /// Quit workers after PeerConnection close/dispose.
+    fun release() {
         val worker: HandlerThread?
         val postedHandler: Handler?
         synchronized(lock) {
@@ -797,8 +819,15 @@ internal object SendTextureAppearanceSoftener {
             thread = null
         }
         if (postedHandler != null) {
-            postedHandler.post {
-                releaseGl()
+            val posted = try {
+                postedHandler.post {
+                    releaseGl()
+                    worker?.quitSafely()
+                }
+            } catch (_: RuntimeException) {
+                false
+            }
+            if (!posted) {
                 worker?.quitSafely()
             }
         } else {
@@ -955,17 +984,20 @@ internal object SendTextureAppearanceSoftener {
 
     private fun recycleTexture(textureId: Int) {
         val glHandler = handler
-        if (glHandler == null) {
+        if (glHandler == null || !glHandler.looper.thread.isAlive) {
             return
         }
-        glHandler.post {
-            synchronized(lock) {
-                if (handler == null) {
-                    GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
-                } else {
-                    freeTextures.add(textureId)
+        try {
+            glHandler.post {
+                synchronized(lock) {
+                    if (handler == null) {
+                        GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+                    } else {
+                        freeTextures.add(textureId)
+                    }
                 }
             }
+        } catch (_: RuntimeException) {
         }
     }
 
@@ -1046,24 +1078,51 @@ private class SoftenedRgbTextureBuffer(
     }
 
     override fun toI420(): VideoFrame.I420Buffer? {
-        if (Looper.myLooper() == handler.looper) {
-            return yuvConverter.convert(this)
+        // Hangup toI420 must not latch.await a dead Handler. stopCapture used
+        // to quit pqsr-gl-soften while the encoder still held this buffer;
+        // Handler.post then failed and latch.await blocked nativeClose (ANR).
+        val looper = handler.looper
+        val worker = looper.thread
+        if (!worker.isAlive) {
+            return null
+        }
+        if (Looper.myLooper() == looper) {
+            return convertOrNull()
         }
         val latch = CountDownLatch(1)
         val result = arrayOfNulls<VideoFrame.I420Buffer>(1)
-        handler.post {
-            try {
-                result[0] = yuvConverter.convert(this)
-            } finally {
-                latch.countDown()
+        val posted = try {
+            handler.post {
+                try {
+                    result[0] = convertOrNull()
+                } finally {
+                    latch.countDown()
+                }
             }
+        } catch (_: RuntimeException) {
+            false
         }
-        try {
-            latch.await()
+        if (!posted) {
+            return null
+        }
+        return try {
+            if (latch.await(200, TimeUnit.MILLISECONDS)) {
+                result[0]
+            } else {
+                null
+            }
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
+            null
         }
-        return result[0]
+    }
+
+    private fun convertOrNull(): VideoFrame.I420Buffer? {
+        return try {
+            yuvConverter.convert(this)
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     override fun cropAndScale(
@@ -1088,9 +1147,9 @@ private class SoftenedRgbTextureBuffer(
     }
 }
 
-/// Skin mix at the draw target resolution (overlay or send frame). Kernel is
-/// `min(viewport)/80` so PiP ~367 px is several pixels, not 1 px after a 1280
-/// downscale (lesson 52).
+/// Skin mix at the draw target resolution (overlay or send frame). Kernel and
+/// blend match Apple `MetalProcessor` (`min(extent)/240`, 0.45) so this is
+/// a chroma-masked touch-up, not a whole-frame blur (lesson 108).
 private class AppearanceSoftenGlDrawer : RendererCommon.GlDrawer {
     private var oesShader: RoundedRectGlDrawer.ShaderProgram? = null
     private var rgbShader: RoundedRectGlDrawer.ShaderProgram? = null
@@ -1206,7 +1265,7 @@ private object AppearanceSoftenShader {
         "vec4 appearanceColor() {\n" +
             "  vec4 color = sampleColor(tc);\n" +
             "  if (uSoften <= 0.5) return color;\n" +
-            "  float px = max(2.5, min(uViewportSize.x, uViewportSize.y) / 80.0);\n" +
+            "  float px = max(1.5, min(uViewportSize.x, uViewportSize.y) / 240.0);\n" +
             "  vec2 o = vec2(px) / max(uViewportSize, vec2(1.0));\n" +
             "  vec4 blur = (color\n" +
             "    + sampleColor(tc + vec2(o.x, 0.0))\n" +
@@ -1217,10 +1276,18 @@ private object AppearanceSoftenShader {
             "    + sampleColor(tc - vec2(o.x, o.y))\n" +
             "    + sampleColor(tc + vec2(o.x, -o.y))\n" +
             "    + sampleColor(tc + vec2(-o.x, o.y))) * 0.111111;\n" +
-            "  float luma = dot(color.rgb, vec3(0.299, 0.587, 0.114));\n" +
-            "  float skin = smoothstep(0.15, 0.35, luma) * smoothstep(0.95, 0.75, luma);\n" +
-            "  skin *= smoothstep(0.0, 0.08, color.r - color.g);\n" +
-            "  return vec4(mix(color.rgb, blur.rgb, 0.65 * skin * uSoften), color.a);\n" +
+            "  float R = color.r * 255.0;\n" +
+            "  float G = color.g * 255.0;\n" +
+            "  float B = color.b * 255.0;\n" +
+            "  float Y = 0.299 * R + 0.587 * G + 0.114 * B;\n" +
+            "  float Cb = 128.0 - 0.168736 * R - 0.331264 * G + 0.5 * B;\n" +
+            "  float Cr = 128.0 + 0.5 * R - 0.418688 * G - 0.081312 * B;\n" +
+            "  float dcb = abs(Cb - 102.0) / 25.0;\n" +
+            "  float dcr = abs(Cr - 153.0) / 20.0;\n" +
+            "  float dist = dcb * dcb + dcr * dcr;\n" +
+            "  float skin = dist >= 1.6 ? 0.0 : (dist <= 0.7 ? 1.0 : (1.6 - dist) / 0.9);\n" +
+            "  if (Y < 40.0 || Y > 250.0) skin = 0.0;\n" +
+            "  return vec4(mix(color.rgb, blur.rgb, 0.45 * skin * uSoften), color.a);\n" +
             "}\n"
 
     private val NDC: FloatBuffer = GlUtil.createFloatBuffer(
@@ -2009,7 +2076,7 @@ object AndroidRTCViewSupport {
     /// 120/0/120 at 30.0 in ~500 µs and still looked skippy. The PiP was a
     /// TextureView over a full-screen remote SurfaceView hole-punch. Bump
     /// when the local capture / preview pipeline changes.
-    const val LOCAL_PREVIEW_PIPELINE_REVISION = "2026-09-12-a"
+    const val LOCAL_PREVIEW_PIPELINE_REVISION = "2026-09-20-b"
 
     /// Device3 09:49: `Attached Camera2 preview surface 1280x720` then 90° /
     /// smaller PiP; camera floated 13–26 fps; LocalPreview EGL 0 frames; GC
@@ -2161,6 +2228,10 @@ object AndroidRTCViewSupport {
         openedPreviewSurface?.release()
         openedPreviewSurface = null
         CameraCaptureFrameRouter.stop()
+    }
+
+    fun releaseCaptureFrameRouter() {
+        CameraCaptureFrameRouter.release()
     }
 
     fun isCamera2PreviewSurfaceAttached(): Boolean = camera2PreviewAttached

@@ -284,7 +284,7 @@ struct AndroidRuntimeSourceContractTests {
         #expect(native.contains("fun attachOpenedCamera2PreviewSurfaceIfNeeded"))
         #expect(native.contains("Attached Camera2 preview surface"))
         #expect(native.contains("Do not `for (dx in -2..2)`"))
-        #expect(native.contains("LOCAL_PREVIEW_PIPELINE_REVISION = \"2026-09-12-a\""))
+        #expect(native.contains("LOCAL_PREVIEW_PIPELINE_REVISION = \"2026-09-20-b\""))
         #expect(native.contains("shouldSkipUnchangedConferenceLetterboxApply"))
         #expect(native.contains("shouldUseRememberedSettledConferenceTile"))
         #expect(native.contains("shouldForceConferenceLetterboxExactSize"))
@@ -416,6 +416,94 @@ struct AndroidRuntimeSourceContractTests {
         let controller = try source("Sources/PQSRTC/Views/Android/AndroidVideoCallController.swift")
         #expect(controller.contains("publishRemoteParticipantTilesDidChangeIfNeeded"))
         #expect(controller.contains("shouldSkipRemoteTilesDidChangeDuringInFlightEpisode"))
+    }
+
+    @Test("Android GL soften matches Apple skin mix, not a whole-frame blur")
+    func androidGlSoftenMatchesAppleSkinMix() throws {
+        let native = try source("Sources/PQSRTC/Skip/AndroidRTCNativeSupport.kt")
+        #expect(native.contains("min(uViewportSize.x, uViewportSize.y) / 240.0"))
+        #expect(!native.contains("min(uViewportSize.x, uViewportSize.y) / 80.0"))
+        #expect(native.contains("0.45 * skin * uSoften"))
+        #expect(!native.contains("0.65 * skin * uSoften"))
+        #expect(native.contains("abs(Cb - 102.0) / 25.0"))
+        #expect(native.contains("abs(Cr - 153.0) / 20.0"))
+        #expect(native.contains("if (Y < 40.0 || Y > 250.0) skin = 0.0"))
+        #expect(!native.contains("smoothstep(0.0, 0.08, color.r - color.g)"))
+        #expect(native.contains("ANDROID_CPU_APPEARANCE_SOFTENING = false"))
+        #expect(native.contains("chroma-masked touch-up, not a whole-frame blur"))
+    }
+
+    @Test("hangup toI420 does not wait on a quit softener thread")
+    func hangupToI420DoesNotWaitOnQuitSoftenerThread() throws {
+        let native = try source("Sources/PQSRTC/Skip/AndroidRTCNativeSupport.kt")
+        let client = try source("Sources/PQSRTC/Android/AndroidRTCClient.swift")
+
+        #expect(native.contains("Hangup toI420 must not latch.await a dead Handler"))
+        #expect(native.contains("latch.await(200, TimeUnit.MILLISECONDS)"))
+        #expect(native.contains("if (!worker.isAlive)"))
+        #expect(native.contains("if (!posted)"))
+        #expect(native.contains("private fun convertOrNull()"))
+        #expect(native.contains("Drop pending frames only. Do not quit the worker — encoder may still toI420."))
+        #expect(native.contains("Quit workers after PeerConnection close/dispose."))
+        #expect(native.contains("fun releaseCaptureFrameRouter()"))
+        #expect(native.contains("CameraCaptureFrameRouter.release()"))
+        #expect(native.contains("SendTextureAppearanceSoftener.release()"))
+
+        let cameraRouterStop = try #require(firstFunctionBody(named: "stop", after: "object CameraCaptureFrameRouter", in: native))
+        #expect(!cameraRouterStop.contains("quitSafely"))
+        #expect(cameraRouterStop.contains("SendTextureAppearanceSoftener.stop()"))
+
+        let cameraRouterRelease = try #require(firstFunctionBody(named: "release", after: "object CameraCaptureFrameRouter", in: native))
+        #expect(cameraRouterRelease.contains("quitSafely"))
+        #expect(cameraRouterRelease.contains("SendTextureAppearanceSoftener.release()"))
+
+        let clearCapturer = try #require(
+            firstFunctionBody(named: "clearOpenedCameraCapturer", after: "object AndroidRTCViewSupport", in: native)
+        )
+        #expect(clearCapturer.contains("CameraCaptureFrameRouter.stop()"))
+        #expect(!clearCapturer.contains("CameraCaptureFrameRouter.release()"))
+
+        let retryBody = try SourceContract.sourceBody(of: "resetPeerConnectionForRetry", in: client)
+        #expect(retryBody.contains("peerConnectionToClose?.dispose()"))
+        #expect(retryBody.contains("AndroidRTCViewSupport.releaseCaptureFrameRouter()"))
+        let retryDispose = try #require(retryBody.range(of: "peerConnectionToClose?.dispose()"))
+        let retryRelease = try #require(retryBody.range(of: "AndroidRTCViewSupport.releaseCaptureFrameRouter()"))
+        #expect(retryDispose.lowerBound < retryRelease.lowerBound)
+
+        let closeBody = try SourceContract.sourceBody(of: "close", in: client)
+        #expect(closeBody.contains("peerConnectionToClose?.dispose()"))
+        #expect(closeBody.contains("AndroidRTCViewSupport.releaseCaptureFrameRouter()"))
+        let closeDispose = try #require(closeBody.range(of: "peerConnectionToClose?.dispose()"))
+        let closeRelease = try #require(closeBody.range(of: "AndroidRTCViewSupport.releaseCaptureFrameRouter()"))
+        #expect(closeDispose.lowerBound < closeRelease.lowerBound)
+
+        #expect(client.contains("CameraCaptureFrameRouter.stop()"))
+        #expect(!client.contains("CameraCaptureFrameRouter.release()"))
+    }
+
+    private func firstFunctionBody(named name: String, after marker: String, in source: String) -> String? {
+        guard let markerRange = source.range(of: marker) else { return nil }
+        let haystack = source[markerRange.upperBound...]
+        let header = "fun \(name)("
+        guard let headerRange = haystack.range(of: header) else { return nil }
+        let fromHeader = haystack[headerRange.lowerBound...]
+        guard let openBrace = fromHeader.firstIndex(of: "{") else { return nil }
+        var depth = 0
+        var index = openBrace
+        while index < fromHeader.endIndex {
+            let character = fromHeader[index]
+            if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+                if depth == 0 {
+                    let bodyStart = fromHeader.index(after: openBrace)
+                    return String(fromHeader[bodyStart..<index])
+                }
+            }
+            index = fromHeader.index(after: index)
+        }
+        return nil
     }
 
     private func source(_ relativePath: String) throws -> String {
