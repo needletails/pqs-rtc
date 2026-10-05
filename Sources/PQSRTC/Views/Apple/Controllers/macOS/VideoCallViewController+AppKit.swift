@@ -213,7 +213,12 @@ public final class VideoCallViewController: NSViewController {
         
         stateStreamTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.videoCallDelegate?.passSize(.init(width: 450, height: 100))
+            // Compact 450×100 is only for a standalone voice window. Embedded SwiftUI
+            // chrome (Nudge's VoIP scene) already has its own minimum and must not
+            // inherit that strip size.
+            if !self.usesEmbeddedControls {
+                await self.videoCallDelegate?.passSize(.init(width: 450, height: 100))
+            }
             
             // The host app may present this controller before `RTCSession.createStateStream(with:)`
             // has run. Wait until the stream exists rather than silently returning.
@@ -260,7 +265,7 @@ public final class VideoCallViewController: NSViewController {
                     case .inbound(let callType), .outbound(let callType):
                         switch callType {
                         case .voice:
-                            break
+                            await applyVoiceCallWindowLayout()
                         case .video:
                             await applyVideoCallWindowLayout()
                             if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
@@ -272,9 +277,15 @@ public final class VideoCallViewController: NSViewController {
                         }
                     }
                     await incrementDuration()
-                case .held(_, let currentCall):
+                case .held(let callDirection, let currentCall):
                     self.currentCall = currentCall
                     controllerView.statusLabel.stringValue = "Held"
+                    switch callDirection {
+                    case .inbound(.voice), .outbound(.voice):
+                        await applyVoiceCallWindowLayout()
+                    case .inbound(.video), .outbound(.video):
+                        await applyVideoCallWindowLayout()
+                    }
                 case .ended(_, _):
                     controllerView.statusLabel.stringValue = "Ended"
                     await tearDownCall()
@@ -328,7 +339,7 @@ public final class VideoCallViewController: NSViewController {
                     case .inbound(let callType), .outbound(let callType):
                         switch callType {
                         case .voice:
-                            break
+                            await applyVoiceCallWindowLayout()
                         case .video:
                             await applyVideoCallWindowLayout()
                             if videoViews.views.contains(where: { $0.videoView.contextName == "preview" }) == false {
@@ -340,9 +351,15 @@ public final class VideoCallViewController: NSViewController {
                         }
                     }
                     await incrementDuration()
-                case .held(_, let currentCall):
+                case .held(let callDirection, let currentCall):
                     self.currentCall = currentCall
                     controllerView.statusLabel.stringValue = "Held"
+                    switch callDirection {
+                    case .inbound(.voice), .outbound(.voice):
+                        await applyVoiceCallWindowLayout()
+                    case .inbound(.video), .outbound(.video):
+                        await applyVideoCallWindowLayout()
+                    }
                 case .ended(_, _):
                     controllerView.statusLabel.stringValue = "Ended"
                     await tearDownCall()
@@ -610,15 +627,27 @@ public final class VideoCallViewController: NSViewController {
                 controllerView.voiceImageData = avatarData
             }
         }
-        controllerView.statusLabel.stringValue = "Connecting secure video..."
+        controllerView.statusLabel.stringValue = currentCall.supportsVideo
+            ? "Connecting secure video..."
+            : "Connecting secure voice..."
         controllerView.statusLabel.fadeInOutLoop(duration: 1.5)
     }
     
     private func applyVoiceCallWindowLayout() async {
         let controllerView = self.view as! ControllerView
+        if usesEmbeddedControls {
+            // A required 450×100 root fights the host's edge pins. Nudge's VoIP
+            // window is at least 640×480 with SwiftUI controls over this view, so
+            // the equality constraints collapsed the audio surface into a short strip.
+            controllerView.clearCallRootSizingConstraints()
+            controllerView.setCallVideoSurfaceHidden(true)
+            logLayoutProbe("applyVoiceCallWindowLayout embedded=clearFixedRootSizing hideVideoSurface")
+            return
+        }
         await videoCallDelegate?.passSize(.init(width: 450, height: 100))
         logLayoutProbe("applyVoiceCallWindowLayout passSize=450x100 replaceRootSizing=450x100")
         controllerView.replaceCallRootSizingForVoiceCall(width: 450, height: 100)
+        controllerView.setCallVideoSurfaceHidden(false)
     }
     
     /// Resizes the host window and pins the call root view for video (same as pre-refactor `.connecting` video).
@@ -628,6 +657,7 @@ public final class VideoCallViewController: NSViewController {
     /// the initial 450×100 chrome and broke video layout/rendering.
     private func applyVideoCallWindowLayout() async {
         let controllerView = self.view as! ControllerView
+        controllerView.setCallVideoSurfaceHidden(false)
         await videoCallDelegate?.passSize(.init(width: 335, height: 475))
         logLayoutProbe("applyVideoCallWindowLayout passSize=335x475 replaceRootSizing=min335x475 note=noDuplicateSelfEdgePins scrollViewAlreadyFillsBounds")
         controllerView.replaceCallRootSizingForVideoCall(minWidth: 335, minHeight: 475)

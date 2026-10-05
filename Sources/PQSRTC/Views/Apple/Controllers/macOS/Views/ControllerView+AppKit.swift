@@ -187,6 +187,13 @@ class ControllerView: NSView {
         callRootSizingConstraints = [w, h]
     }
     
+    /// Hides the empty video grid during an audio-only call hosted in a full window.
+    /// Screen share and video legs call this with `false` so tiles can fill the surface again.
+    func setCallVideoSurfaceHidden(_ hidden: Bool) {
+        scrollView.isHidden = hidden
+        localPreviewOverlay.isHidden = hidden
+    }
+
     /// Replaces minimum size hints for video calls (matches ``VideoCallViewController`` `passSize` defaults).
     func replaceCallRootSizingForVideoCall(minWidth: CGFloat, minHeight: CGFloat) {
         NSLayoutConstraint.deactivate(callRootSizingConstraints)
