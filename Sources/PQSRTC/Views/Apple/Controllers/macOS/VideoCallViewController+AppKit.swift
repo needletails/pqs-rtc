@@ -285,6 +285,12 @@ public final class VideoCallViewController: NSViewController {
                         await applyVoiceCallWindowLayout()
                     case .inbound(.video), .outbound(.video):
                         await applyVideoCallWindowLayout()
+                    case nil:
+                        if currentCall.supportsVideo {
+                            await applyVideoCallWindowLayout()
+                        } else {
+                            await applyVoiceCallWindowLayout()
+                        }
                     }
                 case .ended(_, _):
                     controllerView.statusLabel.stringValue = "Ended"
@@ -359,6 +365,12 @@ public final class VideoCallViewController: NSViewController {
                         await applyVoiceCallWindowLayout()
                     case .inbound(.video), .outbound(.video):
                         await applyVideoCallWindowLayout()
+                    case nil:
+                        if currentCall.supportsVideo {
+                            await applyVideoCallWindowLayout()
+                        } else {
+                            await applyVoiceCallWindowLayout()
+                        }
                     }
                 case .ended(_, _):
                     controllerView.statusLabel.stringValue = "Ended"
