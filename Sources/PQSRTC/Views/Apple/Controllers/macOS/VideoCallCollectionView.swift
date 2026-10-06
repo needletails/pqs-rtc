@@ -75,14 +75,16 @@ final class VideoCallCollectionView: NSCollectionView {
             object: window,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            guard self.bounds.width > 0, self.bounds.height > 0 else { return }
-            self.logLayoutProbe("didEndLiveResize invalidateLayout bounds=\(Int(self.bounds.width))x\(Int(self.bounds.height))")
-            self.collectionViewLayout?.invalidateLayout()
-            self.needsLayout = true
-            self.layoutSubtreeIfNeeded()
-            self.logLayoutSnapshot(reason: "didEndLiveResize-immediate")
-            self.schedulePostResizeLayoutSnapshots()
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                guard self.bounds.width > 0, self.bounds.height > 0 else { return }
+                self.logLayoutProbe("didEndLiveResize invalidateLayout bounds=\(Int(self.bounds.width))x\(Int(self.bounds.height))")
+                self.collectionViewLayout?.invalidateLayout()
+                self.needsLayout = true
+                self.layoutSubtreeIfNeeded()
+                self.logLayoutSnapshot(reason: "didEndLiveResize-immediate")
+                self.schedulePostResizeLayoutSnapshots()
+            }
         }
     }
     
@@ -135,7 +137,7 @@ final class VideoCallCollectionView: NSCollectionView {
         layoutInvalidationScheduled = true
         let useSyncMain = Thread.isMainThread
         logLayoutProbe("bounds=\(Int(b.width))x\(Int(b.height)) from=\(Int(previous.width))x\(Int(previous.height)) action=\(useSyncMain ? "invalidateLayoutSyncMain" : "scheduleInvalidateOnNextMain")")
-        let runInvalidate: () -> Void = { [weak self] in
+        let runInvalidate: @MainActor @Sendable () -> Void = { [weak self] in
             guard let self else { return }
             self.layoutInvalidationScheduled = false
             // Skip transient zero-sized layouts during live resize; a later pass will invalidate again.

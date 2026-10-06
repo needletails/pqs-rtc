@@ -1984,7 +1984,7 @@ public final class VideoCallViewController: UICollectionViewController {
             return deviceOrientation
         }
 
-        if let interfaceOrientation = view.window?.windowScene?.interfaceOrientation {
+        if let interfaceOrientation = view.window?.windowScene?.effectiveGeometry.interfaceOrientation {
             switch interfaceOrientation {
             case .portrait:
                 return .portrait
@@ -3213,6 +3213,15 @@ public final class VideoCallViewController: UICollectionViewController {
         }
     }
 
+    /// Display size for this controller's window scene, then the foreground scene.
+    private func fallbackScreenSize() -> CGSize {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = view.window?.windowScene
+            ?? scenes.first(where: { $0.activationState == .foregroundActive })
+            ?? scenes.first
+        return scene?.screen.bounds.size ?? .zero
+    }
+
     private func pictureInPictureLayoutSize() -> CGSize {
         let container: CGSize
         if lastStableCompositionalContentSize.width > 1, lastStableCompositionalContentSize.height > 1 {
@@ -3220,7 +3229,7 @@ public final class VideoCallViewController: UICollectionViewController {
         } else if view.bounds.width > 1, view.bounds.height > 1 {
             container = view.bounds.size
         } else {
-            container = UIScreen.main.bounds.size
+            container = fallbackScreenSize()
         }
         return controllerView.setSize(
             isLandscape: container.width > container.height,

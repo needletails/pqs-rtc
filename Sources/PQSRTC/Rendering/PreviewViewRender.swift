@@ -678,6 +678,7 @@ actor PreviewViewRender: RendererDelegate {
         UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .first(where: { $0.activationState == .foregroundActive })?
+            .effectiveGeometry
             .interfaceOrientation
     }
 

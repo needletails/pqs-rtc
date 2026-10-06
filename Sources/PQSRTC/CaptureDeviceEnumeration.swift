@@ -19,7 +19,7 @@ extension PQSRTCCallUIPreferences {
             .builtInTrueDepthCamera,
         ]
 #else
-        types = [.builtInWideAngleCamera, .externalUnknown]
+        types = [.builtInWideAngleCamera, .external]
 #endif
         let session = AVCaptureDevice.DiscoverySession(
             deviceTypes: types,

@@ -264,6 +264,16 @@ class ControllerView: UIView {
     }
     
     // MARK: - Size Management (used by the view controller for preview layout)
+    /// Display size for this view's window scene, then the foreground scene.
+    /// Used only before this view has a real layout box.
+    private func fallbackScreenSize() -> CGSize {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = window?.windowScene
+            ?? scenes.first(where: { $0.activationState == .foregroundActive })
+            ?? scenes.first
+        return scene?.screen.bounds.size ?? .zero
+    }
+
     /// Computes the local preview size for the current device/orientation.
     ///
     /// - Parameters:
@@ -275,7 +285,7 @@ class ControllerView: UIView {
         if bounds.width > 1, bounds.height > 1 {
             fallback = bounds.size
         } else {
-            fallback = UIScreen.main.bounds.size
+            fallback = fallbackScreenSize()
         }
         let explicit = containerSize.flatMap { size -> GroupCallLayoutSize? in
             guard size.width > 1, size.height > 1 else { return nil }
@@ -312,7 +322,7 @@ class ControllerView: UIView {
         if UIApplication.shared.applicationState != .background {
             let fallbackBox = bounds.width > 1 && bounds.height > 1
                 ? bounds.size
-                : UIScreen.main.bounds.size
+                : fallbackScreenSize()
             let isLandscape: Bool
             if let containerSize, containerSize.width > 1, containerSize.height > 1 {
                 isLandscape = containerSize.width > containerSize.height

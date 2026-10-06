@@ -771,7 +771,7 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
         lastDrawableSizeDiagnosticLogUptimeNs = now
 #if os(macOS)
         let contentsScaleForLog = layer?.contentsScale ?? 1
-        let liveResize = (window as? NSWindow)?.inLiveResize == true
+        let liveResize = window?.inLiveResize == true
 #else
         let contentsScaleForLog = layer.contentsScale
         let liveResize = false
@@ -786,7 +786,7 @@ public final class NTMTKView: MTKView, BufferToMetalDelegate {
     @MainActor
     private func metalLayoutDebugSuffix() -> String {
 #if os(macOS)
-        let live = (window as? NSWindow)?.inLiveResize == true
+        let live = window?.inLiveResize == true
         let wsz = window?.frame.size ?? .zero
         let sup = superview?.bounds.size ?? .zero
         return " inLiveResize=\(live) windowFrame=\(wsz) frame=\(frame.size) superBounds=\(sup) hidden=\(isHidden) alpha=\(alphaValue)"

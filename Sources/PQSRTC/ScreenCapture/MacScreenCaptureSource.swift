@@ -293,6 +293,9 @@ extension MacScreenCaptureSource: SCStreamOutput {
             handleScreenSampleBuffer(sampleBuffer)
         case .audio:
             handleAudioSampleBuffer(sampleBuffer)
+        case .microphone:
+            // This source only registers screen and system-audio outputs.
+            return
         @unknown default:
             return
         }

@@ -592,10 +592,15 @@ public final class VideoCallViewController: NSViewController {
         let controllerView = self.view as! ControllerView
         Task { [weak self] in
             guard let self else { return }
-            while self.isRunning {
-                try await Task.sleep(until: .now + .seconds(1))
+            while self.isRunning, !Task.isCancelled {
+                do {
+                    try await Task.sleep(until: .now + .seconds(1))
+                } catch {
+                    return
+                }
+                guard self.isRunning else { return }
                 self.duration += 1
-                controllerView.statusLabel.stringValue = formatDuration(self.duration)
+                controllerView.statusLabel.stringValue = self.formatDuration(self.duration)
             }
         }
     }

@@ -23,6 +23,9 @@ import NeedleTailLogger
 import CoreVideo
 import CoreImage
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 
 
 // MARK: - Sendable Extensions
@@ -698,8 +701,9 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
     @MainActor
     private var determineScale: ScaleMode {
 #if os(iOS)
-        // We are landscape no matter what, whether upright or flat
-        if UIScreen.main.bounds.width > UIScreen.main.bounds.height {
+        // Scene screen bounds stay orientation-correct when the device is flat.
+        let size = Self.foregroundSceneScreenBounds().size
+        if size.width > size.height {
             return .aspectFitHorizontal
         } else {
             return .aspectFitVertical
@@ -708,6 +712,15 @@ actor SampleBufferViewRenderer: RendererDelegate, PiPEventReceiverDelegate {
         return .aspectFitHorizontal
 #endif
     }
+
+#if os(iOS)
+    @MainActor
+    private static func foregroundSceneScreenBounds() -> CGRect {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
+        return scene?.screen.bounds ?? .zero
+    }
+#endif
     
     private func handleFrame(_ frame: RTCVideoFrame?, ciContext: CIContext) async throws {
         guard let frame = frame else {

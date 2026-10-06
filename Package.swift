@@ -1,4 +1,4 @@
-// swift-tools-version: 6.3
+// swift-tools-version: 6.4
 
 import PackageDescription
 
@@ -6,8 +6,8 @@ let package = Package(
     name: "pqs-rtc",
     defaultLocalization: "en",
     platforms: [
-        .iOS(.v18),
-        .macOS(.v15)
+        .iOS("26.0"),
+        .macOS("26.0"),
     ],
     products: [
         .library(name: "PQSRTC", targets: ["PQSRTC"]),
@@ -16,13 +16,14 @@ let package = Package(
         .package(url: "https://source.skip.tools/skip.git", from: "1.6.32"),
         .package(url: "https://source.skip.tools/skip-fuse.git", from: "1.0.2"),
         .package(url: "https://source.skip.tools/skip-fuse-ui.git", from: "1.10.0"),
-        .package(url: "https://github.com/needletails/Specs.git", from: "144.7559.10"),
+        .package(url: "https://github.com/needletails/Specs.git", from: "150.7871.01"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.3.0"),
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.2.1"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5"),
         .package(url: "https://github.com/needletails/needletail-media-kit.git", from: "1.1.0"),
-        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "4.0.0"),
+        .package(path: "../double-ratchet-kit")
+//        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "4.0.0"),
     ],
     targets: [
         .target(
