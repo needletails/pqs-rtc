@@ -1814,7 +1814,7 @@ extension ScreenShareRenegotiationTests {
         conference.conferencePassword = "secret"
         #expect(RTCSession.shouldEnforceExclusiveRoomScreenShare(call: conference))
 
-        var group = try Call(
+        let group = try Call(
             sharedCommunicationId: "#group-room",
             channelWireId: "#group-room",
             sender: sender,
@@ -1823,7 +1823,7 @@ extension ScreenShareRenegotiationTests {
         #expect(RTCSession.shouldEnforceExclusiveRoomScreenShare(call: group))
 
         let wireId = UUID().uuidString
-        var oneToOneSfu = try Call(
+        let oneToOneSfu = try Call(
             sharedCommunicationId: wireId,
             channelWireId: wireId,
             sender: sender,
@@ -1831,7 +1831,7 @@ extension ScreenShareRenegotiationTests {
         )
         #expect(RTCSession.shouldEnforceExclusiveRoomScreenShare(call: oneToOneSfu))
 
-        var plainP2P = try Call(
+        let plainP2P = try Call(
             sharedCommunicationId: UUID().uuidString,
             sender: sender,
             recipients: [recipient]
@@ -1845,7 +1845,7 @@ extension ScreenShareRenegotiationTests {
         let recipient = try Call.Participant(secretName: "bob", nickname: "bob", deviceId: "device")
 
         let wireId = UUID().uuidString
-        var oneToOneSfu = try Call(
+        let oneToOneSfu = try Call(
             sharedCommunicationId: wireId,
             channelWireId: wireId,
             sender: sender,
@@ -1853,7 +1853,7 @@ extension ScreenShareRenegotiationTests {
         )
         #expect(RTCSession.exclusiveScreenShareStopWaitTimeout(for: oneToOneSfu) == 20.0)
 
-        var plainP2P = try Call(
+        let plainP2P = try Call(
             sharedCommunicationId: UUID().uuidString,
             sender: sender,
             recipients: [recipient]
@@ -1988,7 +1988,7 @@ extension ScreenShareRenegotiationTests {
         _ = try await negotiateScreenShareOntoReceiver(receiver: receiverPC, participant: "nudge")
 
         var connection = try await makeViewerConferenceConnection(peerConnection: receiverPC)
-        guard let staleTrack = receiverPC.transceivers.compactMap({ $0.receiver.track as? RTCVideoTrack }).first(
+        guard let _ = receiverPC.transceivers.compactMap({ $0.receiver.track as? RTCVideoTrack }).first(
             where: { $0.readyState != .ended }
         ) else {
             Issue.record("Missing live relay receiver")

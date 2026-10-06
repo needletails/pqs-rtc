@@ -66,7 +66,7 @@ struct ScreenShareRenderingAndLifecycleTests {
             landscapeBuffer,
             orientationRawValue: UInt8(CGImagePropertyOrientation.right.rawValue)
         )
-        let (normalized, width, height) = ReplayKitScreenShareJPEGOrientation.normalizedUprightImage(portraitUpright)
+        let (_, width, height) = ReplayKitScreenShareJPEGOrientation.normalizedUprightImage(portraitUpright)
         #expect(width == 100)
         #expect(height == 200)
     }

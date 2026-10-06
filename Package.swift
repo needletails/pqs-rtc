@@ -13,7 +13,7 @@ let package = Package(
         .library(name: "PQSRTC", targets: ["PQSRTC"]),
     ],
     dependencies: [
-        .package(url: "https://source.skip.tools/skip.git", from: "1.6.32"),
+        .package(url: "https://source.skip.tools/skip.git", from: "1.9.13"),
         .package(url: "https://source.skip.tools/skip-fuse.git", from: "1.0.2"),
         .package(url: "https://source.skip.tools/skip-fuse-ui.git", from: "1.10.0"),
         .package(url: "https://github.com/needletails/Specs.git", from: "150.7871.01"),
@@ -21,7 +21,8 @@ let package = Package(
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.2.1"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5"),
-        .package(url: "https://github.com/needletails/needletail-media-kit.git", from: "1.1.0"),
+//        .package(url: "https://github.com/needletails/needletail-media-kit.git", from: "1.1.0"),
+        .package(path: "../needletail-media-kit"),
         .package(path: "../double-ratchet-kit")
 //        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "4.0.0"),
     ],

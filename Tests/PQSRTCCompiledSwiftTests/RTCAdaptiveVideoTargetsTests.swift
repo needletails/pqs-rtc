@@ -89,7 +89,7 @@ struct RTCAdaptiveVideoTargetsTests {
 
     @Test("High RTT with low incoming bitrate enters survival")
     func survivalFromHighRttAndLowIncoming() {
-        let cfg = RTCVideoQualityProfile.standard.adaptiveConfig
+        _ = RTCVideoQualityProfile.standard.adaptiveConfig
         #expect(RTCAdaptiveVideoTargets.shouldUseSurvivalMode(
             reportedAvailableOutgoingBps: 900_000,
             currentRttSeconds: 0.40,
