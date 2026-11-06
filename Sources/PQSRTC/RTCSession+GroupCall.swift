@@ -96,14 +96,16 @@ extension RTCSession {
             flag: .mediaReady,
             call: readinessCall)
         let confirmationKey = "\(readinessCall.sharedCommunicationId.normalizedConnectionId)|\(Self.conferenceParticipantIdentityKey(sourceId))"
-        let sendWaitId = await taskProcessor.beginOutboundSendWait(matching: .mediaReady)
+        // Same processor for begin, feed and wait (see `sendGroupCallOffer`).
+        let processor = taskProcessor
+        let sendWaitId = await processor.beginOutboundSendWait(matching: .mediaReady)
         pendingSfuGroupMediaReadyKeys.insert(confirmationKey)
         await noteEssentialOutbound(.begin, connectionId: readinessCall.sharedCommunicationId)
         do {
-            try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+            try await processor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
         } catch {
             pendingSfuGroupMediaReadyKeys.remove(confirmationKey)
-            await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+            await processor.cancelOutboundSendWait(id: sendWaitId)
             await noteEssentialOutbound(.failed, connectionId: readinessCall.sharedCommunicationId)
             throw error
         }
@@ -112,6 +114,7 @@ extension RTCSession {
             calledFromSharedCallControlActor: true
         ) {
             try await finishSfuGroupMediaReadySend(
+                processor: processor,
                 sendWaitId: sendWaitId,
                 confirmationKey: confirmationKey,
                 sourceId: sourceId,
@@ -127,6 +130,7 @@ extension RTCSession {
                 guard let self else { return }
                 do {
                     try await self.finishSfuGroupMediaReadySend(
+                        processor: processor,
                         sendWaitId: sendWaitId,
                         confirmationKey: confirmationKey,
                         sourceId: sourceId,
@@ -147,6 +151,7 @@ extension RTCSession {
     ///
     /// Must not run on the shared call-control actor that just received a sender key.
     func finishSfuGroupMediaReadySend(
+        processor: TaskProcessor,
         sendWaitId: UUID,
         confirmationKey: String,
         sourceId: String,
@@ -154,12 +159,12 @@ extension RTCSession {
         connectionId: String
     ) async throws {
         do {
-            try await taskProcessor.waitForOutboundSendCompletion(id: sendWaitId)
+            try await processor.waitForOutboundSendCompletion(id: sendWaitId)
             pendingSfuGroupMediaReadyKeys.remove(confirmationKey)
             await noteEssentialOutbound(.completed, connectionId: connectionId)
         } catch {
             pendingSfuGroupMediaReadyKeys.remove(confirmationKey)
-            await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+            await processor.cancelOutboundSendWait(id: sendWaitId)
             await noteEssentialOutbound(.failed, connectionId: connectionId)
             throw error
         }
@@ -436,14 +441,17 @@ extension RTCSession {
             roomId: wireRoomId,
             flag: .offer,
             call: call)
-        let sendWaitId = await taskProcessor.beginOutboundSendWait(matching: .offer)
+        // A wait token belongs to the processor that issued it. Hangup retires it and the
+        // accessor builds a new one, which would never resolve this token.
+        let processor = taskProcessor
+        let sendWaitId = await processor.beginOutboundSendWait(matching: .offer)
         await noteEssentialOutbound(.begin, connectionId: call.sharedCommunicationId)
         do {
-            try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
-            try await taskProcessor.waitForOutboundSendCompletion(id: sendWaitId)
+            try await processor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+            try await processor.waitForOutboundSendCompletion(id: sendWaitId)
             await noteEssentialOutbound(.completed, connectionId: call.sharedCommunicationId)
         } catch {
-            await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+            await processor.cancelOutboundSendWait(id: sendWaitId)
             await noteEssentialOutbound(.failed, connectionId: call.sharedCommunicationId)
             throw error
         }
@@ -720,6 +728,9 @@ extension RTCSession {
             return
         }
 
+        if let willCreateMedia = group.willCreateMediaForTesting { await willCreateMedia() }
+        guard groupMediaBootstrapIsLive(group, room: normalizedLookup) else { return }
+
         logger.log(
             level: .info,
             message: sendInitialOffer
@@ -761,6 +772,7 @@ extension RTCSession {
                     message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: non-CallKit audio prep failed before SFU PeerConnection: \(error)")
                 throw error
             }
+            guard groupMediaBootstrapIsLive(group, room: normalizedLookup) else { return }
         }
 #endif
 
@@ -801,6 +813,19 @@ extension RTCSession {
         }
     }
     
+    /// Media bootstrap suspends on key, connection and (iOS) audio work, and `leave` or `shutdown`
+    /// can run in any of those gaps. Media is created only while `group` is still the room's group
+    /// and no teardown is under way.
+    private func groupMediaBootstrapIsLive(_ group: RTCGroupCall, room: String) -> Bool {
+        guard groupCall(forSfuIdentity: room) === group, !isCallTeardownInProgress else {
+            logger.log(
+                level: .info,
+                message: "beginGroupCallMediaAfterSfuRegistrationIfNeeded: group for room=\(room) ended during bootstrap; not creating media")
+            return false
+        }
+        return true
+    }
+
     /// Single entrypoint to apply decoded control-plane messages.
     ///
     /// This is the intended transport-agnostic surface: your app owns the networking and
@@ -1037,7 +1062,11 @@ extension RTCSession {
                 message: "Ignoring inbound SFU mediaReady packet on client; media readiness is consumed by the SFU room=\(packet.sfuIdentity)")
         case .screenSharePreempt:
             let decoded = try BinaryDecoder().decode(Call.self, from: plaintext)
-            await handleInboundScreenSharePreempt(call: decoded, sfuIdentity: packet.sfuIdentity)
+            // Stopping the share waits for its renegotiation offer, a sibling TaskProcessor
+            // job. Run it off this inbound job like renegotiation answers, or the lane deadlocks.
+            Task { [weak self] in
+                await self?.handleInboundScreenSharePreempt(call: decoded, sfuIdentity: packet.sfuIdentity)
+            }
         }
     }
 

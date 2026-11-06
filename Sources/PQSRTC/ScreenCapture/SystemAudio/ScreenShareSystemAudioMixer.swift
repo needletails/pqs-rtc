@@ -34,6 +34,8 @@ final class ScreenShareSystemAudioMixer: @unchecked Sendable {
     private var targetChannelCount: Int
     private var buffered: [Float] = []
     private var droppedSampleCount = 0
+    /// Fractional output frame carried between resampled pushes.
+    private var resampleFrameRemainder = 0.0
 
     init(
         targetSampleRate: Int = ScreenShareSystemAudioContract.captureSampleRate,
@@ -54,6 +56,7 @@ final class ScreenShareSystemAudioMixer: @unchecked Sendable {
             targetSampleRate = sampleRate
             targetChannelCount = channelCount
             buffered.removeAll(keepingCapacity: true)
+            resampleFrameRemainder = 0
         }
     }
 
@@ -70,6 +73,7 @@ final class ScreenShareSystemAudioMixer: @unchecked Sendable {
             active = false
             buffered.removeAll(keepingCapacity: false)
             droppedSampleCount = 0
+            resampleFrameRemainder = 0
         }
     }
 
@@ -96,7 +100,8 @@ final class ScreenShareSystemAudioMixer: @unchecked Sendable {
             let converted = Self.convert(
                 frame: frame,
                 toSampleRate: targetSampleRate,
-                channelCount: targetChannelCount
+                channelCount: targetChannelCount,
+                frameRemainder: &resampleFrameRemainder
             )
             guard !converted.isEmpty else { return }
             buffered.append(contentsOf: converted)
@@ -140,7 +145,8 @@ final class ScreenShareSystemAudioMixer: @unchecked Sendable {
     static func convert(
         frame: ScreenSharePCMFrame,
         toSampleRate targetSampleRate: Int,
-        channelCount targetChannelCount: Int
+        channelCount targetChannelCount: Int,
+        frameRemainder: inout Double
     ) -> [Float] {
         let channelMapped = mapChannels(
             samples: frame.samples,
@@ -152,7 +158,8 @@ final class ScreenShareSystemAudioMixer: @unchecked Sendable {
             interleaved: channelMapped,
             channelCount: targetChannelCount,
             from: frame.sampleRate,
-            to: targetSampleRate
+            to: targetSampleRate,
+            frameRemainder: &frameRemainder
         )
     }
 
@@ -190,12 +197,34 @@ final class ScreenShareSystemAudioMixer: @unchecked Sendable {
         from sourceRate: Int,
         to targetRate: Int
     ) -> [Float] {
+        var frameRemainder = 0.0
+        return resampleLinear(
+            interleaved: interleaved,
+            channelCount: channelCount,
+            from: sourceRate,
+            to: targetRate,
+            frameRemainder: &frameRemainder
+        )
+    }
+
+    /// Linear-interpolation resampler over interleaved samples. Each chunk
+    /// yields a whole number of frames; `frameRemainder` carries the fraction
+    /// to the next chunk of the same stream so the output rate stays exact.
+    static func resampleLinear(
+        interleaved: [Float],
+        channelCount: Int,
+        from sourceRate: Int,
+        to targetRate: Int,
+        frameRemainder: inout Double
+    ) -> [Float] {
         guard sourceRate > 0, targetRate > 0, channelCount > 0 else { return [] }
         guard sourceRate != targetRate else { return interleaved }
 
         let sourceFrames = interleaved.count / channelCount
         guard sourceFrames > 0 else { return [] }
-        let targetFrames = max(1, Int((Double(sourceFrames) * Double(targetRate) / Double(sourceRate)).rounded()))
+        let exactFrames = Double(sourceFrames) * Double(targetRate) / Double(sourceRate) + frameRemainder
+        let targetFrames = Int(exactFrames.rounded())
+        frameRemainder = exactFrames - Double(targetFrames)
 
         var output = [Float](repeating: 0, count: targetFrames * channelCount)
         let step = Double(sourceFrames - 1) / Double(max(1, targetFrames - 1))

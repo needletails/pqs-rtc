@@ -22,6 +22,8 @@ import NeedleTailLogger
 
 extension RTCSession {
     func handleState(stateStream: AsyncStream<CallStateMachine.State>) async throws {
+        // Each state stream carries one call; a failure after it connected was an answered call.
+        var callConnected = false
         for await state in stateStream {
             switch state {
             case CallStateMachine.State.waiting:
@@ -31,6 +33,7 @@ extension RTCSession {
             case CallStateMachine.State.connecting(_, _):
                 break
             case CallStateMachine.State.connected(let callDirection, _):
+                callConnected = true
 #if os(macOS)
                 await stopRingtone()
 #endif
@@ -123,7 +126,14 @@ extension RTCSession {
                 // Also disable audio on failure to avoid leaving the session active
                 setAudio(false)
 #endif
-                let endState: CallStateMachine.EndState = error == "PeerConnection Failed" ? (callDirection == CallStateMachine.CallDirection.inbound(CallStateMachine.CallType.video) || callDirection == CallStateMachine.CallDirection.inbound(CallStateMachine.CallType.voice) ? CallStateMachine.EndState.partnerInitiatedUnanswered : CallStateMachine.EndState.userInitiatedUnanswered) : CallStateMachine.EndState.failed
+                let endState: CallStateMachine.EndState
+                if callConnected || error != "PeerConnection Failed" {
+                    endState = .failed
+                } else if case .inbound? = callDirection {
+                    endState = .partnerInitiatedUnanswered
+                } else {
+                    endState = .userInitiatedUnanswered
+                }
                 if let delegate {
                     try? await delegate.didEnd(call: currentCall, endState: endState)
                 } else {

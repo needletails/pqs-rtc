@@ -226,26 +226,36 @@ final class iOSScreenCaptureSource: @unchecked Sendable {
             }
 
             logger.log(level: .info, message: "ReplayKit broadcast extension connected")
-            readLoop(client: client)
+            let broadcastEnded = readLoop(client: client)
             clearClientSocket(client)
+            if broadcastEnded {
+                deactivateSystemAudioIfNeeded()
+                onBroadcastFinished?()
+            }
         }
     }
 
-    private func readLoop(client: Int32) {
+    /// Reads packets from the extension. Returns true when the broadcast is over: the
+    /// extension sent `.finished`, or its end of the socket closed while this client was still
+    /// the relay's own (it crashed, or was killed at the 50 MB extension memory limit, and
+    /// nothing will reconnect). `stopCapture` clears `isRunning` before it closes the socket,
+    /// so its own close is not reported. A malformed packet only drops this connection; the
+    /// extension reconnects on its next write.
+    private func readLoop(client: Int32) -> Bool {
         while relayIsRunning(client: client) {
             guard let header = readExactly(from: client, byteCount: ReplayKitBroadcastRelayPacket.headerLength) else {
-                break
+                return relayIsRunning(client: client)
             }
             guard let payloadLength = ReplayKitBroadcastRelayPacket.payloadLength(inHeader: header) else {
                 logger.log(level: .warning, message: "ReplayKit relay received invalid packet header")
-                break
+                return false
             }
             guard payloadLength <= ReplayKitBroadcastRelayPacket.maxPayloadLength else {
                 logger.log(level: .warning, message: "ReplayKit relay packet too large: \(payloadLength) bytes")
-                break
+                return false
             }
             guard let payload = readExactly(from: client, byteCount: Int(payloadLength)) else {
-                break
+                return relayIsRunning(client: client)
             }
 
             var packetData = header
@@ -253,15 +263,17 @@ final class iOSScreenCaptureSource: @unchecked Sendable {
             do {
                 let packet = try ReplayKitBroadcastRelayPacket.parse(packetData)
                 if !handle(packet: packet) {
-                    break
+                    return true
                 }
             } catch {
                 logger.log(level: .warning, message: "ReplayKit relay packet parse failed: \(error)")
-                break
+                return false
             }
         }
+        return false
     }
 
+    /// Returns false only for `.finished`, which ends the broadcast.
     private func handle(packet: ReplayKitBroadcastRelayPacket) -> Bool {
         switch packet.type {
         case .started:
@@ -275,8 +287,6 @@ final class iOSScreenCaptureSource: @unchecked Sendable {
             logger.log(level: .info, message: "ReplayKit broadcast resumed")
         case .finished:
             logger.log(level: .info, message: "ReplayKit broadcast finished")
-            deactivateSystemAudioIfNeeded()
-            onBroadcastFinished?()
             return false
         case .audioApp:
             handleAppAudioPacket(packet)

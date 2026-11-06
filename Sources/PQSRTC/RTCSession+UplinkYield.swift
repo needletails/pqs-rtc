@@ -66,7 +66,7 @@ extension RTCSession {
             scaleResolutionDownBy: targets.scaleResolutionDownBy
         )
 #elseif canImport(WebRTC)
-        for sender in connection.peerConnection.senders where sender.track?.kind == kRTCMediaStreamTrackKindVideo {
+        for sender in cameraVideoSenders(of: connection) {
             let params = sender.parameters
             guard !params.encodings.isEmpty else { continue }
             for encoding in params.encodings {

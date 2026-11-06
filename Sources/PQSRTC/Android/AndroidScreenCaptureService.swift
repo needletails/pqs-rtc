@@ -186,7 +186,8 @@ public final class AndroidScreenCaptureService: Service {
         // SKIP INSERT:     startForeground(notificationId, notification)
         // SKIP INSERT: }
         AndroidScreenCaptureForeground.markForegroundReady()
-        // SKIP INSERT: return android.app.Service.START_STICKY
+        // The projection dies with the process, so a restarted service would have nothing to hold.
+        // SKIP INSERT: return android.app.Service.START_NOT_STICKY
     }
 
     public override func onDestroy() {

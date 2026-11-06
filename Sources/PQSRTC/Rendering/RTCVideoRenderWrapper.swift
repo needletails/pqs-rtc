@@ -127,23 +127,41 @@ final class RTCVideoRenderWrapper: NSObject, RTCVideoRenderer, @unchecked Sendab
         }
 
         if CVPixelBufferIsPlanar(source) {
-            let planeCount = CVPixelBufferGetPlaneCount(source)
-            for plane in 0..<planeCount {
-                guard let src = CVPixelBufferGetBaseAddressOfPlane(source, plane),
-                      let dst = CVPixelBufferGetBaseAddressOfPlane(destination, plane) else {
-                    continue
-                }
-                let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
-                let planeHeight = CVPixelBufferGetHeightOfPlane(source, plane)
-                memcpy(dst, src, rowBytes * planeHeight)
+            for plane in 0..<CVPixelBufferGetPlaneCount(source) {
+                copyRows(
+                    from: CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                    sourceBytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(source, plane),
+                    to: CVPixelBufferGetBaseAddressOfPlane(destination, plane),
+                    destinationBytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(destination, plane),
+                    rows: CVPixelBufferGetHeightOfPlane(source, plane)
+                )
             }
-        } else if let src = CVPixelBufferGetBaseAddress(source),
-                  let dst = CVPixelBufferGetBaseAddress(destination) {
-            let rowBytes = CVPixelBufferGetBytesPerRow(source)
-            memcpy(dst, src, rowBytes * height)
+        } else {
+            copyRows(
+                from: CVPixelBufferGetBaseAddress(source),
+                sourceBytesPerRow: CVPixelBufferGetBytesPerRow(source),
+                to: CVPixelBufferGetBaseAddress(destination),
+                destinationBytesPerRow: CVPixelBufferGetBytesPerRow(destination),
+                rows: height
+            )
         }
 
         return destination
+    }
+
+    /// Copies row by row: CoreVideo picks the destination's row padding, which can differ from the source's.
+    private func copyRows(
+        from src: UnsafeRawPointer?,
+        sourceBytesPerRow: Int,
+        to dst: UnsafeMutableRawPointer?,
+        destinationBytesPerRow: Int,
+        rows: Int
+    ) {
+        guard let src, let dst else { return }
+        let rowBytes = min(sourceBytesPerRow, destinationBytesPerRow)
+        for row in 0..<rows {
+            memcpy(dst + row * destinationBytesPerRow, src + row * sourceBytesPerRow, rowBytes)
+        }
     }
 }
 #endif

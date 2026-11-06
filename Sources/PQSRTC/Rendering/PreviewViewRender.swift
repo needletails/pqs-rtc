@@ -149,7 +149,7 @@ actor PreviewViewRender: RendererDelegate {
     func initializeCaptureStream() async throws {
         try await createCaptureSession()
         try await startCaptureSession()
-        try await startStream(ciContext: ciContext)
+        await startStream(ciContext: ciContext)
     }
     
     deinit {
@@ -158,7 +158,7 @@ actor PreviewViewRender: RendererDelegate {
 #endif
     }
     
-    private func startStream(ciContext: CIContext) async throws {
+    private func startStream(ciContext: CIContext) async {
         self.logger.log(level: .debug, message: "Started the Preview Buffer Stream")
         let stream = AsyncStream<CaptureOutputWrapper.CaptureOutputPacket?>(bufferingPolicy: .bufferingNewest(1)) { [weak self] continuation in
             guard let self else { return }
@@ -181,7 +181,9 @@ actor PreviewViewRender: RendererDelegate {
         for await packet in stream {
             layer.connection?.isEnabled = shouldRender
             if shouldRender {
-                try await self.handleOutputStream(packet, ciContext: ciContext)
+                // Drop only this frame on error (e.g. a Metal preview conversion): the same loop
+                // injects every camera frame into WebRTC, so it must keep running.
+                try? await self.handleOutputStream(packet, ciContext: ciContext)
             }
         }
     }

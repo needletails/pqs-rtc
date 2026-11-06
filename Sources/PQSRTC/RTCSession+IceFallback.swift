@@ -114,20 +114,17 @@ extension RTCSession {
         logger.log(level: .debug, message: "Reset per-connection retry flags for new call attempt: \(normalizedId)")
     }
 
+    /// An outbound attempt that has not retried yet, under a strategy that configures a relay fallback.
+    private func relayFallbackIsAvailable(_ state: RTCConnectionFallbackState) -> Bool {
+        guard case .allThenRelay = iceTransportPolicyStrategy, case .outbound = state.direction else { return false }
+        return state.currentPolicy == .all && !state.hasRetriedToRelay
+    }
+
     func armRelayFallbackTimerIfNeeded(for call: Call) {
         let connectionId = normalizedFallbackConnectionId(for: call.sharedCommunicationId)
-        guard var existing = connectionFallbackStateByConnectionId[connectionId] else { return }
-        guard case .outbound = existing.direction else { return }
-        guard existing.currentPolicy == .all else { return }
-        guard !existing.hasRetriedToRelay else { return }
-
-        let timeoutMs: UInt64
-        switch iceTransportPolicyStrategy {
-        case .allThenRelay(let configured):
-            timeoutMs = configured
-        case .all, .relayOnly:
-            return
-        }
+        guard var existing = connectionFallbackStateByConnectionId[connectionId],
+              relayFallbackIsAvailable(existing),
+              case .allThenRelay(let timeoutMs) = iceTransportPolicyStrategy else { return }
 
         existing.timeoutTask?.cancel()
         existing.timeoutTask = Task { [weak self] in
@@ -151,16 +148,14 @@ extension RTCSession {
     func shouldDeferDisconnectFailure(for call: Call) -> Bool {
         let connectionId = normalizedFallbackConnectionId(for: call.sharedCommunicationId)
         guard let existing = connectionFallbackStateByConnectionId[connectionId] else { return false }
-        guard case .outbound = existing.direction else { return false }
-        return existing.currentPolicy == .all && !existing.hasRetriedToRelay
+        return relayFallbackIsAvailable(existing)
     }
 
     func retryWithRelayIfNeeded(call: Call, reason: String) async -> Bool {
         let connectionId = normalizedFallbackConnectionId(for: call.sharedCommunicationId)
         guard var existing = connectionFallbackStateByConnectionId[connectionId] else { return false }
         guard !isConnectionFinishingOrEnded(connectionId) else { return false }
-        guard case .outbound = existing.direction else { return false }
-        guard existing.currentPolicy == .all, !existing.hasRetriedToRelay else { return false }
+        guard relayFallbackIsAvailable(existing) else { return false }
 
         guard let state = await callState.currentState else { return false }
         switch state {
@@ -190,7 +185,10 @@ extension RTCSession {
 
         existing.hasRetriedToRelay = true
         existing.currentPolicy = .relay
-        existing.timeoutTask?.cancel()
+        // An ice_timeout retry runs inside timeoutTask: cancelling it would cancel this retry.
+        if reason != "ice_timeout" {
+            existing.timeoutTask?.cancel()
+        }
         existing.timeoutTask = nil
         connectionFallbackStateByConnectionId[connectionId] = existing
         relayFallbackRetryingConnectionIds.insert(connectionId)
@@ -207,11 +205,25 @@ extension RTCSession {
                 recipient: existing.recipient,
                 localIdentity: existing.localIdentity)
 
+            // A hangup while this retry was suspended has run this id's only teardown: stop at
+            // the next write (the offer, then the retry state) and let the catch drop the rest.
+            guard !isConnectionFinishingOrEnded(connectionId) else { throw CancellationError() }
             let retriedCall = try await resendOfferForRelayFallback(call: existing.latestCall)
+            guard !isConnectionFinishingOrEnded(connectionId) else { throw CancellationError() }
             existing.latestCall = retriedCall
             connectionFallbackStateByConnectionId[connectionId] = existing
+            if case .connected = state {
+                // Mid-call nothing else times out a re-offer that is never answered.
+                armDisconnectGraceTimer(call: retriedCall, connectionId: connectionId)
+            }
             return true
         } catch {
+            if isConnectionFinishingOrEnded(connectionId) {
+                // That teardown skips repeats, so drop what this retry created after it.
+                clearFallbackState(connectionId: connectionId)
+                await discardPeerConnectionAttemptForRetry(call: existing.latestCall)
+                return false
+            }
             if error is CancellationError {
                 logger.log(level: .warning, message: "Relay fallback retry canceled for connection=\(connectionId); preserving existing call state")
                 return false
@@ -379,8 +391,13 @@ extension RTCSession {
             guard !Task.isCancelled else { return }
             guard let self else { return }
 
-            let currentState = await self.callState.currentState
-            guard case .connected = currentState else { return }
+            switch await self.callState.currentState {
+            case .connected, .held:
+                break
+            default:
+                return
+            }
+            guard await self.releaseExpiredDisconnectGraceTask() else { return }
 
             self.logger.log(level: .warning, message: "ICE disconnect grace period expired for \(connectionId), failing call")
 
@@ -401,6 +418,15 @@ extension RTCSession {
     func cancelDisconnectGraceTask() {
         disconnectGraceTask?.cancel()
         disconnectGraceTask = nil
+    }
+
+    /// Run by an expired grace task before it fails the call: drops its handle without cancelling, so
+    /// the teardown's `cancelDisconnectGraceTask()` cannot cancel it and skip the sender drain.
+    /// False if it was cancelled (re-armed or reconnected) meanwhile; then the handle is not its own.
+    private func releaseExpiredDisconnectGraceTask() -> Bool {
+        guard !Task.isCancelled else { return false }
+        disconnectGraceTask = nil
+        return true
     }
 
     // MARK: - ICE restart during SFU media renegotiation
