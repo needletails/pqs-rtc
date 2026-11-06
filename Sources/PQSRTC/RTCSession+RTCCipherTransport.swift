@@ -243,15 +243,17 @@ extension RTCSession {
         return await connectionManager.findConnection(with: roleCall.sharedCommunicationId) != nil
     }
 
-    /// Participant id used by ``setMessageKey`` for outbound media in per-participant mode.
+    /// Key-provider slot of the local sender in per-participant mode.
     ///
-    /// Sender FrameCryptors are bound to `RTCConnection.localParticipantId`, including 1:1 SFU
-    /// calls where `remoteParticipantId` is the room id. Receive slots are populated by
-    /// ``setReceivingMessageKey`` under the resolved remote track owner.
+    /// WebRTC's key provider matches participant ids exactly, so ``setMessageKey``, sender
+    /// FrameCryptors and ``setFrameEncryptionKey(_:index:for:)`` must all use this canonical form
+    /// of `RTCConnection.localParticipantId`, including 1:1 SFU calls where `remoteParticipantId`
+    /// is the room id. Receive slots are populated by ``setReceivingMessageKey`` under the
+    /// resolved remote track owner.
     internal static func senderFrameKeyParticipantIdForSetMessageKey(
         connectionLocalParticipantId: String
     ) -> String {
-        connectionLocalParticipantId
+        conferenceParticipantIdentityKey(connectionLocalParticipantId)
     }
 
     /// True when media frame keys are supplied by the group sender-key/control-plane exchange.
@@ -1078,7 +1080,7 @@ extension RTCSession {
         }
         cryptor.enabled = false
         // Allow any in-flight encrypt pass to finish before we drop delegate / deallocate.
-        try? await Task.sleep(nanoseconds: 80_000_000)
+        await drainAppleSenderFrameTransformersBeforeSenderTeardown()
         cryptor.delegate = nil
         connection.screenSenderCryptor = nil
         connection.screenSenderCryptorBinding = nil
@@ -1105,9 +1107,13 @@ extension RTCSession {
     /// capture injection and disable sender cryptors); this then allows one bounded drain for
     /// encrypt/send tasks already in flight, mirroring
     /// ``prepareAppleScreenSenderCryptorForTrackRemoval(from:reason:)``.
+    ///
+    /// Teardown often runs in a task that has cancelled itself (relay-fallback timer, disconnect
+    /// grace expiry), where `Task.sleep` returns at once; the unstructured task does not inherit
+    /// that cancellation, so the drain always waits.
     func drainAppleSenderFrameTransformersBeforeSenderTeardown() async {
 #if canImport(WebRTC) && !os(Android)
-        try? await Task.sleep(nanoseconds: 80_000_000)
+        await Task { try? await Task.sleep(nanoseconds: 80_000_000) }.value
 #endif
     }
 
@@ -1553,14 +1559,15 @@ extension RTCSession {
         case .videoSender, .audioSender, .screenSender:
             break
         }
+        // Outbound media reads the local sender slot, under the id the key was installed with.
+        let localSenderParticipantId = Self.senderFrameKeyParticipantIdForSetMessageKey(
+            connectionLocalParticipantId: connection.localParticipantId)
         switch kind {
         case .videoSender(let sender):
-            // For outbound media, participantId must be the LOCAL participant identity
-            // so that the remote receiver can use the same id to decrypt.
             let videoFrameCryptor = RTCFrameCryptor(
                 factory: Self.factory,
                 rtpSender: sender,
-                participantId: connection.localParticipantId,
+                participantId: localSenderParticipantId,
                 algorithm: .aesGcm,
                 keyProvider: keyProvider)
 
@@ -1573,7 +1580,7 @@ extension RTCSession {
                     reason: "Failed to create video sender FrameCryptor")
             }
 
-            enableAppleFrameCryptor(videoFrameCryptor, participantId: connection.localParticipantId)
+            enableAppleFrameCryptor(videoFrameCryptor, participantId: localSenderParticipantId)
             connection.videoSenderCryptor = videoFrameCryptor
             await markSenderEncryptionReady(connection: &connection, mediaKind: "video", sender: sender)
         case .videoReceiver(let receiver):
@@ -1624,11 +1631,10 @@ extension RTCSession {
                 message: "Created receiver FrameCryptor kind=video participantId=\(binding.participantId) connId=\(connection.id) trackId=\(binding.trackId) receiverId=\(binding.receiverId) keyIndex=\(appleFrameCryptorKeyIndex(for: binding.participantId))")
 
         case .audioSender(let sender):
-            // For outbound media, participantId must be the LOCAL participant identity.
             let audioCryptor = RTCFrameCryptor(
                 factory: Self.factory,
                 rtpSender: sender,
-                participantId: connection.localParticipantId,
+                participantId: localSenderParticipantId,
                 algorithm: .aesGcm,
                 keyProvider: keyProvider)
 
@@ -1641,7 +1647,7 @@ extension RTCSession {
                     reason: "Failed to create audio sender FrameCryptor")
             }
 
-            enableAppleFrameCryptor(audioCryptor, participantId: connection.localParticipantId)
+            enableAppleFrameCryptor(audioCryptor, participantId: localSenderParticipantId)
             connection.audioSenderCryptor = audioCryptor
             await markSenderEncryptionReady(connection: &connection, mediaKind: "audio", sender: sender)
         case .audioReceiver(let receiver):
@@ -1704,7 +1710,7 @@ extension RTCSession {
             let screenCryptor = RTCFrameCryptor(
                 factory: Self.factory,
                 rtpSender: sender,
-                participantId: connection.localParticipantId,
+                participantId: localSenderParticipantId,
                 algorithm: .aesGcm,
                 keyProvider: keyProvider)
 
@@ -1717,7 +1723,7 @@ extension RTCSession {
                     reason: "Failed to create screen sender FrameCryptor")
             }
 
-            enableAppleFrameCryptor(screenCryptor, participantId: connection.localParticipantId)
+            enableAppleFrameCryptor(screenCryptor, participantId: localSenderParticipantId)
             connection.screenSenderCryptor = screenCryptor
             if let trackId = sender.track?.trackId {
                 connection.screenSenderCryptorBinding = RTCSenderCryptorBinding(
@@ -1727,7 +1733,7 @@ extension RTCSession {
             }
             logger.log(
                 level: .info,
-                message: "Created sender FrameCryptor kind=screen participantId=\(connection.localParticipantId) connId=\(connection.id) trackId=\(sender.track?.trackId ?? "nil") senderId=\(String(describing: ObjectIdentifier(sender))) keyIndex=\(appleFrameCryptorKeyIndex(for: connection.localParticipantId))"
+                message: "Created sender FrameCryptor kind=screen participantId=\(localSenderParticipantId) connId=\(connection.id) trackId=\(sender.track?.trackId ?? "nil") senderId=\(String(describing: ObjectIdentifier(sender))) keyIndex=\(appleFrameCryptorKeyIndex(for: localSenderParticipantId))"
             )
             await markSenderEncryptionReady(connection: &connection, mediaKind: "screen", sender: sender)
         case .screenReceiver(let receiver):
@@ -1868,7 +1874,8 @@ extension RTCSession {
         // Here we only attach sender cryptors via the AndroidRTCClient bridge.
         guard enableEncryption else { return }
         let attached = rtcClient.createSenderEncryptedFrame(
-            participant: connection.localParticipantId,
+            participant: Self.senderFrameKeyParticipantIdForSetMessageKey(
+                connectionLocalParticipantId: connection.localParticipantId),
             connectionId: connection.id
         )
         if !attached {
@@ -2318,10 +2325,12 @@ extension RTCSession {
                 mlKEM: remoteProps.mlKEMPublicKey),
             localKeys: connection.localKeys)
 
-        switch connection.cipherNegotiationState {
-        case .waiting, .setRecipientKey:
-            // Check per-connection instead of global flag: each party must send its own
-            // `call_cipher` so the peer receives the matching local frame identity props.
+        // Check per-connection instead of global flag: each party must send its own
+        // `call_cipher` so the peer receives the matching local frame identity props.
+        // `force` resends it after a sender-key refresh.
+        let sendsInitialCipher = connection.cipherNegotiationState == .waiting
+            || connection.cipherNegotiationState == .setRecipientKey
+        if sendsInitialCipher || force {
             let ciphertext = try await ratchetManager.getCipherText(sessionId: sendSessionIdentity.id)
             let outboundCall = try await callCipherPayloadWithLocalIdentityProps(call)
             for recipient in call.recipients {
@@ -2330,37 +2339,21 @@ extension RTCSession {
                     connectionId: connection.id,
                     ciphertext: ciphertext,
                     call: outboundCall)
-                logger.log(level: .info, message: "Sent ciphertext to recipient: \(recipient.secretName)")
+                logger.log(
+                    level: .info,
+                    message: "Sent \(sendsInitialCipher ? "" : "refreshed ")ciphertext to recipient: \(recipient.secretName)")
             }
-
-            // The actor can be re-entered while `sendCiphertext` awaits. Re-read the current
-            // connection before writing negotiation state back so a stale `.waiting` snapshot
-            // cannot regress a connection that already received the peer's cipher.
-            connection = await connectionManager.findConnection(with: connection.id) ?? connection
-            if connection.cipherNegotiationState == .setRecipientKey {
-                connection.transition(to: .complete)
-            } else if connection.cipherNegotiationState == .waiting {
-                connection.transition(to: .setSenderKey)
-            }
-        default:
-            if force {
-                let ciphertext = try await ratchetManager.getCipherText(sessionId: sendSessionIdentity.id)
-                let outboundCall = try await callCipherPayloadWithLocalIdentityProps(call)
-                for recipient in call.recipients {
-                    try await requireTransport().sendCiphertext(
-                        recipient: recipient.secretName,
-                        connectionId: connection.id,
-                        ciphertext: ciphertext,
-                        call: outboundCall)
-                    logger.log(
-                        level: .info,
-                        message: "Sent refreshed ciphertext to recipient: \(recipient.secretName)")
-                }
-            }
-            break
         }
+
+        // The actor can be re-entered while the awaits above suspend. Re-read the current
+        // connection before writing negotiation state back so a stale snapshot cannot regress
+        // a connection that already received the peer's cipher, or revert track and cryptor
+        // bindings stored on it in the meantime.
+        connection = await connectionManager.findConnection(with: connection.id) ?? connection
         if connection.cipherNegotiationState == .setRecipientKey {
             connection.transition(to: .complete)
+        } else if sendsInitialCipher, connection.cipherNegotiationState == .waiting {
+            connection.transition(to: .setSenderKey)
         }
         await connectionManager.updateConnection(id: connection.id, with: connection)
         if connection.cipherNegotiationState == .complete {
@@ -2604,13 +2597,15 @@ extension RTCSession {
             }
         }
 
+        // `recipient` is the remote peer; the local identity belongs to `call.sender`, the same
+        // name `createPeerConnection` below uses as the connection's local participant.
         let localFrameIdentity: ConnectionLocalIdentity
         if let existing = try? await keyManager.fetchCallKeyBundle() {
             localFrameIdentity = existing
         } else {
             localFrameIdentity = try await keyManager.generateSenderIdentity(
                 connectionId: call.sharedCommunicationId,
-                secretName: recipient)
+                secretName: call.sender.secretName)
         }
 
         let localSignalingIdentity: ConnectionLocalIdentity
@@ -2619,7 +2614,7 @@ extension RTCSession {
         } else {
             localSignalingIdentity = try await pcKeyManager.generateSenderIdentity(
                 connectionId: call.sharedCommunicationId,
-                secretName: recipient)
+                secretName: call.sender.secretName)
         }
 
         guard let frameProps = await localFrameIdentity.sessionIdentity.props(symmetricKey: localFrameIdentity.symmetricKey) else {
@@ -2673,17 +2668,9 @@ extension RTCSession {
         logger.log(level: .info, message: "Received ciphertext for connectionId: \(connection.id) in cipher negotiation state: \(initialState)")
         switch initialState {
         case .waiting, .setSenderKey, .complete:
-            if initialState == .complete,
-               !shouldRefreshSenderFrameKey,
-               senderFrameKeyProvisionedConnectionIds.contains(normalizedCallCipherConnectionId) {
-                logger.log(
-                    level: .info,
-                    message: "Ignoring duplicate 1:1 SFU call_cipher after media keys are established connectionId=\(connection.id)"
-                )
-                rememberProcessedCiphertext = true
-                return
-            }
-
+            // Exact duplicates were dropped above. A distinct ciphertext is a fresh bootstrap
+            // even in `.complete`: the peer re-derived its sender key (for example after it
+            // learned our real frame identity), so the receive key must follow it.
             var connection = connection
 
             logger.log(level: .info, message: "\(connection.sender.uppercased()) received ciphertext for connectionId: \(connection.id)")

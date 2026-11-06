@@ -145,15 +145,25 @@ extension RTCSession {
 
     /// Merges a decrypted post-cipher ``Call`` from ``PacketFlag.handshakeComplete`` (see
     /// ``finishCryptoSessionCreation``) into the active SFU group/connection without touching SDP.
+    ///
+    /// The SFU relays another member's own `Call` (its id, sender, recipients and SDP), so only
+    /// its identity props are taken; the local call keeps its id, which ``leave(sfuRecipientId:call:endState:)`` matches.
     func applyInboundSfuPostCipherHandshakeMerge(resolved: Call, sfuIdentity: String) async throws {
         let normRoom = sfuIdentity.normalizedConnectionId
         guard let group = groupCall(forSfuIdentity: normRoom) else {
             throw RTCErrors.missingGroupCall
         }
-        await group.applyUpdatedCallForNegotiation(resolved)
-        updateFallbackLatestCall(resolved)
-        if var connection = await connectionManager.findConnection(with: resolved.sharedCommunicationId) {
-            connection.call = resolved
+        func mergingIdentityProps(into call: Call) -> Call {
+            var call = call
+            call.frameIdentityProps = resolved.frameIdentityProps
+            call.signalingIdentityProps = resolved.signalingIdentityProps
+            return call
+        }
+        let localCall = mergingIdentityProps(into: await group.currentCall)
+        await group.applyUpdatedCallForNegotiation(localCall)
+        updateFallbackLatestCall(localCall)
+        if var connection = await connectionManager.findConnection(with: localCall.sharedCommunicationId) {
+            connection.call = mergingIdentityProps(into: connection.call)
             await connectionManager.updateConnection(id: connection.id, with: connection)
         }
     }
@@ -192,19 +202,19 @@ extension RTCSession {
             stripSsrcLines: false)
 
 #if os(Android)
-        try await setRemote(
+        let remoteApplyResult = try await setRemote(
             sdp: RTCSessionDescription(
                 typeDescription: "OFFER",
                 sdp: modified),
             call: call)
 #else
-        try await setRemote(sdp:
+        let remoteApplyResult = try await setRemote(sdp:
                                 WebRTC.RTCSessionDescription(
                                     type: sdp.type.rtcSdpType,
                                     sdp: modified),
                             call: call)
 #endif
-
+        guard remoteApplyResult == .applied else { throw RTCErrors.connectionNotFound }
 
         let processedCall = try await createAnswer(call: call)
 
@@ -334,16 +344,17 @@ extension RTCSession {
         }
 #endif
 #if os(Android)
-        try await setRemote(
+        let remoteApplyResult = try await setRemote(
             sdp: RTCSessionDescription(
                 typeDescription: "OFFER",
                 sdp: modified),
             call: call)
 #else
-        try await setRemote(sdp:
+        let remoteApplyResult = try await setRemote(sdp:
                                 WebRTC.RTCSessionDescription(type: sdp.type.rtcSdpType, sdp: modified),
                             call: call)
 #endif
+        guard remoteApplyResult == .applied else { throw RTCErrors.connectionNotFound }
 #if canImport(WebRTC) && !os(Android)
         if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
            connection.localScreenTrack != nil {
@@ -468,6 +479,7 @@ extension RTCSession {
         noteSfuGroupRenegotiationSettlementStarted(connectionId: normId)
 
         let processedCall: Call
+        let processor: TaskProcessor
         let sendWaitId: UUID
         do {
             processedCall = try await handleRenegotiationOffer(sdp: sdp, call: call)
@@ -482,12 +494,14 @@ extension RTCSession {
                 roomId: (call.resolvedChannelWireId ?? call.sharedCommunicationId).normalizedConnectionId,
                 flag: .answer,
                 call: processedCall)
-            sendWaitId = await taskProcessor.beginOutboundSendWait(matching: .answer)
+            // Same processor for begin, feed and wait (see `sendGroupCallOffer`).
+            processor = taskProcessor
+            sendWaitId = await processor.beginOutboundSendWait(matching: .answer)
             await noteEssentialOutbound(.begin, connectionId: call.sharedCommunicationId)
             do {
-                try await taskProcessor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
+                try await processor.feedTask(task: EncryptableTask(task: .writeMessage(writeTask)))
             } catch {
-                await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+                await processor.cancelOutboundSendWait(id: sendWaitId)
                 await noteEssentialOutbound(.failed, connectionId: call.sharedCommunicationId)
                 throw error
             }
@@ -500,6 +514,7 @@ extension RTCSession {
             calledFromTaskProcessorInboundJob: true
         ) {
             await finishSfuRenegotiationAnswerSend(
+                processor: processor,
                 sendWaitId: sendWaitId,
                 call: processedCall,
                 normId: normId
@@ -512,6 +527,7 @@ extension RTCSession {
             Task { [weak self] in
                 guard let self else { return }
                 await self.finishSfuRenegotiationAnswerSend(
+                    processor: processor,
                     sendWaitId: sendWaitId,
                     call: processedCall,
                     normId: normId
@@ -524,15 +540,16 @@ extension RTCSession {
     ///
     /// Must not run on the inbound `TaskProcessor.process` stack.
     func finishSfuRenegotiationAnswerSend(
+        processor: TaskProcessor,
         sendWaitId: UUID,
         call: Call,
         normId: String
     ) async {
         do {
-            try await taskProcessor.waitForOutboundSendCompletion(id: sendWaitId)
+            try await processor.waitForOutboundSendCompletion(id: sendWaitId)
             await noteEssentialOutbound(.completed, connectionId: call.sharedCommunicationId)
         } catch {
-            await taskProcessor.cancelOutboundSendWait(id: sendWaitId)
+            await processor.cancelOutboundSendWait(id: sendWaitId)
             await noteEssentialOutbound(.failed, connectionId: call.sharedCommunicationId)
             sfuRenegotiationInFlightConnectionIds.remove(normId)
             logger.log(
@@ -668,12 +685,18 @@ extension RTCSession {
 #endif
 
 #if os(Android)
-        try await setRemote(
+        let remoteApplyResult = try await setRemote(
             sdp: RTCSessionDescription(
                 typeDescription: "ANSWER",
                 sdp: modified),
             call: call)
-        let remoteApplyResult = RemoteDescriptionApplyResult.applied
+#else
+        let remoteApplyResult = try await setRemote(sdp:
+                                WebRTC.RTCSessionDescription(type: sdp.type.rtcSdpType, sdp: modified),
+                            call: call)
+#endif
+        guard remoteApplyResult == .applied else { return }
+#if os(Android)
         if let connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
             if Self.isTrueOneToOneSfuRoom(call: call) {
                 await rebindInboundRemoteVideoAfterSfuRenegotiationIfNeeded(call: call)
@@ -687,11 +710,6 @@ extension RTCSession {
             }
         }
 #else
-        let remoteApplyResult = try await setRemote(sdp:
-                                WebRTC.RTCSessionDescription(type: sdp.type.rtcSdpType, sdp: modified),
-                            call: call)
-        guard remoteApplyResult == .applied else { return }
-#if canImport(WebRTC) && !os(Android)
         if Self.isTrueOneToOneSfuRoom(call: call),
            let connection = await connectionManager.findConnection(with: call.sharedCommunicationId),
            let remoteSdp = connection.peerConnection.remoteDescription?.sdp {
@@ -727,8 +745,10 @@ extension RTCSession {
             await rebindGroupRemoteParticipantScreenAfterSfuRenegotiationIfNeeded(connectionId: call.sharedCommunicationId)
         }
 #endif
-#endif
         screenShareAnswerApplied = true
+        // Our offer is answered. Clear its awaiting flag before the deferred SFU offer is replayed
+        // below, or handleRenegotiationOffer stashes it again; the defer settles the rest.
+        screenShareRenegotiationAwaitingAnswerConnectionIds.remove(screenShareAnswerConnectionId)
         if var connection = await connectionManager.findConnection(with: call.sharedCommunicationId) {
             connection.call = call
             await connectionManager.updateConnection(id: call.sharedCommunicationId, with: connection)
@@ -976,6 +996,30 @@ extension RTCSession {
 
     //MARK: Internal
 
+    /// True when `call` is no longer the call this session is working on: teardown of its
+    /// connection has begun or finished, or a different call is now current. This is the
+    /// liveness rule ``handleTerminalSignalingJobFailure(task:error:)`` applies.
+    func isSupersededCall(_ call: Call) async -> Bool {
+        if isConnectionFinishingOrEnded(call.sharedCommunicationId) { return true }
+        guard let currentCall = await callState.currentCall else { return false }
+        return currentCall.sharedCommunicationId.normalizedConnectionId
+            != call.sharedCommunicationId.normalizedConnectionId
+    }
+
+    /// Fails and ends `call` after a fatal offer/answer/remote-description error.
+    ///
+    /// Offer/answer waits can outlive a hangup and redial (createOffer polls up to 30 s for its
+    /// connection); a superseded attempt failing late must not fail or tear down the live call.
+    private func failCallAfterExchangeError(
+        _ call: Call,
+        direction: CallStateMachine.CallDirection,
+        error: Error
+    ) async {
+        if await isSupersededCall(call) { return }
+        await callState.transition(to: .failed(direction, call, error.localizedDescription))
+        await finishEndConnection(currentCall: call)
+    }
+
     /// Creates an SDP offer for a call with proper error handling and validation
     /// - Parameters:
     ///   - call: The call to create an offer for
@@ -996,7 +1040,7 @@ extension RTCSession {
             // we don't miss generated ICE candidates on subsequent calls.
             handleNotificationsStream()
 
-            let connection: RTCConnection? = try await loop.runReturningLoop(expiresIn: 30, sleep: .seconds(1)) { [weak self] in
+            let connection: RTCConnection? = try await loop.runReturningLoop(expiresIn: 30, sleep: .seconds(1), checkImmediately: true) { [weak self] in
                 guard let self else { return (false, nil) }
                 // First try to find by sharedCommunicationId
                 if let foundConnection = await self.connectionManager.findConnection(with: call.sharedCommunicationId) {
@@ -1070,18 +1114,15 @@ extension RTCSession {
             throw CancellationError()
         } catch let error as SDPHandlerError {
             logger.log(level: .error, message: "SDP offer creation failed: \(error.localizedDescription)")
-            await callState.transition(to: .failed(inferredCallDirection(for: call), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: inferredCallDirection(for: call), error: error)
             throw error
         } catch let error as RTCErrors {
             logger.log(level: .error, message: "RTC error during offer creation: \(error.localizedDescription)")
-            await callState.transition(to: .failed(inferredCallDirection(for: call), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: inferredCallDirection(for: call), error: error)
             throw error
         } catch {
             logger.log(level: .error, message: "Unexpected error during offer creation: \(error)")
-            await callState.transition(to: .failed(inferredCallDirection(for: call), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: inferredCallDirection(for: call), error: error)
             throw RTCErrors.mediaError("Offer creation failed: \(error.localizedDescription)")
         }
     }
@@ -1102,7 +1143,7 @@ extension RTCSession {
         // This is on the critical inbound-call path; 1s polling introduces visible lag in UI
         // transition and can delay remote track availability. Use a tighter polling interval
         // while keeping the same overall timeout budget (~10s).
-        try await loop.run(200, sleep: Duration.milliseconds(50)) { [weak self] in
+        try await loop.run(10, sleep: Duration.milliseconds(50), checkImmediately: true) { [weak self] in
             guard let self else { return false }
             var canRun = true
             let stateKey = call.sharedCommunicationId.normalizedConnectionId
@@ -1225,32 +1266,74 @@ extension RTCSession {
             throw CancellationError()
         } catch let error as SDPHandlerError {
             logger.log(level: .error, message: "SDP answer creation failed: \(error.localizedDescription)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: .inbound(call.supportsVideo ? .video : .voice), error: error)
             throw error
         } catch let error as RTCErrors {
             logger.log(level: .error, message: "RTC error during answer creation: \(error.localizedDescription)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: .inbound(call.supportsVideo ? .video : .voice), error: error)
             throw error
         } catch {
             logger.log(level: .error, message: "Unexpected error during answer creation: \(error)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: .inbound(call.supportsVideo ? .video : .voice), error: error)
             throw RTCErrors.mediaError("Answer creation failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Guards against stale answers. When audio and video tracks are added in quick succession,
+    /// peerConnectionShouldNegotiate can fire twice and produce two offers; the first answer moves
+    /// signaling back to stable, and a second (or late) answer then fails with "wrong state" (and
+    /// can crash Apple WebRTC), which would end a live call. Logs and returns true for such an answer.
+    private func isStaleRemoteAnswer(isAnswer: Bool, connection: RTCConnection, call: Call) -> Bool {
+        guard isAnswer else { return false }
+#if canImport(WebRTC) && !os(Android)
+        let isStable = connection.peerConnection.signalingState == .stable
+#else
+        // Android reads the state its peer observer last reported: native `signalingState()`
+        // crashes once the PeerConnection is closed.
+        let isStable = signalingStateByConnectionId[connection.id.normalizedConnectionId]?.description == "stable"
+#endif
+        guard isStable else { return false }
+        logger.log(level: .warning, message: "Dropping stale SDP answer for \(call.sharedCommunicationId): signaling state is already stable")
+        return true
+    }
+
+    /// Marks `connection`'s remote description set and applies the ICE candidates that arrived
+    /// before it. A hangup or ICE-fallback retry can remove or replace the connection while
+    /// `setRemoteSDP` is suspended; its teardown already cleared this state, and re-creating it
+    /// would let the next attempt's early candidates in before its own remote description.
+    private func recordRemoteDescriptionApplied(on connection: RTCConnection, call: Call) async -> RemoteDescriptionApplyResult {
+        guard await connectionManager.findConnection(with: call.sharedCommunicationId)?.peerConnection
+                === connection.peerConnection else {
+            return .dropped
+        }
+        let stateKey = call.sharedCommunicationId.normalizedConnectionId
+        pcState = PeerConnectionState.setRemote
+        pcStateByConnectionId[stateKey] = .setRemote
+        logger.log(level: .info, message: "Successfully set remote SDP for call: \(call.sharedCommunicationId)")
+
+        // Process any queued incoming candidates that arrived before setRemote
+        do {
+            let consumer = inboundCandidateConsumer(for: stateKey)
+            try await processAllQueuedCandidates(connection: connection, consumer: consumer)
+        } catch {
+            logger.log(level: .warning, message: "Error processing queued candidates: \(error.localizedDescription)")
+        }
+        return .applied
     }
 
     /// Sets the remote SDP for a call with proper error handling and validation
     /// - Parameters:
     ///   - sdp: The remote SDP to set
     ///   - call: The call to set the SDP for
+    /// - Returns: `.dropped` for a stale answer (see `isStaleRemoteAnswer`) or a connection torn
+    ///   down meanwhile (see `recordRemoteDescriptionApplied`), else `.applied`
     /// - Throws: SDPHandlerError or RTCErrors if setting fails
 #if os(Android)
+    @discardableResult
     func setRemote(
         sdp: RTCSessionDescription,
         call: Call
-    ) async throws {
+    ) async throws -> RemoteDescriptionApplyResult {
         logger.log(level: .info, message: "Setting remote SDP for call: \(call.sharedCommunicationId)")
 
         // Remote description can trigger negotiation/ICE events; ensure consumer is alive.
@@ -1262,11 +1345,15 @@ extension RTCSession {
                 throw RTCErrors.invalidConfiguration("Connection must be created before setting remote SDP.")
             }
 
+            let isAnswer = sdp.typeDescription.caseInsensitiveCompare("ANSWER") == .orderedSame
+            if isStaleRemoteAnswer(isAnswer: isAnswer, connection: connection, call: call) {
+                return .dropped
+            }
+
             logger.log(level: .debug, message: "Found connection for call: \(call.sharedCommunicationId)")
 
             // Modify SDP for specific requirements
             var modifiedSdp = sdp
-            let isAnswer = sdp.typeDescription.caseInsensitiveCompare("ANSWER") == .orderedSame
             let prepared: (sdp: String, preserveVideoDirectionsForMids: Set<String>)
             if isAnswer {
                 prepared = await preprocessAndroidInboundAnswerSdp(sdp.sdp, call: call)
@@ -1289,34 +1376,19 @@ extension RTCSession {
 
             // Set remote SDP using the new SDPHandler
             try await setRemoteSDP(modifiedSdp, for: connection)
-
-            let stateKey = call.sharedCommunicationId.normalizedConnectionId
-            pcState = PeerConnectionState.setRemote
-            pcStateByConnectionId[stateKey] = .setRemote
-            logger.log(level: .info, message: "Successfully set remote SDP for call: \(call.sharedCommunicationId)")
-
-            // Process any queued incoming candidates that arrived before setRemote
-            do {
-                let consumer = inboundCandidateConsumer(for: stateKey)
-                try await processAllQueuedCandidates(connection: connection, consumer: consumer)
-            } catch {
-                logger.log(level: .warning, message: "Error processing queued candidates: \(error.localizedDescription)")
-            }
+            return await recordRemoteDescriptionApplied(on: connection, call: call)
 
         } catch let error as SDPHandlerError {
             logger.log(level: .error, message: "Failed to set remote SDP: \(error.localizedDescription)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: .inbound(call.supportsVideo ? .video : .voice), error: error)
             throw error
         } catch let error as RTCErrors {
             logger.log(level: .error, message: "RTC error setting remote SDP: \(error.localizedDescription)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: .inbound(call.supportsVideo ? .video : .voice), error: error)
             throw error
         } catch {
             logger.log(level: .error, message: "Unexpected error setting remote SDP: \(error)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: .inbound(call.supportsVideo ? .video : .voice), error: error)
             throw RTCErrors.mediaError("Failed to set remote SDP: \(error.localizedDescription)")
         }
     }
@@ -1348,13 +1420,7 @@ extension RTCSession {
                 throw RTCErrors.invalidConfiguration("Connection must be created before setting remote SDP.")
             }
 
-            // Guard against stale answers from duplicate offer/answer cycles.
-            // When audio and video tracks are added in quick succession,
-            // peerConnectionShouldNegotiate can fire twice, producing two offers.
-            // The first answer moves signaling back to stable; the second answer
-            // would crash WebRTC if we tried to apply it.
-            if sdp.type == .answer && connection.peerConnection.signalingState == .stable {
-                logger.log(level: .warning, message: "Dropping stale SDP answer for \(call.sharedCommunicationId): signaling state is already stable")
+            if isStaleRemoteAnswer(isAnswer: sdp.type == .answer, connection: connection, call: call) {
                 return .dropped
             }
 
@@ -1388,19 +1454,7 @@ extension RTCSession {
 
             // Set remote SDP using the new SDPHandler
             try await setRemoteSDP(modifiedSdp, for: connection)
-
-            let stateKey = call.sharedCommunicationId.normalizedConnectionId
-            pcState = PeerConnectionState.setRemote
-            pcStateByConnectionId[stateKey] = .setRemote
-            logger.log(level: .info, message: "Successfully set remote SDP for call: \(call.sharedCommunicationId)")
-
-            // Process any queued incoming candidates that arrived before setRemote
-            do {
-                let consumer = inboundCandidateConsumer(for: stateKey)
-                try await processAllQueuedCandidates(connection: connection, consumer: consumer)
-            } catch {
-                logger.log(level: .warning, message: "Error processing queued candidates: \(error.localizedDescription)")
-            }
+            return await recordRemoteDescriptionApplied(on: connection, call: call)
 
         } catch let error as SDPHandlerError {
             if await recoverFromScreenShareAnswerSetRemoteFailureIfNeeded(
@@ -1411,13 +1465,11 @@ extension RTCSession {
                 return .dropped
             }
             logger.log(level: .error, message: "Failed to set remote SDP: \(error.localizedDescription)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: .inbound(call.supportsVideo ? .video : .voice), error: error)
             throw error
         } catch let error as RTCErrors {
             logger.log(level: .error, message: "RTC error setting remote SDP: \(error.localizedDescription)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: .inbound(call.supportsVideo ? .video : .voice), error: error)
             throw error
         } catch {
             if await recoverFromScreenShareAnswerSetRemoteFailureIfNeeded(
@@ -1428,11 +1480,9 @@ extension RTCSession {
                 return .dropped
             }
             logger.log(level: .error, message: "Unexpected error setting remote SDP: \(error)")
-            await callState.transition(to: .failed(.inbound(call.supportsVideo ? .video : .voice), call, error.localizedDescription))
-            await finishEndConnection(currentCall: call)
+            await failCallAfterExchangeError(call, direction: .inbound(call.supportsVideo ? .video : .voice), error: error)
             throw RTCErrors.mediaError("Failed to set remote SDP: \(error.localizedDescription)")
         }
-        return .applied
     }
 
     private func recoverFromScreenShareAnswerSetRemoteFailureIfNeeded(

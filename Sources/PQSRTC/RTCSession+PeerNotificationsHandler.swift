@@ -276,6 +276,8 @@ extension RTCSession {
         // Safe fallback for 1:1 SFU rooms where SFU stream ids are random UUIDs.
         // Conference channels use `conf-<uuid>` room ids and often have empty recipients; do not
         // treat them as 1:1-over-SFU or we remap stream ids to the room string and break E2EE keys.
+        // Multi-party rooms never guess a UUID label's owner: it stays a placeholder, and the UUID
+        // delay holds the receiver until a stable owner is known.
         let isOneToOneSfuRoom = Self.isTrueOneToOneSfuRoom(call: connection.call)
         let streamLooksLikeUuid = UUID(uuidString: streamId) != nil
         if isOneToOneSfuRoom,
@@ -287,29 +289,6 @@ extension RTCSession {
                 return (effectiveRemote, true, true)
             }
         }
-
-        // Conference SFU relay screen legs often publish UUID stream labels (no `screen_<participant>`
-        // prefix). Frame keys are provisioned under stable participant ids such as `echo`.
-        #if canImport(WebRTC) && !os(Android)
-        if isGroup,
-           !isOneToOneSfuRoom,
-           streamLooksLikeUuid {
-            let local = connection.localParticipantId.trimmingCharacters(in: .whitespacesAndNewlines)
-            let loneRemoteParticipantIds = connection.remoteVideoTracksByParticipantId.keys.compactMap { key -> String? in
-                let candidate = key.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !candidate.isEmpty, candidate.caseInsensitiveCompare(local) != .orderedSame else { return nil }
-                return candidate
-            }
-            if loneRemoteParticipantIds.count == 1, let relay = loneRemoteParticipantIds.first {
-                return (relay, true, true)
-            }
-            if let owner = remoteTrackOwnerParticipantId(connection: connection, call: connection.call)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               !owner.isEmpty {
-                return (owner, true, true)
-            }
-        }
-        #endif
 
         if isGroup,
            let normalized = Self.normalizedRemoteParticipantIdFromSfuMediaLabel(
@@ -4886,10 +4865,8 @@ extension RTCSession {
 #endif
 
     func handlePeerConnectionNotifications(generation: UInt64) async {
-        notificationsConsumerIsRunning = true
         logger.log(level: .info, message: "Peer-notifications consumer is now listening (generation=\(generation))")
         defer {
-            notificationsConsumerIsRunning = false
             let activeConnectionIdDescription = activeConnectionId ?? "nil"
             logger.log(
                 level: .info,
@@ -4963,7 +4940,8 @@ extension RTCSession {
                     }
                     if let localScreenTrack = connection.localScreenTrack {
                         rtcClient.createScreenSenderEncryptedFrame(
-                            participant: connection.localParticipantId,
+                            participant: Self.senderFrameKeyParticipantIdForSetMessageKey(
+                                connectionLocalParticipantId: connection.localParticipantId),
                             connectionId: connection.id,
                             trackId: localScreenTrack.trackId
                         )
@@ -5990,10 +5968,17 @@ extension RTCSession {
                     cancelRelayFallbackTimer(connectionId: connection.id)
                     cancelDisconnectGraceTask()
 
-                    await self.callState.transition(
-                        to: .connected(
-                            callDirection,
-                            connection.call))
+                    // Same rule as the standardized path: ICE advances a call that is still being
+                    // set up and never overrides a later state such as the host's `.held`.
+                    switch await self.callState.currentState {
+                    case .connecting, .ready:
+                        await self.callState.transition(
+                            to: .connected(
+                                callDirection,
+                                connection.call))
+                    default:
+                        break
+                    }
 
 #if canImport(WebRTC)
                     // Start periodic stats logging so we can prove whether RTP is actually leaving the client.
@@ -6090,20 +6075,17 @@ extension RTCSession {
 #endif
                     let callDirection = await self.callState.callDirection
                         ?? self.inferredCallDirection(for: connection.call)
-                    let current = await self.callState.currentState
-                    if case .connecting = current {
-                        await self.callState.transition(
-                            to: .connected(
-                                callDirection,
-                                connection.call))
-                    } else if case .ready = current {
-                        // If `setConnectingIfReady` could not run (e.g. state not `.ready` yet) but
-                        // the native stack still reaches ICE connected, advance so the UI is not
+                    switch await self.callState.currentState {
+                    case .connecting, .ready:
+                        // `.ready`: if `setConnectingIfReady` could not run (e.g. state not `.ready` yet)
+                        // but the native stack still reaches ICE connected, advance so the UI is not
                         // stuck in "connecting" forever.
                         await self.callState.transition(
                             to: .connected(
                                 callDirection,
                                 connection.call))
+                    default:
+                        break
                     }
 #if canImport(WebRTC) && !os(Android)
                     await reconcileDeferredAppleRemoteScreenTracksIfNeeded(connectionId: connection.id)
@@ -6130,9 +6112,12 @@ extension RTCSession {
                         self.logger.log(level: .warning, message: "Deferring disconnect failure while outbound relay fallback remains available for \(connection.id)")
                         continue
                     }
-                    if case .connected = await self.callState.currentState {
+                    switch await self.callState.currentState {
+                    case .connected, .held:
                         armDisconnectGraceTimer(for: connection)
                         continue
+                    default:
+                        break
                     }
                 }
 

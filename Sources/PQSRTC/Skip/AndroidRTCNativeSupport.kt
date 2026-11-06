@@ -3972,6 +3972,7 @@ object AndroidRTCViewSupport {
 class AndroidFrameCryptorSupport {
     private var keyProvider: FrameCryptorKeyProvider? = null
     private var generation: Long = 0
+    // Session-lifetime: installed once by RTCSession init, so disposeAll() must keep them.
     var videoReceiverFrameCryptorReadyHandler: ((String) -> Unit)? = null
     // H1: forwards (tag, participantId, stateDescription) so decrypt failures surface as events.
     var frameCryptorStateHandler: ((String, String, String) -> Unit)? = null
@@ -4032,8 +4033,6 @@ class AndroidFrameCryptorSupport {
         videoReceiverTrackIdsByParticipantId.clear()
         audioReceiverTrackIdsByParticipantId.clear()
         screenReceiverTrackIdsByParticipantId.clear()
-        videoReceiverFrameCryptorReadyHandler = null
-        frameCryptorStateHandler = null
     }
 
     @Synchronized
@@ -4362,6 +4361,22 @@ class AndroidFrameCryptorSupport {
                 enableAndroidRemoteAudioReceiverTrack(receiver)
             }
         }
+    }
+
+    /// E2EE remote audio is ciphertext until its receiver cryptor binds, and the session can defer
+    /// that attach (1:1 SFU receive key, group participant id, SDP reconcile). onTrack holds it from
+    /// arrival and attachAudioReceiverCryptor releases it. onTrack runs on the signaling thread, which
+    /// attach blocks on while holding this monitor, so the check runs on main, in order with attach.
+    fun holdRemoteAudioUntilCryptorAttached(receiver: RtpReceiver) {
+        Handler(Looper.getMainLooper()).post { holdUnboundRemoteAudioOnMain(receiver) }
+    }
+
+    @Synchronized
+    private fun holdUnboundRemoteAudioOnMain(receiver: RtpReceiver) {
+        if (keyProvider == null) return
+        val trackId = try { receiver.track()?.id() } catch (_: IllegalStateException) { null } ?: return
+        if (audioReceiverTrackIdsByParticipantId.containsValue(trackId)) return
+        holdAndroidRemoteAudioReceiverTrack(receiver)
     }
 
     private fun holdAndroidRemoteAudioReceiverTrack(receiver: RtpReceiver) {
@@ -7169,10 +7184,58 @@ object AndroidWebRTCTrackResolver {
     }
 
     /**
-     * Trackless video transceiver beyond the camera slot (the reserved group-call screen slot),
-     * if one exists.
+     * Puts the screen [track] on the screen slot's sender, or on a new send-only transceiver
+     * when there is no slot. `addTrack` never reuses a transceiver that has sent before, so a
+     * restarted share would open a new mid past the audio=0/camera=1/screen=2 contract.
+     * The direction steps up the way `addTrack` does it.
      */
-    fun reusableScreenSlotTransceiver(peerConnection: PeerConnection): RtpTransceiver? {
+    fun attachScreenSender(peerConnection: PeerConnection, track: MediaStreamTrack, streamIds: List<String>) {
+        val slot = reusableScreenSlotTransceiver(peerConnection)
+        if (slot == null) {
+            peerConnection.addTransceiver(
+                track,
+                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY, streamIds)
+            )
+        } else {
+            slot.sender.setTrack(track, false)
+            slot.sender.setStreams(streamIds)
+            when (slot.direction) {
+                RtpTransceiver.RtpTransceiverDirection.RECV_ONLY -> slot.setDirection(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+                RtpTransceiver.RtpTransceiverDirection.INACTIVE -> slot.setDirection(RtpTransceiver.RtpTransceiverDirection.SEND_ONLY)
+                else -> {}
+            }
+        }
+        invalidateTransceiverSnapshot(peerConnection)
+    }
+
+    /**
+     * Takes the screen [track] off its sender, which leaves the slot trackless for the next
+     * share. Clearing the streams drops the screen msid from the stop offer, as the Apple stop
+     * does, so the SFU and the peer tear the share down.
+     */
+    fun detachScreenSender(peerConnection: PeerConnection, track: MediaStreamTrack) {
+        val trackId = try {
+            track.id()
+        } catch (_: IllegalStateException) {
+            return
+        }
+        for (sender in stableSenders(peerConnection)) {
+            try {
+                if (sender.track()?.id() != trackId) continue
+                peerConnection.removeTrack(sender)
+                sender.setStreams(emptyList())
+            } catch (_: IllegalStateException) {
+                continue
+            }
+        }
+        invalidateTransceiverSnapshot(peerConnection)
+    }
+
+    /**
+     * Trackless, unstopped video transceiver beyond the camera slot (the reserved group-call
+     * screen slot, or the slot an earlier share left), if one exists.
+     */
+    private fun reusableScreenSlotTransceiver(peerConnection: PeerConnection): RtpTransceiver? {
         var seenFirstVideo = false
         for (transceiver in transceivers(peerConnection)) {
             if (transceiverMediaTypeOrNull(transceiver) != MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO) continue
@@ -7180,12 +7243,12 @@ object AndroidWebRTCTrackResolver {
                 seenFirstVideo = true
                 continue
             }
-            val senderHasTrack = try {
-                transceiver.sender.track() != null
+            val reusable = try {
+                !transceiver.isStopped && transceiver.sender.track() == null
             } catch (_: IllegalStateException) {
                 continue
             }
-            if (!senderHasTrack) return transceiver
+            if (reusable) return transceiver
         }
         return null
     }

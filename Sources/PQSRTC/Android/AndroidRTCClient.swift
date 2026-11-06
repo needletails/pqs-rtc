@@ -72,43 +72,37 @@ import kotlin.__
 // SKIP INSERT:
 // SKIP INSERT:     override fun onSignalingChange(newState: org.webrtc.PeerConnection.SignalingState) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Signaling state changed to: $newState")
-// SKIP INSERT:         if (newState == org.webrtc.PeerConnection.SignalingState.CLOSED) {
-// SKIP INSERT:             client.retireCurrentNativePeerConnection()
-// SKIP INSERT:         }
 // SKIP INSERT:         val state = convertSignalingState(newState)
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.signalingStateChange(state))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.signalingStateChange(state), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceConnectionChange(newState: org.webrtc.PeerConnection.IceConnectionState) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "ICE connection state changed to: $newState")
 // SKIP INSERT:         val state = convertIceConnectionState(newState)
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceConnectionStateChange(state))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceConnectionStateChange(state), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onStandardizedIceConnectionChange(newState: org.webrtc.PeerConnection.IceConnectionState) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Standardized ICE connection state changed to: $newState")
 // SKIP INSERT:         val state = convertIceConnectionState(newState)
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.standardizedIceConnectionStateChange(state))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.standardizedIceConnectionStateChange(state), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onConnectionChange(newState: org.webrtc.PeerConnection.PeerConnectionState) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Peer connection state changed to: $newState")
-// SKIP INSERT:         if (newState == org.webrtc.PeerConnection.PeerConnectionState.CLOSED) {
-// SKIP INSERT:             client.retireCurrentNativePeerConnection()
-// SKIP INSERT:         }
 // SKIP INSERT:         val state = convertPeerConnectionState(newState)
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.peerConnectionStateChange(state))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.peerConnectionStateChange(state), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceConnectionReceivingChange(receiving: Boolean) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "ICE connection receiving changed to: $receiving")
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceConnectionReceivingChange(receiving))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceConnectionReceivingChange(receiving), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceGatheringChange(newState: org.webrtc.PeerConnection.IceGatheringState) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "ICE gathering state changed to: $newState")
 // SKIP INSERT:         val state = convertIceGatheringState(newState)
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceGatheringStateChange(state))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceGatheringStateChange(state), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceCandidate(candidate: org.webrtc.IceCandidate) {
@@ -118,55 +112,56 @@ import kotlin.__
 // SKIP INSERT:             sdpMLineIndex = candidate.sdpMLineIndex.toInt(),
 // SKIP INSERT:             sdpMid = candidate.sdpMid
 // SKIP INSERT:         )
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.candidate(ice))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.candidate(ice), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onIceCandidatesRemoved(candidates: kotlin.Array<org.webrtc.IceCandidate>) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Removed ${candidates.size} ICE candidates")
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceCandidatesRemoved(candidates.size))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.iceCandidatesRemoved(candidates.size), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onAddStream(stream: org.webrtc.MediaStream) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Stream added: ${stream.id}")
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.addStream(stream.id))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.addStream(stream.id), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onRemoveStream(stream: org.webrtc.MediaStream) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Stream removed: ${stream.id}")
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.removeStream(stream.id))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.removeStream(stream.id), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onDataChannel(dataChannel: org.webrtc.DataChannel) {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Data channel opened: ${dataChannel.label()}")
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.dataChannel(dataChannel.label()))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.dataChannel(dataChannel.label()), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onRenegotiationNeeded() {
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "PeerConnection renegotiation needed")
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.shouldNegotiate)
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.shouldNegotiate, this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onAddTrack(receiver: org.webrtc.RtpReceiver, mediaStreams: kotlin.Array<org.webrtc.MediaStream>) {
 // SKIP INSERT:         val trackKind = receiver.track()?.kind() ?: "unknown"
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "On Add Track: $trackKind")
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.addTrack(trackKind))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.addTrack(trackKind), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onRemoveTrack(receiver: org.webrtc.RtpReceiver) {
 // SKIP INSERT:         val trackKind = receiver.track()?.kind() ?: "unknown"
 // SKIP INSERT:         if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "On Removed Track: $trackKind")
-// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.removeTrack(trackKind))
+// SKIP INSERT:         client.triggerRTCEvent(ClientPCEvent.removeTrack(trackKind), this)
 // SKIP INSERT:     }
 // SKIP INSERT:
 // SKIP INSERT:     override fun onTrack(transceiver: org.webrtc.RtpTransceiver) {
 // SKIP INSERT:         val track = transceiver.receiver.track()
 // SKIP INSERT:         when (track) {
 // SKIP INSERT:             is org.webrtc.AudioTrack -> {
-// SKIP INSERT:                 client.triggerRTCEvent(ClientPCEvent.audioTrack(RTCAudioTrack(track)))
+// SKIP INSERT:                 client.holdRemoteAudioUntilReceiverCryptorAttached(transceiver.receiver)
+// SKIP INSERT:                 client.triggerRTCEvent(ClientPCEvent.audioTrack(RTCAudioTrack(track)), this)
 // SKIP INSERT:                 if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Started receiving on transceiver: audioTrack")
 // SKIP INSERT:             }
 // SKIP INSERT:             is org.webrtc.VideoTrack -> {
-// SKIP INSERT:                 client.triggerRTCEvent(ClientPCEvent.videoTrack(RTCVideoTrack(track)))
+// SKIP INSERT:                 client.triggerRTCEvent(ClientPCEvent.videoTrack(RTCVideoTrack(track)), this)
 // SKIP INSERT:                 if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("RTCClientPeerObserver", "Started receiving on transceiver: videoTrack")
 // SKIP INSERT:             }
 // SKIP INSERT:         }
@@ -227,20 +222,31 @@ import kotlin.__
 private final class RTCOnCreateSdpObserver: NSObject, org.webrtc.SdpObserver, @unchecked Sendable {
     
     private let lock = NSLock()
-    private let callback: (RTCSessionDescription) -> Void
-    init(_ callback: @escaping (RTCSessionDescription) -> Void) { self.callback = callback }
+    /// Receives the created description, or `nil` and the WebRTC create failure message (for
+    /// example a PeerConnection closed or shut down by hangup or relay reset during the operation).
+    private let callback: (RTCSessionDescription?, String?) -> Void
+    init(_ callback: @escaping (RTCSessionDescription?, String?) -> Void) { self.callback = callback }
     
     override func onCreateSuccess(_ desc: org.webrtc.SessionDescription?) {
-        guard let d = desc else { return }
+        guard let d = desc else {
+            onCreateFailure("create description returned no SDP")
+            return
+        }
         lock.lock()
         defer {
             lock.unlock()
         }
-        callback(RTCSessionDescription(type: d.type, sdp: d.description))
+        callback(RTCSessionDescription(type: d.type, sdp: d.description), nil)
     }
     
     override func onSetSuccess() {}
-    override func onCreateFailure(_ error: String?) {}
+    override func onCreateFailure(_ error: String?) {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        callback(nil, error ?? "create description failed")
+    }
     override func onSetFailure(_ error: String?) {}
 }
 
@@ -436,8 +442,8 @@ public enum ClientPCEvent: Sendable {
 /// Thread safety: most methods synchronize internal state with an `NSLock`.
 public final class AndroidRTCClient: @unchecked Sendable {
     
-    /// Callback used to deliver newly created local SDP.
-    private typealias OnLocalSDP = @Sendable (RTCSessionDescription) -> Void
+    /// Callback used to deliver newly created local SDP, or `nil` and the create failure message.
+    private typealias OnLocalSDP = @Sendable (RTCSessionDescription?, String?) -> Void
     
     // Thread safety
     private let lock = NSLock()
@@ -525,10 +531,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
         self.delegate = delegate
     }
     
-    /// Delivers a WebRTC event to the delegate, if the client is not closed.
-    public func triggerRTCEvent(_ event: ClientPCEvent) {
+    /// Delivers a WebRTC event to the delegate, if the client is not closed and `source` is the
+    /// observer of the current PeerConnection. A replaced or reset PeerConnection (including the
+    /// CLOSED transitions its own close fires) must not report into the next connection.
+    public func triggerRTCEvent(_ event: ClientPCEvent, from source: AnyObject) {
         lock.lock()
-        guard !isClosed else {
+        guard !isClosed, observer === source else {
             lock.unlock()
             return
         }
@@ -623,6 +631,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
     // MARK: E2EE
     private var keyProvider: org.webrtc.FrameCryptorKeyProvider?
     private var keyProviderIsSharedKeyMode: Bool?
+    private var keyProviderRatchetSalt: Data?
     private let frameCryptorSupport: AndroidFrameCryptorSupport = AndroidFrameCryptorSupport()
     /// Swift-only: true when keyProvider has been set (by Kotlin). Use this instead of reading keyProvider in Swift to avoid triggering JNI method resolution (setKey/setSharedKey) which crashes.
     private var keyProviderReady: Bool = false
@@ -821,9 +830,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
         // Match RTCSession.ensureFrameKeyProviderIfNeeded() (PBKDF2 = WebRTC default when Apple omits keyDerivationAlgorithm).
         // H1: bounded failureTolerance (32) + ratchetWindowSize (8) mirror the Apple provider.
+        // Empty uncryptedMagicBytes turns off the receiver's skip-decryption-on-magic-tail bypass
+        // (null would abort in the JNI wrapper, which reads the array without a null check).
         // SKIP INSERT: val ratchetWindowSize = 8
         // SKIP INSERT: val sharedKeyMode = true
-        // SKIP INSERT: val uncryptedMagicBytes: ByteArray? = "PQSRTCMagicBytes".encodeToByteArray()
+        // SKIP INSERT: val uncryptedMagicBytes = kotlin.ByteArray(0)
         // SKIP INSERT: val failureTolerance = 32
         // SKIP INSERT: val keyRingSize = 16
         // SKIP INSERT: val discardFrameWhenCryptorNotReady = true
@@ -852,6 +863,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     this@AndroidRTCClient.keyProvider = keyProvider
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderIsSharedKeyMode = sharedKeyMode
+        // SKIP INSERT:     this@AndroidRTCClient.keyProviderRatchetSalt = ratchetSalt
         // SKIP INSERT:     this@AndroidRTCClient.frameCryptorSupport.setKeyProvider(keyProvider)
         // SKIP INSERT:     if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyMode)")
         // SKIP INSERT:     } catch (e: java.lang.UnsatisfiedLinkError) {
@@ -906,8 +918,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: }
     }
 
-    /// Ensures a key provider exists in the requested mode.
-    private func ensureKeyProvider(sharedKeyMode: Bool, ratchetSalt: Data) {
+    /// Ensures a key provider exists in the requested mode, without installing a key.
+    ///
+    /// Sender FrameCryptors bind at track-add only when a provider exists, and then drop frames
+    /// until a key arrives. Apple creates its provider at RTCSession init; call this before adding
+    /// senders so Android does the same instead of sending media unencrypted until the first key.
+    public func ensureKeyProvider(sharedKeyMode: Bool, ratchetSalt: Data) {
         // We piggy-back on `setSharedKey(..., ratchetSalt:)` for provider creation logic.
         // If we're in per-participant mode, we call a dedicated creation path.
         if sharedKeyMode {
@@ -930,9 +946,10 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: }
 
         // H1: bounded failureTolerance (32) + ratchetWindowSize (8) mirror the Apple provider.
+        // Empty uncryptedMagicBytes: see ensureSharedKeyProvider.
         // SKIP INSERT: val ratchetWindowSize = 8
         // SKIP INSERT: val sharedKeyModeK = false
-        // SKIP INSERT: val uncryptedMagicBytes: ByteArray? = "PQSRTCMagicBytes".encodeToByteArray()
+        // SKIP INSERT: val uncryptedMagicBytes = kotlin.ByteArray(0)
         // SKIP INSERT: val failureTolerance = 32
         // SKIP INSERT: val keyRingSize = 16
         // SKIP INSERT: val discardFrameWhenCryptorNotReady = true
@@ -957,6 +974,7 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT:     this@AndroidRTCClient.keyProvider = keyProvider
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderReady = true
         // SKIP INSERT:     this@AndroidRTCClient.keyProviderIsSharedKeyMode = sharedKeyModeK
+        // SKIP INSERT:     this@AndroidRTCClient.keyProviderRatchetSalt = ratchetSalt
         // SKIP INSERT:     this@AndroidRTCClient.frameCryptorSupport.setKeyProvider(keyProvider)
         // SKIP INSERT:     if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "🔐 FrameCryptorKeyProvider created (sharedKeyMode=$sharedKeyModeK)")
         // SKIP INSERT:     } catch (e: java.lang.UnsatisfiedLinkError) {
@@ -1192,6 +1210,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
     public func hasAudioReceiverCryptor(for participant: String) -> Bool {
         frameCryptorSupport.hasAudioReceiverCryptor(participant)
+    }
+
+    /// Called from `RTCClientPeerObserver.onTrack` before the remote audio event is emitted.
+    func holdRemoteAudioUntilReceiverCryptorAttached(_ receiver: org.webrtc.RtpReceiver) {
+        frameCryptorSupport.holdRemoteAudioUntilCryptorAttached(receiver)
     }
 
     public func createReceiverEncryptedFrame(participant: String, connectionId: String, trackKind: String? = nil, trackId: String? = nil) {
@@ -1435,7 +1458,24 @@ public final class AndroidRTCClient: @unchecked Sendable {
         guard !failed else {
             throw RTCClientErrors.peerConnectionError("WebRTC initialization previously failed. Cannot create peer connection. Check WebRTC dependencies.")
         }
-        
+
+        // A previous call's PeerConnection is still here when its teardown has not run yet. Its
+        // own targeted reset will leave the new one alone, so retire it now. Dropping its
+        // observer first keeps the CLOSED callbacks out of the new connection's delegate. Its
+        // FrameCryptors go too: the sender attach keeps any it holds, which would leave the new
+        // senders unencrypted.
+        lock.lock()
+        let replacedPeerConnection = peerConnection?.platformPeerConnection
+        peerConnection = nil
+        observer = nil
+        lock.unlock()
+        if replacedPeerConnection != nil {
+            frameCryptorSupport.disposeAll()
+        }
+        AndroidWebRTCTrackResolver.markPeerConnectionRetired(peerConnection: replacedPeerConnection)
+        replacedPeerConnection?.close()
+        replacedPeerConnection?.dispose()
+
         do {
             let pc = try createPeerConnection(
                 iceServers: iceServers,
@@ -1553,18 +1593,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
         fatalError("createScreenVideoTrack should only be called on Android")
     }
 
-    /// Returns a trackless video transceiver beyond the camera slot that can carry the
-    /// screen sender (the reserved group-call screen slot), if one exists.
-    ///
-    /// Resolution goes through ``AndroidWebRTCTrackResolver`` because raw
-    /// `PeerConnection.getTransceivers()` disposes previously returned wrappers, silently
-    /// detaching live renderer sinks.
-    private func reusableScreenSlotTransceiver(
-        in platformPeerConnection: org.webrtc.PeerConnection
-    ) -> org.webrtc.RtpTransceiver? {
-        return AndroidWebRTCTrackResolver.reusableScreenSlotTransceiver(peerConnection: platformPeerConnection)
-    }
-
     /// Reserves the group-call screen slot (contract mid=2) with an inactive video
     /// transceiver so SFU relay binding does not require escalating mids mid-call.
     /// No-op when a screen slot already exists (reserved earlier or actively sharing).
@@ -1643,21 +1671,16 @@ public final class AndroidRTCClient: @unchecked Sendable {
             lock.unlock()
         }
 
-        // Ensure a trackless video transceiver exists for the screen track. When the
-        // group-call screen slot (contract mid=2) was reserved at join, addTrack below
-        // reuses it; adding another transceiver here would leave a stray empty m-line
-        // (mid=3) that violates the audio=0/camera=1/screen=2 contract.
-        if reusableScreenSlotTransceiver(in: platformPeerConnection) == nil {
-            let initOpts = org.webrtc.RtpTransceiver.RtpTransceiverInit(org.webrtc.RtpTransceiver.RtpTransceiverDirection.SEND_ONLY)
-            platformPeerConnection.addTransceiver(org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, initOpts)
-            AndroidWebRTCTrackResolver.invalidateTransceiverSnapshot(peerConnection: platformPeerConnection)
-        }
-
+        // Every share in the call rides the screen slot (contract mid=2 when reserved at
+        // join), including a restart after stopScreenCapture left it trackless.
         if let track = trackToReturn {
             var ids = [String]()
             ids.append("screen_\(id)")
-            _ = platformPeerConnection.addTrack(track.platformTrack, ids.toList())
-            AndroidWebRTCTrackResolver.invalidateTransceiverSnapshot(peerConnection: platformPeerConnection)
+            AndroidWebRTCTrackResolver.attachScreenSender(
+                peerConnection: platformPeerConnection,
+                track: track.platformTrack,
+                streamIds: ids.toList()
+            )
         }
 
         if shouldStartCapture {
@@ -1733,16 +1756,6 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
         staleHelper?.dispose()
 
-        // SKIP INSERT: if (!AndroidScreenCaptureForeground.startAndAwaitReady(5000)) {
-        // SKIP INSERT:     AndroidScreenCaptureForeground.stopIfRunning()
-        // SKIP INSERT:     throw IllegalStateException("Media projection foreground service did not become ready")
-        // SKIP INSERT: }
-
-        let helper = org.webrtc.SurfaceTextureHelper.create("WebRTCScreenCapture", eglBase.eglBaseContext)
-        guard let helper else {
-            throw RTCClientErrors.peerConnectionError("Failed to create SurfaceTextureHelper for screen capture")
-        }
-
         let rawDownstream = existingSource.platformSource.getCapturerObserver()
         let orientedObserver = CapturerObserverProxy(
             downstream: rawDownstream,
@@ -1750,6 +1763,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
             allowAppearanceSoftening: false,
             fanOutLocalPreview: false)
 
+        // Checks that open nothing come first. Once the foreground service and the helper (a thread
+        // and an EGL context) are up, only startCapture can fail, and the tail below releases them.
         // SKIP INSERT: val intentData = AndroidMediaProjectionResultHolder.consume()
         // SKIP INSERT:     ?: throw IllegalStateException("MediaProjection consent intent not available; launch the consent flow before starting screen share")
         // SKIP INSERT: var lifecycleObserverRef: ScreenCaptureLifecycleObserver? = null
@@ -1768,40 +1783,69 @@ public final class AndroidRTCClient: @unchecked Sendable {
         // SKIP INSERT: lifecycleObserverRef = lifecycleObserver
         // SKIP INSERT: val ctx = ProcessInfo.processInfo.androidContext
         // SKIP INSERT:     ?: throw IllegalStateException("Android context not available")
+
+        // SKIP INSERT: if (!AndroidScreenCaptureForeground.startAndAwaitReady(5000)) {
+        // SKIP INSERT:     AndroidScreenCaptureForeground.stopIfRunning()
+        // SKIP INSERT:     throw IllegalStateException("Media projection foreground service did not become ready")
+        // SKIP INSERT: }
+
+        let helper = org.webrtc.SurfaceTextureHelper.create("WebRTCScreenCapture", eglBase.eglBaseContext)
+        guard let helper else {
+            // SKIP INSERT: AndroidScreenCaptureForeground.stopIfRunning()
+            throw RTCClientErrors.peerConnectionError("Failed to create SurfaceTextureHelper for screen capture")
+        }
+
         // SKIP INSERT: capturer.initialize(helper, ctx, lifecycleObserver)
         // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "Starting screen capture at ${width}x${height}@${fps}fps")
-        // SKIP INSERT: capturer.startCapture(width, height, fps)
 
+        // A String, not an Error: `import kotlin.__` makes a bare Kotlin `Error` ambiguous.
+        var startFailure: String? = nil
+        do {
+            // SKIP INSERT: capturer.startCapture(width, height, fps)
+        } catch {
+            startFailure = "\(error)"
+        }
+
+        // Same race as startLocalVideo, with the foreground-service wait (up to 5 s) inside it:
+        // a start that failed (MediaProjection SecurityException) or whose source was retired
+        // releases what it opened and stops the service; one whose slot another capture took
+        // only stops its capturer.
         lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed else {
-            helper.dispose()
+        let retired = startFailure != nil || isClosed || screenVideoSource?.platformSource !== existingSource.platformSource
+        let superseded = retired || screenCapturer != nil
+        if !superseded {
+            screenSurfaceTextureHelper = helper
+            // SKIP INSERT: this.screenCaptureLifecycleObserver = lifecycleObserver
+            // SKIP INSERT: this.screenCapturer = capturer
+        }
+        lock.unlock()
+        guard superseded else { return }
+
+        // SKIP INSERT: capturer.stopCapture()
+        // SKIP INSERT: capturer.dispose()
+        helper.dispose()
+        if retired {
             // SKIP INSERT: AndroidScreenCaptureForeground.stopIfRunning()
-            throw RTCClientErrors.peerConnectionError("AndroidRTCClient closed during screen capture startup")
+            throw RTCClientErrors.peerConnectionError(startFailure ?? "Screen capture start retired by reset or close")
         }
-        if screenCapturer != nil {
-            helper.dispose()
-            return
-        }
-        screenSurfaceTextureHelper = helper
-        // SKIP INSERT: this.screenCaptureLifecycleObserver = lifecycleObserver
-        // SKIP INSERT: this.screenCapturer = capturer
     }
 
     /// Stops the screen capturer and releases screen-specific resources.
     public func stopScreenCapture() {
         // Snapshot and clear state under the lock, then perform capturer/track teardown outside
-        // it. `stopCapture`, `dispose`, and `setEnabled` block on WebRTC internal threads, and the
+        // it. `stopCapture`, `dispose`, and `removeTrack` block on WebRTC internal threads, and the
         // signaling thread takes this same lock in `triggerRTCEvent` — holding it here can
         // deadlock the whole client.
         let capturerToStop: org.webrtc.VideoCapturer?
         let helperToDispose: org.webrtc.SurfaceTextureHelper?
-        let trackToDisable: RTCVideoTrack?
+        let trackToDetach: RTCVideoTrack?
+        let platformPeerConnection: org.webrtc.PeerConnection?
 
         lock.lock()
         capturerToStop = screenCapturer
         helperToDispose = screenSurfaceTextureHelper
-        trackToDisable = screenVideoTrack
+        trackToDetach = screenVideoTrack
+        platformPeerConnection = isClosed ? nil : peerConnection?.platformPeerConnection
         screenCapturer = nil
         screenCaptureLifecycleObserver = nil
         screenCaptureStartedHandler = nil
@@ -1816,7 +1860,13 @@ public final class AndroidRTCClient: @unchecked Sendable {
         helperToDispose?.dispose()
         frameCryptorSupport.disposeScreenSender()
 
-        trackToDisable?._isEnabled = false
+        // Off its sender, the track stops sending and the slot is free for the next share.
+        if let platformPeerConnection, let trackToDetach {
+            AndroidWebRTCTrackResolver.detachScreenSender(
+                peerConnection: platformPeerConnection,
+                track: trackToDetach.platformTrack
+            )
+        }
 
         // SKIP INSERT: AndroidMediaProjectionResultHolder.clear()
         // SKIP INSERT: AndroidScreenCaptureForeground.stopIfRunning()
@@ -2277,19 +2327,26 @@ public final class AndroidRTCClient: @unchecked Sendable {
             throw RTCClientErrors.peerConnectionError("No suitable video format found")
         }
 
+        // Hangup and relay fallback (`resetPeerConnectionForRetry`) can retire this start's source
+        // while the camera opens; `close()` never runs on those paths. A stored capturer would
+        // keep feeding the disposed source and block the next call's start, so a start that is
+        // no longer current stops the camera it opened (outside the lock: stopCapture blocks).
         lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed else {
-            throw RTCClientErrors.peerConnectionError("AndroidRTCClient has been closed")
+        let retired = isClosed || self.videoSource?.platformSource !== existingVideoSource.platformSource
+        let superseded = retired || videoCapturer != nil
+        if !superseded {
+            surfaceTextureHelper = helper
+            videoCapturer = capturer
         }
+        lock.unlock()
+        guard superseded else { return }
 
-        if videoCapturer != nil {
-            helper.dispose()
-            return
+        capturer.stopCapture()
+        helper.dispose()
+        if retired {
+            AndroidRTCViewSupport.clearOpenedCameraCapturer()
+            throw RTCClientErrors.peerConnectionError("Camera capture start retired by reset or close")
         }
-
-        surfaceTextureHelper = helper
-        videoCapturer = capturer
     }
     
     /// Stops camera capture and releases capture-related resources.
@@ -2576,10 +2633,15 @@ public final class AndroidRTCClient: @unchecked Sendable {
 
     /// Marks the live native PeerConnection retired so later track lookups never call
     /// `signalingState()` / `getTransceivers()` after hangup close/dispose.
-    public func retireCurrentNativePeerConnection() {
+    ///
+    /// - Parameter target: As in ``resetPeerConnectionForRetry(_:)``: a newer call's
+    ///   PeerConnection is left alone (``initializeFactory`` already retired the one it
+    ///   replaced). `nil` retires whatever is current.
+    public func retireCurrentNativePeerConnection(_ target: RTCPeerConnection? = nil) {
         lock.lock()
         let pc = peerConnection?.platformPeerConnection
         lock.unlock()
+        guard target == nil || target?.platformPeerConnection === pc else { return }
         AndroidWebRTCTrackResolver.markPeerConnectionRetired(peerConnection: pc)
     }
 
@@ -2728,12 +2790,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
             throw RTCClientErrors.peerConnectionError("PeerConnection not yet established")
         }
         
-        let obs = RTCOnCreateSdpObserver { [weak self] sdp in
+        let obs = RTCOnCreateSdpObserver { [weak self] sdp, failure in
             guard let self else { return }
             self.lock.lock()
             defer { self.lock.unlock() }
             self.pendingOfferObserver = nil
-            completion(sdp)
+            completion(sdp, failure)
         }
         
         lock.lock()
@@ -2757,12 +2819,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
             throw RTCClientErrors.peerConnectionError("PeerConnection not yet established")
         }
         
-        let obs = RTCOnCreateSdpObserver { [weak self] sdp in
+        let obs = RTCOnCreateSdpObserver { [weak self] sdp, failure in
             guard let self else { return }
             self.lock.lock()
             defer { self.lock.unlock() }
-            completion(sdp)
             self.pendingAnswerObserver = nil
+            completion(sdp, failure)
         }
         
         lock.lock()
@@ -2861,8 +2923,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Creates a local SDP offer.
     public func createOffer(constraints: RTCMediaConstraints) async throws -> RTCSessionDescription {
         try await withCheckedThrowingContinuation { continuation in
-            try self.createOffer(constraints: constraints) {
-                sdp in continuation.resume(returning: sdp)
+            try self.createOffer(constraints: constraints) { sdp, failure in
+                if let sdp = sdp {
+                    continuation.resume(returning: sdp)
+                } else {
+                    continuation.resume(throwing: RTCClientErrors.peerConnectionError(failure ?? "create offer failed"))
+                }
             }
         }
     }
@@ -2870,8 +2936,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Creates a local SDP answer.
     public func createAnswer(constraints: RTCMediaConstraints) async throws -> RTCSessionDescription {
         try await withCheckedThrowingContinuation { continuation in
-            try self.createAnswer(constraints: constraints) {
-                sdp in continuation.resume(returning: sdp)
+            try self.createAnswer(constraints: constraints) { sdp, failure in
+                if let sdp = sdp {
+                    continuation.resume(returning: sdp)
+                } else {
+                    continuation.resume(throwing: RTCClientErrors.peerConnectionError(failure ?? "create answer failed"))
+                }
             }
         }
     }
@@ -2904,7 +2974,11 @@ public final class AndroidRTCClient: @unchecked Sendable {
     ///
     /// Hangup must also call ``resetFrameKeyProviderForHangup()``. ICE retry must not: mid-call
     /// recreation has to keep the live FrameCryptor key ring.
-    public func resetPeerConnectionForRetry() {
+    ///
+    /// - Parameter target: The PeerConnection a call's own teardown retires. When a newer call has
+    ///   already replaced it (``initializeFactory`` closed it then), this does nothing, so a stale
+    ///   teardown cannot reset the newer call. `nil` resets whatever is current.
+    public func resetPeerConnectionForRetry(_ target: RTCPeerConnection? = nil) {
         let videoCapturerToStop: org.webrtc.Camera2Capturer?
         let screenCapturerToStop: org.webrtc.VideoCapturer?
         let surfaceTextureHelperToDispose: org.webrtc.SurfaceTextureHelper?
@@ -2919,7 +2993,8 @@ public final class AndroidRTCClient: @unchecked Sendable {
         let audioSourceToDispose: RTCAudioSource?
 
         lock.lock()
-        guard !isClosed else {
+        guard !isClosed,
+              target == nil || target?.platformPeerConnection === peerConnection?.platformPeerConnection else {
             lock.unlock()
             return
         }
@@ -2994,11 +3069,20 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// PeerConnection mid-call. A later call on the same process would then `setKey(..., index: 0)`
     /// on leftover native ratchet state (Device3 18:02: same pid, new call, same room). Apple hangup
     /// already nils `keyProvider`; Android must do the same without `close()`.
+    ///
+    /// The old provider is replaced with an empty one of the same mode and salt, not left nil:
+    /// with no provider the next call's sender FrameCryptors are skipped at track-add and its
+    /// media leaves unencrypted until a later attach. Apple's next ensure recreates its provider
+    /// the same way.
     public func resetFrameKeyProviderForHangup() {
         lock.lock()
-        defer { lock.unlock() }
-        guard !isClosed else { return }
+        guard !isClosed else {
+            lock.unlock()
+            return
+        }
 
+        let freshSharedKeyMode = keyProviderIsSharedKeyMode
+        let freshRatchetSalt = keyProviderRatchetSalt
         frameCryptorSupport.clearKeyProvider()
         keyProvider = nil
         keyProviderIsSharedKeyMode = nil
@@ -3006,7 +3090,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
         pendingPerParticipantKeys.removeAll()
         pendingSharedKey = nil
         pendingSharedKeyIndex = nil
-        // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "🔐 Reset FrameCryptorKeyProvider after hangup; next call will create a fresh provider")
+        lock.unlock()
+        // SKIP INSERT: if (pqsrtc.module.AndroidRTCViewSupport.verboseNativeLogsEnabled()) android.util.Log.d("AndroidRTCClient", "🔐 Reset FrameCryptorKeyProvider after hangup; replacing it with a fresh provider")
+
+        if let freshSharedKeyMode, let freshRatchetSalt {
+            ensureKeyProvider(sharedKeyMode: freshSharedKeyMode, ratchetSalt: freshRatchetSalt)
+        }
     }
     
     /// Closes the peer connection and releases all WebRTC resources owned by this client.

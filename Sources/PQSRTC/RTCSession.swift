@@ -292,10 +292,15 @@ public actor RTCSession {
     }
 
     func shouldSkipShutdownForLiveAttempt(_ endingCall: Call?) async -> Bool {
-        guard let endingCall,
-              let liveCall = await callState.currentCall else {
-            return false
+        guard let endingCall else { return false }
+        // `currentCall` is set from `.connecting`; a rejoin still `.ready` already owns the room.
+        let liveCall: Call?
+        if case .ready(let readyCall) = await callState.currentState {
+            liveCall = readyCall
+        } else {
+            liveCall = await callState.currentCall
         }
+        guard let liveCall else { return false }
         return CallTeardownOwnershipPolicy.shouldSkipShutdownForLiveAttempt(
             endingCallId: endingCall.id,
             liveCallId: liveCall.id,
@@ -668,6 +673,7 @@ public actor RTCSession {
     func clearAndroidSessionRemoteAudioResolvedTrackIdsForNewCall() {
         androidSessionRemoteAudioResolvedTrackIdsByParticipantId.removeAll()
         androidPrunedRemoteCameraParticipantKeys.removeAll()
+        lastReceiverCryptorEventKindByParticipantId.removeAll()
     }
 
     func noteAndroidRemoteCameraParticipantPruned(_ participantId: String) {
@@ -1158,6 +1164,7 @@ public actor RTCSession {
     }
 
     /// Last receiver-cryptor event kind emitted per participant, to emit only transitions (H1).
+    /// Per call: participant ids repeat across calls, so hangup / new call attempt clear it.
     var lastReceiverCryptorEventKindByParticipantId: [String: E2EEStateEvent.Kind] = [:]
 
     /// Emits receiver-cryptor state transitions on `e2eeStateStream()` (H1).
@@ -2202,6 +2209,8 @@ public actor RTCSession {
             screenShareRenegotiationAwaitingAnswerConnectionIds.remove(v)
             screenShareAnswerApplicationConnectionIds.remove(v)
             pendingSettledScreenShareRenegotiationReasonsByConnectionId.removeValue(forKey: v)
+            lastEmittedNetworkQualityByConnectionId.removeValue(forKey: v)
+            lastEmittedNetworkQualityUptimeNsByConnectionId.removeValue(forKey: v)
             setScreenShareRenegotiationActive(false, connectionId: v)
         }
     }
@@ -2459,6 +2468,11 @@ public actor RTCSession {
 #if os(Android)
         installAndroidVideoReceiverFrameCryptorReadyHandler()
         installAndroidFrameCryptorFailureHandler()
+        // Like Apple's provider above: sender FrameCryptors bind at track-add only when a
+        // provider exists, so the first call must not add senders without one.
+        if enableEncryption {
+            rtcClient.ensureKeyProvider(sharedKeyMode: frameEncryptionKeyMode == .shared, ratchetSalt: ratchetSalt)
+        }
 #endif
 #if canImport(WebRTC)
         // H1: forward cryptor state transitions into e2eeStateStream instead of log-only.
@@ -2482,11 +2496,13 @@ public actor RTCSession {
         // DECRYPTIONFAILED (delegate event) instead of silently dropping frames forever.
         // 32 consecutive failures ≈ 1s of video; explicit setKey always recovers.
         // ratchetWindowSize 8 lets the receiver catch up when a sender ratchets forward.
+        // No uncrypted magic bytes: WebRTC would pass any frame ending in them through
+        // undecrypted, so a relay could inject keyless media.
         keyProvider = RTCFrameCryptorKeyProvider(
             ratchetSalt: ratchetSalt,
             ratchetWindowSize: 8,
             sharedKeyMode: frameEncryptionKeyMode == .shared,
-            uncryptedMagicBytes: "PQSRTCMagicBytes".data(using: .utf8)!,
+            uncryptedMagicBytes: nil,
             failureTolerance: 32,
             keyRingSize: 16,
             discardFrameWhenCryptorNotReady: true)

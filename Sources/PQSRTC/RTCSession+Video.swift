@@ -3671,7 +3671,7 @@ extension RTCSession {
         }
 
         var touchedAnyVideoSender = false
-        for sender in connection.peerConnection.senders where sender.track?.kind == kRTCMediaStreamTrackKindVideo {
+        for sender in cameraVideoSenders(of: connection) {
             sender.track = newVideoTrack
             let params = sender.parameters
             if !params.encodings.isEmpty {
@@ -3692,6 +3692,14 @@ extension RTCSession {
         await manager.updateConnection(id: normalizedId, with: connection)
         logger.log(level: .warning, message: "Rebuilt local video sender pipeline for connection id=\(normalizedId)")
         return true
+    }
+
+    /// Local video senders that carry the camera: every video sender except the screen share's.
+    func cameraVideoSenders(of connection: RTCConnection) -> [RTCRtpSender] {
+        connection.peerConnection.senders.filter { sender in
+            guard let track = sender.track, track.kind == kRTCMediaStreamTrackKindVideo else { return false }
+            return !Self.isScreenShareId(track.trackId)
+        }
     }
 #endif
     
@@ -3775,6 +3783,8 @@ extension RTCSession {
     }
     
 #if !os(Android)
+    /// Enables or disables the microphone or camera tracks. The screen-share track is never touched:
+    /// its lifecycle belongs to screen sharing, not to camera mute.
     func setTrackEnabled<T: RTCMediaStreamTrack>(_ type: T.Type, isEnabled: Bool, with connection: RTCConnection) async {
         // Prefer `senders` — some stacks attach local tracks there before transceiver.sender.track is wired.
         var applied = Set<ObjectIdentifier>()
@@ -3782,12 +3792,12 @@ extension RTCSession {
         var audioEncoderMuteApplied = false
 #endif
         for sender in connection.peerConnection.senders {
-            guard let track = sender.track as? T else { continue }
+            guard let track = sender.track as? T, !Self.isScreenShareId(track.trackId) else { continue }
             track.isEnabled = isEnabled
             applied.insert(ObjectIdentifier(track))
         }
         for transceiver in connection.peerConnection.transceivers {
-            guard let track = transceiver.sender.track as? T else { continue }
+            guard let track = transceiver.sender.track as? T, !Self.isScreenShareId(track.trackId) else { continue }
             let id = ObjectIdentifier(track)
             guard !applied.contains(id) else { continue }
             track.isEnabled = isEnabled

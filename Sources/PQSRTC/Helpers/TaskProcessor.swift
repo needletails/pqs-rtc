@@ -37,10 +37,13 @@ actor TaskProcessor {
     var logger: NeedleTailLogger
     var isRunning = false
 
-    /// Job currently inside ``process(_:)``. It has been popped from the deque but is still in
-    /// `jobs` (removed only on completion), so cache reloads must not re-enqueue it — a second
-    /// pass over the same StreamTask advances the ratchet twice and fails decrypt.
-    private var inFlightJobId: String?
+    /// Test seam: the loop awaits this after popping a job and before running it. In production
+    /// the pop is still crossing the consumer actor hops at that point.
+    private var willProcessJobForTesting: (@Sendable (Job) async -> Void)?
+
+    func setWillProcessJobForTesting(_ hook: (@Sendable (Job) async -> Void)?) {
+        willProcessJobForTesting = hook
+    }
 
     // MARK: - Outbound send lane
     //
@@ -220,9 +223,7 @@ actor TaskProcessor {
         if let job {
             try await jobConsumer.loadAndOrganizeTasks(job)
         } else {
-            for job in jobs where job.id != inFlightJobId {
-                try await jobConsumer.loadAndOrganizeTasks(job)
-            }
+            try await loadFromCache()
         }
         try await startProcessingIfNeeded()
     }
@@ -356,11 +357,14 @@ actor TaskProcessor {
             for try await result in NeedleTailAsyncSequence(consumer: jobConsumer) {
                 switch result {
                 case let .success(job):
+                    if let willProcessJob = willProcessJobForTesting { await willProcessJob(job) }
+                    // A reload can re-insert a job the loop already popped or finished: the pop
+                    // and the reload cross actor hops. Only a job still in `jobs` is pending; a
+                    // second pass encrypts and sends twice, or advances the ratchet twice and
+                    // fails decrypt.
+                    guard jobs.contains(where: { $0.id == job.id }) else { continue }
                     do {
-                        
-                        inFlightJobId = job.id
                         let outcome = try await process(job)
-                        inFlightJobId = nil
 
                         if outcome == .paused {
                             consecutivePauses += 1
@@ -390,7 +394,6 @@ actor TaskProcessor {
                             return
                         }
                     } catch {
-                        inFlightJobId = nil
                         await jobConsumer.gracefulShutdown()
                         throw error
                     }
@@ -406,7 +409,7 @@ actor TaskProcessor {
     // MARK: - Cache loading
 
     private func loadFromCache() async throws {
-        for job in jobs where job.id != inFlightJobId {
+        for job in jobs {
             try await jobConsumer.loadAndOrganizeTasks(job)
         }
     }

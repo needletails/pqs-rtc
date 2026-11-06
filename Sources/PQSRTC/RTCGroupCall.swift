@@ -89,6 +89,10 @@ public actor RTCGroupCall: RTCSessionMediaEvents {
         call
     }
 
+    /// Test seam: media bootstrap awaits this right before it creates the room's media, where a
+    /// real bootstrap is suspended on key, connection or (iOS) audio-session work.
+    nonisolated(unsafe) var willCreateMediaForTesting: (@Sendable () async -> Void)?
+
     private var state: State = .idle
     private var participantsById: [String: Participant] = [:]
 

@@ -304,7 +304,8 @@ extension RTCSession {
         await connectionManager.updateConnection(id: normalizedId, with: connection)
         if enableEncryption, let screenTrack {
             rtcClient.createScreenSenderEncryptedFrame(
-                participant: connection.localParticipantId,
+                participant: Self.senderFrameKeyParticipantIdForSetMessageKey(
+                    connectionLocalParticipantId: connection.localParticipantId),
                 connectionId: normalizedId,
                 trackId: screenTrack.trackId
             )
@@ -437,7 +438,16 @@ extension RTCSession {
         connectionId: String,
         timeoutSeconds: Double
     ) async {
+        // Call teardown cancels neither this timer nor the pending id. Once the track has left its
+        // connection the share already ended, so only drop the stale state: rolling back would stop
+        // whatever capture is current (maybe a later call's) and report sharing stopped.
+        let shareIsOnConnection = await connectionManager.findConnection(with: connectionId)?.localScreenTrack != nil
         guard pendingScreenShareRenegotiationConnectionIds.contains(connectionId) else { return }
+        guard shareIsOnConnection else {
+            pendingScreenShareRenegotiationConnectionIds.remove(connectionId)
+            clearAbandonedScreenShareCaptureCleanupTask(for: connectionId)
+            return
+        }
         logger.log(
             level: .warning,
             message: "Abandoned screen share capture cleanup after \(Int(timeoutSeconds))s without capture-ready connId=\(connectionId)")
@@ -579,12 +589,16 @@ extension RTCSession {
         logger.log(level: .info, message: "Screen share track removed for connection \(normalizedId)")
     }
 
+    /// `remoteOfferPending`: an inbound (SFU) offer is applied but not answered yet. WebRTC rejects
+    /// a local offer in `have-remote-offer`; ``screenShareSignalingDidBecomeStable(connectionId:)``
+    /// flushes the coalesced share once that answer lands.
     static func shouldCoalesceScreenShareRenegotiation(
         awaitingAnswer: Bool,
         applyingAnswer: Bool,
-        offerInFlight: Bool
+        offerInFlight: Bool,
+        remoteOfferPending: Bool = false
     ) -> Bool {
-        awaitingAnswer || applyingAnswer || offerInFlight
+        awaitingAnswer || applyingAnswer || offerInFlight || remoteOfferPending
     }
 
     func beginScreenShareAnswerApplicationIfNeeded(connectionId: String) -> Bool {
@@ -657,10 +671,16 @@ extension RTCSession {
             return
         }
 
+#if canImport(WebRTC) && !os(Android)
+        let remoteOfferPending = connection.peerConnection.signalingState == .haveRemoteOffer
+#else
+        let remoteOfferPending = signalingStateByConnectionId[connection.id.normalizedConnectionId]?.state == .haveRemoteOffer
+#endif
         if Self.shouldCoalesceScreenShareRenegotiation(
             awaitingAnswer: screenShareRenegotiationAwaitingAnswerConnectionIds.contains(normalizedId),
             applyingAnswer: screenShareAnswerApplicationConnectionIds.contains(normalizedId),
-            offerInFlight: offerInFlightConnectionIds.contains(normalizedId)
+            offerInFlight: offerInFlightConnectionIds.contains(normalizedId),
+            remoteOfferPending: remoteOfferPending
         ) {
             pendingSettledScreenShareRenegotiationReasonsByConnectionId[normalizedId] = reason
             setScreenShareRenegotiationActive(true, connectionId: normalizedId)
@@ -1005,13 +1025,10 @@ extension RTCSession {
         options: ScreenShareOptions = ScreenShareOptions(),
         with connection: RTCConnection
     ) async throws -> (WebRTC.RTCVideoTrack, RTCConnection) {
-        var updatedConnection = connection
         let videoSource = RTCSession.factory.videoSource()
 
         let screenTrackId = "\(Self.screenTrackPrefix)\(connection.localParticipantId)_\(connection.id)"
         let screenTrack = RTCSession.factory.videoTrack(with: videoSource, trackId: screenTrackId)
-        updatedConnection.localScreenTrack = screenTrack
-        updatedConnection.screenCaptureWrapper = RTCVideoCaptureWrapper(delegate: videoSource)
 
         #if !os(Android)
         let systemAudioEgress: any ScreenShareSystemAudioEgress = Self.supportsScreenShareSystemAudioEgress
@@ -1077,6 +1094,16 @@ extension RTCSession {
         }
         #endif
 
+        // A stop or call end during the start released this capture (or the connection) but could
+        // not stop it yet. Stop it now instead of publishing it, and write onto the connection as
+        // it is now, not the copy from before the start.
+        guard var updatedConnection = await connectionManager.findConnection(with: connection.id),
+              isCurrentPlatformScreenCaptureGeneration(captureGeneration) else {
+            await stopPlatformScreenCapture(captureSource)
+            throw RTCErrors.mediaError("Screen share stopped before capture started.")
+        }
+        updatedConnection.localScreenTrack = screenTrack
+        updatedConnection.screenCaptureWrapper = RTCVideoCaptureWrapper(delegate: videoSource)
         await connectionManager.updateConnection(id: connection.id, with: updatedConnection)
         return (screenTrack, updatedConnection)
     }

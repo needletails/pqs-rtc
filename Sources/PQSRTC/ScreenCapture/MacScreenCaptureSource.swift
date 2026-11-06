@@ -44,6 +44,9 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
     private var silentSystemAudioFrameCount = 0
     /// True only while a capture with `shareSystemAudio` is running.
     private var systemAudioActive = false
+    /// Test seam: stands in for the ScreenCaptureKit start, which needs screen-recording
+    /// permission. nil outside tests.
+    nonisolated(unsafe) static var startCaptureForTesting: (@Sendable () async throws -> Void)?
 
     init(
         systemAudioEgress: ScreenShareSystemAudioEgress = NoOpScreenShareSystemAudioEgress(),
@@ -78,6 +81,7 @@ final class MacScreenCaptureSource: NSObject, @unchecked Sendable {
             await stopCapture()
         }
         self.videoSource = videoSource
+        if let startCaptureForTesting = Self.startCaptureForTesting { return try await startCaptureForTesting() }
 
         let content = try await Self.availableContent()
 

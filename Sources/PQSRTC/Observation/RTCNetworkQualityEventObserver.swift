@@ -38,7 +38,7 @@ public final class RTCNetworkQualityEventObserver {
     }
 
     // `deinit` is nonisolated; cancellation is thread-safe.
-    private var task: Task<Void, Never>?
+    @ObservationIgnored private var task: Task<Void, Never>?
 
     // MARK: - Observation-backed stream (NudgeKit-style)
     public private(set) var latestStream: AsyncStream<RTCNetworkQualityUpdate>?
@@ -46,14 +46,17 @@ public final class RTCNetworkQualityEventObserver {
 
     public init() {}
 
+    deinit {
+        task?.cancel()
+    }
+
     /// Starts (or restarts) observing `session` network quality events.
     public func start(session: RTCSession) {
         stop()
         task = Task { [weak self] in
-            guard let self else { return }
             let stream = await session.createNetworkQualityStream()
             for await update in stream {
-                if Task.isCancelled { return }
+                guard let self, !Task.isCancelled else { return }
                 self.setLatest(update)
             }
         }

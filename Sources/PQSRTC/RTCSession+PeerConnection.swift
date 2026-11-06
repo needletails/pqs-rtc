@@ -71,6 +71,8 @@ extension RTCSession {
     /// This is intentionally separate from full signaling/peer-connection teardown so UI end actions
     /// can reclaim device access before transport `didEnd` or remote cleanup finishes.
     public func releaseLocalMediaResourcesForCallEnding(call: Call?) async {
+        // Releases by room id, which a same-room rejoin shares: never strip the live attempt.
+        guard await !shouldSkipShutdownForLiveAttempt(call) else { return }
         shouldOffer = false
 
 #if os(iOS) || os(macOS)
@@ -104,7 +106,6 @@ extension RTCSession {
         rtcClient.stopLocalVideo()
         rtcClient.stopScreenCapture()
         rtcClient.releaseAllSurfaceRenderers()
-        rtcClient.retireCurrentNativePeerConnection()
 #endif
 
         logger.log(level: .info, message: "Released local media resources for ending call: \(call?.sharedCommunicationId ?? "<none>")")
@@ -153,6 +154,7 @@ extension RTCSession {
             notifyLocalScreenShareChanged(isSharing: false)
         }
         await connectionManager.updateConnection(id: connectionId, with: connection)
+        rtcClient.retireCurrentNativePeerConnection(connection.peerConnection)
 #elseif canImport(WebRTC)
         if connection.localAudioTrack != nil {
             await setTrackEnabled(WebRTC.RTCAudioTrack.self, isEnabled: false, with: connection)
@@ -458,11 +460,14 @@ extension RTCSession {
         with call: Call?,
         endState: CallStateMachine.EndState = .userInitiated
     ) async {
+        // Await before the in-progress check: check and claim must not straddle a suspension,
+        // or an overlapping shutdown runs a second teardown after this one resumed waiters.
+        let skipForLiveAttempt = await shouldSkipShutdownForLiveAttempt(call)
         if isCallTeardownInProgress {
             await waitForCallTeardownIfNeeded()
             return
         }
-        if await shouldSkipShutdownForLiveAttempt(call) {
+        if skipForLiveAttempt {
             logger.log(
                 level: .warning,
                 message: "Skipping RTC shutdown for ended attempt \(call?.id.uuidString ?? "nil"); live attempt owns this room"
@@ -471,6 +476,15 @@ extension RTCSession {
         }
         beginCallTeardown()
         defer { finishCallTeardown() }
+
+    #if os(Android)
+        // finishEndConnection removes the connection; the reset below must still leave a newer
+        // call's PeerConnection alone.
+        var ownPeerConnection: RTCPeerConnection?
+        if let call {
+            ownPeerConnection = await connectionManager.findConnection(with: call.sharedCommunicationId)?.peerConnection
+        }
+    #endif
 
         await releaseLocalMediaResourcesForCallEnding(call: call)
 
@@ -487,7 +501,6 @@ extension RTCSession {
         peerConnectionNotificationsContinuation.yield(nil)
         notificationsTask?.cancel()
         notificationsTask = nil
-        notificationsConsumerIsRunning = false
 
         // Recreate the notifications stream so subsequent calls start with a fresh pipeline.
         // This is critical for sequential-call reliability when the previous stream has
@@ -513,7 +526,7 @@ extension RTCSession {
         }
 
     #if os(Android)
-        self.rtcClient.resetPeerConnectionForRetry()
+        self.rtcClient.resetPeerConnectionForRetry(ownPeerConnection)
         self.rtcClient.resetFrameKeyProviderForHangup()
         logger.log(level: .info, message: "Did reset AndroidRTCClient during shutdown")
     #endif
@@ -749,20 +762,10 @@ extension RTCSession {
     /// The session consumes an internal notification stream (emitted by platform delegates) to
     /// coordinate negotiation, media events, and crypto lifecycle changes.
     func handleNotificationsStream() {
-        // Start a new task if one doesn't exist, is cancelled, or we previously observed that the
-        // consumer isn't actually running.
-        let needsRestart = notificationsTask == nil
-            || notificationsTask?.isCancelled == true
-            || notificationsConsumerIsRunning == false
-
-        guard needsRestart else { return }
-
-        if notificationsTask != nil {
-            logger.log(level: .info, message: "Restarting peer-notifications consumer task")
-            // Wake any existing consumer so it can observe cancellation/generation mismatch.
-            peerConnectionNotificationsContinuation.yield(nil)
-            notificationsTask?.cancel()
-        }
+        // An existing task is the consumer, even before it reaches the actor. Never cancel it to
+        // restart: cancelling an `AsyncStream` iterator finishes the shared stream for every
+        // consumer. Teardown and the consumer's own exit clear `notificationsTask`.
+        guard notificationsTask == nil else { return }
 
         notificationsTaskGeneration &+= 1
         let generation = notificationsTaskGeneration
@@ -784,7 +787,6 @@ extension RTCSession {
         // Only clear if this is still the latest task.
         guard generation == notificationsTaskGeneration else { return }
         notificationsTask = nil
-        notificationsConsumerIsRunning = false
     }
     
     /// Creates a state stream for a call.
@@ -1122,7 +1124,7 @@ extension RTCSession {
         
         func cleanup(connection: RTCConnection) async {
 #if os(Android)
-            self.rtcClient.resetPeerConnectionForRetry()
+            self.rtcClient.resetPeerConnectionForRetry(connection.peerConnection)
             logger.log(level: .info, message: "Did reset AndroidRTCClient for call: \(connection)")
 #else
             connection.peerConnection.delegate = nil
@@ -1239,6 +1241,7 @@ extension RTCSession {
         remoteVideoRendererAttachedTrackIdByConnectionId.removeAll()
         remoteParticipantVideoRendererAttachedTrackIdByKey.removeAll()
         sfuRenegotiationReceiverCryptorRebindDeferredConnectionIds.removeAll()
+        sfuRenegotiationInFlightConnectionIds.removeAll()
         oneToOneSfuLockedRemoteDeviceIdByNormalizedConnectionId.removeAll()
         lastFrameKeyIndexByParticipantId.removeAll()
         lastSharedFrameKeyIndex = 0
