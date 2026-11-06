@@ -222,10 +222,10 @@ import kotlin.__
 private final class RTCOnCreateSdpObserver: NSObject, org.webrtc.SdpObserver, @unchecked Sendable {
     
     private let lock = NSLock()
-    /// Receives the created description, or the WebRTC create failure (for example a
-    /// PeerConnection closed or shut down by hangup or relay reset during the operation).
-    private let callback: (Result<RTCSessionDescription, Error>) -> Void
-    init(_ callback: @escaping (Result<RTCSessionDescription, Error>) -> Void) { self.callback = callback }
+    /// Receives the created description, or `nil` and the WebRTC create failure message (for
+    /// example a PeerConnection closed or shut down by hangup or relay reset during the operation).
+    private let callback: (RTCSessionDescription?, String?) -> Void
+    init(_ callback: @escaping (RTCSessionDescription?, String?) -> Void) { self.callback = callback }
     
     override func onCreateSuccess(_ desc: org.webrtc.SessionDescription?) {
         guard let d = desc else {
@@ -236,7 +236,7 @@ private final class RTCOnCreateSdpObserver: NSObject, org.webrtc.SdpObserver, @u
         defer {
             lock.unlock()
         }
-        callback(.success(RTCSessionDescription(type: d.type, sdp: d.description)))
+        callback(RTCSessionDescription(type: d.type, sdp: d.description), nil)
     }
     
     override func onSetSuccess() {}
@@ -245,7 +245,7 @@ private final class RTCOnCreateSdpObserver: NSObject, org.webrtc.SdpObserver, @u
         defer {
             lock.unlock()
         }
-        callback(.failure(RTCClientErrors.peerConnectionError(error ?? "create description failed")))
+        callback(nil, error ?? "create description failed")
     }
     override func onSetFailure(_ error: String?) {}
 }
@@ -442,8 +442,8 @@ public enum ClientPCEvent: Sendable {
 /// Thread safety: most methods synchronize internal state with an `NSLock`.
 public final class AndroidRTCClient: @unchecked Sendable {
     
-    /// Callback used to deliver newly created local SDP or the create failure.
-    private typealias OnLocalSDP = @Sendable (Result<RTCSessionDescription, Error>) -> Void
+    /// Callback used to deliver newly created local SDP, or `nil` and the create failure message.
+    private typealias OnLocalSDP = @Sendable (RTCSessionDescription?, String?) -> Void
     
     // Thread safety
     private let lock = NSLock()
@@ -2790,12 +2790,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
             throw RTCClientErrors.peerConnectionError("PeerConnection not yet established")
         }
         
-        let obs = RTCOnCreateSdpObserver { [weak self] result in
+        let obs = RTCOnCreateSdpObserver { [weak self] sdp, failure in
             guard let self else { return }
             self.lock.lock()
             defer { self.lock.unlock() }
             self.pendingOfferObserver = nil
-            completion(result)
+            completion(sdp, failure)
         }
         
         lock.lock()
@@ -2819,12 +2819,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
             throw RTCClientErrors.peerConnectionError("PeerConnection not yet established")
         }
         
-        let obs = RTCOnCreateSdpObserver { [weak self] result in
+        let obs = RTCOnCreateSdpObserver { [weak self] sdp, failure in
             guard let self else { return }
             self.lock.lock()
             defer { self.lock.unlock() }
             self.pendingAnswerObserver = nil
-            completion(result)
+            completion(sdp, failure)
         }
         
         lock.lock()
@@ -2923,8 +2923,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Creates a local SDP offer.
     public func createOffer(constraints: RTCMediaConstraints) async throws -> RTCSessionDescription {
         try await withCheckedThrowingContinuation { continuation in
-            try self.createOffer(constraints: constraints) { result in
-                continuation.resume(with: result)
+            try self.createOffer(constraints: constraints) { sdp, failure in
+                if let sdp = sdp {
+                    continuation.resume(returning: sdp)
+                } else {
+                    continuation.resume(throwing: RTCClientErrors.peerConnectionError(failure ?? "create offer failed"))
+                }
             }
         }
     }
@@ -2932,8 +2936,12 @@ public final class AndroidRTCClient: @unchecked Sendable {
     /// Creates a local SDP answer.
     public func createAnswer(constraints: RTCMediaConstraints) async throws -> RTCSessionDescription {
         try await withCheckedThrowingContinuation { continuation in
-            try self.createAnswer(constraints: constraints) { result in
-                continuation.resume(with: result)
+            try self.createAnswer(constraints: constraints) { sdp, failure in
+                if let sdp = sdp {
+                    continuation.resume(returning: sdp)
+                } else {
+                    continuation.resume(throwing: RTCClientErrors.peerConnectionError(failure ?? "create answer failed"))
+                }
             }
         }
     }

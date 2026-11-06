@@ -39,6 +39,15 @@ struct AndroidCreateSdpFailureResumesTests {
         }
     }
 
+    /// In Skip-transpiled Kotlin, `Result` is ambiguous between Skip's `Result<Success, Failure>`
+    /// and `kotlin.Result<T>`, so `.success`/`.failure` and `resume(with:)` fail `compileDebugKotlin`.
+    @Test("transpiled Android client does not use Swift Result")
+    func transpiledClientAvoidsSwiftResult() throws {
+        let client = try source("Sources/PQSRTC/Android/AndroidRTCClient.swift")
+        #expect(!client.contains("Result<"))
+        #expect(!client.contains("resume(with:"))
+    }
+
     private func source(_ relativePath: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
